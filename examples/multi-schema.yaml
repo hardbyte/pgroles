@@ -1,0 +1,108 @@
+# Multi-schema pgpolicy manifest with profiles, one-off roles, and
+# external identity provider memberships.
+#
+# Scenario: a SaaS product with separate schemas for different domains
+# (orders, products, customers). A migration runner role owns all objects.
+# Teams access schemas through Google Workspace groups managed externally
+# (e.g. via Terraform) — pgpolicy only manages the membership edges, not
+# the group roles themselves.
+
+default_owner: migration_runner
+
+profiles:
+  editor:
+    grants:
+      - on: { type: schema }
+        privileges: [USAGE]
+      - on: { type: table, name: "*" }
+        privileges: [SELECT, INSERT, UPDATE, DELETE]
+      - on: { type: sequence, name: "*" }
+        privileges: [USAGE, SELECT]
+      - on: { type: function, name: "*" }
+        privileges: [EXECUTE]
+    default_privileges:
+      - on_type: table
+        privileges: [SELECT, INSERT, UPDATE, DELETE]
+      - on_type: sequence
+        privileges: [USAGE, SELECT]
+      - on_type: function
+        privileges: [EXECUTE]
+
+  viewer:
+    grants:
+      - on: { type: schema }
+        privileges: [USAGE]
+      - on: { type: table, name: "*" }
+        privileges: [SELECT]
+      - on: { type: sequence, name: "*" }
+        privileges: [SELECT]
+    default_privileges:
+      - on_type: table
+        privileges: [SELECT]
+      - on_type: sequence
+        privileges: [SELECT]
+
+schemas:
+  - name: orders
+    profiles: [editor, viewer]
+  - name: products
+    profiles: [editor, viewer]
+  - name: customers
+    profiles: [editor, viewer]
+
+# One-off roles that don't fit the profile pattern.
+roles:
+  - name: readonly-all
+    comment: "Cross-schema read-only access for analytics"
+  - name: etl-service
+    login: true
+    comment: "Service account for the ETL pipeline"
+
+# Grants for one-off roles — manually specified per-schema.
+grants:
+  - role: readonly-all
+    on: { type: schema, name: orders }
+    privileges: [USAGE]
+  - role: readonly-all
+    on: { type: table, schema: orders, name: "*" }
+    privileges: [SELECT]
+  - role: readonly-all
+    on: { type: schema, name: products }
+    privileges: [USAGE]
+  - role: readonly-all
+    on: { type: table, schema: products, name: "*" }
+    privileges: [SELECT]
+  - role: readonly-all
+    on: { type: schema, name: customers }
+    privileges: [USAGE]
+  - role: readonly-all
+    on: { type: table, schema: customers, name: "*" }
+    privileges: [SELECT]
+
+# Memberships — external group roles are NOT created by pgpolicy.
+# Only the GRANT <role> TO <member> edge is managed.
+memberships:
+  - role: orders-editor
+    members:
+      - name: orders-team@example.com
+  - role: orders-viewer
+    members:
+      - name: orders-readers@example.com
+      - name: readonly-all
+  - role: products-editor
+    members:
+      - name: products-team@example.com
+  - role: products-viewer
+    members:
+      - name: products-readers@example.com
+      - name: readonly-all
+  - role: customers-editor
+    members:
+      - name: customers-team@example.com
+  - role: customers-viewer
+    members:
+      - name: customers-readers@example.com
+      - name: readonly-all
+  - role: etl-service
+    members:
+      - name: readonly-all

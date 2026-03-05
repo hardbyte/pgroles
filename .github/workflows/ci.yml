@@ -1,0 +1,171 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+  SQLX_OFFLINE: "true"
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Job 1: Lint — clippy, rustfmt, CRD drift check
+  # ---------------------------------------------------------------------------
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Check formatting
+        run: cargo fmt --all --check
+
+      - name: Clippy
+        run: cargo clippy --all-targets --all-features -- -D warnings
+
+      - name: CRD drift check
+        run: |
+          cargo run --bin crdgen > /tmp/crd-generated.yaml
+          diff k8s/crd.yaml /tmp/crd-generated.yaml || {
+            echo "::error::CRD YAML is out of date. Run 'cargo run --bin crdgen > k8s/crd.yaml' and commit."
+            exit 1
+          }
+
+  # ---------------------------------------------------------------------------
+  # Job 2: Unit tests
+  # ---------------------------------------------------------------------------
+  unit-test:
+    name: Unit Tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Run tests
+        run: cargo test --workspace
+
+  # ---------------------------------------------------------------------------
+  # Job 3: Integration tests — with a live PostgreSQL
+  # ---------------------------------------------------------------------------
+  integration-test:
+    name: Integration Tests
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: testpassword
+          POSTGRES_DB: pgpolicy_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd="pg_isready -U postgres"
+          --health-interval=5s
+          --health-timeout=5s
+          --health-retries=10
+    env:
+      DATABASE_URL: "postgres://postgres:testpassword@localhost:5432/pgpolicy_test"
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Run integration tests (including ignored)
+        run: cargo test --workspace -- --include-ignored
+
+  # ---------------------------------------------------------------------------
+  # Job 4: E2E — kind cluster + operator deployment
+  # ---------------------------------------------------------------------------
+  e2e:
+    name: E2E Tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build binaries
+        run: cargo build --workspace
+
+      - name: Install kind
+        run: |
+          [ -f /usr/local/bin/kind ] || {
+            curl -Lo /usr/local/bin/kind https://kind.sigs.k8s.io/dl/v0.24.0/kind-linux-amd64
+            chmod +x /usr/local/bin/kind
+          }
+
+      - name: Create kind cluster
+        run: kind create cluster --name pgpolicy-e2e --wait 60s
+
+      - name: Install CRD
+        run: kubectl apply -f k8s/crd.yaml
+
+      - name: Deploy dev PostgreSQL
+        run: |
+          kubectl apply -f k8s/dev/postgres.yaml
+          kubectl rollout status statefulset/postgres --timeout=120s
+
+      - name: Wait for PostgreSQL readiness
+        run: |
+          kubectl wait --for=condition=ready pod/postgres-0 --timeout=90s
+
+      - name: Build operator image and load into kind
+        run: |
+          docker build --target operator -t pgpolicy-operator:e2e -f docker/Dockerfile .
+          kind load docker-image pgpolicy-operator:e2e --name pgpolicy-e2e
+
+      - name: Deploy operator
+        run: |
+          kubectl apply -f k8s/deploy/namespace.yaml
+          kubectl apply -f k8s/deploy/rbac.yaml
+
+          # Patch deployment to use the locally-built image.
+          sed 's|ghcr.io/hardbyte/pgpolicy-operator:latest|pgpolicy-operator:e2e|' \
+            k8s/deploy/deployment.yaml | \
+            sed 's|imagePullPolicy:.*|imagePullPolicy: Never|' | \
+            kubectl apply -f -
+
+          kubectl -n pgpolicy-system rollout status deployment/pgpolicy-operator --timeout=60s
+
+      - name: Apply sample policy
+        run: kubectl apply -f k8s/samples/basic-policy.yaml
+
+      - name: Wait for reconciliation
+        run: |
+          for i in $(seq 1 30); do
+            STATUS=$(kubectl get pgp basic-policy -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}' 2>/dev/null || echo "")
+            if [ "$STATUS" = "True" ]; then
+              echo "Policy reconciled successfully"
+              exit 0
+            fi
+            echo "Waiting for reconciliation... (attempt $i/30)"
+            sleep 5
+          done
+          echo "::error::Policy did not reach Ready=True within timeout"
+          kubectl get pgp basic-policy -o yaml
+          kubectl -n pgpolicy-system logs deployment/pgpolicy-operator --tail=50
+          exit 1
+
+      - name: Verify roles exist in PostgreSQL
+        run: |
+          kubectl exec postgres-0 -- psql -U postgres -c "SELECT rolname FROM pg_roles WHERE rolname LIKE 'public-%' ORDER BY rolname;" | tee /dev/stderr | grep -q "public-editor"
+
+      - name: Cleanup
+        if: always()
+        run: kind delete cluster --name pgpolicy-e2e

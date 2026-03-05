@@ -1,0 +1,49 @@
+---
+apiVersion: pgpolicy.io/v1alpha1
+kind: PostgresPolicy
+metadata:
+  name: basic-policy
+  namespace: default
+spec:
+  connection:
+    secretRef:
+      name: postgres-credentials
+    # secretKey defaults to DATABASE_URL
+  interval: "5m"
+  defaultOwner: pgloader_pg
+
+  profiles:
+    editor:
+      grants:
+        - on: { type: schema }
+          privileges: [USAGE]
+        - on: { type: table, name: "*" }
+          privileges: [SELECT, INSERT, UPDATE, DELETE]
+        - on: { type: sequence, name: "*" }
+          privileges: [USAGE]
+      default_privileges:
+        - on_type: table
+          privileges: [SELECT, INSERT, UPDATE, DELETE]
+        - on_type: sequence
+          privileges: [USAGE]
+    viewer:
+      grants:
+        - on: { type: schema }
+          privileges: [USAGE]
+        - on: { type: table, name: "*" }
+          privileges: [SELECT]
+      default_privileges:
+        - on_type: table
+          privileges: [SELECT]
+
+  schemas:
+    - name: public
+      profiles: [editor, viewer]
+
+  memberships:
+    - role: public-editor
+      members:
+        - name: app-service-account
+    - role: public-viewer
+      members:
+        - name: reporting-user

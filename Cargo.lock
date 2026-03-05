@@ -630,6 +630,7 @@ checksum = "8b147ee9d1f6d097cef9ce628cd2ee62288d963e16fb287bd9286455b241382d"
 dependencies = [
  "futures-channel",
  "futures-core",
+ "futures-executor",
  "futures-io",
  "futures-sink",
  "futures-task",
@@ -1614,6 +1615,7 @@ dependencies = [
 name = "pgpolicy-core"
 version = "0.1.0"
 dependencies = [
+ "schemars",
  "serde",
  "serde_json",
  "serde_yaml",
@@ -1635,6 +1637,7 @@ name = "pgpolicy-operator"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "futures",
  "k8s-openapi",
  "kube",
  "pgpolicy-core",
@@ -1644,6 +1647,7 @@ dependencies = [
  "serde_json",
  "serde_yaml",
  "sqlx",
+ "thiserror 2.0.18",
  "tokio",
  "tracing",
  "tracing-subscriber",

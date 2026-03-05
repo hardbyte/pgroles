@@ -1,0 +1,44 @@
+# Minimal pgpolicy manifest — a single schema with editor/viewer profiles.
+#
+# This is the simplest useful configuration: two profiles applied to one
+# schema, producing two managed roles with appropriate grants and
+# default privileges so future tables are accessible automatically.
+
+default_owner: app_migrator
+
+profiles:
+  editor:
+    grants:
+      - on: { type: schema }
+        privileges: [USAGE]
+      - on: { type: table, name: "*" }
+        privileges: [SELECT, INSERT, UPDATE, DELETE]
+      - on: { type: sequence, name: "*" }
+        privileges: [USAGE]
+    default_privileges:
+      - on_type: table
+        privileges: [SELECT, INSERT, UPDATE, DELETE]
+      - on_type: sequence
+        privileges: [USAGE]
+
+  viewer:
+    grants:
+      - on: { type: schema }
+        privileges: [USAGE]
+      - on: { type: table, name: "*" }
+        privileges: [SELECT]
+    default_privileges:
+      - on_type: table
+        privileges: [SELECT]
+
+schemas:
+  - name: app
+    profiles: [editor, viewer]
+
+memberships:
+  - role: app-editor
+    members:
+      - name: backend-service
+  - role: app-viewer
+    members:
+      - name: reporting-service

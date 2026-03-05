@@ -1,0 +1,44 @@
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: pgpolicy-operator
+  namespace: pgpolicy-system
+  labels:
+    app.kubernetes.io/name: pgpolicy-operator
+    app.kubernetes.io/component: controller
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: pgpolicy-operator
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: pgpolicy-operator
+        app.kubernetes.io/component: controller
+    spec:
+      serviceAccountName: pgpolicy-operator
+      containers:
+        - name: operator
+          image: ghcr.io/hardbyte/pgpolicy-operator:latest
+          env:
+            - name: RUST_LOG
+              value: "info,pgpolicy_operator=debug"
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 200m
+              memory: 128Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            runAsUser: 65534
+            capabilities:
+              drop: ["ALL"]
+      securityContext:
+        seccompProfile:
+          type: RuntimeDefault

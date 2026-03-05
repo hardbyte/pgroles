@@ -1,0 +1,8 @@
+//! pgpolicy-operator — Kubernetes operator for PostgresPolicy CRDs.
+//!
+//! Watches `PostgresPolicy` custom resources and reconciles PostgreSQL roles,
+//! grants, default privileges, and memberships against live databases.
+
+pub mod context;
+pub mod crd;
+pub mod reconciler;

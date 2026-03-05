@@ -1,3 +1,4 @@
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use thiserror::Error;
@@ -26,7 +27,7 @@ pub enum ManifestError {
 // ---------------------------------------------------------------------------
 
 /// PostgreSQL object types that can have privileges granted on them.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum ObjectType {
     Table,
@@ -56,7 +57,7 @@ impl std::fmt::Display for ObjectType {
 }
 
 /// PostgreSQL privilege types.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "UPPERCASE")]
 pub enum Privilege {
     Select,
@@ -159,7 +160,7 @@ pub struct ProfileObjectTarget {
 }
 
 /// A schema binding — associates a schema with one or more profiles.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct SchemaBinding {
     pub name: String,
 
@@ -213,7 +214,7 @@ pub struct RoleDefinition {
 }
 
 /// A concrete grant on a specific object or wildcard.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct Grant {
     pub role: String,
     pub privileges: Vec<Privilege>,
@@ -221,7 +222,7 @@ pub struct Grant {
 }
 
 /// Target object for a grant.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct ObjectTarget {
     #[serde(rename = "type")]
     pub object_type: ObjectType,
@@ -236,7 +237,7 @@ pub struct ObjectTarget {
 }
 
 /// Default privilege configuration.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct DefaultPrivilege {
     /// The role that owns newly created objects. If omitted, uses manifest's default_owner.
     #[serde(default)]
@@ -248,7 +249,7 @@ pub struct DefaultPrivilege {
 }
 
 /// A single default privilege grant entry.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct DefaultPrivilegeGrant {
     /// The role receiving the default privilege. Only used in top-level default_privileges
     /// (in profiles, the role is determined by expansion).
@@ -260,14 +261,14 @@ pub struct DefaultPrivilegeGrant {
 }
 
 /// A membership declaration — which members belong to a role.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct Membership {
     pub role: String,
     pub members: Vec<MemberSpec>,
 }
 
 /// A single member of a role.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct MemberSpec {
     pub name: String,
 
@@ -480,7 +481,7 @@ roles:
 memberships:
   - role: ibody-editor
     members:
-      - name: "felix@partly.com"
+      - name: "alice@example.com"
         inherit: true
 "#;
         let manifest = parse_manifest(yaml).unwrap();
@@ -726,15 +727,15 @@ grants:
 memberships:
   - role: ibody-editor
     members:
-      - name: "felix@partly.com"
+      - name: "alice@example.com"
         inherit: true
-      - name: "engineering@partly.com"
+      - name: "engineering@example.com"
         admin: true
 "#;
         let manifest = parse_manifest(yaml).unwrap();
         assert_eq!(manifest.memberships.len(), 1);
         assert_eq!(manifest.memberships[0].members.len(), 2);
-        assert_eq!(manifest.memberships[0].members[0].name, "felix@partly.com");
+        assert_eq!(manifest.memberships[0].members[0].name, "alice@example.com");
         assert!(manifest.memberships[0].members[0].inherit);
         assert!(manifest.memberships[0].members[1].admin);
     }
