@@ -43,7 +43,7 @@ pgroles plan --database-url postgres://localhost/mydb
 
 The `sql` format prints the full SQL script. The `summary` format shows counts of each change type.
 
-If the plan includes role drops, `diff` also runs a live safety check and reports obvious hazards such as owned objects or active sessions.
+If the plan includes role drops, `diff` also runs a live safety check and reports hazards such as owned objects, privilege dependencies, policy/init-privilege references, or active sessions.
 
 For intentional removals, declare a `retirements` block in the manifest so pgroles can inspect the soon-to-be-dropped role even though it is absent from the desired role list:
 
@@ -58,6 +58,8 @@ retirements:
 ```
 
 That causes the generated plan to insert `REASSIGN OWNED BY`, `DROP OWNED BY`, and then `DROP ROLE`.
+
+`REASSIGN OWNED` and `DROP OWNED` only clean the current database plus shared objects. If the safety report mentions other databases, repeat the cleanup there before expecting the final drop to succeed.
 
 ## apply
 
@@ -83,7 +85,7 @@ If any statement fails during `apply`, the transaction is rolled back and earlie
 {% /callout %}
 
 {% callout type="warning" title="Unsafe role drops are blocked" %}
-If pgroles detects that a role scheduled for removal still owns objects or has active sessions, `apply` refuses the change by default instead of attempting a `DROP ROLE`.
+If pgroles detects that a role scheduled for removal still owns objects, still has privilege/dependency references, or has active sessions, `apply` refuses the change by default instead of attempting a `DROP ROLE`.
 {% /callout %}
 
 ## inspect

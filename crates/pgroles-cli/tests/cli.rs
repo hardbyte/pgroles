@@ -849,6 +849,83 @@ memberships:
 
     #[test]
     #[ignore]
+    fn retirement_manifest_requires_drop_owned_for_privilege_dependencies() {
+        let schema = unique_name("acl_schema");
+        let role = unique_name("acl_role");
+
+        execute_sql(&format!(
+            r#"
+            DROP SCHEMA IF EXISTS "{schema}" CASCADE;
+            DROP ROLE IF EXISTS "{role}";
+            CREATE ROLE "{role}";
+            CREATE SCHEMA "{schema}";
+            CREATE TABLE "{schema}"."widgets" (id integer);
+            GRANT SELECT ON "{schema}"."widgets" TO "{role}";
+            "#
+        ));
+
+        let report = query_drop_role_safety(&role);
+        assert_eq!(report.issues.len(), 1, "expected one unsafe drop issue");
+        let issue = &report.issues[0];
+        assert_eq!(issue.role, role);
+        assert!(
+            issue.privilege_dependency_count >= 1,
+            "expected privilege dependency to be detected, got {:?}",
+            issue
+        );
+
+        let blocked_manifest = write_temp_manifest(&format!(
+            r#"
+retirements:
+  - role: {role}
+"#
+        ));
+
+        pgroles_cmd()
+            .args([
+                "apply",
+                "--file",
+                blocked_manifest.path().to_str().unwrap(),
+                "--database-url",
+                &database_url(),
+            ])
+            .assert()
+            .failure()
+            .stderr(predicate::str::contains("privilege dependency"));
+
+        let cleanup_manifest = write_temp_manifest(&format!(
+            r#"
+retirements:
+  - role: {role}
+    drop_owned: true
+"#
+        ));
+
+        pgroles_cmd()
+            .args([
+                "apply",
+                "--file",
+                cleanup_manifest.path().to_str().unwrap(),
+                "--database-url",
+                &database_url(),
+            ])
+            .assert()
+            .success();
+
+        assert!(
+            !query_role_exists(&role),
+            "role should be dropped after DROP OWNED cleanup"
+        );
+
+        execute_sql(&format!(
+            r#"
+            DROP SCHEMA IF EXISTS "{schema}" CASCADE;
+            "#
+        ));
+    }
+
+    #[test]
+    #[ignore]
     fn retirement_manifest_reassigns_owned_objects_and_drops_role() {
         let schema = unique_name("retire_schema");
         let retired_role = unique_name("retired_role");

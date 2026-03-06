@@ -9,9 +9,10 @@
 ## Phase 1: Safety and Semantic Validation
 
 - Extend the current live destructive-operation preflight:
-  - ownership and active-session checks are implemented now
+  - ownership, privilege-dependency, and active-session checks are implemented now
+  - current reports also distinguish current-db/shared cleanup from other-database cleanup
   - next add broader unmanaged dependency detection before destructive changes
-  - next surface likely blockers more precisely in dry-run output
+  - next surface likely blockers more precisely as warnings vs hard blockers in dry-run output
 - Harden the new role-retirement path:
   - explicit `retirements` with `REASSIGN OWNED` / `DROP OWNED` are implemented now
   - next decide whether session termination should ever be an explicit opt-in workflow

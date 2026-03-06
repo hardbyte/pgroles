@@ -1,42 +1,10 @@
 # pgroles
 
-Declarative PostgreSQL role graph manager. Define roles, memberships, object privileges, and default privileges in YAML — pgroles diffs against live databases and applies changes.
+Stop managing PostgreSQL roles with ad-hoc SQL. Define them in YAML, diff against live databases, apply the changes.
 
-Requires **PostgreSQL 16+** (uses `GRANT ... WITH INHERIT` syntax).
+pgroles treats your manifest as the **entire desired state** — roles, grants, and memberships not in the manifest get revoked or dropped. This is the same convergent model used by Terraform and Kubernetes, applied to PostgreSQL access control.
 
-## Components
-
-- **pgroles-core** — Manifest parsing, profile expansion, diff engine, SQL generation. No database dependencies.
-- **pgroles-inspect** — Live database introspection via `pg_catalog` queries (sqlx + tokio).
-- **pgroles-cli** — Command-line tool for validating manifests, planning changes, and applying them.
-- **pgroles-operator** — *(work in progress)* Kubernetes operator that reconciles `PostgresPolicy` custom resources against PostgreSQL databases.
-
-## Installation
-
-### From crates.io
-
-```bash
-cargo install pgroles-cli
-```
-
-### From GitHub Releases
-
-Download pre-built binaries from the [releases page](https://github.com/hardbyte/pgroles/releases). Archives are available for Linux (x86_64, aarch64) and macOS (x86_64, aarch64).
-
-### Docker
-
-```bash
-docker run --rm ghcr.io/hardbyte/pgroles:0.1.0 --help
-```
-
-### Kubernetes Operator
-
-Install via Helm:
-
-```bash
-helm repo add pgroles https://hardbyte.github.io/pgroles
-helm install pgroles-operator pgroles/pgroles-operator
-```
+> **Requires PostgreSQL 16+** (uses `GRANT ... WITH INHERIT` syntax).
 
 ## Quick Start
 
@@ -64,6 +32,25 @@ pgroles inspect -f policy.yaml --database-url postgres://...
 ```
 
 If `-f` is omitted, it defaults to `pgroles.yaml` in the current directory. The `--database-url` flag can also be set via the `DATABASE_URL` environment variable.
+
+Example `pgroles diff` output:
+
+```sql
+CREATE ROLE "inventory-editor"
+  NOLOGIN NOSUPERUSER INHERIT;
+COMMENT ON ROLE "inventory-editor"
+  IS 'Generated from profile editor';
+
+GRANT USAGE ON SCHEMA "inventory"
+  TO "inventory-editor";
+GRANT SELECT, INSERT, UPDATE, DELETE
+  ON ALL TABLES IN SCHEMA "inventory"
+  TO "inventory-editor";
+
+REVOKE ALL ON SCHEMA "legacy"
+  FROM "old-reader";
+DROP ROLE "old-reader";
+```
 
 ## Manifest Format
 
@@ -140,7 +127,7 @@ Supported object types for grants: `table`, `view`, `materialized_view`, `sequen
 
 pgroles is convergent within the scope it manages today: the manifest is treated as the desired truth for the roles, grants, default privileges, and memberships it inspects. Roles, grants, and memberships present in the database but absent from the manifest will be dropped or revoked.
 
-Before applying planned role drops, pgroles now performs a live preflight check for obvious hazards such as owned objects and active sessions, and refuses unsafe drops by default.
+Before applying planned role drops, pgroles now performs a live preflight check for obvious hazards such as owned objects, privilege dependencies, policy/init-privilege references, and active sessions, and refuses unsafe drops by default.
 
 Use `retirements` to make planned role removal explicit and to declare how pgroles should clean up ownership before the final `DROP ROLE`:
 
@@ -155,6 +142,48 @@ retirements:
 ```
 
 That expands the inspection scope to include `legacy_app` even though it is no longer in the desired role set, then executes `REASSIGN OWNED`, `DROP OWNED`, and `DROP ROLE` in that order.
+
+Cleanup is still scoped to the current database plus shared objects. If the preflight reports dependencies in other databases, run the same cleanup against those databases before the final drop.
+
+## Installation
+
+### From source
+
+```bash
+cargo install --git https://github.com/hardbyte/pgroles pgroles-cli
+```
+
+### From crates.io
+
+```bash
+cargo install pgroles-cli
+```
+
+### From GitHub Releases
+
+Download pre-built binaries from the [releases page](https://github.com/hardbyte/pgroles/releases). Archives are available for Linux (x86_64, aarch64) and macOS (x86_64, aarch64).
+
+### Docker
+
+```bash
+docker run --rm ghcr.io/hardbyte/pgroles:0.1.0 --help
+```
+
+### Kubernetes Operator *(work in progress)*
+
+Install via Helm:
+
+```bash
+helm repo add pgroles https://hardbyte.github.io/pgroles
+helm install pgroles-operator pgroles/pgroles-operator
+```
+
+## Components
+
+- **pgroles-core** — Manifest parsing, profile expansion, diff engine, SQL generation. No database dependencies.
+- **pgroles-inspect** — Live database introspection via `pg_catalog` queries (sqlx + tokio).
+- **pgroles-cli** — Command-line tool for validating manifests, planning changes, and applying them.
+- **pgroles-operator** — *(work in progress)* Kubernetes operator that reconciles `PostgresPolicy` custom resources against PostgreSQL databases.
 
 ## License
 
