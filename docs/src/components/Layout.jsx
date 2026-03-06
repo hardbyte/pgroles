@@ -31,6 +31,12 @@ const navigation = [
         ],
     },
     {
+        title: 'Kubernetes',
+        links: [
+            {title: 'Operator', href: '/docs/operator'},
+        ],
+    },
+    {
         title: 'Reference',
         links: [
             {title: 'CLI commands', href: '/docs/cli'},

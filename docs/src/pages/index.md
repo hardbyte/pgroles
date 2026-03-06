@@ -1,10 +1,10 @@
 ---
 title: Getting started
 pageTitle: pgroles - Declarative PostgreSQL role management
-description: Define roles, memberships, object privileges, and default privileges in YAML. pgroles diffs against live databases and applies changes.
+description: One YAML file. Every role, grant, and privilege in your database — defined, diffed, and applied.
 ---
 
-Manage PostgreSQL roles, grants, and privileges declaratively. {% .lead %}
+One YAML file. Every role, grant, and privilege in your database — defined, diffed, and applied. {% .lead %}
 
 ---
 
@@ -12,19 +12,19 @@ Manage PostgreSQL roles, grants, and privileges declaratively. {% .lead %}
 
 Managing PostgreSQL roles and privileges across environments is error-prone. Teams typically resort to ad-hoc SQL scripts, manual `GRANT` statements, or fragile migration files. When a new schema is added or a role needs adjusting, it's easy to miss a grant or leave stale privileges in place.
 
-pgroles takes a **convergent, declarative approach**: you define the desired state in a YAML manifest, and pgroles computes the exact SQL needed to bring your database in line. Anything in the database not declared in the manifest gets revoked or dropped.
+pgroles takes a **convergent, declarative approach**: you define the desired state in a YAML manifest, and pgroles computes the exact SQL needed to bring your database in line. Anything in the database but not in the manifest gets revoked or dropped — so your access control never drifts.
 
-This is the same "infrastructure as code" pattern used by Terraform and Kubernetes, applied to PostgreSQL access control.
+Built for platform teams, DBAs, and anyone managing more than a handful of PostgreSQL roles across environments.
 
 ## Key features
 
-- **Declarative YAML manifests** with reusable privilege profiles
-- **Profile expansion** across schemas to reduce boilerplate
-- **Convergent diff engine** that computes minimal changes
-- **Safe planning** via `pgroles diff` before applying
-- **Dry-run mode** to preview SQL without executing
-- **Default privilege management** via `ALTER DEFAULT PRIVILEGES`
-- **Role membership management** with inherit/admin flags
+- **Write privilege rules once**, expand them across every schema automatically via profiles
+- **See exactly what will change** before touching the database with `pgroles diff`
+- **Convergent diff engine** — the manifest is the entire truth; stale grants get revoked
+- **Dry-run mode** to preview generated SQL without executing
+- **Default privilege management** so future tables get the right grants automatically
+- **Role membership management** with inherit and admin flags
+- **Safe drops** — preflight checks block dropping roles with owned objects or active sessions
 
 {% quick-links %}
 

@@ -82,7 +82,7 @@ export function Hero() {
                 Declarative PostgreSQL role and privilege management.
               </p>
               <p className="mt-3 text-2xl tracking-tight text-slate-400">
-                Define roles, grants, default privileges, and memberships in YAML. pgroles diffs against live databases and applies changes.
+                One YAML file. Every role, grant, and privilege in your database — defined, diffed, and applied.
               </p>
               <div className="mt-8 flex gap-4 md:justify-center lg:justify-start">
                 <Button href="/docs/quick-start">Get started</Button>
