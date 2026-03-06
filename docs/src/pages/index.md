@@ -16,10 +16,6 @@ pgroles takes a **convergent, declarative approach**: you define the desired sta
 
 This is the same "infrastructure as code" pattern used by Terraform and Kubernetes, applied to PostgreSQL access control.
 
-{% callout title="Rename in progress" %}
-The project is now called `pgroles`. The repository path is still `hardbyte/pgpolicy`, but the CLI, manifest default, and operator surfaces in this tree are being renamed to `pgroles`.
-{% /callout %}
-
 ## Key features
 
 - **Declarative YAML manifests** with reusable privilege profiles

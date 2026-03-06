@@ -12,7 +12,7 @@ version = "0.1.0"
 edition = "2024"
 authors = ["Brian Thorne <brian@thorne.link>"]
 license = "MIT"
-repository = "https://github.com/hardbyte/pgpolicy"
+repository = "https://github.com/hardbyte/pgroles"
 
 [workspace.dependencies]
 # Serialization

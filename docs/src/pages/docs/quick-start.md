@@ -17,14 +17,10 @@ Get up and running with pgroles in a few minutes. {% .lead %}
 Build from source using Cargo:
 
 ```shell
-cargo install --git https://github.com/hardbyte/pgpolicy pgroles-cli
+cargo install --git https://github.com/hardbyte/pgroles pgroles-cli
 ```
 
 This installs the `pgroles` binary.
-
-{% callout title="Repository path" %}
-The project name is `pgroles`, but the repository path is still `hardbyte/pgpolicy` until the GitHub repository is renamed.
-{% /callout %}
 
 ## Create a manifest
 

@@ -8,7 +8,7 @@ description: How to install the pgroles CLI tool.
 pgroles is written in Rust. Build and install with Cargo:
 
 ```shell
-cargo install --git https://github.com/hardbyte/pgpolicy pgroles-cli
+cargo install --git https://github.com/hardbyte/pgroles pgroles-cli
 ```
 
 This compiles the `pgroles` binary and places it in your Cargo bin directory (usually `~/.cargo/bin/`).
@@ -16,7 +16,7 @@ This compiles the `pgroles` binary and places it in your Cargo bin directory (us
 ## From a local clone
 
 ```shell
-git clone https://github.com/hardbyte/pgpolicy.git pgroles
+git clone https://github.com/hardbyte/pgroles.git pgroles
 cd pgroles
 cargo build --release
 ```

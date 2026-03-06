@@ -4,8 +4,6 @@ Declarative PostgreSQL role graph manager. Define roles, memberships, object pri
 
 Requires **PostgreSQL 16+** (uses `GRANT ... WITH INHERIT` syntax).
 
-The project name is `pgroles`. The repository path is still `hardbyte/pgpolicy` until the GitHub repository is renamed.
-
 ## Components
 
 - **pgroles-core** — Manifest parsing, profile expansion, diff engine, SQL generation. No database dependencies.
