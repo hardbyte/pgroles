@@ -35,18 +35,18 @@ struct AclRow {
 /// Map a PostgreSQL ACL privilege character to our `Privilege` enum.
 fn acl_char_to_privilege(character: &str) -> Option<Privilege> {
     match character {
-        "r" => Some(Privilege::Select),
-        "a" => Some(Privilege::Insert),
-        "w" => Some(Privilege::Update),
-        "d" => Some(Privilege::Delete),
-        "D" => Some(Privilege::Truncate),
-        "x" => Some(Privilege::References),
-        "t" => Some(Privilege::Trigger),
-        "X" => Some(Privilege::Execute),
-        "U" => Some(Privilege::Usage),
-        "C" => Some(Privilege::Create),
-        "c" => Some(Privilege::Connect),
-        "T" => Some(Privilege::Temporary),
+        "r" | "SELECT" => Some(Privilege::Select),
+        "a" | "INSERT" => Some(Privilege::Insert),
+        "w" | "UPDATE" => Some(Privilege::Update),
+        "d" | "DELETE" => Some(Privilege::Delete),
+        "D" | "TRUNCATE" => Some(Privilege::Truncate),
+        "x" | "REFERENCES" => Some(Privilege::References),
+        "t" | "TRIGGER" => Some(Privilege::Trigger),
+        "X" | "EXECUTE" => Some(Privilege::Execute),
+        "U" | "USAGE" => Some(Privilege::Usage),
+        "C" | "CREATE" => Some(Privilege::Create),
+        "c" | "CONNECT" => Some(Privilege::Connect),
+        "T" | "TEMPORARY" => Some(Privilege::Temporary),
         _ => None,
     }
 }
@@ -299,7 +299,7 @@ async fn fetch_relation_privileges(
             COALESCE(
                 c.relacl,
                 acldefault(
-                    CASE WHEN c.relkind = 'S' THEN 'S' ELSE 'r' END,
+                    CASE WHEN c.relkind = 'S' THEN 'S'::"char" ELSE 'r'::"char" END,
                     c.relowner
                 )
             )
@@ -335,7 +335,7 @@ async fn fetch_schema_privileges(
         CROSS JOIN LATERAL aclexplode(
             COALESCE(
                 n.nspacl,
-                acldefault('n', n.nspowner)
+                acldefault('n'::"char", n.nspowner)
             )
         ) AS acl
         LEFT JOIN pg_roles grantee ON grantee.oid = acl.grantee
@@ -370,7 +370,7 @@ async fn fetch_function_privileges(
         CROSS JOIN LATERAL aclexplode(
             COALESCE(
                 p.proacl,
-                acldefault('f', p.proowner)
+                acldefault('f'::"char", p.proowner)
             )
         ) AS acl
         LEFT JOIN pg_roles grantee ON grantee.oid = acl.grantee
@@ -405,7 +405,7 @@ async fn fetch_type_privileges(
         CROSS JOIN LATERAL aclexplode(
             COALESCE(
                 t.typacl,
-                acldefault('T', t.typowner)
+                acldefault('T'::"char", t.typowner)
             )
         ) AS acl
         LEFT JOIN pg_roles grantee ON grantee.oid = acl.grantee
@@ -441,7 +441,7 @@ pub async fn fetch_database_privileges(
         CROSS JOIN LATERAL aclexplode(
             COALESCE(
                 db.datacl,
-                acldefault('d', db.datdba)
+                acldefault('d'::"char", db.datdba)
             )
         ) AS acl
         LEFT JOIN pg_roles grantee ON grantee.oid = acl.grantee

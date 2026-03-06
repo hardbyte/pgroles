@@ -371,9 +371,74 @@ fn apply_with_invalid_manifest() {
 ///   DATABASE_URL=postgres://localhost/pgpolicy_test cargo test -- --ignored
 mod live_db {
     use super::*;
+    use sqlx::{Executor, PgPool, Row};
+    use tokio::runtime::Runtime;
+
+    fn with_runtime<T>(future: impl std::future::Future<Output = T>) -> T {
+        Runtime::new()
+            .expect("failed to create tokio runtime")
+            .block_on(future)
+    }
 
     fn database_url() -> String {
         std::env::var("DATABASE_URL").expect("DATABASE_URL must be set for live DB tests")
+    }
+
+    fn unique_name(prefix: &str) -> String {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock before unix epoch")
+            .as_nanos();
+        format!("{prefix}_{nanos}")
+    }
+
+    fn execute_sql(sql: &str) {
+        with_runtime(async {
+            let pool = PgPool::connect(&database_url())
+                .await
+                .expect("failed to connect to live test database");
+            pool.execute(sql)
+                .await
+                .expect("failed to execute setup SQL");
+        });
+    }
+
+    fn query_membership_flags(role: &str, member: &str) -> (bool, bool) {
+        with_runtime(async {
+            let pool = PgPool::connect(&database_url())
+                .await
+                .expect("failed to connect to live test database");
+            let row = sqlx::query(
+                r#"
+                SELECT m.admin_option, m.inherit_option
+                FROM pg_auth_members m
+                JOIN pg_roles gr ON gr.oid = m.roleid
+                JOIN pg_roles mr ON mr.oid = m.member
+                WHERE gr.rolname = $1 AND mr.rolname = $2
+                "#,
+            )
+            .bind(role)
+            .bind(member)
+            .fetch_one(&pool)
+            .await
+            .expect("failed to query membership flags");
+            (row.get("admin_option"), row.get("inherit_option"))
+        })
+    }
+
+    fn query_has_function_privilege(role: &str, signature: &str) -> bool {
+        with_runtime(async {
+            let pool = PgPool::connect(&database_url())
+                .await
+                .expect("failed to connect to live test database");
+            let row = sqlx::query("SELECT has_function_privilege($1, $2, 'EXECUTE') AS allowed")
+                .bind(role)
+                .bind(signature)
+                .fetch_one(&pool)
+                .await
+                .expect("failed to query function privilege");
+            row.get("allowed")
+        })
     }
 
     #[test]
@@ -447,5 +512,229 @@ mod live_db {
             .success()
             .stdout(predicate::str::contains("Roles:"))
             .stdout(predicate::str::contains("Grants:"));
+    }
+
+    #[test]
+    #[ignore]
+    fn wildcard_table_grants_converge_after_apply() {
+        let schema = unique_name("wildcard_schema");
+        let role = unique_name("wildcard_role");
+
+        execute_sql(&format!(
+            r#"
+            DROP SCHEMA IF EXISTS "{schema}" CASCADE;
+            DROP ROLE IF EXISTS "{role}";
+            CREATE SCHEMA "{schema}";
+            CREATE TABLE "{schema}"."widgets" (id integer);
+            CREATE TABLE "{schema}"."orders" (id integer);
+            "#
+        ));
+
+        let manifest_file = write_temp_manifest(&format!(
+            r#"
+roles:
+  - name: {role}
+
+grants:
+  - role: {role}
+    privileges: [SELECT]
+    on: {{ type: table, schema: {schema}, name: "*" }}
+"#
+        ));
+
+        pgpolicy_cmd()
+            .args([
+                "apply",
+                "--file",
+                manifest_file.path().to_str().unwrap(),
+                "--database-url",
+                &database_url(),
+            ])
+            .assert()
+            .success();
+
+        pgpolicy_cmd()
+            .args([
+                "diff",
+                "--file",
+                manifest_file.path().to_str().unwrap(),
+                "--database-url",
+                &database_url(),
+                "--format",
+                "summary",
+            ])
+            .assert()
+            .success()
+            .stdout(predicate::str::contains("No changes needed"));
+
+        execute_sql(&format!(
+            r#"
+            DROP SCHEMA IF EXISTS "{schema}" CASCADE;
+            DROP ROLE IF EXISTS "{role}";
+            "#
+        ));
+    }
+
+    #[test]
+    #[ignore]
+    fn specific_function_grants_apply_and_converge() {
+        let schema = unique_name("function_schema");
+        let role = unique_name("function_role");
+        let function_name = "refresh_users";
+        let signature = format!(r#""{schema}"."{function_name}"(integer, text)"#);
+
+        execute_sql(&format!(
+            r#"
+            DROP SCHEMA IF EXISTS "{schema}" CASCADE;
+            DROP ROLE IF EXISTS "{role}";
+            CREATE SCHEMA "{schema}";
+            CREATE FUNCTION "{schema}"."{function_name}"(integer, text)
+            RETURNS integer
+            LANGUAGE SQL
+            AS $$ SELECT $1; $$;
+            "#
+        ));
+
+        let manifest_file = write_temp_manifest(&format!(
+            r#"
+roles:
+  - name: {role}
+
+grants:
+  - role: {role}
+    privileges: [EXECUTE]
+    on: {{ type: function, schema: {schema}, name: "{function_name}(integer, text)" }}
+"#
+        ));
+
+        pgpolicy_cmd()
+            .args([
+                "apply",
+                "--file",
+                manifest_file.path().to_str().unwrap(),
+                "--database-url",
+                &database_url(),
+            ])
+            .assert()
+            .success();
+
+        assert!(
+            query_has_function_privilege(&role, &signature),
+            "role should have EXECUTE privilege on the function"
+        );
+
+        pgpolicy_cmd()
+            .args([
+                "diff",
+                "--file",
+                manifest_file.path().to_str().unwrap(),
+                "--database-url",
+                &database_url(),
+                "--format",
+                "summary",
+            ])
+            .assert()
+            .success()
+            .stdout(predicate::str::contains("No changes needed"));
+
+        execute_sql(&format!(
+            r#"
+            DROP SCHEMA IF EXISTS "{schema}" CASCADE;
+            DROP ROLE IF EXISTS "{role}";
+            "#
+        ));
+    }
+
+    #[test]
+    #[ignore]
+    fn membership_option_updates_apply_without_dropping_membership() {
+        let group_role = unique_name("group_role");
+        let member_role = unique_name("member_role");
+
+        execute_sql(&format!(
+            r#"
+            DROP ROLE IF EXISTS "{member_role}";
+            DROP ROLE IF EXISTS "{group_role}";
+            "#
+        ));
+
+        let initial_manifest = write_temp_manifest(&format!(
+            r#"
+roles:
+  - name: {group_role}
+  - name: {member_role}
+
+memberships:
+  - role: {group_role}
+    members:
+      - name: {member_role}
+        inherit: true
+        admin: false
+"#
+        ));
+
+        pgpolicy_cmd()
+            .args([
+                "apply",
+                "--file",
+                initial_manifest.path().to_str().unwrap(),
+                "--database-url",
+                &database_url(),
+            ])
+            .assert()
+            .success();
+
+        let updated_manifest = write_temp_manifest(&format!(
+            r#"
+roles:
+  - name: {group_role}
+  - name: {member_role}
+
+memberships:
+  - role: {group_role}
+    members:
+      - name: {member_role}
+        inherit: false
+        admin: true
+"#
+        ));
+
+        pgpolicy_cmd()
+            .args([
+                "apply",
+                "--file",
+                updated_manifest.path().to_str().unwrap(),
+                "--database-url",
+                &database_url(),
+            ])
+            .assert()
+            .success();
+
+        assert_eq!(
+            query_membership_flags(&group_role, &member_role),
+            (true, false),
+            "membership should remain present with updated admin/inherit flags"
+        );
+
+        pgpolicy_cmd()
+            .args([
+                "diff",
+                "--file",
+                updated_manifest.path().to_str().unwrap(),
+                "--database-url",
+                &database_url(),
+                "--format",
+                "summary",
+            ])
+            .assert()
+            .success()
+            .stdout(predicate::str::contains("No changes needed"));
+
+        execute_sql(&format!(
+            r#"
+            DROP ROLE IF EXISTS "{member_role}";
+            DROP ROLE IF EXISTS "{group_role}";
+            "#
+        ));
     }
 }

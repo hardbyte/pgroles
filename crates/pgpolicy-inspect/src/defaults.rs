@@ -53,18 +53,18 @@ fn defacl_obj_type_to_object_type(character: &str) -> Option<ObjectType> {
 /// the module self-contained. Both modules are internal implementation details.
 fn acl_char_to_privilege(character: &str) -> Option<Privilege> {
     match character {
-        "r" => Some(Privilege::Select),
-        "a" => Some(Privilege::Insert),
-        "w" => Some(Privilege::Update),
-        "d" => Some(Privilege::Delete),
-        "D" => Some(Privilege::Truncate),
-        "x" => Some(Privilege::References),
-        "t" => Some(Privilege::Trigger),
-        "X" => Some(Privilege::Execute),
-        "U" => Some(Privilege::Usage),
-        "C" => Some(Privilege::Create),
-        "c" => Some(Privilege::Connect),
-        "T" => Some(Privilege::Temporary),
+        "r" | "SELECT" => Some(Privilege::Select),
+        "a" | "INSERT" => Some(Privilege::Insert),
+        "w" | "UPDATE" => Some(Privilege::Update),
+        "d" | "DELETE" => Some(Privilege::Delete),
+        "D" | "TRUNCATE" => Some(Privilege::Truncate),
+        "x" | "REFERENCES" => Some(Privilege::References),
+        "t" | "TRIGGER" => Some(Privilege::Trigger),
+        "X" | "EXECUTE" => Some(Privilege::Execute),
+        "U" | "USAGE" => Some(Privilege::Usage),
+        "C" | "CREATE" => Some(Privilege::Create),
+        "c" | "CONNECT" => Some(Privilege::Connect),
+        "T" | "TEMPORARY" => Some(Privilege::Temporary),
         _ => None,
     }
 }

@@ -33,6 +33,11 @@ pub fn quote_ident(identifier: &str) -> String {
 
 /// Render a single [`Change`] into a SQL statement (including trailing `;`).
 pub fn render(change: &Change) -> String {
+    render_statements(change).join("\n")
+}
+
+/// Render a single [`Change`] into one or more SQL statements.
+pub fn render_statements(change: &Change) -> Vec<String> {
     match change {
         Change::CreateRole { name, state } => render_create_role(name, state),
         Change::AlterRole { name, attributes } => render_alter_role(name, attributes),
@@ -84,20 +89,24 @@ pub fn render(change: &Change) -> String {
             admin,
         } => render_add_member(role, member, *inherit, *admin),
         Change::RemoveMember { role, member } => render_remove_member(role, member),
-        Change::DropRole { name } => format!("DROP ROLE {};", quote_ident(name)),
+        Change::DropRole { name } => vec![format!("DROP ROLE {};", quote_ident(name))],
     }
 }
 
 /// Render all changes into a single SQL script.
 pub fn render_all(changes: &[Change]) -> String {
-    changes.iter().map(render).collect::<Vec<_>>().join("\n")
+    changes
+        .iter()
+        .flat_map(render_statements)
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 // ---------------------------------------------------------------------------
 // CREATE ROLE
 // ---------------------------------------------------------------------------
 
-fn render_create_role(name: &str, state: &RoleState) -> String {
+fn render_create_role(name: &str, state: &RoleState) -> Vec<String> {
     let mut sql = format!("CREATE ROLE {}", quote_ident(name));
     let mut options = vec![
         bool_option("LOGIN", "NOLOGIN", state.login),
@@ -116,17 +125,16 @@ fn render_create_role(name: &str, state: &RoleState) -> String {
     let _ = write!(sql, " {}", options.join(" "));
     sql.push(';');
 
-    // Add COMMENT if present
+    let mut statements = vec![sql];
     if let Some(comment) = &state.comment {
-        let _ = write!(
-            sql,
-            "\nCOMMENT ON ROLE {} IS {};",
+        statements.push(format!(
+            "COMMENT ON ROLE {} IS {};",
             quote_ident(name),
             quote_literal(comment)
-        );
+        ));
     }
 
-    sql
+    statements
 }
 
 fn bool_option(positive: &str, negative: &str, value: bool) -> String {
@@ -141,7 +149,7 @@ fn bool_option(positive: &str, negative: &str, value: bool) -> String {
 // ALTER ROLE
 // ---------------------------------------------------------------------------
 
-fn render_alter_role(name: &str, attributes: &[RoleAttribute]) -> String {
+fn render_alter_role(name: &str, attributes: &[RoleAttribute]) -> Vec<String> {
     let mut options = Vec::new();
     for attr in attributes {
         match attr {
@@ -167,22 +175,26 @@ fn render_alter_role(name: &str, attributes: &[RoleAttribute]) -> String {
             }
         }
     }
-    format!("ALTER ROLE {} {};", quote_ident(name), options.join(" "))
+    vec![format!(
+        "ALTER ROLE {} {};",
+        quote_ident(name),
+        options.join(" ")
+    )]
 }
 
 // ---------------------------------------------------------------------------
 // COMMENT ON ROLE
 // ---------------------------------------------------------------------------
 
-fn render_set_comment(name: &str, comment: &Option<String>) -> String {
-    match comment {
+fn render_set_comment(name: &str, comment: &Option<String>) -> Vec<String> {
+    vec![match comment {
         Some(text) => format!(
             "COMMENT ON ROLE {} IS {};",
             quote_ident(name),
             quote_literal(text)
         ),
         None => format!("COMMENT ON ROLE {} IS NULL;", quote_ident(name)),
-    }
+    }]
 }
 
 // ---------------------------------------------------------------------------
@@ -195,15 +207,15 @@ fn render_grant(
     object_type: ObjectType,
     schema: Option<&str>,
     name: Option<&str>,
-) -> String {
+) -> Vec<String> {
     let privilege_list = format_privileges(privileges);
     let target = format_object_target(object_type, schema, name);
-    format!(
+    vec![format!(
         "GRANT {} ON {} TO {};",
         privilege_list,
         target,
         quote_ident(role)
-    )
+    )]
 }
 
 fn render_revoke(
@@ -212,15 +224,15 @@ fn render_revoke(
     object_type: ObjectType,
     schema: Option<&str>,
     name: Option<&str>,
-) -> String {
+) -> Vec<String> {
     let privilege_list = format_privileges(privileges);
     let target = format_object_target(object_type, schema, name);
-    format!(
+    vec![format!(
         "REVOKE {} ON {} FROM {};",
         privilege_list,
         target,
         quote_ident(role)
-    )
+    )]
 }
 
 /// Format the object target for GRANT/REVOKE statements.
@@ -351,17 +363,17 @@ fn render_set_default_privilege(
     on_type: ObjectType,
     grantee: &str,
     privileges: &BTreeSet<Privilege>,
-) -> String {
+) -> Vec<String> {
     let privilege_list = format_privileges(privileges);
     let type_plural = sql_object_type_plural(on_type);
-    format!(
+    vec![format!(
         "ALTER DEFAULT PRIVILEGES FOR ROLE {} IN SCHEMA {} GRANT {} ON {} TO {};",
         quote_ident(owner),
         quote_ident(schema),
         privilege_list,
         type_plural,
         quote_ident(grantee)
-    )
+    )]
 }
 
 fn render_revoke_default_privilege(
@@ -370,24 +382,24 @@ fn render_revoke_default_privilege(
     on_type: ObjectType,
     grantee: &str,
     privileges: &BTreeSet<Privilege>,
-) -> String {
+) -> Vec<String> {
     let privilege_list = format_privileges(privileges);
     let type_plural = sql_object_type_plural(on_type);
-    format!(
+    vec![format!(
         "ALTER DEFAULT PRIVILEGES FOR ROLE {} IN SCHEMA {} REVOKE {} ON {} FROM {};",
         quote_ident(owner),
         quote_ident(schema),
         privilege_list,
         type_plural,
         quote_ident(grantee)
-    )
+    )]
 }
 
 // ---------------------------------------------------------------------------
 // Membership
 // ---------------------------------------------------------------------------
 
-fn render_add_member(role: &str, member: &str, inherit: bool, admin: bool) -> String {
+fn render_add_member(role: &str, member: &str, inherit: bool, admin: bool) -> Vec<String> {
     let mut sql = format!("GRANT {} TO {}", quote_ident(role), quote_ident(member));
 
     // PostgreSQL 16+ supports WITH INHERIT / WITH ADMIN in GRANT ... TO
@@ -406,11 +418,15 @@ fn render_add_member(role: &str, member: &str, inherit: bool, admin: bool) -> St
     }
 
     sql.push(';');
-    sql
+    vec![sql]
 }
 
-fn render_remove_member(role: &str, member: &str) -> String {
-    format!("REVOKE {} FROM {};", quote_ident(role), quote_ident(member))
+fn render_remove_member(role: &str, member: &str) -> Vec<String> {
+    vec![format!(
+        "REVOKE {} FROM {};",
+        quote_ident(role),
+        quote_ident(member)
+    )]
 }
 
 // ---------------------------------------------------------------------------

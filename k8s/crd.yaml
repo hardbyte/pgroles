@@ -1,482 +1,628 @@
-apiVersion: apiextensions.k8s.io/v1
-kind: CustomResourceDefinition
-metadata:
-  name: postgrespolicies.pgpolicy.io
-spec:
-  group: pgpolicy.io
-  names:
-    categories: []
-    kind: PostgresPolicy
-    plural: postgrespolicies
-    shortNames:
-    - pgp
-    singular: postgrespolicy
-  scope: Namespaced
-  versions:
-  - additionalPrinterColumns:
-    - jsonPath: .status.conditions[?(@.type=="Ready")].status
-      name: Ready
-      type: string
-    - jsonPath: .metadata.creationTimestamp
-      name: Age
-      type: date
-    name: v1alpha1
-    schema:
-      openAPIV3Schema:
-        description: Auto-generated derived type for PostgresPolicySpec via `CustomResource`
-        properties:
-          spec:
-            description: |-
-              Spec for a `PostgresPolicy` custom resource.
-
-              Defines the desired state of PostgreSQL roles, grants, default privileges, and memberships for a single database connection.
-            properties:
-              connection:
-                description: Database connection configuration.
-                properties:
-                  secretKey:
-                    default: DATABASE_URL
-                    description: Override the key in the Secret to read. Defaults to `DATABASE_URL`.
-                    type: string
-                  secretRef:
-                    description: Reference to a Kubernetes Secret containing the connection string. The secret must have a key named `DATABASE_URL`.
-                    properties:
-                      name:
-                        description: Name of the Secret.
-                        type: string
-                    required:
-                    - name
-                    type: object
-                required:
-                - secretRef
-                type: object
-              default_owner:
-                description: Default owner for ALTER DEFAULT PRIVILEGES (e.g. "app_owner").
-                nullable: true
-                type: string
-              default_privileges:
-                default: []
-                description: One-off default privileges.
-                items:
-                  description: Default privilege configuration.
-                  properties:
-                    grant:
-                      items:
-                        description: A single default privilege grant entry.
-                        properties:
-                          on_type:
-                            description: PostgreSQL object types that can have privileges granted on them.
-                            enum:
-                            - table
-                            - view
-                            - materialized_view
-                            - sequence
-                            - function
-                            - schema
-                            - database
-                            - type
-                            type: string
-                          privileges:
-                            items:
-                              description: PostgreSQL privilege types.
-                              enum:
-                              - SELECT
-                              - INSERT
-                              - UPDATE
-                              - DELETE
-                              - TRUNCATE
-                              - REFERENCES
-                              - TRIGGER
-                              - EXECUTE
-                              - USAGE
-                              - CREATE
-                              - CONNECT
-                              - TEMPORARY
-                              type: string
-                            type: array
-                          role:
-                            description: The role receiving the default privilege. Only used in top-level default_privileges (in profiles, the role is determined by expansion).
-                            nullable: true
-                            type: string
-                        required:
-                        - on_type
-                        - privileges
-                        type: object
-                      type: array
-                    owner:
-                      description: The role that owns newly created objects. If omitted, uses manifest's default_owner.
-                      nullable: true
-                      type: string
-                    schema:
-                      type: string
-                  required:
-                  - grant
-                  - schema
-                  type: object
-                type: array
-              grants:
-                default: []
-                description: One-off grants.
-                items:
-                  description: A concrete grant on a specific object or wildcard.
-                  properties:
-                    on:
-                      description: Target object for a grant.
-                      properties:
-                        name:
-                          description: Object name, or "*" for all objects. Omit for schema-level grants.
-                          nullable: true
-                          type: string
-                        schema:
-                          description: Schema name. Required for most object types except database.
-                          nullable: true
-                          type: string
-                        type:
-                          description: PostgreSQL object types that can have privileges granted on them.
-                          enum:
-                          - table
-                          - view
-                          - materialized_view
-                          - sequence
-                          - function
-                          - schema
-                          - database
-                          - type
-                          type: string
-                      required:
-                      - type
-                      type: object
-                    privileges:
-                      items:
-                        description: PostgreSQL privilege types.
-                        enum:
-                        - SELECT
-                        - INSERT
-                        - UPDATE
-                        - DELETE
-                        - TRUNCATE
-                        - REFERENCES
-                        - TRIGGER
-                        - EXECUTE
-                        - USAGE
-                        - CREATE
-                        - CONNECT
-                        - TEMPORARY
-                        type: string
-                      type: array
-                    role:
-                      type: string
-                  required:
-                  - on
-                  - privileges
-                  - role
-                  type: object
-                type: array
-              interval:
-                default: 5m
-                description: Reconciliation interval (e.g. "5m", "1h"). Defaults to "5m".
-                type: string
-              memberships:
-                default: []
-                description: Membership edges.
-                items:
-                  description: A membership declaration — which members belong to a role.
-                  properties:
-                    members:
-                      items:
-                        description: A single member of a role.
-                        properties:
-                          admin:
-                            default: false
-                            type: boolean
-                          inherit:
-                            default: true
-                            type: boolean
-                          name:
-                            type: string
-                        required:
-                        - name
-                        type: object
-                      type: array
-                    role:
-                      type: string
-                  required:
-                  - members
-                  - role
-                  type: object
-                type: array
-              profiles:
-                additionalProperties:
-                  description: |-
-                    A reusable privilege profile (CRD-compatible version).
-
-                    This mirrors `pgpolicy_core::manifest::Profile` but derives `JsonSchema`.
-                  properties:
-                    default_privileges:
-                      default: []
-                      items:
-                        description: Default privilege grant within a profile.
-                        properties:
-                          on_type:
-                            description: PostgreSQL object types that can have privileges granted on them.
-                            enum:
-                            - table
-                            - view
-                            - materialized_view
-                            - sequence
-                            - function
-                            - schema
-                            - database
-                            - type
-                            type: string
-                          privileges:
-                            items:
-                              description: PostgreSQL privilege types.
-                              enum:
-                              - SELECT
-                              - INSERT
-                              - UPDATE
-                              - DELETE
-                              - TRUNCATE
-                              - REFERENCES
-                              - TRIGGER
-                              - EXECUTE
-                              - USAGE
-                              - CREATE
-                              - CONNECT
-                              - TEMPORARY
-                              type: string
-                            type: array
-                          role:
-                            nullable: true
-                            type: string
-                        required:
-                        - on_type
-                        - privileges
-                        type: object
-                      type: array
-                    grants:
-                      default: []
-                      items:
-                        description: Grant template within a profile.
-                        properties:
-                          on:
-                            description: Object target within a profile.
-                            properties:
-                              name:
-                                nullable: true
-                                type: string
-                              type:
-                                description: PostgreSQL object types that can have privileges granted on them.
-                                enum:
-                                - table
-                                - view
-                                - materialized_view
-                                - sequence
-                                - function
-                                - schema
-                                - database
-                                - type
-                                type: string
-                            required:
-                            - type
-                            type: object
-                          privileges:
-                            items:
-                              description: PostgreSQL privilege types.
-                              enum:
-                              - SELECT
-                              - INSERT
-                              - UPDATE
-                              - DELETE
-                              - TRUNCATE
-                              - REFERENCES
-                              - TRIGGER
-                              - EXECUTE
-                              - USAGE
-                              - CREATE
-                              - CONNECT
-                              - TEMPORARY
-                              type: string
-                            type: array
-                        required:
-                        - on
-                        - privileges
-                        type: object
-                      type: array
-                    login:
-                      nullable: true
-                      type: boolean
-                  type: object
-                default: {}
-                description: Reusable privilege profiles.
-                type: object
-              roles:
-                default: []
-                description: One-off role definitions.
-                items:
-                  description: A concrete role definition (CRD-compatible version).
-                  properties:
-                    bypassrls:
-                      nullable: true
-                      type: boolean
-                    comment:
-                      nullable: true
-                      type: string
-                    connection_limit:
-                      format: int32
-                      nullable: true
-                      type: integer
-                    createdb:
-                      nullable: true
-                      type: boolean
-                    createrole:
-                      nullable: true
-                      type: boolean
-                    inherit:
-                      nullable: true
-                      type: boolean
-                    login:
-                      nullable: true
-                      type: boolean
-                    name:
-                      type: string
-                    replication:
-                      nullable: true
-                      type: boolean
-                    superuser:
-                      nullable: true
-                      type: boolean
-                  required:
-                  - name
-                  type: object
-                type: array
-              schemas:
-                default: []
-                description: Schema bindings that expand profiles into concrete roles/grants.
-                items:
-                  description: A schema binding — associates a schema with one or more profiles.
-                  properties:
-                    name:
-                      type: string
-                    owner:
-                      description: Override default_owner for this schema's default privileges.
-                      nullable: true
-                      type: string
-                    profiles:
-                      items:
-                        type: string
-                      type: array
-                    role_pattern:
-                      default: '{schema}-{profile}'
-                      description: Role naming pattern. Supports `{schema}` and `{profile}` placeholders. Defaults to `"{schema}-{profile}"`.
-                      type: string
-                  required:
-                  - name
-                  - profiles
-                  type: object
-                type: array
-              suspend:
-                default: false
-                description: Suspend reconciliation when true. Defaults to false.
-                type: boolean
-            required:
-            - connection
-            type: object
-          status:
-            description: Status of a `PostgresPolicy` resource.
-            nullable: true
-            properties:
-              change_summary:
-                description: Summary of changes applied in the last reconciliation.
-                nullable: true
-                properties:
-                  default_privileges_revoked:
-                    format: int32
-                    type: integer
-                  default_privileges_set:
-                    format: int32
-                    type: integer
-                  grants_added:
-                    format: int32
-                    type: integer
-                  grants_revoked:
-                    format: int32
-                    type: integer
-                  members_added:
-                    format: int32
-                    type: integer
-                  members_removed:
-                    format: int32
-                    type: integer
-                  roles_altered:
-                    format: int32
-                    type: integer
-                  roles_created:
-                    format: int32
-                    type: integer
-                  roles_dropped:
-                    format: int32
-                    type: integer
-                  total:
-                    format: int32
-                    type: integer
-                required:
-                - default_privileges_revoked
-                - default_privileges_set
-                - grants_added
-                - grants_revoked
-                - members_added
-                - members_removed
-                - roles_altered
-                - roles_created
-                - roles_dropped
-                - total
-                type: object
-              conditions:
-                default: []
-                description: Standard Kubernetes conditions.
-                items:
-                  description: A condition on the `PostgresPolicy` resource.
-                  properties:
-                    last_transition_time:
-                      description: Last time the condition transitioned.
-                      nullable: true
-                      type: string
-                    message:
-                      description: Human-readable message.
-                      nullable: true
-                      type: string
-                    reason:
-                      description: Human-readable reason for the condition.
-                      nullable: true
-                      type: string
-                    status:
-                      description: 'Status: "True", "False", or "Unknown".'
-                      type: string
-                    type:
-                      description: 'Type of condition: "Ready", "Reconciling", "Degraded".'
-                      type: string
-                  required:
-                  - status
-                  - type
-                  type: object
-                type: array
-              last_reconcile_time:
-                description: ISO 8601 timestamp of the last successful reconciliation.
-                nullable: true
-                type: string
-              observed_generation:
-                description: The `.metadata.generation` that was last successfully reconciled.
-                format: int64
-                nullable: true
-                type: integer
-            type: object
-        required:
-        - spec
-        title: PostgresPolicy
-        type: object
-    served: true
-    storage: true
-    subresources:
-      status: {}
+{
+  "apiVersion": "apiextensions.k8s.io/v1",
+  "kind": "CustomResourceDefinition",
+  "metadata": {
+    "name": "postgrespolicies.pgpolicy.io"
+  },
+  "spec": {
+    "group": "pgpolicy.io",
+    "names": {
+      "categories": [],
+      "kind": "PostgresPolicy",
+      "plural": "postgrespolicies",
+      "shortNames": [
+        "pgp"
+      ],
+      "singular": "postgrespolicy"
+    },
+    "scope": "Namespaced",
+    "versions": [
+      {
+        "additionalPrinterColumns": [
+          {
+            "jsonPath": ".status.conditions[?(@.type==\"Ready\")].status",
+            "name": "Ready",
+            "type": "string"
+          },
+          {
+            "jsonPath": ".metadata.creationTimestamp",
+            "name": "Age",
+            "type": "date"
+          }
+        ],
+        "name": "v1alpha1",
+        "schema": {
+          "openAPIV3Schema": {
+            "description": "Auto-generated derived type for PostgresPolicySpec via `CustomResource`",
+            "properties": {
+              "spec": {
+                "description": "Spec for a `PostgresPolicy` custom resource.\n\nDefines the desired state of PostgreSQL roles, grants, default privileges, and memberships for a single database connection.",
+                "properties": {
+                  "connection": {
+                    "description": "Database connection configuration.",
+                    "properties": {
+                      "secretKey": {
+                        "default": "DATABASE_URL",
+                        "description": "Override the key in the Secret to read. Defaults to `DATABASE_URL`.",
+                        "type": "string"
+                      },
+                      "secretRef": {
+                        "description": "Reference to a Kubernetes Secret containing the connection string. The secret must have a key named `DATABASE_URL`.",
+                        "properties": {
+                          "name": {
+                            "description": "Name of the Secret.",
+                            "type": "string"
+                          }
+                        },
+                        "required": [
+                          "name"
+                        ],
+                        "type": "object"
+                      }
+                    },
+                    "required": [
+                      "secretRef"
+                    ],
+                    "type": "object"
+                  },
+                  "default_owner": {
+                    "description": "Default owner for ALTER DEFAULT PRIVILEGES (e.g. \"app_owner\").",
+                    "nullable": true,
+                    "type": "string"
+                  },
+                  "default_privileges": {
+                    "default": [],
+                    "description": "One-off default privileges.",
+                    "items": {
+                      "description": "Default privilege configuration.",
+                      "properties": {
+                        "grant": {
+                          "items": {
+                            "description": "A single default privilege grant entry.",
+                            "properties": {
+                              "on_type": {
+                                "description": "PostgreSQL object types that can have privileges granted on them.",
+                                "enum": [
+                                  "table",
+                                  "view",
+                                  "materialized_view",
+                                  "sequence",
+                                  "function",
+                                  "schema",
+                                  "database",
+                                  "type"
+                                ],
+                                "type": "string"
+                              },
+                              "privileges": {
+                                "items": {
+                                  "description": "PostgreSQL privilege types.",
+                                  "enum": [
+                                    "SELECT",
+                                    "INSERT",
+                                    "UPDATE",
+                                    "DELETE",
+                                    "TRUNCATE",
+                                    "REFERENCES",
+                                    "TRIGGER",
+                                    "EXECUTE",
+                                    "USAGE",
+                                    "CREATE",
+                                    "CONNECT",
+                                    "TEMPORARY"
+                                  ],
+                                  "type": "string"
+                                },
+                                "type": "array"
+                              },
+                              "role": {
+                                "description": "The role receiving the default privilege. Only used in top-level default_privileges (in profiles, the role is determined by expansion).",
+                                "nullable": true,
+                                "type": "string"
+                              }
+                            },
+                            "required": [
+                              "on_type",
+                              "privileges"
+                            ],
+                            "type": "object"
+                          },
+                          "type": "array"
+                        },
+                        "owner": {
+                          "description": "The role that owns newly created objects. If omitted, uses manifest's default_owner.",
+                          "nullable": true,
+                          "type": "string"
+                        },
+                        "schema": {
+                          "type": "string"
+                        }
+                      },
+                      "required": [
+                        "grant",
+                        "schema"
+                      ],
+                      "type": "object"
+                    },
+                    "type": "array"
+                  },
+                  "grants": {
+                    "default": [],
+                    "description": "One-off grants.",
+                    "items": {
+                      "description": "A concrete grant on a specific object or wildcard.",
+                      "properties": {
+                        "on": {
+                          "description": "Target object for a grant.",
+                          "properties": {
+                            "name": {
+                              "description": "Object name, or \"*\" for all objects. Omit for schema-level grants.",
+                              "nullable": true,
+                              "type": "string"
+                            },
+                            "schema": {
+                              "description": "Schema name. Required for most object types except database.",
+                              "nullable": true,
+                              "type": "string"
+                            },
+                            "type": {
+                              "description": "PostgreSQL object types that can have privileges granted on them.",
+                              "enum": [
+                                "table",
+                                "view",
+                                "materialized_view",
+                                "sequence",
+                                "function",
+                                "schema",
+                                "database",
+                                "type"
+                              ],
+                              "type": "string"
+                            }
+                          },
+                          "required": [
+                            "type"
+                          ],
+                          "type": "object"
+                        },
+                        "privileges": {
+                          "items": {
+                            "description": "PostgreSQL privilege types.",
+                            "enum": [
+                              "SELECT",
+                              "INSERT",
+                              "UPDATE",
+                              "DELETE",
+                              "TRUNCATE",
+                              "REFERENCES",
+                              "TRIGGER",
+                              "EXECUTE",
+                              "USAGE",
+                              "CREATE",
+                              "CONNECT",
+                              "TEMPORARY"
+                            ],
+                            "type": "string"
+                          },
+                          "type": "array"
+                        },
+                        "role": {
+                          "type": "string"
+                        }
+                      },
+                      "required": [
+                        "on",
+                        "privileges",
+                        "role"
+                      ],
+                      "type": "object"
+                    },
+                    "type": "array"
+                  },
+                  "interval": {
+                    "default": "5m",
+                    "description": "Reconciliation interval (e.g. \"5m\", \"1h\"). Defaults to \"5m\".",
+                    "type": "string"
+                  },
+                  "memberships": {
+                    "default": [],
+                    "description": "Membership edges.",
+                    "items": {
+                      "description": "A membership declaration — which members belong to a role.",
+                      "properties": {
+                        "members": {
+                          "items": {
+                            "description": "A single member of a role.",
+                            "properties": {
+                              "admin": {
+                                "default": false,
+                                "type": "boolean"
+                              },
+                              "inherit": {
+                                "default": true,
+                                "type": "boolean"
+                              },
+                              "name": {
+                                "type": "string"
+                              }
+                            },
+                            "required": [
+                              "name"
+                            ],
+                            "type": "object"
+                          },
+                          "type": "array"
+                        },
+                        "role": {
+                          "type": "string"
+                        }
+                      },
+                      "required": [
+                        "members",
+                        "role"
+                      ],
+                      "type": "object"
+                    },
+                    "type": "array"
+                  },
+                  "profiles": {
+                    "additionalProperties": {
+                      "description": "A reusable privilege profile (CRD-compatible version).\n\nThis mirrors `pgpolicy_core::manifest::Profile` but derives `JsonSchema`.",
+                      "properties": {
+                        "default_privileges": {
+                          "default": [],
+                          "items": {
+                            "description": "Default privilege grant within a profile.",
+                            "properties": {
+                              "on_type": {
+                                "description": "PostgreSQL object types that can have privileges granted on them.",
+                                "enum": [
+                                  "table",
+                                  "view",
+                                  "materialized_view",
+                                  "sequence",
+                                  "function",
+                                  "schema",
+                                  "database",
+                                  "type"
+                                ],
+                                "type": "string"
+                              },
+                              "privileges": {
+                                "items": {
+                                  "description": "PostgreSQL privilege types.",
+                                  "enum": [
+                                    "SELECT",
+                                    "INSERT",
+                                    "UPDATE",
+                                    "DELETE",
+                                    "TRUNCATE",
+                                    "REFERENCES",
+                                    "TRIGGER",
+                                    "EXECUTE",
+                                    "USAGE",
+                                    "CREATE",
+                                    "CONNECT",
+                                    "TEMPORARY"
+                                  ],
+                                  "type": "string"
+                                },
+                                "type": "array"
+                              },
+                              "role": {
+                                "nullable": true,
+                                "type": "string"
+                              }
+                            },
+                            "required": [
+                              "on_type",
+                              "privileges"
+                            ],
+                            "type": "object"
+                          },
+                          "type": "array"
+                        },
+                        "grants": {
+                          "default": [],
+                          "items": {
+                            "description": "Grant template within a profile.",
+                            "properties": {
+                              "on": {
+                                "description": "Object target within a profile.",
+                                "properties": {
+                                  "name": {
+                                    "nullable": true,
+                                    "type": "string"
+                                  },
+                                  "type": {
+                                    "description": "PostgreSQL object types that can have privileges granted on them.",
+                                    "enum": [
+                                      "table",
+                                      "view",
+                                      "materialized_view",
+                                      "sequence",
+                                      "function",
+                                      "schema",
+                                      "database",
+                                      "type"
+                                    ],
+                                    "type": "string"
+                                  }
+                                },
+                                "required": [
+                                  "type"
+                                ],
+                                "type": "object"
+                              },
+                              "privileges": {
+                                "items": {
+                                  "description": "PostgreSQL privilege types.",
+                                  "enum": [
+                                    "SELECT",
+                                    "INSERT",
+                                    "UPDATE",
+                                    "DELETE",
+                                    "TRUNCATE",
+                                    "REFERENCES",
+                                    "TRIGGER",
+                                    "EXECUTE",
+                                    "USAGE",
+                                    "CREATE",
+                                    "CONNECT",
+                                    "TEMPORARY"
+                                  ],
+                                  "type": "string"
+                                },
+                                "type": "array"
+                              }
+                            },
+                            "required": [
+                              "on",
+                              "privileges"
+                            ],
+                            "type": "object"
+                          },
+                          "type": "array"
+                        },
+                        "login": {
+                          "nullable": true,
+                          "type": "boolean"
+                        }
+                      },
+                      "type": "object"
+                    },
+                    "default": {},
+                    "description": "Reusable privilege profiles.",
+                    "type": "object"
+                  },
+                  "roles": {
+                    "default": [],
+                    "description": "One-off role definitions.",
+                    "items": {
+                      "description": "A concrete role definition (CRD-compatible version).",
+                      "properties": {
+                        "bypassrls": {
+                          "nullable": true,
+                          "type": "boolean"
+                        },
+                        "comment": {
+                          "nullable": true,
+                          "type": "string"
+                        },
+                        "connection_limit": {
+                          "format": "int32",
+                          "nullable": true,
+                          "type": "integer"
+                        },
+                        "createdb": {
+                          "nullable": true,
+                          "type": "boolean"
+                        },
+                        "createrole": {
+                          "nullable": true,
+                          "type": "boolean"
+                        },
+                        "inherit": {
+                          "nullable": true,
+                          "type": "boolean"
+                        },
+                        "login": {
+                          "nullable": true,
+                          "type": "boolean"
+                        },
+                        "name": {
+                          "type": "string"
+                        },
+                        "replication": {
+                          "nullable": true,
+                          "type": "boolean"
+                        },
+                        "superuser": {
+                          "nullable": true,
+                          "type": "boolean"
+                        }
+                      },
+                      "required": [
+                        "name"
+                      ],
+                      "type": "object"
+                    },
+                    "type": "array"
+                  },
+                  "schemas": {
+                    "default": [],
+                    "description": "Schema bindings that expand profiles into concrete roles/grants.",
+                    "items": {
+                      "description": "A schema binding — associates a schema with one or more profiles.",
+                      "properties": {
+                        "name": {
+                          "type": "string"
+                        },
+                        "owner": {
+                          "description": "Override default_owner for this schema's default privileges.",
+                          "nullable": true,
+                          "type": "string"
+                        },
+                        "profiles": {
+                          "items": {
+                            "type": "string"
+                          },
+                          "type": "array"
+                        },
+                        "role_pattern": {
+                          "default": "{schema}-{profile}",
+                          "description": "Role naming pattern. Supports `{schema}` and `{profile}` placeholders. Defaults to `\"{schema}-{profile}\"`.",
+                          "type": "string"
+                        }
+                      },
+                      "required": [
+                        "name",
+                        "profiles"
+                      ],
+                      "type": "object"
+                    },
+                    "type": "array"
+                  },
+                  "suspend": {
+                    "default": false,
+                    "description": "Suspend reconciliation when true. Defaults to false.",
+                    "type": "boolean"
+                  }
+                },
+                "required": [
+                  "connection"
+                ],
+                "type": "object"
+              },
+              "status": {
+                "description": "Status of a `PostgresPolicy` resource.",
+                "nullable": true,
+                "properties": {
+                  "change_summary": {
+                    "description": "Summary of changes applied in the last reconciliation.",
+                    "nullable": true,
+                    "properties": {
+                      "default_privileges_revoked": {
+                        "format": "int32",
+                        "type": "integer"
+                      },
+                      "default_privileges_set": {
+                        "format": "int32",
+                        "type": "integer"
+                      },
+                      "grants_added": {
+                        "format": "int32",
+                        "type": "integer"
+                      },
+                      "grants_revoked": {
+                        "format": "int32",
+                        "type": "integer"
+                      },
+                      "members_added": {
+                        "format": "int32",
+                        "type": "integer"
+                      },
+                      "members_removed": {
+                        "format": "int32",
+                        "type": "integer"
+                      },
+                      "roles_altered": {
+                        "format": "int32",
+                        "type": "integer"
+                      },
+                      "roles_created": {
+                        "format": "int32",
+                        "type": "integer"
+                      },
+                      "roles_dropped": {
+                        "format": "int32",
+                        "type": "integer"
+                      },
+                      "total": {
+                        "format": "int32",
+                        "type": "integer"
+                      }
+                    },
+                    "required": [
+                      "default_privileges_revoked",
+                      "default_privileges_set",
+                      "grants_added",
+                      "grants_revoked",
+                      "members_added",
+                      "members_removed",
+                      "roles_altered",
+                      "roles_created",
+                      "roles_dropped",
+                      "total"
+                    ],
+                    "type": "object"
+                  },
+                  "conditions": {
+                    "default": [],
+                    "description": "Standard Kubernetes conditions.",
+                    "items": {
+                      "description": "A condition on the `PostgresPolicy` resource.",
+                      "properties": {
+                        "last_transition_time": {
+                          "description": "Last time the condition transitioned.",
+                          "nullable": true,
+                          "type": "string"
+                        },
+                        "message": {
+                          "description": "Human-readable message.",
+                          "nullable": true,
+                          "type": "string"
+                        },
+                        "reason": {
+                          "description": "Human-readable reason for the condition.",
+                          "nullable": true,
+                          "type": "string"
+                        },
+                        "status": {
+                          "description": "Status: \"True\", \"False\", or \"Unknown\".",
+                          "type": "string"
+                        },
+                        "type": {
+                          "description": "Type of condition: \"Ready\", \"Reconciling\", \"Degraded\".",
+                          "type": "string"
+                        }
+                      },
+                      "required": [
+                        "status",
+                        "type"
+                      ],
+                      "type": "object"
+                    },
+                    "type": "array"
+                  },
+                  "last_reconcile_time": {
+                    "description": "ISO 8601 timestamp of the last successful reconciliation.",
+                    "nullable": true,
+                    "type": "string"
+                  },
+                  "observed_generation": {
+                    "description": "The `.metadata.generation` that was last successfully reconciled.",
+                    "format": "int64",
+                    "nullable": true,
+                    "type": "integer"
+                  }
+                },
+                "type": "object"
+              }
+            },
+            "required": [
+              "spec"
+            ],
+            "title": "PostgresPolicy",
+            "type": "object"
+          }
+        },
+        "served": true,
+        "storage": true,
+        "subresources": {
+          "status": {}
+        }
+      }
+    ]
+  }
+}

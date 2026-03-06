@@ -224,9 +224,10 @@ async fn reconcile_apply_inner(
 
         let mut transaction = pool.begin().await?;
         for change in &changes {
-            let sql = pgpolicy_core::sql::render(change);
-            tracing::debug!(%sql, "executing");
-            sqlx::query(&sql).execute(transaction.as_mut()).await?;
+            for sql in pgpolicy_core::sql::render_statements(change) {
+                tracing::debug!(%sql, "executing");
+                sqlx::query(&sql).execute(transaction.as_mut()).await?;
+            }
             accumulate_summary(&mut summary, change);
         }
         transaction.commit().await?;
