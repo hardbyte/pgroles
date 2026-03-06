@@ -103,6 +103,6 @@ memberships:
     members:
       - name: customers-readers@example.com
       - name: readonly-all
-  - role: etl-service
+  - role: readonly-all
     members:
-      - name: readonly-all
+      - name: etl-service

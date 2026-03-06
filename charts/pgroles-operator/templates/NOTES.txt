@@ -26,7 +26,7 @@ Then apply a PostgresPolicy resource:
         login: false
     grants:
       - role: app-reader
-        on: { type: schema, schema: public }
+        on: { type: schema, name: public }
         privileges: [USAGE]
       - role: app-reader
         on: { type: table, schema: public, name: "*" }

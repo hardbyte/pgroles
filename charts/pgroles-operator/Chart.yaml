@@ -7,7 +7,7 @@ description: >-
 type: application
 version: 0.1.0
 appVersion: "0.1.0"
-icon: https://raw.githubusercontent.com/hardbyte/pgroles/main/.github/logo.png
+# icon: TODO — add a project logo to the repository
 sources:
   - https://github.com/hardbyte/pgroles
 maintainers:
@@ -21,7 +21,7 @@ annotations:
   artifacthub.io/category: database
   artifacthub.io/operator: "true"
   artifacthub.io/prerelease: "true"
-  artifacthub.io/operatorCapabilities: Full Lifecycle
+  artifacthub.io/operatorCapabilities: Basic Install
   artifacthub.io/license: MIT
   artifacthub.io/links: |
     - name: Source

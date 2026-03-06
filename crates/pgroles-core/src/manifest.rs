@@ -1,6 +1,6 @@
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use thiserror::Error;
 
 // ---------------------------------------------------------------------------
@@ -449,22 +449,21 @@ pub fn expand_manifest(manifest: &PolicyManifest) -> Result<ExpandedManifest, Ma
     let memberships = manifest.memberships.clone();
 
     // Validate no duplicate role names
-    let mut seen_roles: HashMap<String, bool> = HashMap::new();
+    let mut seen_roles: HashSet<String> = HashSet::new();
     for role in &roles {
-        if seen_roles.contains_key(&role.name) {
+        if seen_roles.contains(&role.name) {
             return Err(ManifestError::DuplicateRole(role.name.clone()));
         }
-        seen_roles.insert(role.name.clone(), true);
+        seen_roles.insert(role.name.clone());
     }
 
-    let desired_role_names: HashMap<String, bool> =
-        roles.iter().map(|role| (role.name.clone(), true)).collect();
-    let mut seen_retirements: HashMap<String, bool> = HashMap::new();
+    let desired_role_names: HashSet<String> = roles.iter().map(|role| role.name.clone()).collect();
+    let mut seen_retirements: HashSet<String> = HashSet::new();
     for retirement in &manifest.retirements {
-        if seen_retirements.contains_key(&retirement.role) {
+        if seen_retirements.contains(&retirement.role) {
             return Err(ManifestError::DuplicateRetirement(retirement.role.clone()));
         }
-        if desired_role_names.contains_key(&retirement.role) {
+        if desired_role_names.contains(&retirement.role) {
             return Err(ManifestError::RetirementRoleStillDesired(
                 retirement.role.clone(),
             ));
@@ -474,7 +473,7 @@ pub fn expand_manifest(manifest: &PolicyManifest) -> Result<ExpandedManifest, Ma
                 role: retirement.role.clone(),
             });
         }
-        seen_retirements.insert(retirement.role.clone(), true);
+        seen_retirements.insert(retirement.role.clone());
     }
 
     Ok(ExpandedManifest {

@@ -141,3 +141,24 @@ memberships:
 {% callout type="warning" title="pgroles is convergent" %}
 The manifest represents the **entire desired state**. Roles, grants, default privileges, and memberships that exist in the database but are absent from the manifest will be dropped or revoked. Only declare roles that pgroles should manage.
 {% /callout %}
+
+## retirements
+
+When removing a role that owns objects, declare a retirement workflow so pgroles can safely clean up before dropping it:
+
+```yaml
+retirements:
+  - role: legacy_app
+    reassign_owned_to: app_owner
+    drop_owned: true
+```
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `role` | string | *required* | The role to retire and ultimately drop |
+| `reassign_owned_to` | string | *none* | Successor role for `REASSIGN OWNED BY ... TO ...` |
+| `drop_owned` | bool | `false` | Run `DROP OWNED BY` before dropping the role |
+
+Retired roles are included in the inspection scope even though they are absent from the desired role list. The generated plan inserts `REASSIGN OWNED` and/or `DROP OWNED` immediately before the `DROP ROLE` statement.
+
+A retirement entry cannot reference a role that is also listed in `roles` (that would be contradictory), and a role cannot reassign ownership to itself.

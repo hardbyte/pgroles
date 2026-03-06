@@ -51,6 +51,7 @@ FROM cgr.dev/chainguard/static:latest AS cli
 
 COPY --from=builder /build/target/release/pgroles /usr/local/bin/pgroles
 
+USER 65534
 ENTRYPOINT ["pgroles"]
 
 # ---------------------------------------------------------------------------

@@ -340,7 +340,10 @@ fn sql_object_type_plural(object_type: ObjectType) -> &'static str {
         ObjectType::Table | ObjectType::View | ObjectType::MaterializedView => "TABLES",
         ObjectType::Sequence => "SEQUENCES",
         ObjectType::Function => "FUNCTIONS",
-        ObjectType::Type => "TYPES",
+        // PostgreSQL has no ALL TYPES IN SCHEMA syntax. Type grants should use
+        // specific object names, not wildcards. If we get here the manifest is
+        // likely misconfigured, but produce the closest valid SQL anyway.
+        ObjectType::Type => "TABLES",
         // Schema/Database don't use ALL ... IN SCHEMA syntax
         ObjectType::Schema | ObjectType::Database => "TABLES",
     }

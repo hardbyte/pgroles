@@ -11,6 +11,33 @@ Requires **PostgreSQL 16+** (uses `GRANT ... WITH INHERIT` syntax).
 - **pgroles-cli** — Command-line tool for validating manifests, planning changes, and applying them.
 - **pgroles-operator** — *(work in progress)* Kubernetes operator that reconciles `PostgresPolicy` custom resources against PostgreSQL databases.
 
+## Installation
+
+### From crates.io
+
+```bash
+cargo install pgroles-cli
+```
+
+### From GitHub Releases
+
+Download pre-built binaries from the [releases page](https://github.com/hardbyte/pgroles/releases). Archives are available for Linux (x86_64, aarch64) and macOS (x86_64, aarch64).
+
+### Docker
+
+```bash
+docker run --rm ghcr.io/hardbyte/pgroles:0.1.0 --help
+```
+
+### Kubernetes Operator
+
+Install via Helm:
+
+```bash
+helm repo add pgroles https://hardbyte.github.io/pgroles
+helm install pgroles-operator pgroles/pgroles-operator
+```
+
 ## Quick Start
 
 ```bash

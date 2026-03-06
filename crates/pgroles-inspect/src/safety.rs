@@ -174,16 +174,18 @@ pub async fn inspect_drop_role_safety(
         .collect();
 
     for row in owned_objects {
-        let issue = by_role.get_mut(&row.role_name).expect("role should exist");
-        issue.owned_object_count += 1;
-        if issue.owned_object_examples.len() < 5 {
-            issue.owned_object_examples.push(row.description);
+        if let Some(issue) = by_role.get_mut(&row.role_name) {
+            issue.owned_object_count += 1;
+            if issue.owned_object_examples.len() < 5 {
+                issue.owned_object_examples.push(row.description);
+            }
         }
     }
 
     for row in active_sessions {
-        let issue = by_role.get_mut(&row.role_name).expect("role should exist");
-        issue.active_session_count = row.active_sessions.max(0) as usize;
+        if let Some(issue) = by_role.get_mut(&row.role_name) {
+            issue.active_session_count = row.active_sessions.max(0) as usize;
+        }
     }
 
     let issues = by_role

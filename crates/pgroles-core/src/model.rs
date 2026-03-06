@@ -7,9 +7,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use crate::manifest::{
-    DefaultPrivilege, ExpandedManifest, Grant, ObjectType, Privilege, RoleDefinition,
-};
+use crate::manifest::{ExpandedManifest, Grant, ObjectType, Privilege, RoleDefinition};
 
 // ---------------------------------------------------------------------------
 // Role attributes
@@ -284,20 +282,6 @@ fn grant_key_from_manifest(grant: &Grant) -> GrantKey {
         object_type: grant.on.object_type,
         schema: grant.on.schema.clone(),
         name: grant.on.name.clone(),
-    }
-}
-
-fn _default_priv_key_from_manifest(
-    default_priv: &DefaultPrivilege,
-    owner: &str,
-    grantee: &str,
-    on_type: ObjectType,
-) -> DefaultPrivKey {
-    DefaultPrivKey {
-        owner: owner.to_string(),
-        schema: default_priv.schema.clone(),
-        on_type,
-        grantee: grantee.to_string(),
     }
 }
 
