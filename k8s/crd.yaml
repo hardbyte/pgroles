@@ -395,6 +395,34 @@
                     "description": "Reusable privilege profiles.",
                     "type": "object"
                   },
+                  "retirements": {
+                    "default": [],
+                    "description": "Explicit role-retirement workflows for roles that should be removed.",
+                    "items": {
+                      "description": "Declarative workflow for retiring an existing role.",
+                      "properties": {
+                        "drop_owned": {
+                          "default": false,
+                          "description": "Whether to run `DROP OWNED BY` before dropping the role.",
+                          "type": "boolean"
+                        },
+                        "reassign_owned_to": {
+                          "description": "Optional successor role for `REASSIGN OWNED BY ... TO ...`.",
+                          "nullable": true,
+                          "type": "string"
+                        },
+                        "role": {
+                          "description": "The role to retire and ultimately drop.",
+                          "type": "string"
+                        }
+                      },
+                      "required": [
+                        "role"
+                      ],
+                      "type": "object"
+                    },
+                    "type": "array"
+                  },
                   "roles": {
                     "default": [],
                     "description": "One-off role definitions.",

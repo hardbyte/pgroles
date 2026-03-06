@@ -115,6 +115,20 @@ pgroles is convergent within the scope it manages today: the manifest is treated
 
 Before applying planned role drops, pgroles now performs a live preflight check for obvious hazards such as owned objects and active sessions, and refuses unsafe drops by default.
 
+Use `retirements` to make planned role removal explicit and to declare how pgroles should clean up ownership before the final `DROP ROLE`:
+
+```yaml
+roles:
+  - name: app_owner
+
+retirements:
+  - role: legacy_app
+    reassign_owned_to: app_owner
+    drop_owned: true
+```
+
+That expands the inspection scope to include `legacy_app` even though it is no longer in the desired role set, then executes `REASSIGN OWNED`, `DROP OWNED`, and `DROP ROLE` in that order.
+
 ## License
 
 MIT

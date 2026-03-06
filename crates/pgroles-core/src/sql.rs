@@ -89,6 +89,8 @@ pub fn render_statements(change: &Change) -> Vec<String> {
             admin,
         } => render_add_member(role, member, *inherit, *admin),
         Change::RemoveMember { role, member } => render_remove_member(role, member),
+        Change::ReassignOwned { from_role, to_role } => render_reassign_owned(from_role, to_role),
+        Change::DropOwned { role } => render_drop_owned(role),
         Change::DropRole { name } => vec![format!("DROP ROLE {};", quote_ident(name))],
     }
 }
@@ -429,6 +431,18 @@ fn render_remove_member(role: &str, member: &str) -> Vec<String> {
     )]
 }
 
+fn render_reassign_owned(from_role: &str, to_role: &str) -> Vec<String> {
+    vec![format!(
+        "REASSIGN OWNED BY {} TO {};",
+        quote_ident(from_role),
+        quote_ident(to_role)
+    )]
+}
+
+fn render_drop_owned(role: &str) -> Vec<String> {
+    vec![format!("DROP OWNED BY {};", quote_ident(role))]
+}
+
 // ---------------------------------------------------------------------------
 // String quoting
 // ---------------------------------------------------------------------------
@@ -688,6 +702,26 @@ mod tests {
             sql,
             "REVOKE \"inventory-editor\" FROM \"user@example.com\";"
         );
+    }
+
+    #[test]
+    fn render_reassign_owned() {
+        let change = Change::ReassignOwned {
+            from_role: "legacy-owner".to_string(),
+            to_role: "app-owner".to_string(),
+        };
+        assert_eq!(
+            render(&change),
+            "REASSIGN OWNED BY \"legacy-owner\" TO \"app-owner\";"
+        );
+    }
+
+    #[test]
+    fn render_drop_owned() {
+        let change = Change::DropOwned {
+            role: "legacy-owner".to_string(),
+        };
+        assert_eq!(render(&change), "DROP OWNED BY \"legacy-owner\";");
     }
 
     #[test]

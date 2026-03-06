@@ -9,7 +9,7 @@ use std::path::Path;
 use anyhow::{Context, Result};
 
 use pgroles_core::diff::{self, Change};
-use pgroles_core::manifest::{self, ExpandedManifest, PolicyManifest};
+use pgroles_core::manifest::{self, ExpandedManifest, PolicyManifest, RoleRetirement};
 use pgroles_core::model::RoleGraph;
 use pgroles_core::sql;
 
@@ -83,6 +83,11 @@ pub fn planned_role_drops(changes: &[Change]) -> Vec<String> {
         .collect()
 }
 
+/// Insert explicit retirement actions before any matching role drops.
+pub fn apply_role_retirements(changes: Vec<Change>, retirements: &[RoleRetirement]) -> Vec<Change> {
+    diff::apply_role_retirements(changes, retirements)
+}
+
 // ---------------------------------------------------------------------------
 // Output formatting
 // ---------------------------------------------------------------------------
@@ -99,6 +104,8 @@ pub struct PlanSummary {
     pub roles_altered: usize,
     pub roles_dropped: usize,
     pub comments_changed: usize,
+    pub ownerships_reassigned: usize,
+    pub owned_objects_dropped: usize,
     pub grants: usize,
     pub revokes: usize,
     pub default_privileges_set: usize,
@@ -117,6 +124,8 @@ impl PlanSummary {
                 Change::AlterRole { .. } => summary.roles_altered += 1,
                 Change::DropRole { .. } => summary.roles_dropped += 1,
                 Change::SetComment { .. } => summary.comments_changed += 1,
+                Change::ReassignOwned { .. } => summary.ownerships_reassigned += 1,
+                Change::DropOwned { .. } => summary.owned_objects_dropped += 1,
                 Change::Grant { .. } => summary.grants += 1,
                 Change::Revoke { .. } => summary.revokes += 1,
                 Change::SetDefaultPrivilege { .. } => summary.default_privileges_set += 1,
@@ -134,6 +143,8 @@ impl PlanSummary {
             + self.roles_altered
             + self.roles_dropped
             + self.comments_changed
+            + self.ownerships_reassigned
+            + self.owned_objects_dropped
             + self.grants
             + self.revokes
             + self.default_privileges_set
@@ -161,6 +172,8 @@ impl std::fmt::Display for PlanSummary {
             ("role(s) to alter", self.roles_altered),
             ("role(s) to drop", self.roles_dropped),
             ("comment(s) to change", self.comments_changed),
+            ("ownership reassignment(s)", self.ownerships_reassigned),
+            ("DROP OWNED cleanup step(s)", self.owned_objects_dropped),
             ("grant(s) to add", self.grants),
             ("grant(s) to revoke", self.revokes),
             ("default privilege(s) to set", self.default_privileges_set),
@@ -438,6 +451,26 @@ schemas:
             planned_role_drops(&changes),
             vec!["old-role".to_string(), "stale-role".to_string()]
         );
+    }
+
+    #[test]
+    fn apply_role_retirements_updates_plan_summary() {
+        let changes = apply_role_retirements(
+            vec![Change::DropRole {
+                name: "legacy-app".to_string(),
+            }],
+            &[pgroles_core::manifest::RoleRetirement {
+                role: "legacy-app".to_string(),
+                reassign_owned_to: Some("app-owner".to_string()),
+                drop_owned: true,
+            }],
+        );
+
+        let summary = PlanSummary::from_changes(&changes);
+        assert_eq!(summary.roles_dropped, 1);
+        assert_eq!(summary.ownerships_reassigned, 1);
+        assert_eq!(summary.owned_objects_dropped, 1);
+        assert_eq!(summary.total(), 3);
     }
 
     // -----------------------------------------------------------------------

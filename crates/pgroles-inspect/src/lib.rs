@@ -123,6 +123,17 @@ impl InspectConfig {
             wildcard_grants: wildcard_grants.into_iter().collect(),
         }
     }
+
+    /// Extend the managed role scope with additional explicit role names.
+    pub fn with_additional_roles<I>(mut self, roles: I) -> Self
+    where
+        I: IntoIterator<Item = String>,
+    {
+        let mut managed_roles: BTreeSet<String> = self.managed_roles.into_iter().collect();
+        managed_roles.extend(roles);
+        self.managed_roles = managed_roles.into_iter().collect();
+        self
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -272,5 +283,21 @@ grants:
 
         assert!(config.include_database_privileges);
         assert_eq!(config.wildcard_grants.len(), 2);
+    }
+
+    #[test]
+    fn inspect_config_can_include_retired_roles() {
+        let yaml = r#"
+roles:
+  - name: analytics
+"#;
+        let manifest = parse_manifest(yaml).unwrap();
+        let expanded = expand_manifest(&manifest).unwrap();
+        let config = InspectConfig::from_expanded(&expanded, false)
+            .with_additional_roles(vec!["legacy-app".to_string(), "analytics".to_string()]);
+
+        assert_eq!(config.managed_roles.len(), 2);
+        assert!(config.managed_roles.contains(&"analytics".to_string()));
+        assert!(config.managed_roles.contains(&"legacy-app".to_string()));
     }
 }

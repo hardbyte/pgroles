@@ -9,7 +9,7 @@ use sqlx::PgPool;
 use tracing::info;
 
 use pgroles_cli::{
-    PlanSummary, compute_plan, format_plan_sql, format_role_graph_summary,
+    PlanSummary, apply_role_retirements, compute_plan, format_plan_sql, format_role_graph_summary,
     format_validation_result, planned_role_drops, read_manifest_file, validate_manifest,
 };
 use pgroles_inspect::{InspectConfig, inspect_drop_role_safety};
@@ -149,8 +149,11 @@ async fn cmd_diff(file: &Path, database_url: &str, format: &OutputFormat) -> Res
     let pool = connect_db(database_url).await?;
     let current = inspect_current(&pool, &validated).await?;
 
-    let changes = compute_plan(&current, &validated.desired);
-    let drop_safety = inspect_drop_safety(&pool, &changes).await?;
+    let changes = apply_role_retirements(
+        compute_plan(&current, &validated.desired),
+        &validated.manifest.retirements,
+    );
+    let drop_safety = inspect_drop_safety(&pool, &changes, &validated.manifest.retirements).await?;
     let summary = PlanSummary::from_changes(&changes);
 
     match format {
@@ -183,8 +186,11 @@ async fn cmd_apply(file: &Path, database_url: &str, dry_run: bool) -> Result<()>
     let pool = connect_db(database_url).await?;
     let current = inspect_current(&pool, &validated).await?;
 
-    let changes = compute_plan(&current, &validated.desired);
-    let drop_safety = inspect_drop_safety(&pool, &changes).await?;
+    let changes = apply_role_retirements(
+        compute_plan(&current, &validated.desired),
+        &validated.manifest.retirements,
+    );
+    let drop_safety = inspect_drop_safety(&pool, &changes, &validated.manifest.retirements).await?;
     let summary = PlanSummary::from_changes(&changes);
 
     if summary.is_empty() {
@@ -268,7 +274,14 @@ async fn inspect_current(
         .iter()
         .any(|g| g.on.object_type == pgroles_core::manifest::ObjectType::Database);
 
-    let config = InspectConfig::from_expanded(&validated.expanded, has_database_grants);
+    let config = InspectConfig::from_expanded(&validated.expanded, has_database_grants)
+        .with_additional_roles(
+            validated
+                .manifest
+                .retirements
+                .iter()
+                .map(|retirement| retirement.role.clone()),
+        );
 
     info!(
         managed_roles = config.managed_roles.len(),
@@ -284,9 +297,11 @@ async fn inspect_current(
 async fn inspect_drop_safety(
     pool: &PgPool,
     changes: &[pgroles_core::diff::Change],
+    retirements: &[pgroles_core::manifest::RoleRetirement],
 ) -> Result<pgroles_inspect::DropRoleSafetyReport> {
     let dropped_roles = planned_role_drops(changes);
-    inspect_drop_role_safety(pool, &dropped_roles)
+    let report = inspect_drop_role_safety(pool, &dropped_roles)
         .await
-        .context("failed to inspect role-drop safety")
+        .context("failed to inspect role-drop safety")?;
+    Ok(report.apply_retirements(retirements))
 }

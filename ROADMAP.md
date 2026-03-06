@@ -8,14 +8,14 @@
 
 ## Phase 1: Safety and Semantic Validation
 
-- Add dry-run safety checks against live state for destructive operations:
-  - dropping roles that still own objects
-  - dropping roles with unmanaged dependencies
-  - destructive changes that are likely to be blocked by active sessions or ownership rules
-- Add a safe role-retirement path:
-  - inspect and report owned objects before destructive changes
-  - support explicit `REASSIGN OWNED` / `DROP OWNED` workflows where allowed
-  - refuse unsafe drops by default when ownership cannot be resolved
+- Extend the current live destructive-operation preflight:
+  - ownership and active-session checks are implemented now
+  - next add broader unmanaged dependency detection before destructive changes
+  - next surface likely blockers more precisely in dry-run output
+- Harden the new role-retirement path:
+  - explicit `retirements` with `REASSIGN OWNED` / `DROP OWNED` are implemented now
+  - next decide whether session termination should ever be an explicit opt-in workflow
+  - next document the current single-database boundary for retirement cleanup more clearly
 - Expand manifest semantic validation:
   - top-level default privileges must declare `grant.role`
   - object target combinations should be checked for required/forbidden fields

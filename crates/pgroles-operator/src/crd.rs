@@ -9,7 +9,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use pgroles_core::manifest::{
-    DefaultPrivilege, Grant, Membership, ObjectType, Privilege, SchemaBinding,
+    DefaultPrivilege, Grant, Membership, ObjectType, Privilege, RoleRetirement, SchemaBinding,
 };
 
 // ---------------------------------------------------------------------------
@@ -70,6 +70,10 @@ pub struct PostgresPolicySpec {
     /// Membership edges.
     #[serde(default)]
     pub memberships: Vec<Membership>,
+
+    /// Explicit role-retirement workflows for roles that should be removed.
+    #[serde(default)]
+    pub retirements: Vec<RoleRetirement>,
 }
 
 fn default_interval() -> String {
@@ -314,6 +318,7 @@ impl PostgresPolicySpec {
             grants: self.grants.clone(),
             default_privileges: self.default_privileges.clone(),
             memberships,
+            retirements: self.retirements.clone(),
         }
     }
 }
@@ -457,6 +462,11 @@ mod tests {
             grants: vec![],
             default_privileges: vec![],
             memberships: vec![],
+            retirements: vec![RoleRetirement {
+                role: "legacy-app".to_string(),
+                reassign_owned_to: Some("app_owner".to_string()),
+                drop_owned: true,
+            }],
         };
 
         let manifest = spec.to_policy_manifest();
@@ -465,6 +475,13 @@ mod tests {
         assert_eq!(manifest.roles[0].name, "analytics");
         assert_eq!(manifest.roles[0].login, Some(true));
         assert_eq!(manifest.roles[0].comment, Some("test role".to_string()));
+        assert_eq!(manifest.retirements.len(), 1);
+        assert_eq!(manifest.retirements[0].role, "legacy-app");
+        assert_eq!(
+            manifest.retirements[0].reassign_owned_to.as_deref(),
+            Some("app_owner")
+        );
+        assert!(manifest.retirements[0].drop_owned);
     }
 
     #[test]
@@ -533,6 +550,10 @@ memberships:
   - role: inventory-editor
     members:
       - name: analytics
+retirements:
+  - role: legacy-app
+    reassign_owned_to: app_owner
+    drop_owned: true
 "#;
         let spec: PostgresPolicySpec = serde_yaml::from_str(yaml).expect("should deserialize");
         assert_eq!(spec.interval, "10m");
@@ -543,5 +564,7 @@ memberships:
         assert_eq!(spec.roles.len(), 1);
         assert_eq!(spec.grants.len(), 1);
         assert_eq!(spec.memberships.len(), 1);
+        assert_eq!(spec.retirements.len(), 1);
+        assert_eq!(spec.retirements[0].role, "legacy-app");
     }
 }

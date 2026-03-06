@@ -211,11 +211,20 @@ async fn reconcile_apply_inner(
         .iter()
         .any(|g| g.on.object_type == pgroles_core::manifest::ObjectType::Database);
     let inspect_config =
-        pgroles_inspect::InspectConfig::from_expanded(&expanded, has_database_grants);
+        pgroles_inspect::InspectConfig::from_expanded(&expanded, has_database_grants)
+            .with_additional_roles(
+                manifest
+                    .retirements
+                    .iter()
+                    .map(|retirement| retirement.role.clone()),
+            );
     let current = pgroles_inspect::inspect(&pool, &inspect_config).await?;
 
     // 6. Compute diff.
-    let changes = pgroles_core::diff::diff(&current, &desired);
+    let changes = pgroles_core::diff::apply_role_retirements(
+        pgroles_core::diff::diff(&current, &desired),
+        &manifest.retirements,
+    );
     let dropped_roles: Vec<String> = changes
         .iter()
         .filter_map(|change| match change {
@@ -223,7 +232,9 @@ async fn reconcile_apply_inner(
             _ => None,
         })
         .collect();
-    let drop_safety = pgroles_inspect::inspect_drop_role_safety(&pool, &dropped_roles).await?;
+    let drop_safety = pgroles_inspect::inspect_drop_role_safety(&pool, &dropped_roles)
+        .await?
+        .apply_retirements(&manifest.retirements);
     if !drop_safety.is_empty() {
         return Err(ReconcileError::UnsafeRoleDrops(drop_safety.to_string()));
     }
@@ -314,6 +325,8 @@ fn accumulate_summary(summary: &mut ChangeSummary, change: &pgroles_core::diff::
         Change::AlterRole { .. } => summary.roles_altered += 1,
         Change::SetComment { .. } => summary.roles_altered += 1,
         Change::DropRole { .. } => summary.roles_dropped += 1,
+        Change::ReassignOwned { .. } => {}
+        Change::DropOwned { .. } => {}
         Change::Grant { .. } => summary.grants_added += 1,
         Change::Revoke { .. } => summary.grants_revoked += 1,
         Change::SetDefaultPrivilege { .. } => summary.default_privileges_set += 1,

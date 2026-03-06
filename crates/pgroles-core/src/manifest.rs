@@ -23,6 +23,15 @@ pub enum ManifestError {
 
     #[error("top-level default privilege for schema \"{schema}\" must specify grant.role")]
     MissingDefaultPrivilegeRole { schema: String },
+
+    #[error("duplicate retirement entry for role: \"{0}\"")]
+    DuplicateRetirement(String),
+
+    #[error("retirement entry for role \"{0}\" conflicts with a desired role of the same name")]
+    RetirementRoleStillDesired(String),
+
+    #[error("retirement entry for role \"{role}\" cannot reassign ownership to itself")]
+    RetirementSelfReassign { role: String },
 }
 
 // ---------------------------------------------------------------------------
@@ -130,6 +139,10 @@ pub struct PolicyManifest {
     /// Membership edges (opt-in).
     #[serde(default)]
     pub memberships: Vec<Membership>,
+
+    /// Explicit role-retirement workflows for roles that should be removed.
+    #[serde(default)]
+    pub retirements: Vec<RoleRetirement>,
 }
 
 /// A reusable privilege profile — defines what grants a role should have.
@@ -286,6 +299,21 @@ fn default_true() -> bool {
     true
 }
 
+/// Declarative workflow for retiring an existing role.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct RoleRetirement {
+    /// The role to retire and ultimately drop.
+    pub role: String,
+
+    /// Optional successor role for `REASSIGN OWNED BY ... TO ...`.
+    #[serde(default)]
+    pub reassign_owned_to: Option<String>,
+
+    /// Whether to run `DROP OWNED BY` before dropping the role.
+    #[serde(default)]
+    pub drop_owned: bool,
+}
+
 // ---------------------------------------------------------------------------
 // Expanded manifest — the result of profile expansion
 // ---------------------------------------------------------------------------
@@ -427,6 +455,26 @@ pub fn expand_manifest(manifest: &PolicyManifest) -> Result<ExpandedManifest, Ma
             return Err(ManifestError::DuplicateRole(role.name.clone()));
         }
         seen_roles.insert(role.name.clone(), true);
+    }
+
+    let desired_role_names: HashMap<String, bool> =
+        roles.iter().map(|role| (role.name.clone(), true)).collect();
+    let mut seen_retirements: HashMap<String, bool> = HashMap::new();
+    for retirement in &manifest.retirements {
+        if seen_retirements.contains_key(&retirement.role) {
+            return Err(ManifestError::DuplicateRetirement(retirement.role.clone()));
+        }
+        if desired_role_names.contains_key(&retirement.role) {
+            return Err(ManifestError::RetirementRoleStillDesired(
+                retirement.role.clone(),
+            ));
+        }
+        if retirement.reassign_owned_to.as_deref() == Some(retirement.role.as_str()) {
+            return Err(ManifestError::RetirementSelfReassign {
+                role: retirement.role.clone(),
+            });
+        }
+        seen_retirements.insert(retirement.role.clone(), true);
     }
 
     Ok(ExpandedManifest {
@@ -786,5 +834,52 @@ memberships:
         // inherit defaults to true, admin defaults to false
         assert!(manifest.memberships[0].members[0].inherit);
         assert!(!manifest.memberships[0].members[0].admin);
+    }
+
+    #[test]
+    fn expand_rejects_duplicate_retirements() {
+        let yaml = r#"
+retirements:
+  - role: old-app
+  - role: old-app
+"#;
+        let manifest = parse_manifest(yaml).unwrap();
+        let result = expand_manifest(&manifest);
+        assert!(matches!(
+            result,
+            Err(ManifestError::DuplicateRetirement(role)) if role == "old-app"
+        ));
+    }
+
+    #[test]
+    fn expand_rejects_retirement_for_desired_role() {
+        let yaml = r#"
+roles:
+  - name: old-app
+
+retirements:
+  - role: old-app
+"#;
+        let manifest = parse_manifest(yaml).unwrap();
+        let result = expand_manifest(&manifest);
+        assert!(matches!(
+            result,
+            Err(ManifestError::RetirementRoleStillDesired(role)) if role == "old-app"
+        ));
+    }
+
+    #[test]
+    fn expand_rejects_self_reassign_retirement() {
+        let yaml = r#"
+retirements:
+  - role: old-app
+    reassign_owned_to: old-app
+"#;
+        let manifest = parse_manifest(yaml).unwrap();
+        let result = expand_manifest(&manifest);
+        assert!(matches!(
+            result,
+            Err(ManifestError::RetirementSelfReassign { role }) if role == "old-app"
+        ));
     }
 }

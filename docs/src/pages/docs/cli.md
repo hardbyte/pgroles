@@ -45,6 +45,20 @@ The `sql` format prints the full SQL script. The `summary` format shows counts o
 
 If the plan includes role drops, `diff` also runs a live safety check and reports obvious hazards such as owned objects or active sessions.
 
+For intentional removals, declare a `retirements` block in the manifest so pgroles can inspect the soon-to-be-dropped role even though it is absent from the desired role list:
+
+```yaml
+roles:
+  - name: app_owner
+
+retirements:
+  - role: legacy_app
+    reassign_owned_to: app_owner
+    drop_owned: true
+```
+
+That causes the generated plan to insert `REASSIGN OWNED BY`, `DROP OWNED BY`, and then `DROP ROLE`.
+
 ## apply
 
 Apply changes to bring the database in sync with the manifest.
@@ -94,6 +108,8 @@ pgroles applies changes in dependency order:
 6. Add memberships
 7. Revoke default privileges
 8. Revoke privileges
-9. Drop roles
+9. Reassign owned objects for retired roles
+10. Drop owned objects / revoke remaining privileges for retired roles
+11. Drop roles
 
-This ensures roles exist before they're granted privileges, membership flag changes can be re-applied safely, and privileges are revoked before roles are dropped.
+This ensures roles exist before they're granted privileges, membership flag changes can be re-applied safely, and retired roles can be cleaned up before the final drop.

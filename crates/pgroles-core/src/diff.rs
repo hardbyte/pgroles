@@ -10,7 +10,7 @@
 
 use std::collections::BTreeSet;
 
-use crate::manifest::{ObjectType, Privilege};
+use crate::manifest::{ObjectType, Privilege, RoleRetirement};
 use crate::model::{DefaultPrivKey, GrantKey, MembershipEdge, RoleAttribute, RoleGraph, RoleState};
 
 // ---------------------------------------------------------------------------
@@ -92,6 +92,12 @@ pub enum Change {
 
     /// Revoke membership (REVOKE role FROM member).
     RemoveMember { role: String, member: String },
+
+    /// Reassign owned objects to a successor role before drop.
+    ReassignOwned { from_role: String, to_role: String },
+
+    /// Drop owned objects and revoke remaining privileges before drop.
+    DropOwned { role: String },
 
     /// Drop a role.
     DropRole { name: String },
@@ -178,6 +184,42 @@ pub fn diff(current: &RoleGraph, desired: &RoleGraph) -> Vec<Change> {
     changes.extend(revokes);
     changes.extend(drops);
     changes
+}
+
+/// Augment a diff plan with explicit role-retirement actions.
+///
+/// Retirement steps are inserted immediately before the matching `DropRole`
+/// so the final plan remains dependency-safe:
+/// `REASSIGN OWNED` → `DROP OWNED` → `DROP ROLE`.
+pub fn apply_role_retirements(changes: Vec<Change>, retirements: &[RoleRetirement]) -> Vec<Change> {
+    if retirements.is_empty() {
+        return changes;
+    }
+
+    let retirement_by_role: std::collections::BTreeMap<&str, &RoleRetirement> = retirements
+        .iter()
+        .map(|retirement| (retirement.role.as_str(), retirement))
+        .collect();
+
+    let mut planned = Vec::with_capacity(changes.len());
+    for change in changes {
+        if let Change::DropRole { name } = &change
+            && let Some(retirement) = retirement_by_role.get(name.as_str())
+        {
+            if let Some(successor) = &retirement.reassign_owned_to {
+                planned.push(Change::ReassignOwned {
+                    from_role: name.clone(),
+                    to_role: successor.clone(),
+                });
+            }
+            if retirement.drop_owned {
+                planned.push(Change::DropOwned { role: name.clone() });
+            }
+        }
+        planned.push(change);
+    }
+
+    planned
 }
 
 // ---------------------------------------------------------------------------
@@ -788,5 +830,47 @@ memberships:
         // Diffing desired against itself should produce no changes
         let no_changes = diff(&desired, &desired);
         assert!(no_changes.is_empty());
+    }
+
+    #[test]
+    fn apply_role_retirements_inserts_cleanup_before_drop() {
+        let changes = vec![
+            Change::Grant {
+                role: "analytics".to_string(),
+                privileges: BTreeSet::from([Privilege::Select]),
+                object_type: ObjectType::Table,
+                schema: Some("public".to_string()),
+                name: Some("*".to_string()),
+            },
+            Change::DropRole {
+                name: "old-app".to_string(),
+            },
+        ];
+
+        let planned = apply_role_retirements(
+            changes,
+            &[crate::manifest::RoleRetirement {
+                role: "old-app".to_string(),
+                reassign_owned_to: Some("successor".to_string()),
+                drop_owned: true,
+            }],
+        );
+
+        assert!(matches!(planned[0], Change::Grant { .. }));
+        assert!(matches!(
+            planned[1],
+            Change::ReassignOwned {
+                ref from_role,
+                ref to_role
+            } if from_role == "old-app" && to_role == "successor"
+        ));
+        assert!(matches!(
+            planned[2],
+            Change::DropOwned { ref role } if role == "old-app"
+        ));
+        assert!(matches!(
+            planned[3],
+            Change::DropRole { ref name } if name == "old-app"
+        ));
     }
 }

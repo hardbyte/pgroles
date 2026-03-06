@@ -5,6 +5,7 @@
 
 use std::collections::BTreeMap;
 
+use pgroles_core::manifest::RoleRetirement;
 use sqlx::PgPool;
 
 /// Summary of why dropping a specific role is unsafe.
@@ -31,6 +32,31 @@ pub struct DropRoleSafetyReport {
 impl DropRoleSafetyReport {
     pub fn is_empty(&self) -> bool {
         self.issues.is_empty()
+    }
+
+    /// Remove ownership hazards that are explicitly handled by retirement steps.
+    pub fn apply_retirements(mut self, retirements: &[RoleRetirement]) -> Self {
+        let retirement_by_role: BTreeMap<&str, &RoleRetirement> = retirements
+            .iter()
+            .map(|retirement| (retirement.role.as_str(), retirement))
+            .collect();
+
+        self.issues = self
+            .issues
+            .into_iter()
+            .filter_map(|mut issue| {
+                if let Some(retirement) = retirement_by_role.get(issue.role.as_str())
+                    && (retirement.reassign_owned_to.is_some() || retirement.drop_owned)
+                {
+                    issue.owned_object_count = 0;
+                    issue.owned_object_examples.clear();
+                }
+
+                (!issue.is_empty()).then_some(issue)
+            })
+            .collect();
+
+        self
     }
 }
 
@@ -166,4 +192,51 @@ pub async fn inspect_drop_role_safety(
         .collect();
 
     Ok(DropRoleSafetyReport { issues })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn apply_retirements_clears_owned_object_hazards_when_planned() {
+        let report = DropRoleSafetyReport {
+            issues: vec![DropRoleSafetyIssue {
+                role: "legacy-app".to_string(),
+                owned_object_count: 2,
+                owned_object_examples: vec!["table public.widgets".to_string()],
+                active_session_count: 0,
+            }],
+        };
+
+        let filtered = report.apply_retirements(&[RoleRetirement {
+            role: "legacy-app".to_string(),
+            reassign_owned_to: Some("app-owner".to_string()),
+            drop_owned: false,
+        }]);
+
+        assert!(filtered.is_empty());
+    }
+
+    #[test]
+    fn apply_retirements_keeps_active_session_hazards() {
+        let report = DropRoleSafetyReport {
+            issues: vec![DropRoleSafetyIssue {
+                role: "legacy-app".to_string(),
+                owned_object_count: 1,
+                owned_object_examples: vec!["table public.widgets".to_string()],
+                active_session_count: 3,
+            }],
+        };
+
+        let filtered = report.apply_retirements(&[RoleRetirement {
+            role: "legacy-app".to_string(),
+            reassign_owned_to: Some("app-owner".to_string()),
+            drop_owned: true,
+        }]);
+
+        assert_eq!(filtered.issues.len(), 1);
+        assert_eq!(filtered.issues[0].active_session_count, 3);
+        assert_eq!(filtered.issues[0].owned_object_count, 0);
+    }
 }

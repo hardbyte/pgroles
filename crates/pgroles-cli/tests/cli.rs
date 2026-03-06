@@ -452,6 +452,61 @@ mod live_db {
         })
     }
 
+    fn query_role_exists(role: &str) -> bool {
+        with_runtime(async {
+            let pool = PgPool::connect(&database_url())
+                .await
+                .expect("failed to connect to live test database");
+            let row =
+                sqlx::query("SELECT EXISTS(SELECT 1 FROM pg_roles WHERE rolname = $1) AS present")
+                    .bind(role)
+                    .fetch_one(&pool)
+                    .await
+                    .expect("failed to query role existence");
+            row.get("present")
+        })
+    }
+
+    fn query_schema_owner(schema: &str) -> Option<String> {
+        with_runtime(async {
+            let pool = PgPool::connect(&database_url())
+                .await
+                .expect("failed to connect to live test database");
+            let row = sqlx::query(
+                "SELECT pg_get_userbyid(nspowner) AS owner FROM pg_namespace WHERE nspname = $1",
+            )
+            .bind(schema)
+            .fetch_optional(&pool)
+            .await
+            .expect("failed to query schema owner");
+            row.map(|row| row.get("owner"))
+        })
+    }
+
+    fn query_table_owner(schema: &str, table: &str) -> Option<String> {
+        with_runtime(async {
+            let pool = PgPool::connect(&database_url())
+                .await
+                .expect("failed to connect to live test database");
+            let row = sqlx::query(
+                r#"
+                SELECT pg_get_userbyid(c.relowner) AS owner
+                FROM pg_class c
+                JOIN pg_namespace n ON n.oid = c.relnamespace
+                WHERE n.nspname = $1
+                  AND c.relname = $2
+                  AND c.relkind IN ('r', 'p')
+                "#,
+            )
+            .bind(schema)
+            .bind(table)
+            .fetch_optional(&pool)
+            .await
+            .expect("failed to query table owner");
+            row.map(|row| row.get("owner"))
+        })
+    }
+
     #[test]
     #[ignore]
     fn diff_against_live_db() {
@@ -788,6 +843,87 @@ memberships:
             r#"
             DROP SCHEMA IF EXISTS "{schema}" CASCADE;
             DROP ROLE IF EXISTS "{role}";
+            "#
+        ));
+    }
+
+    #[test]
+    #[ignore]
+    fn retirement_manifest_reassigns_owned_objects_and_drops_role() {
+        let schema = unique_name("retire_schema");
+        let retired_role = unique_name("retired_role");
+        let successor_role = unique_name("successor_role");
+
+        execute_sql(&format!(
+            r#"
+            DROP SCHEMA IF EXISTS "{schema}" CASCADE;
+            DROP ROLE IF EXISTS "{retired_role}";
+            DROP ROLE IF EXISTS "{successor_role}";
+            CREATE ROLE "{successor_role}";
+            CREATE ROLE "{retired_role}";
+            CREATE SCHEMA "{schema}" AUTHORIZATION "{retired_role}";
+            SET ROLE "{retired_role}";
+            CREATE TABLE "{schema}"."widgets" (id integer);
+            RESET ROLE;
+            "#
+        ));
+
+        let manifest_file = write_temp_manifest(&format!(
+            r#"
+roles:
+  - name: {successor_role}
+
+retirements:
+  - role: {retired_role}
+    reassign_owned_to: {successor_role}
+    drop_owned: true
+"#
+        ));
+
+        pgroles_cmd()
+            .args([
+                "apply",
+                "--file",
+                manifest_file.path().to_str().unwrap(),
+                "--database-url",
+                &database_url(),
+            ])
+            .assert()
+            .success();
+
+        assert!(
+            !query_role_exists(&retired_role),
+            "retired role should have been dropped"
+        );
+        assert_eq!(
+            query_schema_owner(&schema).as_deref(),
+            Some(successor_role.as_str()),
+            "schema ownership should be reassigned"
+        );
+        assert_eq!(
+            query_table_owner(&schema, "widgets").as_deref(),
+            Some(successor_role.as_str()),
+            "table ownership should be reassigned"
+        );
+
+        pgroles_cmd()
+            .args([
+                "diff",
+                "--file",
+                manifest_file.path().to_str().unwrap(),
+                "--database-url",
+                &database_url(),
+                "--format",
+                "summary",
+            ])
+            .assert()
+            .success()
+            .stdout(predicate::str::contains("No changes needed"));
+
+        execute_sql(&format!(
+            r#"
+            DROP SCHEMA IF EXISTS "{schema}" CASCADE;
+            DROP ROLE IF EXISTS "{successor_role}";
             "#
         ));
     }
