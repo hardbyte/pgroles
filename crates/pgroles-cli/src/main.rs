@@ -56,7 +56,8 @@ enum Commands {
         format: OutputFormat,
 
         /// Exit with code 2 when drift is detected (useful for CI gates).
-        #[arg(long, default_value_t = true)]
+        /// Supports `--no-exit-code` to disable non-zero exit on drift.
+        #[arg(long, action = clap::ArgAction::Set, default_value_t = true)]
         exit_code: bool,
     },
 
