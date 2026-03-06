@@ -163,6 +163,16 @@ pub enum AuthProvider {
         #[serde(default)]
         project: Option<String>,
     },
+    /// Google AlloyDB IAM authentication.
+    /// IAM users and groups map to PostgreSQL roles managed by AlloyDB.
+    AlloyDbIam {
+        /// GCP project ID (for documentation/validation).
+        #[serde(default)]
+        project: Option<String>,
+        /// AlloyDB cluster name (for documentation/validation).
+        #[serde(default)]
+        cluster: Option<String>,
+    },
     /// AWS RDS IAM authentication.
     /// IAM users authenticate via token; the PG role must have `rds_iam` granted.
     RdsIam {
@@ -175,6 +185,18 @@ pub enum AuthProvider {
         /// Azure tenant ID (for documentation/validation).
         #[serde(default)]
         tenant_id: Option<String>,
+    },
+    /// Supabase-managed PostgreSQL authentication.
+    Supabase {
+        /// Supabase project ref (for documentation/validation).
+        #[serde(default)]
+        project_ref: Option<String>,
+    },
+    /// PlanetScale PostgreSQL authentication metadata.
+    PlanetScale {
+        /// PlanetScale organization (for documentation/validation).
+        #[serde(default)]
+        organization: Option<String>,
     },
 }
 
@@ -925,27 +947,49 @@ retirements:
 auth_providers:
   - type: cloud_sql_iam
     project: my-gcp-project
+  - type: alloydb_iam
+    project: my-gcp-project
+    cluster: analytics-prod
   - type: rds_iam
     region: us-east-1
   - type: azure_ad
     tenant_id: "abc-123"
+  - type: supabase
+    project_ref: myprojref
+  - type: planet_scale
+    organization: my-org
 
 roles:
   - name: app-service
 "#;
         let manifest = parse_manifest(yaml).unwrap();
-        assert_eq!(manifest.auth_providers.len(), 3);
+        assert_eq!(manifest.auth_providers.len(), 6);
         assert!(matches!(
             &manifest.auth_providers[0],
             AuthProvider::CloudSqlIam { project: Some(p) } if p == "my-gcp-project"
         ));
         assert!(matches!(
             &manifest.auth_providers[1],
-            AuthProvider::RdsIam { region: Some(r) } if r == "us-east-1"
+            AuthProvider::AlloyDbIam {
+                project: Some(p),
+                cluster: Some(c)
+            } if p == "my-gcp-project" && c == "analytics-prod"
         ));
         assert!(matches!(
             &manifest.auth_providers[2],
+            AuthProvider::RdsIam { region: Some(r) } if r == "us-east-1"
+        ));
+        assert!(matches!(
+            &manifest.auth_providers[3],
             AuthProvider::AzureAd { tenant_id: Some(t) } if t == "abc-123"
+        ));
+        assert!(matches!(
+            &manifest.auth_providers[4],
+            AuthProvider::Supabase { project_ref: Some(r) } if r == "myprojref"
+        ));
+        assert!(matches!(
+            &manifest.auth_providers[5],
+            AuthProvider::PlanetScale { organization: Some(o) } if o == "my-org"
         ));
     }
 

@@ -13,7 +13,7 @@ pgroles is a Rust workspace with four crates, each with a clear responsibility. 
 
 The core library with no database dependencies. Contains:
 
-- **Manifest parsing** (`manifest.rs`) -- YAML deserialization, profile expansion, validation. Includes `AuthProvider` model for cloud IAM provider declarations.
+- **Manifest parsing** (`manifest.rs`) -- YAML deserialization, profile expansion, validation. Includes `AuthProvider` model for managed PostgreSQL provider metadata.
 - **Role graph model** (`model.rs`) -- normalized representation of roles, grants, default privileges, and memberships
 - **Diff engine** (`diff.rs`) -- compares two `RoleGraph` instances and produces an ordered list of `Change` operations. Changes are `serde::Serialize` for JSON output.
 - **SQL generation** (`sql.rs`) -- renders `Change` operations into PostgreSQL DDL statements. Uses `SqlContext` for version-dependent rendering (PG 14/15 legacy syntax vs PG 16+ `WITH INHERIT`/`WITH ADMIN`).
@@ -33,7 +33,7 @@ Inspects:
 
 Also provides:
 - **Version detection** (`version.rs`) -- queries `server_version_num` to determine PG major version for syntax adaptation
-- **Cloud provider detection** (`cloud.rs`) -- detects whether the connecting role is a true superuser, an explicitly recognized cloud-provider admin role (`rds_superuser`, `cloudsqlsuperuser`, `azure_pg_admin`), or a regular user. Validates planned changes against detected privilege level.
+- **Cloud provider detection** (`cloud.rs`) -- detects whether the connecting role is a true superuser, an explicitly recognized managed-service admin role (`rds_superuser`, `cloudsqlsuperuser`, `alloydbsuperuser`, `azure_pg_admin`), or a regular user. Validates planned changes against detected privilege level.
 - **Unscoped introspection** (`inspect_all`) -- discovers all non-system roles for the `generate` command
 
 ### pgroles-cli

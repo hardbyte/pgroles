@@ -30,10 +30,17 @@ Declare cloud authentication providers to document how IAM-mapped roles connect 
 auth_providers:
   - type: cloud_sql_iam
     project: my-gcp-project
+  - type: alloydb_iam
+    project: my-gcp-project
+    cluster: analytics-prod
   - type: rds_iam
     region: us-east-1
   - type: azure_ad
     tenant_id: "00000000-0000-0000-0000-000000000000"
+  - type: supabase
+    project_ref: abcd1234
+  - type: planet_scale
+    organization: my-org
 ```
 
 Supported provider types:
@@ -41,11 +48,14 @@ Supported provider types:
 | Type | Description |
 |---|---|
 | `cloud_sql_iam` | Google Cloud SQL IAM authentication. Optional `project` field. |
+| `alloydb_iam` | Google AlloyDB IAM authentication. Optional `project` and `cluster` fields. |
 | `rds_iam` | AWS RDS/Aurora IAM authentication. Optional `region` field. |
 | `azure_ad` | Azure Active Directory authentication. Optional `tenant_id` field. |
+| `supabase` | Supabase PostgreSQL metadata. Optional `project_ref` field. |
+| `planet_scale` | PlanetScale PostgreSQL metadata. Optional `organization` field. |
 
 {% callout type="note" title="Managed service metadata is intentionally narrow" %}
-The `auth_providers` block only models the provider types listed above today. Other PostgreSQL-compatible managed services may still work with pgroles, but they are not yet represented as first-class `auth_providers` entries.
+The `auth_providers` block models the provider types listed above, but not every variant has provider-specific runtime behavior yet. Today the privilege-warning path has explicit detection for RDS/Aurora, Cloud SQL, AlloyDB, and Azure. Supabase and PlanetScale PostgreSQL entries are currently documentation and validation metadata.
 {% /callout %}
 
 ## default_owner

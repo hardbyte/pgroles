@@ -104,7 +104,7 @@ pgroles apply --database-url postgres://localhost/mydb --dry-run
 
 Before executing changes, `apply` detects the connecting role's privilege level — true superuser, cloud provider superuser (for the explicitly supported providers), or regular user — and warns about any planned changes that exceed the detected privileges (for example setting `SUPERUSER` or `BYPASSRLS` through a managed-service admin role).
 
-Provider-aware warning logic currently recognizes `rds_superuser`, `cloudsqlsuperuser`, and `azure_pg_admin`. Other PostgreSQL-compatible managed services, including AlloyDB, may still work, but privilege warnings will be generic rather than provider-specific.
+Provider-aware warning logic currently recognizes `rds_superuser`, `cloudsqlsuperuser`, `alloydbsuperuser`, and `azure_pg_admin`. Other PostgreSQL-compatible managed services, including Supabase and PlanetScale PostgreSQL, may still work, but privilege warnings will be generic rather than provider-specific.
 
 {% callout type="note" title="Transactional apply" %}
 If any statement fails during `apply`, the transaction is rolled back and earlier changes from that run are not committed.

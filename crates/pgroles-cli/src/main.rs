@@ -56,9 +56,12 @@ enum Commands {
         format: OutputFormat,
 
         /// Exit with code 2 when drift is detected (useful for CI gates).
-        /// Supports `--no-exit-code` to disable non-zero exit on drift.
-        #[arg(long, action = clap::ArgAction::Set, default_value_t = true)]
+        #[arg(long, default_value_t = true, overrides_with = "no_exit_code")]
         exit_code: bool,
+
+        /// Disable non-zero exit when drift is detected.
+        #[arg(long, action = clap::ArgAction::SetTrue, overrides_with = "exit_code")]
+        no_exit_code: bool,
     },
 
     /// Apply the changes to bring the database in sync with the manifest.
@@ -145,7 +148,8 @@ async fn run(cli: Cli) -> Result<ExitCode> {
             database_url,
             format,
             exit_code,
-        } => cmd_diff(&file, &database_url, &format, exit_code).await,
+            no_exit_code,
+        } => cmd_diff(&file, &database_url, &format, exit_code && !no_exit_code).await,
         Commands::Apply {
             file,
             database_url,

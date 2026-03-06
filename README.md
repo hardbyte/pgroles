@@ -11,7 +11,8 @@ pgroles treats your manifest as the **entire desired state** — roles, grants, 
 - **PostgreSQL 16+**: Full support including `GRANT ... WITH INHERIT`/`WITH ADMIN` syntax
 - **PostgreSQL 14–15**: Supported with automatic fallback to legacy grant syntax (`WITH ADMIN OPTION`)
 - CI integration tests run against PostgreSQL **16, 17, and 18**
-- Provider-aware privilege warnings currently recognize **AWS RDS/Aurora**, **Google Cloud SQL**, and **Azure Database for PostgreSQL**. Other PostgreSQL-compatible managed services, including **AlloyDB**, may still work, but warnings will be generic.
+- Provider-aware privilege warnings currently recognize **AWS RDS/Aurora**, **Google Cloud SQL**, **AlloyDB**, and **Azure Database for PostgreSQL**.
+- Manifest metadata also supports **Supabase** and **PlanetScale PostgreSQL**, but those variants are currently informational only.
 
 ## Quick Start
 
@@ -169,7 +170,7 @@ Cleanup is still scoped to the current database plus shared objects. If the pref
 - One manifest converges one PostgreSQL connection target.
 - `pgroles` is authoritative within the roles, grants, default privileges, and memberships it inspects for that manifest.
 - Retirement cleanup (`REASSIGN OWNED` / `DROP OWNED`) only covers the current database plus shared objects.
-- Managed PostgreSQL is supported at the PostgreSQL protocol/DDL level, but provider-specific warning logic is only explicit for RDS/Aurora, Cloud SQL, and Azure today. Other services, including AlloyDB, are not yet special-cased.
+- Managed PostgreSQL is supported at the PostgreSQL protocol/DDL level, but provider-specific warning logic is only explicit for RDS/Aurora, Cloud SQL, AlloyDB, and Azure today. Other services, including Supabase and PlanetScale PostgreSQL, are not yet special-cased.
 
 ## CI/CD
 

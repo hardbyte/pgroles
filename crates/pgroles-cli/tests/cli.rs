@@ -250,7 +250,8 @@ fn diff_help() {
         .success()
         .stdout(predicate::str::contains("--database-url"))
         .stdout(predicate::str::contains("--file"))
-        .stdout(predicate::str::contains("--format"));
+        .stdout(predicate::str::contains("--format"))
+        .stdout(predicate::str::contains("--no-exit-code"));
 }
 
 #[test]
@@ -339,6 +340,24 @@ fn diff_with_invalid_manifest() {
             manifest_file.path().to_str().unwrap(),
             "--database-url",
             "postgres://localhost/test",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("YAML parse error"));
+}
+
+#[test]
+fn diff_with_invalid_manifest_accepts_no_exit_code_flag() {
+    let manifest_file = write_temp_manifest(INVALID_YAML);
+
+    pgroles_cmd()
+        .args([
+            "diff",
+            "--file",
+            manifest_file.path().to_str().unwrap(),
+            "--database-url",
+            "postgres://localhost/test",
+            "--no-exit-code",
         ])
         .assert()
         .failure()

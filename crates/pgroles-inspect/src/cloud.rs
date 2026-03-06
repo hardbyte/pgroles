@@ -1,8 +1,9 @@
 //! Cloud-managed PostgreSQL detection and privilege level assessment.
 //!
 //! Detects whether the connecting role is a true superuser, a cloud provider's
-//! "superuser equivalent" (rds_superuser, cloudsqlsuperuser), or a regular
-//! user. This determines which DDL operations are safe to attempt.
+//! "superuser equivalent" (for example `rds_superuser`, `cloudsqlsuperuser`,
+//! `alloydbsuperuser`), or a regular user. This determines which DDL
+//! operations are safe to attempt.
 
 use sqlx::PgPool;
 
@@ -13,6 +14,8 @@ pub enum CloudProvider {
     AwsRds,
     /// Google Cloud SQL.
     GcpCloudSql,
+    /// Google AlloyDB for PostgreSQL.
+    GcpAlloyDb,
     /// Azure Database for PostgreSQL.
     AzureFlexible,
     /// Not a recognized cloud provider (self-hosted or unknown).
@@ -24,6 +27,7 @@ impl std::fmt::Display for CloudProvider {
         match self {
             CloudProvider::AwsRds => write!(f, "AWS RDS/Aurora"),
             CloudProvider::GcpCloudSql => write!(f, "Google Cloud SQL"),
+            CloudProvider::GcpAlloyDb => write!(f, "Google AlloyDB"),
             CloudProvider::AzureFlexible => write!(f, "Azure Flexible Server"),
             CloudProvider::Unknown => write!(f, "unknown"),
         }
@@ -99,7 +103,7 @@ impl std::fmt::Display for PrivilegeLevel {
 ///
 /// Queries the current role's attributes and role memberships to determine:
 /// 1. Whether the role has SUPERUSER
-/// 2. Whether it's a member of rds_superuser, cloudsqlsuperuser, or azure_pg_admin
+/// 2. Whether it's a member of a recognized managed-service admin role
 /// 3. Falls back to Regular if neither
 pub async fn detect_privilege_level(pool: &PgPool) -> Result<PrivilegeLevel, sqlx::Error> {
     // Check if current user is a true superuser.
@@ -120,7 +124,7 @@ pub async fn detect_privilege_level(pool: &PgPool) -> Result<PrivilegeLevel, sql
         JOIN pg_roles gr ON gr.oid = m.roleid
         JOIN pg_roles mr ON mr.oid = m.member
         WHERE mr.rolname = current_user
-          AND gr.rolname IN ('rds_superuser', 'cloudsqlsuperuser', 'azure_pg_admin')
+          AND gr.rolname IN ('rds_superuser', 'cloudsqlsuperuser', 'alloydbsuperuser', 'azure_pg_admin')
         "#,
     )
     .fetch_all(pool)
@@ -131,6 +135,9 @@ pub async fn detect_privilege_level(pool: &PgPool) -> Result<PrivilegeLevel, sql
             "rds_superuser" => return Ok(PrivilegeLevel::CloudSuperuser(CloudProvider::AwsRds)),
             "cloudsqlsuperuser" => {
                 return Ok(PrivilegeLevel::CloudSuperuser(CloudProvider::GcpCloudSql));
+            }
+            "alloydbsuperuser" => {
+                return Ok(PrivilegeLevel::CloudSuperuser(CloudProvider::GcpAlloyDb));
             }
             "azure_pg_admin" => {
                 return Ok(PrivilegeLevel::CloudSuperuser(CloudProvider::AzureFlexible));
@@ -284,6 +291,10 @@ mod tests {
         assert_eq!(
             PrivilegeLevel::CloudSuperuser(CloudProvider::AwsRds).to_string(),
             "cloud superuser (AWS RDS/Aurora)"
+        );
+        assert_eq!(
+            PrivilegeLevel::CloudSuperuser(CloudProvider::GcpAlloyDb).to_string(),
+            "cloud superuser (Google AlloyDB)"
         );
         assert_eq!(PrivilegeLevel::Superuser.to_string(), "superuser");
         assert_eq!(PrivilegeLevel::Regular.to_string(), "regular user");

@@ -33,8 +33,9 @@ println!("Privilege level: {privilege_level}");
 
 - This crate is intended to be paired with `pgroles-core`.
 - Provider-aware privilege detection currently covers AWS RDS/Aurora, Google
-  Cloud SQL, and Azure Database for PostgreSQL. Other PostgreSQL-compatible
-  managed services may still work, but warnings may be generic.
+  Cloud SQL, AlloyDB, and Azure Database for PostgreSQL. Other
+  PostgreSQL-compatible managed services may still work, but warnings may be
+  generic.
 
 ## Related Crates
 
