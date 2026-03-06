@@ -9,9 +9,9 @@ use sqlx::PgPool;
 use tracing::info;
 
 use pgroles_cli::{
-    PlanSummary, apply_role_retirements, compute_plan, format_plan_json, format_plan_sql,
-    format_role_graph_summary, format_validation_result, planned_role_drops, read_manifest_file,
-    validate_manifest,
+    PlanSummary, apply_role_retirements, compute_plan, format_plan_json,
+    format_plan_sql_with_context, format_role_graph_summary, format_validation_result,
+    planned_role_drops, read_manifest_file, validate_manifest,
 };
 use pgroles_inspect::{InspectConfig, inspect_drop_role_safety};
 
@@ -196,10 +196,11 @@ async fn cmd_diff(
 
     match format {
         OutputFormat::Sql => {
+            let sql_ctx = detect_sql_context(&pool).await?;
             if summary.is_empty() {
                 println!("-- No changes needed. Database is in sync with manifest.");
             } else {
-                print!("{}", format_plan_sql(&changes));
+                print!("{}", format_plan_sql_with_context(&changes, &sql_ctx));
                 eprintln!("\n{summary}");
                 if !drop_safety.is_empty() {
                     eprintln!("\n{drop_safety}");
@@ -229,6 +230,7 @@ async fn cmd_apply(file: &Path, database_url: &str, dry_run: bool) -> Result<()>
     let validated = validate_manifest(&yaml)?;
 
     let pool = connect_db(database_url).await?;
+    let sql_ctx = detect_sql_context(&pool).await?;
 
     // Detect cloud provider privilege level and warn about unsupported operations.
     let privilege_level = pgroles_inspect::detect_privilege_level(&pool)
@@ -260,7 +262,7 @@ async fn cmd_apply(file: &Path, database_url: &str, dry_run: bool) -> Result<()>
         return Ok(());
     }
 
-    let sql_output = format_plan_sql(&changes);
+    let sql_output = format_plan_sql_with_context(&changes, &sql_ctx);
 
     if dry_run {
         println!("-- DRY RUN: the following SQL would be executed:\n");
@@ -284,7 +286,7 @@ async fn cmd_apply(file: &Path, database_url: &str, dry_run: bool) -> Result<()>
     info!(changes = summary.total(), "applying changes");
     let mut transaction = pool.begin().await.context("failed to start transaction")?;
     for change in &changes {
-        for statement in pgroles_core::sql::render_statements(change) {
+        for statement in pgroles_core::sql::render_statements_with_context(change, &sql_ctx) {
             info!(sql = %statement, "executing");
             sqlx::query(&statement)
                 .execute(transaction.as_mut())
@@ -348,6 +350,19 @@ async fn connect_db(database_url: &str) -> Result<PgPool> {
     PgPool::connect(database_url)
         .await
         .context("failed to connect to database")
+}
+
+async fn detect_sql_context(pool: &PgPool) -> Result<pgroles_core::sql::SqlContext> {
+    let pg_version = pgroles_inspect::detect_pg_version(pool)
+        .await
+        .context("failed to detect PostgreSQL version")?;
+    info!(
+        pg_major = pg_version.major(),
+        "detected PostgreSQL server version"
+    );
+    Ok(pgroles_core::sql::SqlContext::from_version_num(
+        pg_version.version_num,
+    ))
 }
 
 async fn inspect_current(

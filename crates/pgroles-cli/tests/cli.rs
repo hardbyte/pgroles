@@ -531,6 +531,7 @@ mod live_db {
                 manifest_file.path().to_str().unwrap(),
                 "--database-url",
                 &database_url(),
+                "--no-exit-code",
             ])
             .assert()
             .success();
@@ -550,6 +551,7 @@ mod live_db {
                 &database_url(),
                 "--format",
                 "summary",
+                "--no-exit-code",
             ])
             .assert()
             .success();

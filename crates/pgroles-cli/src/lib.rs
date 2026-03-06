@@ -97,6 +97,11 @@ pub fn format_plan_sql(changes: &[Change]) -> String {
     sql::render_all(changes)
 }
 
+/// Format a plan as SQL statements using an explicit SQL context.
+pub fn format_plan_sql_with_context(changes: &[Change], ctx: &sql::SqlContext) -> String {
+    sql::render_all_with_context(changes, ctx)
+}
+
 /// Format a plan as JSON for machine consumption.
 pub fn format_plan_json(changes: &[Change]) -> Result<String> {
     serde_json::to_string_pretty(changes).map_err(|err| anyhow::anyhow!("{err}"))
