@@ -28,15 +28,22 @@ memberships:
 
 ## Generated SQL
 
-pgroles generates PostgreSQL 16+ membership syntax:
+pgroles generates version-appropriate membership syntax. On PostgreSQL 16+:
 
 ```sql
 GRANT "inventory-editor" TO "app-service" WITH INHERIT TRUE;
 GRANT "inventory-editor" TO "deploy@example.com" WITH INHERIT TRUE, ADMIN TRUE;
 ```
 
-{% callout type="warning" title="PostgreSQL 16+ required" %}
-The `WITH INHERIT TRUE/FALSE` syntax requires PostgreSQL 16 or later. Earlier versions do not support per-membership inherit control.
+On PostgreSQL 14–15, pgroles uses the legacy syntax:
+
+```sql
+GRANT "inventory-editor" TO "app-service";
+GRANT "inventory-editor" TO "deploy@example.com" WITH ADMIN OPTION;
+```
+
+{% callout type="note" title="Version-adaptive SQL" %}
+pgroles detects the PostgreSQL server version at runtime and generates the appropriate grant syntax automatically. The `WITH INHERIT TRUE/FALSE` syntax is only available on PostgreSQL 16+. On earlier versions, the role-level `INHERIT` attribute controls inheritance behavior instead of per-membership options.
 {% /callout %}
 
 ## Flag changes

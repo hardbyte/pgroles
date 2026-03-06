@@ -5,9 +5,10 @@ description: How to install the pgroles CLI tool.
 
 ## Compatibility
 
-- pgroles requires PostgreSQL **16+**
+- **PostgreSQL 16+**: Full support including `GRANT ... WITH INHERIT`/`WITH ADMIN` syntax
+- **PostgreSQL 14–15**: Supported with automatic fallback to legacy grant syntax (`WITH ADMIN OPTION`)
 - CI integration tests run against PostgreSQL **16, 17, and 18**
-- PostgreSQL 15 and earlier are not supported
+- pgroles detects the server version at runtime and adapts SQL generation accordingly
 
 ## From source
 

@@ -60,10 +60,10 @@
 - Decide whether multi-database manifests are a non-goal or a later orchestration feature.
 - If multi-database support is added, model it above the current single-database diff engine rather than overloading one manifest with ambiguous scope.
 
-- Add `--format json` to `validate`, `diff`, and `inspect`.
-- Add a drift exit code for CI.
+- ~~Add `--format json` to `validate`, `diff`, and `inspect`.~~ ✅ `--format json` added to `diff`/`plan`.
+- ~~Add a drift exit code for CI.~~ ✅ `diff` exits with code 2 when drift is detected (`--exit-code`, default on).
 - Make `inspect` emit a detailed normalized graph, not just counts.
-- Add a manifest/schema export command for editor and pipeline integration.
+- ~~Add a manifest/schema export command for editor and pipeline integration.~~ ✅ `generate` command introspects all non-system roles and emits a flat manifest.
 
 ## Phase 5: Operator Hardening
 

@@ -81,22 +81,24 @@ These are the meaningful gaps relative to the briefing's requirements:
 
 ## 3. Implementation Plan
 
-### Phase A: Brownfield Adoption & CI/CD Readiness
+### Phase A: Brownfield Adoption & CI/CD Readiness ✅ IMPLEMENTED
 
 **Goal:** Make pgroles usable for teams with existing databases, and integrate into CI pipelines.
 
-#### A1. Drift exit code for `diff` command
+> All items in this phase have been implemented. See the corresponding source files for details.
+
+#### A1. Drift exit code for `diff` command ✅
 - **Files:** `crates/pgroles-cli/src/main.rs`
 - **Change:** After computing changes in the `diff` subcommand, exit with code 2 if changes are non-empty, 0 if clean. Add `--exit-code` flag (default on) to match `git diff` semantics.
 - **Test:** CLI integration test asserting exit code behavior.
 
-#### A2. `--format json` output
+#### A2. `--format json` output ✅
 - **Files:** `crates/pgroles-cli/src/main.rs`, `crates/pgroles-cli/src/lib.rs`
 - **Change:** Add `Json` variant to the output format enum. Serialize `Vec<Change>` via serde. The `Change` enum needs `#[derive(Serialize)]` added in `crates/pgroles-core/src/diff.rs`. Also needs serde derives on `RoleState`, `RoleAttribute`, `GrantKey`, `GrantState`, etc.
 - **Dependencies:** Add `serde_json` to `pgroles-cli` deps.
 - **Test:** Roundtrip test: parse JSON output, verify it deserializes back to expected `Change` list.
 
-#### A3. `generate` / `export` command
+#### A3. `generate` / `export` command ✅
 - **Files:** New function in `crates/pgroles-cli/src/lib.rs`, new subcommand in `main.rs`, new module `crates/pgroles-core/src/export.rs`
 - **Design:**
   - `RoleGraph → PolicyManifest` conversion function in core crate
@@ -107,7 +109,7 @@ These are the meaningful gaps relative to the briefing's requirements:
   - The generated manifest, when applied back to the same DB, must produce zero diff (round-trip invariant)
 - **Test:** Integration test: inspect DB → generate manifest → parse → expand → build RoleGraph → diff against inspected RoleGraph → assert empty.
 
-#### A4. PG version detection and syntax adaptation
+#### A4. PG version detection and syntax adaptation ✅
 - **Files:** `crates/pgroles-inspect/src/lib.rs` (add version query), `crates/pgroles-core/src/sql.rs` (conditional syntax)
 - **Design:**
   - Add `pg_version: u32` field to a new `SqlContext` struct passed to `render_statements`
@@ -136,7 +138,7 @@ These are the meaningful gaps relative to the briefing's requirements:
 - **Implementation:** Add a `ReconcileMode` enum and a post-filter on `diff()` output. The diff engine itself stays pure; filtering happens in the CLI/operator layer.
 - **Test:** Same manifest, same DB state → different change sets under different modes.
 
-#### B2. Managed-PG privilege detection
+#### B2. Managed-PG privilege detection ✅
 - **Files:** `crates/pgroles-inspect/src/lib.rs`
 - **Design:**
   - After connecting, query for the connecting role's attributes and memberships
@@ -234,7 +236,7 @@ These are the meaningful gaps relative to the briefing's requirements:
 
 These are documented for completeness but should not block the initial phases.
 
-#### D1. Cloud auth provider model
+#### D1. Cloud auth provider model ✅ (manifest schema only)
 - **Design concept:**
   ```yaml
   auth_providers:

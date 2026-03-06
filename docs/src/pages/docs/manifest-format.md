@@ -11,6 +11,7 @@ A pgroles manifest is a YAML file that declares the desired state of your Postgr
 
 ```yaml
 default_owner: pgloader_pg       # Owner for ALTER DEFAULT PRIVILEGES
+auth_providers: []                # Cloud IAM provider declarations
 profiles: {}                      # Reusable privilege templates
 schemas: []                       # Schema-profile bindings
 roles: []                         # Role definitions
@@ -20,6 +21,28 @@ memberships: []                   # Role membership edges
 ```
 
 All fields are optional. A minimal manifest might only define `roles` and `grants`.
+
+## auth_providers
+
+Declare cloud authentication providers to document how IAM-mapped roles connect to the database. This is currently informational metadata used for validation and documentation purposes.
+
+```yaml
+auth_providers:
+  - type: cloud_sql_iam
+    project: my-gcp-project
+  - type: rds_iam
+    region: us-east-1
+  - type: azure_ad
+    tenant_id: "00000000-0000-0000-0000-000000000000"
+```
+
+Supported provider types:
+
+| Type | Description |
+|---|---|
+| `cloud_sql_iam` | Google Cloud SQL IAM authentication. Optional `project` field. |
+| `rds_iam` | AWS RDS/Aurora IAM authentication. Optional `region` field. |
+| `azure_ad` | Azure Active Directory authentication. Optional `tenant_id` field. |
 
 ## default_owner
 

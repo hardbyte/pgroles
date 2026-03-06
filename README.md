@@ -4,13 +4,13 @@ Stop managing PostgreSQL roles with ad-hoc SQL. Define them in YAML, diff agains
 
 pgroles treats your manifest as the **entire desired state** — roles, grants, and memberships not in the manifest get revoked or dropped. This is the same convergent model used by Terraform and Kubernetes, applied to PostgreSQL access control.
 
-> **Requires PostgreSQL 16+** (uses `GRANT ... WITH INHERIT` syntax).
+> **Best with PostgreSQL 16+**. Supports PostgreSQL 14+ with version-adaptive SQL generation.
 
 ## Compatibility
 
-- Supports PostgreSQL **16 and newer**
+- **PostgreSQL 16+**: Full support including `GRANT ... WITH INHERIT`/`WITH ADMIN` syntax
+- **PostgreSQL 14–15**: Supported with automatic fallback to legacy grant syntax (`WITH ADMIN OPTION`)
 - CI integration tests run against PostgreSQL **16, 17, and 18**
-- PostgreSQL 15 and earlier are not supported
 
 ## Quick Start
 
@@ -35,6 +35,15 @@ pgroles apply -f policy.yaml --database-url postgres://... --dry-run
 
 # Inspect current database state for managed roles
 pgroles inspect -f policy.yaml --database-url postgres://...
+
+# Generate a manifest from an existing database (brownfield adoption)
+pgroles generate --database-url postgres://...
+
+# Output the diff as JSON (for CI/CD pipelines)
+pgroles diff -f policy.yaml --database-url postgres://... --format json
+
+# Use as a CI drift gate (exits with code 2 when drift is detected)
+pgroles diff -f policy.yaml --database-url postgres://... --exit-code
 ```
 
 If `-f` is omitted, it defaults to `pgroles.yaml` in the current directory. The `--database-url` flag can also be set via the `DATABASE_URL` environment variable.
@@ -198,9 +207,9 @@ helm install pgroles-operator pgroles/pgroles-operator
 
 ## Components
 
-- **pgroles-core** — Manifest parsing, profile expansion, diff engine, SQL generation. No database dependencies.
-- **pgroles-inspect** — Live database introspection via `pg_catalog` queries (sqlx + tokio).
-- **pgroles-cli** — Command-line tool for validating manifests, planning changes, and applying them.
+- **pgroles-core** — Manifest parsing, profile expansion, diff engine, SQL generation, and manifest export. No database dependencies. Includes version-aware SQL rendering via `SqlContext`.
+- **pgroles-inspect** — Live database introspection via `pg_catalog` queries (sqlx + tokio). Includes PostgreSQL version detection, cloud provider detection (RDS, Cloud SQL, Azure), and privilege level assessment.
+- **pgroles-cli** — Command-line tool for validating manifests, planning changes, applying them, and generating manifests from existing databases.
 - **pgroles-operator** — *(work in progress)* Kubernetes operator that reconciles `PostgresPolicy` custom resources against PostgreSQL databases.
 
 ## License
