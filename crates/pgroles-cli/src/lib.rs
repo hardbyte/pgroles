@@ -72,6 +72,17 @@ pub fn compute_plan(current: &RoleGraph, desired: &RoleGraph) -> Vec<Change> {
     diff::diff(current, desired)
 }
 
+/// Collect the role names that the current plan intends to drop.
+pub fn planned_role_drops(changes: &[Change]) -> Vec<String> {
+    changes
+        .iter()
+        .filter_map(|change| match change {
+            Change::DropRole { name } => Some(name.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
 // ---------------------------------------------------------------------------
 // Output formatting
 // ---------------------------------------------------------------------------
@@ -405,6 +416,27 @@ schemas:
         assert!(
             sql_output.contains("\"analytics\""),
             "expected quoted role name in: {sql_output}"
+        );
+    }
+
+    #[test]
+    fn planned_role_drops_only_returns_drop_changes() {
+        let changes = vec![
+            Change::CreateRole {
+                name: "new-role".to_string(),
+                state: pgroles_core::model::RoleState::default(),
+            },
+            Change::DropRole {
+                name: "old-role".to_string(),
+            },
+            Change::DropRole {
+                name: "stale-role".to_string(),
+            },
+        ];
+
+        assert_eq!(
+            planned_role_drops(&changes),
+            vec!["old-role".to_string(), "stale-role".to_string()]
         );
     }
 

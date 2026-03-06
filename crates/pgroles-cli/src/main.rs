@@ -10,9 +10,9 @@ use tracing::info;
 
 use pgroles_cli::{
     PlanSummary, compute_plan, format_plan_sql, format_role_graph_summary,
-    format_validation_result, read_manifest_file, validate_manifest,
+    format_validation_result, planned_role_drops, read_manifest_file, validate_manifest,
 };
-use pgroles_inspect::InspectConfig;
+use pgroles_inspect::{InspectConfig, inspect_drop_role_safety};
 
 // ---------------------------------------------------------------------------
 // CLI argument definitions
@@ -150,6 +150,7 @@ async fn cmd_diff(file: &Path, database_url: &str, format: &OutputFormat) -> Res
     let current = inspect_current(&pool, &validated).await?;
 
     let changes = compute_plan(&current, &validated.desired);
+    let drop_safety = inspect_drop_safety(&pool, &changes).await?;
     let summary = PlanSummary::from_changes(&changes);
 
     match format {
@@ -159,10 +160,16 @@ async fn cmd_diff(file: &Path, database_url: &str, format: &OutputFormat) -> Res
             } else {
                 print!("{}", format_plan_sql(&changes));
                 eprintln!("\n{summary}");
+                if !drop_safety.is_empty() {
+                    eprintln!("\n{drop_safety}");
+                }
             }
         }
         OutputFormat::Summary => {
             print!("{summary}");
+            if !drop_safety.is_empty() {
+                eprintln!("\n{drop_safety}");
+            }
         }
     }
 
@@ -177,6 +184,7 @@ async fn cmd_apply(file: &Path, database_url: &str, dry_run: bool) -> Result<()>
     let current = inspect_current(&pool, &validated).await?;
 
     let changes = compute_plan(&current, &validated.desired);
+    let drop_safety = inspect_drop_safety(&pool, &changes).await?;
     let summary = PlanSummary::from_changes(&changes);
 
     if summary.is_empty() {
@@ -190,7 +198,14 @@ async fn cmd_apply(file: &Path, database_url: &str, dry_run: bool) -> Result<()>
         println!("-- DRY RUN: the following SQL would be executed:\n");
         print!("{sql_output}");
         eprintln!("\n{summary}");
+        if !drop_safety.is_empty() {
+            eprintln!("\n{drop_safety}");
+        }
         return Ok(());
+    }
+
+    if !drop_safety.is_empty() {
+        anyhow::bail!("{drop_safety}");
     }
 
     // Execute the entire plan in one transaction to avoid partial convergence.
@@ -264,4 +279,14 @@ async fn inspect_current(
     pgroles_inspect::inspect(pool, &config)
         .await
         .context("failed to inspect database state")
+}
+
+async fn inspect_drop_safety(
+    pool: &PgPool,
+    changes: &[pgroles_core::diff::Change],
+) -> Result<pgroles_inspect::DropRoleSafetyReport> {
+    let dropped_roles = planned_role_drops(changes);
+    inspect_drop_role_safety(pool, &dropped_roles)
+        .await
+        .context("failed to inspect role-drop safety")
 }

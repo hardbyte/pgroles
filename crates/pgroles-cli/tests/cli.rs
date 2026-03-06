@@ -441,6 +441,17 @@ mod live_db {
         })
     }
 
+    fn query_drop_role_safety(role: &str) -> pgroles_inspect::DropRoleSafetyReport {
+        with_runtime(async {
+            let pool = PgPool::connect(&database_url())
+                .await
+                .expect("failed to connect to live test database");
+            pgroles_inspect::inspect_drop_role_safety(&pool, &[role.to_string()])
+                .await
+                .expect("failed to inspect role-drop safety")
+        })
+    }
+
     #[test]
     #[ignore]
     fn diff_against_live_db() {
@@ -734,6 +745,49 @@ memberships:
             r#"
             DROP ROLE IF EXISTS "{member_role}";
             DROP ROLE IF EXISTS "{group_role}";
+            "#
+        ));
+    }
+
+    #[test]
+    #[ignore]
+    fn drop_role_safety_reports_owned_objects() {
+        let schema = unique_name("safety_schema");
+        let role = unique_name("safety_role");
+
+        execute_sql(&format!(
+            r#"
+            DROP SCHEMA IF EXISTS "{schema}" CASCADE;
+            DROP ROLE IF EXISTS "{role}";
+            CREATE ROLE "{role}";
+            CREATE SCHEMA "{schema}" AUTHORIZATION "{role}";
+            SET ROLE "{role}";
+            CREATE TABLE "{schema}"."widgets" (id integer);
+            RESET ROLE;
+            "#
+        ));
+
+        let report = query_drop_role_safety(&role);
+        assert_eq!(report.issues.len(), 1, "expected one unsafe drop issue");
+        let issue = &report.issues[0];
+        assert_eq!(issue.role, role);
+        assert!(
+            issue.owned_object_count >= 2,
+            "expected owned schema/table to be detected, got {:?}",
+            issue
+        );
+        assert!(
+            issue
+                .owned_object_examples
+                .iter()
+                .any(|example| example.contains(&schema)),
+            "expected at least one example mentioning the owned schema"
+        );
+
+        execute_sql(&format!(
+            r#"
+            DROP SCHEMA IF EXISTS "{schema}" CASCADE;
+            DROP ROLE IF EXISTS "{role}";
             "#
         ));
     }

@@ -39,6 +39,9 @@ pub enum ReconcileError {
     #[error("SQL execution error: {0}")]
     SqlExec(#[from] sqlx::Error),
 
+    #[error("{0}")]
+    UnsafeRoleDrops(String),
+
     #[error("Kubernetes API error: {0}")]
     Kube(#[from] kube::Error),
 
@@ -213,6 +216,17 @@ async fn reconcile_apply_inner(
 
     // 6. Compute diff.
     let changes = pgroles_core::diff::diff(&current, &desired);
+    let dropped_roles: Vec<String> = changes
+        .iter()
+        .filter_map(|change| match change {
+            pgroles_core::diff::Change::DropRole { name } => Some(name.clone()),
+            _ => None,
+        })
+        .collect();
+    let drop_safety = pgroles_inspect::inspect_drop_role_safety(&pool, &dropped_roles).await?;
+    if !drop_safety.is_empty() {
+        return Err(ReconcileError::UnsafeRoleDrops(drop_safety.to_string()));
+    }
 
     // 7. Apply changes.
     let mut summary = ChangeSummary::default();

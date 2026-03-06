@@ -113,7 +113,7 @@ Supported object types for grants: `table`, `view`, `materialized_view`, `sequen
 
 pgroles is convergent within the scope it manages today: the manifest is treated as the desired truth for the roles, grants, default privileges, and memberships it inspects. Roles, grants, and memberships present in the database but absent from the manifest will be dropped or revoked.
 
-Dry-run detection for dangerous destructive operations such as dropping roles that still own objects is still on the roadmap.
+Before applying planned role drops, pgroles now performs a live preflight check for obvious hazards such as owned objects and active sessions, and refuses unsafe drops by default.
 
 ## License
 
