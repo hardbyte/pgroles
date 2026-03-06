@@ -6,6 +6,36 @@
 - Tighten the declarative contract so the manifest expresses intent, not just SQL-shaped inputs.
 - Harden the operator only after the core reconciliation model is reliable.
 
+## Prior Art Comparison
+
+| Capability | pgbedrock | TF cyrilgdn | pgroles |
+|---|---|---|---|
+| Plan/apply workflow | Partial (check/live) | Yes (via TF) | **Yes** (diff/apply) |
+| Fine-grained privileges | No (read/write binary) | Yes | **Yes** (all PG privs) |
+| Default privileges | Broken | Broken | **Correct** (per-owner, per-schema) |
+| Role inheritance graph | Partial | No graph model | **Yes** (BTreeMap/BTreeSet) |
+| Convergent model | Yes | Yes (per resource) | **Yes** (whole-graph) |
+| Profile/template system | No | No | **Yes** (profiles × schemas) |
+| Role retirement lifecycle | No | No | **Yes** (reassign/drop/terminate) |
+| Brownfield `generate` | Yes | N/A | **Yes** |
+| PG version adaptation | No | Broken | **Yes** (PG 14+ via SqlContext) |
+| K8s operator | No | No | **Yes** (alpha CRD) |
+| Transactional apply | No | No | **Yes** |
+| Safety preflight checks | No | No | **Yes** (owned objects, sessions) |
+| Idempotent diff | Broken (spurious changes) | Broken (dirty state) | **Yes** (BTreeMap determinism) |
+| Cloud-managed PG detection | No | No | **Yes** (RDS, Cloud SQL, Azure) |
+
+## Recently Completed
+
+The following features have been implemented:
+
+- **`generate` command** — Introspects all non-system roles and emits a flat manifest for brownfield adoption. Round-trip invariant: generated manifest applied back produces zero diff.
+- **`--format json`** — Machine-readable JSON output for `diff`/`plan`, suitable for CI/CD pipelines.
+- **Drift exit code** — `diff` exits with code 2 when changes are detected (`--exit-code`, default on).
+- **PG version detection** — `SqlContext` adapts SQL generation based on server version. PG 16+ uses `WITH INHERIT`/`WITH ADMIN`; PG 14–15 falls back to legacy `WITH ADMIN OPTION`.
+- **Cloud provider detection** — Detects `rds_superuser`, `cloudsqlsuperuser`, `azure_pg_admin` memberships and validates planned changes against privilege level.
+- **Cloud auth provider schema** — `auth_providers` manifest field for declaring Cloud SQL IAM, RDS IAM, and Azure AD providers (informational metadata).
+
 ## Phase 1: Safety and Semantic Validation
 
 - Extend the current live destructive-operation preflight:
@@ -22,6 +52,7 @@
   - object target combinations should be checked for required/forbidden fields
   - unsupported default privilege object types should be rejected
   - privilege/object combinations should be validated early
+  - validate that declared default privilege owners have CREATE privileges on the schema
 - Keep transactional apply as the default execution model.
 - Keep membership flag changes covered by regression tests; the current remove-then-add behavior is acceptable because apply is transactional.
 - Broaden function grant coverage, especially for overloaded signatures and inspect/render parity.
@@ -40,7 +71,7 @@
   - reconcile recovery after failure
   - safe failure reporting for blocked destructive changes
 
-## Phase 3: Declarative Boundary
+## Phase 3: Declarative Boundary & Reconciliation Modes
 
 - Introduce an explicit managed scope:
   - managed roles
@@ -48,9 +79,10 @@
   - managed ownership transitions
   - whether revokes/drops are authoritative inside that scope
 - Add reconcile modes:
-  - `authoritative`
-  - `additive`
-  - `adopt`
+  - `authoritative` (current behavior, default): full convergence
+  - `additive`: only create/grant, never revoke/drop — filter out `Revoke`, `RevokeDefaultPrivilege`, `RemoveMember`, `DropRole` from the diff output
+  - `adopt`: like authoritative, but only manage roles that already exist in the DB or are declared in the manifest
+- Implementation: `ReconcileMode` enum and a post-filter on `diff()` output. The diff engine stays pure; filtering happens in the CLI/operator layer.
 - Treat selectors like "all tables in schema X" as first-class intent, not a string convention.
 - Make owner context for default privileges explicit instead of relying on fallbacks.
 
@@ -59,18 +91,59 @@
 - Keep the current contract explicit: one manifest reconciles one database connection.
 - Decide whether multi-database manifests are a non-goal or a later orchestration feature.
 - If multi-database support is added, model it above the current single-database diff engine rather than overloading one manifest with ambiguous scope.
-
-- ~~Add `--format json` to `validate`, `diff`, and `inspect`.~~ ✅ `--format json` added to `diff`/`plan`.
-- ~~Add a drift exit code for CI.~~ ✅ `diff` exits with code 2 when drift is detected (`--exit-code`, default on).
 - Make `inspect` emit a detailed normalized graph, not just counts.
-- ~~Add a manifest/schema export command for editor and pipeline integration.~~ ✅ `generate` command introspects all non-system roles and emits a flat manifest.
 
-## Phase 5: Operator Hardening
+## Phase 5: Row-Level Security
+
+Unique differentiator vs all prior art — no other tool manages RLS policies declaratively.
+
+- **RLS data model**: `rls_policies` manifest section with table, schema, policy name, command, permissive/restrictive, roles, USING/WITH CHECK expressions. Extends `RoleGraph` with `rls_policies: BTreeMap<RlsPolicyKey, RlsPolicyState>` and `rls_enabled_tables`.
+- **RLS diff engine**: New `Change` variants — `EnableRls`, `DisableRls`, `CreatePolicy`, `AlterPolicy`, `DropPolicy`. Ordering: `EnableRls` before `CreatePolicy`, `DropPolicy` before `DisableRls`.
+- **RLS introspection**: Query `pg_tables` (rowsecurity) and `pg_policies` for current state.
+- **RLS SQL generation**: `CREATE POLICY`, `ALTER POLICY`, `DROP POLICY`, `ALTER TABLE ... ENABLE/DISABLE ROW LEVEL SECURITY`.
+
+## Phase 6: Operator Hardening
 
 - Cache pools by Secret resource version and watch for Secret updates.
 - Surface `Ready`, `Reconciling`, and `Degraded` conditions consistently.
 - Add rate-limited retries and clearer failure summaries.
 - Add policy around deletion behavior instead of relying on implicit defaults.
+
+## Future: Cloud Auth & Integrations
+
+- **Cloud auth provider runtime**: Auto-detect IAM-mapped role names, validate role naming conventions, set `rds_iam` attribute on RDS IAM roles. (Manifest schema is already in place.)
+- **Vault integration**: Generate Vault-compatible creation statement templates from the manifest (export format, not runtime integration).
+- **LDAP/SCIM adapter**: Enterprise feature, out of scope for v0.x.
+
+## Architecture Principles
+
+The current architecture is clean and should be preserved:
+
+```
+YAML → PolicyManifest → ExpandedManifest → RoleGraph (desired)
+                                                ↓ diff()
+DB   → pg_catalog queries → RoleGraph (current) → Vec<Change> → SQL
+```
+
+All new features should plug into this pipeline without restructuring it:
+- **RLS** extends `RoleGraph`, `Change`, introspection, and SQL generation
+- **Reconciliation modes** are a post-filter on `Vec<Change>`
+- **Version detection** is a context parameter to SQL generation
+- **Export** is `RoleGraph → PolicyManifest` (the reverse of `from_expanded`)
+
+The 4-crate split is correct:
+- `pgroles-core`: Pure, no IO, testable without a database
+- `pgroles-inspect`: Database-dependent, async
+- `pgroles-cli`: Binary, thin orchestration layer
+- `pgroles-operator`: Kubernetes-specific
+
+### Non-goals
+
+- GUI / web dashboard — pgroles is a CLI/operator tool
+- Schema DDL management — pgroles manages authorization, not schema
+- Multi-database orchestration in a single manifest — one manifest = one database connection
+- Password management — Vault handles this better
+- LDAP/SCIM sync — enterprise feature, out of scope for v0.x
 
 ## Declarative Direction
 
