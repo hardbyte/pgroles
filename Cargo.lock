@@ -1580,6 +1580,8 @@ dependencies = [
  "pgroles-core",
  "pgroles-inspect",
  "predicates",
+ "serde_json",
+ "serde_yaml",
  "sqlx",
  "tempfile",
  "tokio",
@@ -1593,6 +1595,7 @@ version = "0.1.0"
 dependencies = [
  "schemars",
  "serde",
+ "serde_json",
  "serde_yaml",
  "thiserror 2.0.18",
 ]

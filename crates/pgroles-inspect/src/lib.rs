@@ -4,11 +4,13 @@
 //! representing the current state of roles, grants, default privileges, and
 //! memberships in a PostgreSQL database.
 
+pub mod cloud;
 mod defaults;
 mod memberships;
 mod privileges;
 mod roles;
 mod safety;
+mod version;
 
 use std::collections::BTreeSet;
 
@@ -19,6 +21,7 @@ use tracing::debug;
 use pgroles_core::model::RoleGraph;
 
 // Re-export the sub-modules' public items for testing / advanced use.
+pub use cloud::{CloudProvider, PrivilegeLevel, detect_privilege_level};
 pub use defaults::fetch_default_privileges;
 pub use memberships::fetch_memberships;
 pub use privileges::{fetch_database_privileges, fetch_privileges};
@@ -26,6 +29,7 @@ pub use roles::fetch_roles;
 pub use safety::{
     DropRoleSafetyAssessment, DropRoleSafetyIssue, DropRoleSafetyReport, inspect_drop_role_safety,
 };
+pub use version::{PgVersion, detect_pg_version};
 
 // ---------------------------------------------------------------------------
 // Errors
@@ -141,6 +145,92 @@ impl InspectConfig {
 // ---------------------------------------------------------------------------
 // Top-level inspect function
 // ---------------------------------------------------------------------------
+
+/// Configuration for unscoped inspection (used by `generate` command).
+#[derive(Debug, Clone)]
+pub struct InspectAllConfig {
+    /// Whether to exclude PostgreSQL system roles (pg_*, postgres).
+    pub exclude_system_roles: bool,
+}
+
+/// Inspect all non-system roles and their privileges for manifest generation.
+///
+/// Unlike [`inspect`], this does not require a manifest to scope the query.
+/// It discovers all user-defined roles, schemas they have access to, and
+/// reconstructs the full RoleGraph.
+pub async fn inspect_all(
+    pool: &PgPool,
+    config: &InspectAllConfig,
+) -> Result<RoleGraph, InspectError> {
+    let mut graph = RoleGraph::default();
+
+    // Fetch all non-system roles.
+    // fetch_roles(None) already excludes pg_* and postgres system roles.
+    // The exclude_system_roles flag is reserved for future use with broader filtering.
+    let _ = config.exclude_system_roles;
+    let role_rows = fetch_roles(pool, None).await?;
+    for row in &role_rows {
+        graph.roles.insert(row.rolname.clone(), row.to_role_state());
+    }
+    debug!(found = graph.roles.len(), "roles discovered for generation");
+
+    if graph.roles.is_empty() {
+        return Ok(graph);
+    }
+
+    let role_names: Vec<String> = graph.roles.keys().cloned().collect();
+    let role_refs: Vec<&str> = role_names.iter().map(|s| s.as_str()).collect();
+
+    // Discover schemas these roles have access to
+    let schema_rows: Vec<(String,)> = sqlx::query_as(
+        r#"
+        SELECT nspname::text FROM pg_namespace
+        WHERE nspname NOT LIKE 'pg_%'
+          AND nspname <> 'information_schema'
+        ORDER BY nspname
+        "#,
+    )
+    .fetch_all(pool)
+    .await?;
+    let schema_names: Vec<String> = schema_rows.into_iter().map(|r| r.0).collect();
+    let schema_refs: Vec<&str> = schema_names.iter().map(|s| s.as_str()).collect();
+
+    // Memberships
+    let membership_rows = fetch_memberships(pool, Some(&role_refs)).await?;
+    for row in &membership_rows {
+        graph.memberships.insert(row.to_membership_edge());
+    }
+
+    // Object privileges (no wildcard patterns for unscoped inspection)
+    if !schema_refs.is_empty() {
+        let privilege_grants = privileges::fetch_privileges_with_wildcards(
+            pool,
+            &schema_refs,
+            &role_refs,
+            &[], // no wildcard patterns
+        )
+        .await?;
+        for (key, state) in privilege_grants {
+            graph.grants.insert(key, state);
+        }
+    }
+
+    // Database privileges
+    let db_grants = fetch_database_privileges(pool, &role_refs).await?;
+    for (key, state) in db_grants {
+        graph.grants.insert(key, state);
+    }
+
+    // Default privileges
+    if !schema_refs.is_empty() {
+        let default_privs = fetch_default_privileges(pool, &schema_refs, &role_refs).await?;
+        for (key, state) in default_privs {
+            graph.default_privileges.insert(key, state);
+        }
+    }
+
+    Ok(graph)
+}
 
 /// Inspect the current state of the database and build a `RoleGraph`.
 ///

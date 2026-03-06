@@ -313,6 +313,7 @@ impl PostgresPolicySpec {
 
         PolicyManifest {
             default_owner: self.default_owner.clone(),
+            auth_providers: Vec::new(),
             profiles,
             schemas: self.schemas.clone(),
             roles,

@@ -97,6 +97,11 @@ pub fn format_plan_sql(changes: &[Change]) -> String {
     sql::render_all(changes)
 }
 
+/// Format a plan as JSON for machine consumption.
+pub fn format_plan_json(changes: &[Change]) -> Result<String> {
+    serde_json::to_string_pretty(changes).map_err(|err| anyhow::anyhow!("{err}"))
+}
+
 /// Summary statistics for a plan.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct PlanSummary {
@@ -544,5 +549,25 @@ schemas:
         let validated = validate_manifest(MINIMAL_MANIFEST).unwrap();
         let summary = format_role_graph_summary(&validated.desired);
         assert!(summary.contains("Roles: 1"), "got: {summary}");
+    }
+
+    // -----------------------------------------------------------------------
+    // format_plan_json
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn plan_json_produces_valid_json() {
+        let validated = validate_manifest(MINIMAL_MANIFEST).unwrap();
+        let current = RoleGraph::default();
+        let changes = compute_plan(&current, &validated.desired);
+
+        let json_output = format_plan_json(&changes).unwrap();
+        // Should be parseable JSON
+        let parsed: serde_json::Value = serde_json::from_str(&json_output).unwrap();
+        assert!(parsed.is_array());
+        // Should contain CreateRole
+        let text = json_output.to_string();
+        assert!(text.contains("CreateRole"), "got: {text}");
+        assert!(text.contains("analytics"), "got: {text}");
     }
 }

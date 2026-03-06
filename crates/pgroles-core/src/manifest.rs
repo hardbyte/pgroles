@@ -116,6 +116,10 @@ pub struct PolicyManifest {
     #[serde(default)]
     pub default_owner: Option<String>,
 
+    /// Cloud auth provider configurations for IAM-mapped role awareness.
+    #[serde(default)]
+    pub auth_providers: Vec<AuthProvider>,
+
     /// Reusable privilege profiles.
     #[serde(default)]
     pub profiles: HashMap<String, Profile>,
@@ -143,6 +147,35 @@ pub struct PolicyManifest {
     /// Explicit role-retirement workflows for roles that should be removed.
     #[serde(default)]
     pub retirements: Vec<RoleRetirement>,
+}
+
+/// Cloud authentication provider configuration.
+///
+/// Declares awareness of cloud IAM-mapped roles so pgroles can correctly
+/// reference auto-created role names in grants and memberships.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum AuthProvider {
+    /// Google Cloud SQL IAM authentication.
+    /// Service accounts map to PG roles like `user@project.iam`.
+    CloudSqlIam {
+        /// GCP project ID (for documentation/validation).
+        #[serde(default)]
+        project: Option<String>,
+    },
+    /// AWS RDS IAM authentication.
+    /// IAM users authenticate via token; the PG role must have `rds_iam` granted.
+    RdsIam {
+        /// AWS region (for documentation/validation).
+        #[serde(default)]
+        region: Option<String>,
+    },
+    /// Azure Entra ID (AAD) authentication for Azure Database for PostgreSQL.
+    AzureAd {
+        /// Azure tenant ID (for documentation/validation).
+        #[serde(default)]
+        tenant_id: Option<String>,
+    },
 }
 
 /// A reusable privilege profile — defines what grants a role should have.
@@ -884,5 +917,45 @@ retirements:
             result,
             Err(ManifestError::RetirementSelfReassign { role }) if role == "old-app"
         ));
+    }
+
+    #[test]
+    fn parse_auth_providers() {
+        let yaml = r#"
+auth_providers:
+  - type: cloud_sql_iam
+    project: my-gcp-project
+  - type: rds_iam
+    region: us-east-1
+  - type: azure_ad
+    tenant_id: "abc-123"
+
+roles:
+  - name: app-service
+"#;
+        let manifest = parse_manifest(yaml).unwrap();
+        assert_eq!(manifest.auth_providers.len(), 3);
+        assert!(matches!(
+            &manifest.auth_providers[0],
+            AuthProvider::CloudSqlIam { project: Some(p) } if p == "my-gcp-project"
+        ));
+        assert!(matches!(
+            &manifest.auth_providers[1],
+            AuthProvider::RdsIam { region: Some(r) } if r == "us-east-1"
+        ));
+        assert!(matches!(
+            &manifest.auth_providers[2],
+            AuthProvider::AzureAd { tenant_id: Some(t) } if t == "abc-123"
+        ));
+    }
+
+    #[test]
+    fn parse_manifest_without_auth_providers() {
+        let yaml = r#"
+roles:
+  - name: test-role
+"#;
+        let manifest = parse_manifest(yaml).unwrap();
+        assert!(manifest.auth_providers.is_empty());
     }
 }

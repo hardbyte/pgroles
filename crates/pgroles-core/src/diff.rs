@@ -29,7 +29,7 @@ use crate::model::{DefaultPrivKey, GrantKey, MembershipEdge, RoleAttribute, Role
 /// 7. Revoke default privileges
 /// 8. Revoke privileges
 /// 9. Drop roles (after revoking everything from them)
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub enum Change {
     /// Create a new role with the given attributes.
     CreateRole { name: String, state: RoleState },

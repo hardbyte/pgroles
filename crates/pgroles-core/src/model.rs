@@ -14,7 +14,7 @@ use crate::manifest::{ExpandedManifest, Grant, ObjectType, Privilege, RoleDefini
 // ---------------------------------------------------------------------------
 
 /// The set of PostgreSQL role attributes we manage.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct RoleState {
     pub login: bool,
     pub superuser: bool,
@@ -95,7 +95,7 @@ impl RoleState {
 }
 
 /// A single attribute change on a role, used by `AlterRole`.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub enum RoleAttribute {
     Login(bool),
     Superuser(bool),
@@ -114,7 +114,7 @@ pub enum RoleAttribute {
 /// Unique key identifying a grant target — (grantee, object_type, schema, name).
 ///
 /// We use `Ord` so these can live in a `BTreeMap` for deterministic output.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize)]
 pub struct GrantKey {
     /// The role receiving the privilege.
     pub role: String,
@@ -127,7 +127,7 @@ pub struct GrantKey {
 }
 
 /// The privilege set on a particular grant target.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct GrantState {
     pub privileges: BTreeSet<Privilege>,
 }
@@ -137,7 +137,7 @@ pub struct GrantState {
 // ---------------------------------------------------------------------------
 
 /// Unique key identifying a default privilege rule.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize)]
 pub struct DefaultPrivKey {
     /// The owner role context (whose newly-created objects get these defaults).
     pub owner: String,
@@ -150,7 +150,7 @@ pub struct DefaultPrivKey {
 }
 
 /// The privilege set for a default privilege rule.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct DefaultPrivState {
     pub privileges: BTreeSet<Privilege>,
 }
@@ -160,7 +160,7 @@ pub struct DefaultPrivState {
 // ---------------------------------------------------------------------------
 
 /// A membership edge — "member belongs to role".
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize)]
 pub struct MembershipEdge {
     /// The group role.
     pub role: String,

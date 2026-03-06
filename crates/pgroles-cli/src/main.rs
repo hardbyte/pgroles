@@ -9,8 +9,9 @@ use sqlx::PgPool;
 use tracing::info;
 
 use pgroles_cli::{
-    PlanSummary, apply_role_retirements, compute_plan, format_plan_sql, format_role_graph_summary,
-    format_validation_result, planned_role_drops, read_manifest_file, validate_manifest,
+    PlanSummary, apply_role_retirements, compute_plan, format_plan_json, format_plan_sql,
+    format_role_graph_summary, format_validation_result, planned_role_drops, read_manifest_file,
+    validate_manifest,
 };
 use pgroles_inspect::{InspectConfig, inspect_drop_role_safety};
 
@@ -50,9 +51,13 @@ enum Commands {
         #[arg(long, env = "DATABASE_URL")]
         database_url: String,
 
-        /// Output format: "sql" for raw SQL, "summary" for a brief summary.
+        /// Output format: "sql" for raw SQL, "summary" for a brief summary, "json" for machine-readable JSON.
         #[arg(long, default_value = "sql")]
         format: OutputFormat,
+
+        /// Exit with code 2 when drift is detected (useful for CI gates).
+        #[arg(long, default_value_t = true)]
+        exit_code: bool,
     },
 
     /// Apply the changes to bring the database in sync with the manifest.
@@ -80,12 +85,23 @@ enum Commands {
         #[arg(long, env = "DATABASE_URL")]
         database_url: String,
     },
+
+    /// Generate a manifest YAML from the current database state (brownfield adoption).
+    ///
+    /// Introspects all non-system roles, their grants, default privileges, and
+    /// memberships, then emits a flat manifest that reproduces the current state.
+    Generate {
+        /// PostgreSQL connection string (or set DATABASE_URL).
+        #[arg(long, env = "DATABASE_URL")]
+        database_url: String,
+    },
 }
 
 #[derive(Clone, Debug, clap::ValueEnum)]
 enum OutputFormat {
     Sql,
     Summary,
+    Json,
 }
 
 // ---------------------------------------------------------------------------
@@ -106,7 +122,7 @@ async fn main() -> ExitCode {
     let cli = Cli::parse();
 
     match run(cli).await {
-        Ok(()) => ExitCode::SUCCESS,
+        Ok(exit) => exit,
         Err(err) => {
             eprintln!("Error: {err:#}");
             ExitCode::FAILURE
@@ -114,20 +130,37 @@ async fn main() -> ExitCode {
     }
 }
 
-async fn run(cli: Cli) -> Result<()> {
+/// Exit code 2 indicates drift was detected (used by `diff`/`plan`).
+const EXIT_DRIFT: u8 = 2;
+
+async fn run(cli: Cli) -> Result<ExitCode> {
     match cli.command {
-        Commands::Validate { file } => cmd_validate(&file),
+        Commands::Validate { file } => {
+            cmd_validate(&file)?;
+            Ok(ExitCode::SUCCESS)
+        }
         Commands::Diff {
             file,
             database_url,
             format,
-        } => cmd_diff(&file, &database_url, &format).await,
+            exit_code,
+        } => cmd_diff(&file, &database_url, &format, exit_code).await,
         Commands::Apply {
             file,
             database_url,
             dry_run,
-        } => cmd_apply(&file, &database_url, dry_run).await,
-        Commands::Inspect { file, database_url } => cmd_inspect(&file, &database_url).await,
+        } => {
+            cmd_apply(&file, &database_url, dry_run).await?;
+            Ok(ExitCode::SUCCESS)
+        }
+        Commands::Inspect { file, database_url } => {
+            cmd_inspect(&file, &database_url).await?;
+            Ok(ExitCode::SUCCESS)
+        }
+        Commands::Generate { database_url } => {
+            cmd_generate(&database_url).await?;
+            Ok(ExitCode::SUCCESS)
+        }
     }
 }
 
@@ -142,7 +175,12 @@ fn cmd_validate(file: &Path) -> Result<()> {
     Ok(())
 }
 
-async fn cmd_diff(file: &Path, database_url: &str, format: &OutputFormat) -> Result<()> {
+async fn cmd_diff(
+    file: &Path,
+    database_url: &str,
+    format: &OutputFormat,
+    use_exit_code: bool,
+) -> Result<ExitCode> {
     let yaml = read_manifest_file(file)?;
     let validated = validate_manifest(&yaml)?;
 
@@ -174,9 +212,16 @@ async fn cmd_diff(file: &Path, database_url: &str, format: &OutputFormat) -> Res
                 eprintln!("\n{drop_safety}");
             }
         }
+        OutputFormat::Json => {
+            println!("{}", format_plan_json(&changes)?);
+        }
     }
 
-    Ok(())
+    if use_exit_code && !summary.is_empty() {
+        Ok(ExitCode::from(EXIT_DRIFT))
+    } else {
+        Ok(ExitCode::SUCCESS)
+    }
 }
 
 async fn cmd_apply(file: &Path, database_url: &str, dry_run: bool) -> Result<()> {
@@ -184,12 +229,29 @@ async fn cmd_apply(file: &Path, database_url: &str, dry_run: bool) -> Result<()>
     let validated = validate_manifest(&yaml)?;
 
     let pool = connect_db(database_url).await?;
+
+    // Detect cloud provider privilege level and warn about unsupported operations.
+    let privilege_level = pgroles_inspect::detect_privilege_level(&pool)
+        .await
+        .context("failed to detect privilege level")?;
+    info!(level = %privilege_level, "detected privilege level");
+
     let current = inspect_current(&pool, &validated).await?;
 
     let changes = apply_role_retirements(
         compute_plan(&current, &validated.desired),
         &validated.manifest.retirements,
     );
+
+    // Validate changes against privilege level.
+    let priv_warnings =
+        pgroles_inspect::cloud::validate_changes_for_privilege_level(&changes, &privilege_level);
+    if !priv_warnings.is_empty() {
+        for warning in &priv_warnings {
+            eprintln!("Warning: {warning}");
+        }
+    }
+
     let drop_safety = inspect_drop_safety(&pool, &changes, &validated.manifest.retirements).await?;
     let summary = PlanSummary::from_changes(&changes);
 
@@ -252,6 +314,27 @@ async fn cmd_inspect(file: &Path, database_url: &str) -> Result<()> {
     let current = inspect_current(&pool, &validated).await?;
 
     print!("{}", format_role_graph_summary(&current));
+
+    Ok(())
+}
+
+async fn cmd_generate(database_url: &str) -> Result<()> {
+    let pool = connect_db(database_url).await?;
+
+    // Introspect all non-system roles by using an unscoped inspect config.
+    info!("introspecting all non-system roles for manifest generation");
+    let graph = pgroles_inspect::inspect_all(
+        &pool,
+        &pgroles_inspect::InspectAllConfig {
+            exclude_system_roles: true,
+        },
+    )
+    .await
+    .context("failed to introspect database for generation")?;
+
+    let manifest = pgroles_core::export::role_graph_to_manifest(&graph);
+    let yaml = serde_yaml::to_string(&manifest).context("failed to serialize manifest to YAML")?;
+    print!("{yaml}");
 
     Ok(())
 }

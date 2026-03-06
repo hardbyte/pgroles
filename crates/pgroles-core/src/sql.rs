@@ -28,16 +28,58 @@ pub fn quote_ident(identifier: &str) -> String {
 }
 
 // ---------------------------------------------------------------------------
+// SQL context for version-dependent rendering
+// ---------------------------------------------------------------------------
+
+/// Context controlling version-dependent SQL generation.
+#[derive(Debug, Clone, Copy)]
+pub struct SqlContext {
+    /// PostgreSQL major version (e.g., 14, 15, 16, 17).
+    /// Controls syntax differences like `WITH INHERIT` in membership grants.
+    pub pg_major_version: i32,
+}
+
+impl SqlContext {
+    /// Create a context for a specific PG version number (from `server_version_num`).
+    pub fn from_version_num(version_num: i32) -> Self {
+        Self {
+            pg_major_version: version_num / 10000,
+        }
+    }
+
+    /// Whether PG supports `GRANT ... WITH INHERIT TRUE/FALSE` (PG 16+).
+    pub fn supports_grant_with_options(&self) -> bool {
+        self.pg_major_version >= 16
+    }
+}
+
+impl Default for SqlContext {
+    fn default() -> Self {
+        Self {
+            pg_major_version: 16, // Default to PG 16+ (current minimum)
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // SQL rendering
 // ---------------------------------------------------------------------------
 
 /// Render a single [`Change`] into a SQL statement (including trailing `;`).
+/// Uses default context (PG 16+).
 pub fn render(change: &Change) -> String {
     render_statements(change).join("\n")
 }
 
 /// Render a single [`Change`] into one or more SQL statements.
+/// Uses default context (PG 16+).
 pub fn render_statements(change: &Change) -> Vec<String> {
+    render_statements_with_context(change, &SqlContext::default())
+}
+
+/// Render a single [`Change`] into one or more SQL statements,
+/// using the given [`SqlContext`] for version-dependent syntax.
+pub fn render_statements_with_context(change: &Change, ctx: &SqlContext) -> Vec<String> {
     match change {
         Change::CreateRole { name, state } => render_create_role(name, state),
         Change::AlterRole { name, attributes } => render_alter_role(name, attributes),
@@ -87,7 +129,7 @@ pub fn render_statements(change: &Change) -> Vec<String> {
             member,
             inherit,
             admin,
-        } => render_add_member(role, member, *inherit, *admin),
+        } => render_add_member(role, member, *inherit, *admin, ctx),
         Change::RemoveMember { role, member } => render_remove_member(role, member),
         Change::ReassignOwned { from_role, to_role } => render_reassign_owned(from_role, to_role),
         Change::DropOwned { role } => render_drop_owned(role),
@@ -96,11 +138,16 @@ pub fn render_statements(change: &Change) -> Vec<String> {
     }
 }
 
-/// Render all changes into a single SQL script.
+/// Render all changes into a single SQL script (default context, PG 16+).
 pub fn render_all(changes: &[Change]) -> String {
+    render_all_with_context(changes, &SqlContext::default())
+}
+
+/// Render all changes into a single SQL script with version context.
+pub fn render_all_with_context(changes: &[Change], ctx: &SqlContext) -> String {
     changes
         .iter()
-        .flat_map(render_statements)
+        .flat_map(|c| render_statements_with_context(c, ctx))
         .collect::<Vec<_>>()
         .join("\n")
 }
@@ -405,22 +452,35 @@ fn render_revoke_default_privilege(
 // Membership
 // ---------------------------------------------------------------------------
 
-fn render_add_member(role: &str, member: &str, inherit: bool, admin: bool) -> Vec<String> {
+fn render_add_member(
+    role: &str,
+    member: &str,
+    inherit: bool,
+    admin: bool,
+    ctx: &SqlContext,
+) -> Vec<String> {
     let mut sql = format!("GRANT {} TO {}", quote_ident(role), quote_ident(member));
 
-    // PostgreSQL 16+ supports WITH INHERIT / WITH ADMIN in GRANT ... TO
-    let mut options = Vec::new();
-    if inherit {
-        options.push("INHERIT TRUE");
+    if ctx.supports_grant_with_options() {
+        // PostgreSQL 16+: use WITH INHERIT / ADMIN syntax.
+        let mut options = Vec::new();
+        if inherit {
+            options.push("INHERIT TRUE");
+        } else {
+            options.push("INHERIT FALSE");
+        }
+        if admin {
+            options.push("ADMIN TRUE");
+        }
+        if !options.is_empty() {
+            let _ = write!(sql, " WITH {}", options.join(", "));
+        }
     } else {
-        options.push("INHERIT FALSE");
-    }
-    if admin {
-        options.push("ADMIN TRUE");
-    }
-
-    if !options.is_empty() {
-        let _ = write!(sql, " WITH {}", options.join(", "));
+        // PostgreSQL < 16: use legacy WITH ADMIN OPTION syntax.
+        // INHERIT is controlled by the member role's attribute, not the grant.
+        if admin {
+            sql.push_str(" WITH ADMIN OPTION");
+        }
     }
 
     sql.push(';');
@@ -762,6 +822,76 @@ mod tests {
             comment: None,
         };
         assert_eq!(render(&change), "COMMENT ON ROLE \"r1\" IS NULL;");
+    }
+
+    // -----------------------------------------------------------------------
+    // PG version-dependent rendering
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn render_add_member_pg15_legacy_syntax() {
+        let ctx = SqlContext {
+            pg_major_version: 15,
+        };
+        let change = Change::AddMember {
+            role: "editors".to_string(),
+            member: "user@example.com".to_string(),
+            inherit: true,
+            admin: false,
+        };
+        let sql = render_statements_with_context(&change, &ctx).join("\n");
+        assert_eq!(sql, "GRANT \"editors\" TO \"user@example.com\";");
+    }
+
+    #[test]
+    fn render_add_member_pg15_with_admin() {
+        let ctx = SqlContext {
+            pg_major_version: 15,
+        };
+        let change = Change::AddMember {
+            role: "editors".to_string(),
+            member: "admin@example.com".to_string(),
+            inherit: true,
+            admin: true,
+        };
+        let sql = render_statements_with_context(&change, &ctx).join("\n");
+        assert_eq!(
+            sql,
+            "GRANT \"editors\" TO \"admin@example.com\" WITH ADMIN OPTION;"
+        );
+    }
+
+    #[test]
+    fn render_add_member_pg16_with_options() {
+        let ctx = SqlContext {
+            pg_major_version: 16,
+        };
+        let change = Change::AddMember {
+            role: "editors".to_string(),
+            member: "user@example.com".to_string(),
+            inherit: false,
+            admin: true,
+        };
+        let sql = render_statements_with_context(&change, &ctx).join("\n");
+        assert_eq!(
+            sql,
+            "GRANT \"editors\" TO \"user@example.com\" WITH INHERIT FALSE, ADMIN TRUE;"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // JSON serialization of changes
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn change_serializes_to_json() {
+        let change = Change::CreateRole {
+            name: "test".to_string(),
+            state: RoleState::default(),
+        };
+        let json = serde_json::to_string(&change).unwrap();
+        assert!(json.contains("CreateRole"));
+        assert!(json.contains("test"));
     }
 
     /// Full integration: manifest → expand → model → diff → SQL
