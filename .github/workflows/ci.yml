@@ -60,11 +60,15 @@ jobs:
   # Job 3: Integration tests — with a live PostgreSQL
   # ---------------------------------------------------------------------------
   integration-test:
-    name: Integration Tests
+    name: Integration Tests (PG${{ matrix.pg_version }})
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        pg_version: ["16", "17", "18"]
     services:
       postgres:
-        image: postgres:16
+        image: postgres:${{ matrix.pg_version }}
         env:
           POSTGRES_PASSWORD: testpassword
           POSTGRES_DB: pgroles_test

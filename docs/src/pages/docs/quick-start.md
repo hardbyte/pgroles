@@ -10,6 +10,7 @@ Get up and running with pgroles in a few minutes. {% .lead %}
 ## Prerequisites
 
 - **PostgreSQL 16+** (pgroles uses `GRANT ... WITH INHERIT` syntax from PG 16)
+- CI coverage currently runs integration tests on PostgreSQL **16, 17, and 18**
 - **Rust toolchain** (for building from source)
 
 ## Installation

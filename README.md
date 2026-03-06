@@ -6,6 +6,12 @@ pgroles treats your manifest as the **entire desired state** — roles, grants, 
 
 > **Requires PostgreSQL 16+** (uses `GRANT ... WITH INHERIT` syntax).
 
+## Compatibility
+
+- Supports PostgreSQL **16 and newer**
+- CI integration tests run against PostgreSQL **16, 17, and 18**
+- PostgreSQL 15 and earlier are not supported
+
 ## Quick Start
 
 ```bash
@@ -168,6 +174,17 @@ Download pre-built binaries from the [releases page](https://github.com/hardbyte
 
 ```bash
 docker run --rm ghcr.io/hardbyte/pgroles:0.1.0 --help
+```
+
+## Local Testing
+
+```bash
+# Unit + non-ignored tests
+cargo test --workspace
+
+# Full integration suite (requires PostgreSQL)
+export DATABASE_URL=postgres://postgres:testpassword@localhost:5432/pgroles_test
+cargo test --workspace -- --include-ignored
 ```
 
 ### Kubernetes Operator *(work in progress)*
