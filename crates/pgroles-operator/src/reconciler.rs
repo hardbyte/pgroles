@@ -599,4 +599,187 @@ mod tests {
         assert_eq!(summary.grants_added, 1);
         assert_eq!(summary.sessions_terminated, 1);
     }
+
+    #[test]
+    fn accumulate_summary_all_change_types() {
+        use pgroles_core::diff::Change;
+        use pgroles_core::model::RoleState;
+
+        let mut summary = ChangeSummary::default();
+
+        accumulate_summary(
+            &mut summary,
+            &Change::CreateRole {
+                name: "r1".to_string(),
+                state: RoleState::default(),
+            },
+        );
+        accumulate_summary(
+            &mut summary,
+            &Change::AlterRole {
+                name: "r1".to_string(),
+                attributes: vec![pgroles_core::model::RoleAttribute::Login(true)],
+            },
+        );
+        accumulate_summary(
+            &mut summary,
+            &Change::SetComment {
+                name: "r1".to_string(),
+                comment: Some("comment".to_string()),
+            },
+        );
+        accumulate_summary(
+            &mut summary,
+            &Change::DropRole {
+                name: "r1".to_string(),
+            },
+        );
+        accumulate_summary(
+            &mut summary,
+            &Change::TerminateSessions {
+                role: "r1".to_string(),
+            },
+        );
+        accumulate_summary(
+            &mut summary,
+            &Change::ReassignOwned {
+                from_role: "r1".to_string(),
+                to_role: "r2".to_string(),
+            },
+        );
+        accumulate_summary(
+            &mut summary,
+            &Change::DropOwned {
+                role: "r1".to_string(),
+            },
+        );
+        accumulate_summary(
+            &mut summary,
+            &Change::Grant {
+                role: "r1".to_string(),
+                object_type: pgroles_core::manifest::ObjectType::Table,
+                schema: Some("public".to_string()),
+                name: Some("*".to_string()),
+                privileges: [pgroles_core::manifest::Privilege::Select]
+                    .into_iter()
+                    .collect(),
+            },
+        );
+        accumulate_summary(
+            &mut summary,
+            &Change::Revoke {
+                role: "r1".to_string(),
+                object_type: pgroles_core::manifest::ObjectType::Table,
+                schema: Some("public".to_string()),
+                name: Some("*".to_string()),
+                privileges: [pgroles_core::manifest::Privilege::Select]
+                    .into_iter()
+                    .collect(),
+            },
+        );
+        accumulate_summary(
+            &mut summary,
+            &Change::SetDefaultPrivilege {
+                schema: "public".to_string(),
+                owner: "owner".to_string(),
+                grantee: "r1".to_string(),
+                on_type: pgroles_core::manifest::ObjectType::Table,
+                privileges: [pgroles_core::manifest::Privilege::Select]
+                    .into_iter()
+                    .collect(),
+            },
+        );
+        accumulate_summary(
+            &mut summary,
+            &Change::RevokeDefaultPrivilege {
+                schema: "public".to_string(),
+                owner: "owner".to_string(),
+                grantee: "r1".to_string(),
+                on_type: pgroles_core::manifest::ObjectType::Table,
+                privileges: [pgroles_core::manifest::Privilege::Select]
+                    .into_iter()
+                    .collect(),
+            },
+        );
+        accumulate_summary(
+            &mut summary,
+            &Change::AddMember {
+                role: "r1".to_string(),
+                member: "r2".to_string(),
+                inherit: true,
+                admin: false,
+            },
+        );
+        accumulate_summary(
+            &mut summary,
+            &Change::RemoveMember {
+                role: "r1".to_string(),
+                member: "r2".to_string(),
+            },
+        );
+
+        assert_eq!(summary.roles_created, 1);
+        // AlterRole + SetComment both increment roles_altered
+        assert_eq!(summary.roles_altered, 2);
+        assert_eq!(summary.roles_dropped, 1);
+        assert_eq!(summary.sessions_terminated, 1);
+        assert_eq!(summary.grants_added, 1);
+        assert_eq!(summary.grants_revoked, 1);
+        assert_eq!(summary.default_privileges_set, 1);
+        assert_eq!(summary.default_privileges_revoked, 1);
+        assert_eq!(summary.members_added, 1);
+        assert_eq!(summary.members_removed, 1);
+    }
+
+    #[test]
+    fn error_reason_invalid_spec_for_manifest_expansion() {
+        let err = ReconcileError::ManifestExpansion(
+            pgroles_core::manifest::ManifestError::UndefinedProfile("bad".into(), "schema1".into()),
+        );
+        assert_eq!(err.reason(), "InvalidSpec");
+    }
+
+    #[test]
+    fn error_reason_invalid_spec_for_invalid_interval() {
+        let err = ReconcileError::InvalidInterval("5x".into(), "unknown unit 'x'".into());
+        assert_eq!(err.reason(), "InvalidSpec");
+    }
+
+    #[test]
+    fn error_reason_conflicting_policy() {
+        let err = ReconcileError::ConflictingPolicy("overlaps with other".into());
+        assert_eq!(err.reason(), "ConflictingPolicy");
+    }
+
+    #[test]
+    fn error_reason_unsafe_role_drops() {
+        let err = ReconcileError::UnsafeRoleDrops("role owns objects".into());
+        assert_eq!(err.reason(), "UnsafeRoleDrops");
+    }
+
+    #[test]
+    fn error_reason_no_namespace() {
+        let err = ReconcileError::NoNamespace;
+        assert_eq!(err.reason(), "InvalidResource");
+    }
+
+    #[test]
+    fn error_reason_context_secret_missing() {
+        let err = ReconcileError::Context(Box::new(crate::context::ContextError::SecretMissing {
+            name: "pg-secret".into(),
+            key: "DATABASE_URL".into(),
+        }));
+        assert_eq!(err.reason(), "SecretMissing");
+    }
+
+    #[test]
+    fn error_display_includes_details() {
+        let err = ReconcileError::InvalidInterval("5x".into(), "unknown unit 'x'".into());
+        let msg = err.to_string();
+        assert!(msg.contains("5x"), "error display should contain interval");
+        assert!(
+            msg.contains("unknown unit"),
+            "error display should contain reason"
+        );
+    }
 }
