@@ -633,8 +633,29 @@
                     },
                     "type": "array"
                   },
+                  "last_attempted_generation": {
+                    "description": "The `.metadata.generation` that was last attempted.",
+                    "format": "int64",
+                    "nullable": true,
+                    "type": "integer"
+                  },
+                  "last_error": {
+                    "description": "Last reconcile error message, if any.",
+                    "nullable": true,
+                    "type": "string"
+                  },
                   "last_reconcile_time": {
+                    "description": "Deprecated alias retained for compatibility with older status readers.",
+                    "nullable": true,
+                    "type": "string"
+                  },
+                  "last_successful_reconcile_time": {
                     "description": "ISO 8601 timestamp of the last successful reconciliation.",
+                    "nullable": true,
+                    "type": "string"
+                  },
+                  "managed_database_identity": {
+                    "description": "Canonical identity of the managed database target.",
                     "nullable": true,
                     "type": "string"
                   },
@@ -643,6 +664,22 @@
                     "format": "int64",
                     "nullable": true,
                     "type": "integer"
+                  },
+                  "owned_roles": {
+                    "default": [],
+                    "description": "Roles claimed by this policy's declared ownership scope.",
+                    "items": {
+                      "type": "string"
+                    },
+                    "type": "array"
+                  },
+                  "owned_schemas": {
+                    "default": [],
+                    "description": "Schemas claimed by this policy's declared ownership scope.",
+                    "items": {
+                      "type": "string"
+                    },
+                    "type": "array"
                   }
                 },
                 "type": "object"
