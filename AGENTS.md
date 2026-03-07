@@ -73,7 +73,7 @@ Four jobs in `.github/workflows/ci.yml`:
 1. **Lint** — `cargo fmt --check`, `clippy -D warnings`, CRD drift check
 2. **Unit Tests** — `cargo test --workspace`
 3. **Integration Tests** — PG 16/17/18 matrix, `cargo test --workspace -- --include-ignored`
-4. **E2E** — kind cluster, deploys operator plus an OpenTelemetry Collector, applies sample policy, verifies roles in database, and verifies OTLP metrics export
+4. **E2E** — kind cluster, deploys operator plus an OpenTelemetry Collector, runs happy-path plus conflict/invalid/missing-secret operator scenarios, verifies roles in database, and verifies OTLP metrics export
 
 ## Release and Containers
 
