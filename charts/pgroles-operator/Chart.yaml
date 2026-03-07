@@ -7,7 +7,7 @@ description: >-
 type: application
 version: 0.1.2
 appVersion: "0.1.2"
-# icon: TODO — add a project logo to the repository
+icon: https://raw.githubusercontent.com/hardbyte/pgroles/main/docs/public/logo.svg
 sources:
   - https://github.com/hardbyte/pgroles
 maintainers:
