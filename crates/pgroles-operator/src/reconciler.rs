@@ -2,6 +2,14 @@
 //!
 //! Implements the core reconcile loop: read desired state from the CR,
 //! inspect current state from the database, compute diff, and apply changes.
+//!
+//! Reconciliation is serialized per database target to prevent overlapping
+//! inspect/diff/apply cycles:
+//!
+//! 1. **In-process lock** — [`OperatorContext::try_lock_database`] prevents
+//!    concurrent reconciles within the same operator replica.
+//! 2. **PostgreSQL advisory lock** — [`crate::advisory::try_acquire`] prevents
+//!    concurrent operations across multiple operator replicas.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -23,6 +31,12 @@ const FINALIZER: &str = "pgroles.io/finalizer";
 
 /// Default requeue interval when no interval is specified on the CR.
 const DEFAULT_REQUEUE_SECS: u64 = 300; // 5 minutes
+
+/// Base requeue delay when lock contention is detected.
+const LOCK_CONTENTION_BASE_SECS: u64 = 10;
+
+/// Maximum jitter added to the base requeue delay on lock contention.
+const LOCK_CONTENTION_JITTER_SECS: u64 = 20;
 
 /// Errors that can occur during reconciliation.
 #[derive(Debug, thiserror::Error)]
@@ -53,6 +67,9 @@ pub enum ReconcileError {
 
     #[error("{0}")]
     ConflictingPolicy(String),
+
+    #[error("lock contention on database \"{0}\": {1}")]
+    LockContention(String, String),
 }
 
 /// Parse a duration string like "5m", "1h", "30s", "2h30m".
@@ -133,17 +150,79 @@ pub fn error_policy(
     error: &finalizer::Error<ReconcileError>,
     _ctx: Arc<OperatorContext>,
 ) -> Action {
+    // Lock contention is expected and should not be logged as an error.
+    if let finalizer::Error::ApplyFailed(ReconcileError::LockContention(db, reason)) = error {
+        tracing::info!(database = %db, reason = %reason, "requeuing due to lock contention");
+        return requeue_with_jitter();
+    }
     tracing::error!(%error, "reconciliation failed, requeuing in 60s");
     Action::requeue(Duration::from_secs(60))
 }
 
+/// Compute a requeue delay with jitter for lock contention back-off.
+fn requeue_with_jitter() -> Action {
+    let delay = jitter_delay();
+    tracing::debug!(delay_secs = delay.as_secs(), "requeue with jitter");
+    Action::requeue(delay)
+}
+
+/// Compute a jittered delay for lock contention back-off.
+///
+/// Returns a [`Duration`] in the range
+/// `[LOCK_CONTENTION_BASE_SECS, LOCK_CONTENTION_BASE_SECS + LOCK_CONTENTION_JITTER_SECS]`.
+fn jitter_delay() -> Duration {
+    // Simple jitter: base + pseudo-random portion of the jitter window.
+    // We combine subsecond nanos with a hash of the thread ID for better
+    // entropy when multiple reconciles hit contention simultaneously.
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .subsec_nanos();
+    let thread_entropy = {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        std::thread::current().id().hash(&mut hasher);
+        hasher.finish() as u32
+    };
+    let jitter_secs = ((nanos ^ thread_entropy) as u64) % (LOCK_CONTENTION_JITTER_SECS + 1);
+    Duration::from_secs(LOCK_CONTENTION_BASE_SECS + jitter_secs)
+}
+
 /// Apply reconciliation — the main "ensure desired state" logic.
+///
+/// Acquires the in-process per-database lock before doing any work. If the
+/// lock is already held, the reconciliation is requeued with jitter.
 async fn reconcile_apply(
     resource: &PostgresPolicy,
     ctx: &OperatorContext,
 ) -> Result<Action, ReconcileError> {
-    match reconcile_apply_inner(resource, ctx).await {
+    // Derive database identity early so we can acquire the in-process lock.
+    let namespace = resource.namespace().ok_or(ReconcileError::NoNamespace)?;
+    let identity = DatabaseIdentity::new(
+        &namespace,
+        &resource.spec.connection.secret_ref.name,
+        &resource.spec.connection.secret_key,
+    );
+
+    // Acquire in-process lock for this database target.
+    let _db_lock = match ctx.try_lock_database(identity.as_str()).await {
+        Some(guard) => guard,
+        None => {
+            return Err(ReconcileError::LockContention(
+                identity.as_str().to_string(),
+                "in-process lock held by another reconcile".to_string(),
+            ));
+        }
+    };
+
+    match reconcile_apply_inner(resource, ctx, &identity).await {
         Ok(action) => Ok(action),
+        Err(ReconcileError::LockContention(db, reason)) => {
+            // Lock contention is expected during normal multi-replica operation.
+            // Re-raise without setting Degraded status to avoid false alarms.
+            tracing::info!(database = %db, %reason, "lock contention — will requeue");
+            Err(ReconcileError::LockContention(db, reason))
+        }
         Err(err) => {
             let error_message = err.to_string();
             let error_reason = err.reason();
@@ -168,6 +247,7 @@ async fn reconcile_apply(
 async fn reconcile_apply_inner(
     resource: &PostgresPolicy,
     ctx: &OperatorContext,
+    identity: &DatabaseIdentity,
 ) -> Result<Action, ReconcileError> {
     let name = resource.name_any();
     let namespace = resource.namespace().ok_or(ReconcileError::NoNamespace)?;
@@ -207,11 +287,6 @@ async fn reconcile_apply_inner(
     })
     .await?;
 
-    let identity = DatabaseIdentity::new(
-        &namespace,
-        &spec.connection.secret_ref.name,
-        &spec.connection.secret_key,
-    );
     let ownership = spec.ownership_claims()?;
     update_status(ctx, resource, |status| {
         status.managed_database_identity = Some(identity.as_str().to_string());
@@ -221,7 +296,7 @@ async fn reconcile_apply_inner(
     .await?;
 
     if let Some(conflict_message) =
-        detect_policy_conflict(ctx, resource, &identity, &ownership).await?
+        detect_policy_conflict(ctx, resource, identity, &ownership).await?
     {
         update_status(ctx, resource, |status| {
             status.set_condition(ready_condition(
@@ -262,25 +337,76 @@ async fn reconcile_apply_inner(
         .await
         .map_err(Box::new)?;
 
-    // 5. Inspect current state from the database.
-    // Check if any grants target "database" type to decide whether to include database privileges.
+    // 5. Acquire PostgreSQL advisory lock for cross-replica safety.
+    let advisory_lock = match crate::advisory::try_acquire(&pool, identity.as_str()).await {
+        Ok(Some(lock)) => lock,
+        Ok(None) => {
+            return Err(ReconcileError::LockContention(
+                identity.as_str().to_string(),
+                "PostgreSQL advisory lock held by another session".to_string(),
+            ));
+        }
+        Err(err) => {
+            tracing::warn!(%err, "failed to acquire advisory lock — treating as connection error");
+            return Err(ReconcileError::SqlExec(err));
+        }
+    };
+
+    // Wrap the remaining work so the advisory lock is released on all paths.
+    let result = apply_under_lock(
+        resource,
+        ctx,
+        &pool,
+        &manifest,
+        &expanded,
+        &desired,
+        generation,
+        requeue_interval,
+        &name,
+        &namespace,
+    )
+    .await;
+
+    // Release advisory lock (always, even on error).
+    advisory_lock.release().await;
+
+    result
+}
+
+/// Execute the inspect/diff/apply cycle while both locks are held.
+///
+/// Extracted to keep `reconcile_apply_inner` focused on lock acquisition.
+#[allow(clippy::too_many_arguments)]
+async fn apply_under_lock(
+    resource: &PostgresPolicy,
+    ctx: &OperatorContext,
+    pool: &sqlx::PgPool,
+    manifest: &pgroles_core::manifest::PolicyManifest,
+    expanded: &pgroles_core::manifest::ExpandedManifest,
+    desired: &pgroles_core::model::RoleGraph,
+    generation: Option<i64>,
+    requeue_interval: Duration,
+    name: &str,
+    namespace: &str,
+) -> Result<Action, ReconcileError> {
+    // 6. Inspect current state from the database.
     let has_database_grants = expanded
         .grants
         .iter()
         .any(|g| g.on.object_type == pgroles_core::manifest::ObjectType::Database);
     let inspect_config =
-        pgroles_inspect::InspectConfig::from_expanded(&expanded, has_database_grants)
+        pgroles_inspect::InspectConfig::from_expanded(expanded, has_database_grants)
             .with_additional_roles(
                 manifest
                     .retirements
                     .iter()
                     .map(|retirement| retirement.role.clone()),
             );
-    let current = pgroles_inspect::inspect(&pool, &inspect_config).await?;
+    let current = pgroles_inspect::inspect(pool, &inspect_config).await?;
 
-    // 6. Compute diff.
+    // 7. Compute diff.
     let changes = pgroles_core::diff::apply_role_retirements(
-        pgroles_core::diff::diff(&current, &desired),
+        pgroles_core::diff::diff(&current, desired),
         &manifest.retirements,
     );
     let dropped_roles: Vec<String> = changes
@@ -290,7 +416,7 @@ async fn reconcile_apply_inner(
             _ => None,
         })
         .collect();
-    let drop_safety = pgroles_inspect::inspect_drop_role_safety(&pool, &dropped_roles)
+    let drop_safety = pgroles_inspect::inspect_drop_role_safety(pool, &dropped_roles)
         .await?
         .assess(&manifest.retirements);
     if !drop_safety.warnings.is_empty() {
@@ -302,7 +428,7 @@ async fn reconcile_apply_inner(
         ));
     }
 
-    // 7. Apply changes.
+    // 8. Apply changes.
     let mut summary = ChangeSummary::default();
 
     if changes.is_empty() {
@@ -339,7 +465,7 @@ async fn reconcile_apply_inner(
         );
     }
 
-    // 8. Update status to Ready.
+    // 9. Update status to Ready.
     update_status(ctx, resource, |status| {
         status.set_condition(ready_condition(true, "Reconciled", "All changes applied"));
         // Clear any previous "Reconciling" or "Degraded" conditions.
@@ -495,6 +621,7 @@ impl ReconcileError {
                 "InvalidSpec"
             }
             ReconcileError::ConflictingPolicy(_) => "ConflictingPolicy",
+            ReconcileError::LockContention(_, _) => "LockContention",
             ReconcileError::Context(context) => match context.as_ref() {
                 ContextError::SecretFetch { .. } => "SecretFetchFailed",
                 ContextError::SecretMissing { .. } => "SecretMissing",
@@ -780,6 +907,64 @@ mod tests {
         assert!(
             msg.contains("unknown unit"),
             "error display should contain reason"
+        );
+    }
+
+    #[test]
+    fn error_reason_lock_contention() {
+        let err = ReconcileError::LockContention(
+            "prod/db-creds/DATABASE_URL".into(),
+            "in-process lock held".into(),
+        );
+        assert_eq!(err.reason(), "LockContention");
+    }
+
+    #[test]
+    fn error_display_lock_contention_includes_database() {
+        let err = ReconcileError::LockContention(
+            "prod/db-creds/DATABASE_URL".into(),
+            "advisory lock held by another session".into(),
+        );
+        let msg = err.to_string();
+        assert!(
+            msg.contains("prod/db-creds/DATABASE_URL"),
+            "lock contention error should include database identity"
+        );
+        assert!(
+            msg.contains("advisory lock"),
+            "lock contention error should include reason"
+        );
+    }
+
+    #[test]
+    fn requeue_with_jitter_produces_bounded_delay() {
+        // Run multiple times to exercise the jitter distribution.
+        let base = LOCK_CONTENTION_BASE_SECS;
+        let max = LOCK_CONTENTION_BASE_SECS + LOCK_CONTENTION_JITTER_SECS;
+        for _ in 0..20 {
+            let delay = jitter_delay();
+            let secs = delay.as_secs();
+            assert!(
+                secs >= base,
+                "jitter delay {secs}s should be at least base {base}s",
+            );
+            assert!(
+                secs <= max,
+                "jitter delay {secs}s should not exceed base+jitter {max}s",
+            );
+        }
+    }
+
+    #[test]
+    fn lock_contention_constants_are_reasonable() {
+        // Use variables to avoid clippy::assertions_on_constants.
+        let base = LOCK_CONTENTION_BASE_SECS;
+        let jitter = LOCK_CONTENTION_JITTER_SECS;
+        assert!(base > 0, "base delay must be positive");
+        assert!(jitter > 0, "jitter window must be positive");
+        assert!(
+            base + jitter <= 60,
+            "total max contention delay should not exceed error_policy's 60s"
         );
     }
 }
