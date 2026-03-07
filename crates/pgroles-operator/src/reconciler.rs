@@ -1265,12 +1265,9 @@ mod tests {
                 name: "db-credentials".into(),
                 namespace: "default".into(),
                 source: kube::Error::Api(
-                    kube::core::Status::failure(
-                        "secrets \"db-credentials\" not found",
-                        "NotFound",
-                    )
-                    .with_code(404)
-                    .boxed(),
+                    kube::core::Status::failure("secrets \"db-credentials\" not found", "NotFound")
+                        .with_code(404)
+                        .boxed(),
                 ),
             },
         )));
