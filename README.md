@@ -258,8 +258,7 @@ Swap the image tag to `postgres:17` or `postgres:18` to mirror the CI integratio
 Install via Helm:
 
 ```bash
-helm repo add pgroles https://hardbyte.github.io/pgroles
-helm install pgroles-operator pgroles/pgroles-operator
+helm install pgroles-operator oci://ghcr.io/hardbyte/charts/pgroles-operator
 ```
 
 ## Components

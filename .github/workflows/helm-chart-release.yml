@@ -1,4 +1,4 @@
-name: Release Helm Charts
+name: Release Helm Chart (OCI)
 
 on:
   push:
@@ -6,29 +6,23 @@ on:
       - "v*"
   workflow_dispatch:
 
+permissions:
+  packages: write
+
 jobs:
   release:
-    permissions:
-      contents: write
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-
-      - name: Configure Git
-        run: |
-          git config user.name "$GITHUB_ACTOR"
-          git config user.email "$GITHUB_ACTOR@users.noreply.github.com"
+      - uses: actions/checkout@v4
 
       - name: Install Helm
         uses: azure/setup-helm@v4
 
-      - name: Run chart-releaser
-        uses: hardbyte/chart-releaser-action@main
-        with:
-          charts_dir: charts
-          mark_as_latest: false
-        env:
-          CR_TOKEN: "${{ secrets.GITHUB_TOKEN }}"
+      - name: Login to GHCR
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | helm registry login ghcr.io -u ${{ github.repository_owner }} --password-stdin
+
+      - name: Package chart
+        run: helm package charts/pgroles-operator
+
+      - name: Push chart to GHCR
+        run: helm push pgroles-operator-*.tgz oci://ghcr.io/hardbyte/charts

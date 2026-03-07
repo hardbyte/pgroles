@@ -25,8 +25,7 @@ The operator is functional but still under active development. The CRD schema ma
 ### Helm
 
 ```shell
-helm repo add pgroles https://hardbyte.github.io/pgroles
-helm install pgroles-operator pgroles/pgroles-operator
+helm install pgroles-operator oci://ghcr.io/hardbyte/charts/pgroles-operator
 ```
 
 ### crates.io

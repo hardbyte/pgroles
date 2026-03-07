@@ -1,6 +1,6 @@
 # Artifact Hub repository metadata file
 # https://artifacthub.io/docs/topics/repositories/
-repositoryID: # Will be assigned by Artifact Hub on first registration
+repositoryID: 4a3193ec-ed70-4f00-86ff-1ca489d3e50f
 owners:
   - name: Brian Thorne
     email: brian@hardbyte.nz
