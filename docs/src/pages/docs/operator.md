@@ -80,53 +80,32 @@ The operator runs as `nobody` (UID 65534) with a read-only root filesystem, no c
 
 ## Production roadmap
 
-The operator is intended to become a production controller, but that requires stricter ownership, observability, and failure-handling semantics than the current `v1alpha1` shape. The near-term roadmap is:
+The operator is intended to become a production controller, but that still requires stricter retry and test semantics than the current `v1alpha1` shape.
 
-### 1. Safe multi-policy ownership for the same database
+### Implemented foundations
 
-- Add a canonical database identity to each policy target so the operator can determine when multiple `PostgresPolicy` resources point at the same database.
-- Add explicit management scope so ownership is unambiguous:
-  - managed role names
-  - managed schema names
-  - generated role patterns
-- Reject overlapping policies by default rather than allowing last-writer-wins behavior.
-- Reconcile multiple policies for the same database only when their managed scopes are provably disjoint.
-
-### 2. Clear invalid-config and conflict handling
-
-- Distinguish invalid spec errors from transient operational failures.
-- Surface conflict and validation outcomes through status conditions rather than hot-looping retries.
-- Extend status to include:
-  - `lastAttemptedGeneration`
-  - `lastSuccessfulReconcileTime`
-  - `lastError`
-  - managed database identity
-  - owned role/schema summary
-
-### 3. Per-database serialization and retry discipline
-
-- Serialize reconciliation for the same database target inside the controller.
-- Add PostgreSQL advisory locking as a second layer of protection against multi-replica races.
-- Replace the fixed retry interval with exponential backoff and jitter for transient failures.
-- Avoid aggressive retries for invalid specs or policy conflicts.
-
-### 4. Production probes and metrics
-
-- Add HTTP endpoints for:
+- Canonical database identity and ownership claims let the controller detect overlapping `PostgresPolicy` resources targeting the same database.
+- Conflicting policies are rejected instead of allowing last-writer-wins behavior.
+- Status records managed database identity, owned role/schema summaries, `lastAttemptedGeneration`, `lastSuccessfulReconcileTime`, and the last error message.
+- Reconciliation is serialized per database target:
+  - in-process locking prevents concurrent reconciles within one operator replica
+  - PostgreSQL advisory locking prevents concurrent reconciles across multiple replicas
+- The operator exposes:
   - `/livez`
   - `/readyz`
-  - `/metrics`
-- Keep readiness tied to controller health rather than the success of any one policy.
-- Export Prometheus metrics for:
-  - reconcile duration and result
-  - database connection failures
-  - lock contention
-  - change counts by type
-  - invalid spec/conflict totals
+- Metrics are exported via OpenTelemetry OTLP with the OpenTelemetry Collector as the intended Kubernetes sink.
 
-### 5. More realistic test coverage
+### Remaining work
 
-- Add E2E coverage for:
+### 1. Error-aware retry discipline
+
+- Replace the fixed retry interval with exponential backoff and jitter for transient failures.
+- Avoid aggressive retries for invalid specs or policy conflicts.
+- Keep lock contention on a separate low-noise path from actual reconcile failures.
+
+### 2. More realistic test coverage
+
+- Add E2E coverage for scenarios such as:
   - multiple policies targeting the same database with conflicting ownership
   - multiple non-overlapping policies targeting the same database
   - invalid specs
@@ -135,7 +114,7 @@ The operator is intended to become a production controller, but that requires st
 - Add scale and load tests covering large manifests, many roles/grants, and many policies across multiple databases.
 - Add reconciliation concurrency tests to prove per-database serialization and backoff behavior.
 
-### 6. API hardening toward production use
+### 3. API hardening toward production use
 
 - Carry these semantics into the next CRD revision rather than leaving them as controller-only conventions.
 - Promote the API only after conflict detection, richer status, probes, metrics, retry behavior, and realistic load tests are all in place.
@@ -227,6 +206,26 @@ The `interval` field controls how often the operator re-reconciles, even when th
 ### Suspending
 
 Set `suspend: true` to pause reconciliation without deleting the resource. The operator will skip the resource until `suspend` is set back to `false`.
+
+### Health and telemetry
+
+The operator exposes health probes on its internal HTTP port:
+
+- `/livez`
+- `/readyz`
+
+The Helm chart configures these probes automatically. Metrics are exported via OpenTelemetry OTLP when standard OTel endpoint environment variables are set, for example:
+
+```yaml
+operator:
+  env:
+    - name: OTEL_EXPORTER_OTLP_ENDPOINT
+      value: http://otel-collector.observability.svc.cluster.local:4317
+    - name: OTEL_METRICS_EXPORTER
+      value: otlp
+```
+
+The intended deployment model is operator -> OpenTelemetry Collector -> your metrics backend.
 
 ### Deletion behaviour
 

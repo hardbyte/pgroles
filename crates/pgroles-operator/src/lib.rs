@@ -6,4 +6,5 @@
 pub mod advisory;
 pub mod context;
 pub mod crd;
+pub mod observability;
 pub mod reconciler;

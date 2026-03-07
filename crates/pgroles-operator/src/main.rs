@@ -12,6 +12,7 @@ use tracing::info;
 
 use pgroles_operator::context::OperatorContext;
 use pgroles_operator::crd::PostgresPolicy;
+use pgroles_operator::observability::{OperatorObservability, serve_health};
 use pgroles_operator::reconciler::{error_policy, reconcile};
 
 #[tokio::main]
@@ -34,13 +35,25 @@ async fn main() -> anyhow::Result<()> {
     // Build kube client from in-cluster config or KUBECONFIG.
     let client = Client::try_default().await?;
 
+    let observability = OperatorObservability::from_env()?;
+    let http_addr = std::env::var("OPERATOR_HTTP_ADDR")
+        .unwrap_or_else(|_| "0.0.0.0:8080".to_string())
+        .parse()?;
+    let observability_server = observability.clone();
+    tokio::spawn(async move {
+        if let Err(error) = serve_health(http_addr, observability_server).await {
+            tracing::error!(%error, %http_addr, "health server exited");
+        }
+    });
+
     // Create the shared operator context.
-    let ctx = Arc::new(OperatorContext::new(client.clone()));
+    let ctx = Arc::new(OperatorContext::new(client.clone(), observability.clone()));
 
     // Watch all PostgresPolicy resources across all namespaces.
     let policies: Api<PostgresPolicy> = Api::all(client);
 
     info!("starting controller");
+    observability.mark_ready();
 
     Controller::new(policies, kube::runtime::watcher::Config::default())
         .shutdown_on_signal()
@@ -57,6 +70,10 @@ async fn main() -> anyhow::Result<()> {
         })
         .await;
 
+    observability.mark_not_ready();
+    if let Err(error) = observability.shutdown() {
+        tracing::warn!(%error, "failed to shut down observability");
+    }
     info!("controller shut down");
     Ok(())
 }

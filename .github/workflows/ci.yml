@@ -159,12 +159,19 @@ jobs:
         run: |
           kubectl apply -f k8s/deploy/namespace.yaml
           kubectl apply -f k8s/deploy/rbac.yaml
+          kubectl apply -f k8s/dev/otel-collector.yaml
+          kubectl -n pgroles-system rollout status deployment/otel-collector --timeout=120s
 
           # Patch deployment to use the locally-built image.
           sed 's|ghcr.io/hardbyte/pgroles-operator:latest|pgroles-operator:e2e|' \
             k8s/deploy/deployment.yaml | \
             sed 's|imagePullPolicy:.*|imagePullPolicy: Never|' | \
             kubectl apply -f -
+
+          kubectl -n pgroles-system set env deployment/pgroles-operator \
+            OTEL_EXPORTER_OTLP_ENDPOINT=http://otel-collector.pgroles-system.svc.cluster.local:4317 \
+            OTEL_METRICS_EXPORTER=otlp \
+            OTEL_METRIC_EXPORT_INTERVAL=2000
 
           kubectl -n pgroles-system rollout status deployment/pgroles-operator --timeout=60s
 
@@ -190,6 +197,24 @@ jobs:
       - name: Verify roles exist in PostgreSQL
         run: |
           kubectl exec postgres-0 -- psql -U postgres -c "SELECT rolname FROM pg_roles WHERE rolname LIKE 'public-%' ORDER BY rolname;" | tee /dev/stderr | grep -q "public-editor"
+
+      - name: Verify OTLP metrics reach the collector
+        run: |
+          for i in $(seq 1 30); do
+            LOGS="$(kubectl -n pgroles-system logs deployment/otel-collector --tail=200 2>/dev/null || true)"
+            printf '%s\n' "$LOGS" | grep -q 'pgroles.reconcile.total' && \
+            printf '%s\n' "$LOGS" | grep -q 'pgroles.policy.conflicts\|pgroles.apply.total\|pgroles.apply.statements' && \
+            printf '%s\n' "$LOGS" | grep -q 'pgroles-operator' && {
+              echo "Collector received operator metrics"
+              exit 0
+            }
+            echo "Waiting for OTLP metrics export... (attempt $i/30)"
+            sleep 5
+          done
+          echo "::error::Collector did not receive expected operator metrics"
+          kubectl -n pgroles-system logs deployment/pgroles-operator --tail=100
+          kubectl -n pgroles-system logs deployment/otel-collector --tail=200
+          exit 1
 
       - name: Cleanup
         if: always()

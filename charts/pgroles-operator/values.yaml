@@ -27,8 +27,28 @@ operator:
   env:
     - name: RUST_LOG
       value: "info,pgroles_operator=debug"
+    # Enable OTLP metrics export by setting one of the standard OpenTelemetry endpoints.
+    # - name: OTEL_EXPORTER_OTLP_ENDPOINT
+    #   value: http://otel-collector.observability.svc.cluster.local:4317
+    # - name: OTEL_METRICS_EXPORTER
+    #   value: otlp
 
   podAnnotations: {}
+
+  http:
+    port: 8080
+
+  probes:
+    liveness:
+      initialDelaySeconds: 5
+      periodSeconds: 10
+      timeoutSeconds: 2
+      failureThreshold: 3
+    readiness:
+      initialDelaySeconds: 2
+      periodSeconds: 10
+      timeoutSeconds: 2
+      failureThreshold: 3
 
   podSecurityContext:
     seccompProfile:

@@ -33,10 +33,32 @@ spec:
             {{- toYaml .Values.operator.securityContext | nindent 12 }}
           image: "{{ .Values.operator.image.repository }}:{{ .Values.operator.image.tag | default .Chart.AppVersion }}"
           imagePullPolicy: {{ .Values.operator.image.pullPolicy }}
-          {{- with .Values.operator.env }}
+          ports:
+            - name: http
+              containerPort: {{ .Values.operator.http.port }}
+              protocol: TCP
           env:
+            - name: OPERATOR_HTTP_ADDR
+              value: "0.0.0.0:{{ .Values.operator.http.port }}"
+          {{- with .Values.operator.env }}
             {{- toYaml . | nindent 12 }}
           {{- end }}
+          livenessProbe:
+            httpGet:
+              path: /livez
+              port: http
+            initialDelaySeconds: {{ .Values.operator.probes.liveness.initialDelaySeconds }}
+            periodSeconds: {{ .Values.operator.probes.liveness.periodSeconds }}
+            timeoutSeconds: {{ .Values.operator.probes.liveness.timeoutSeconds }}
+            failureThreshold: {{ .Values.operator.probes.liveness.failureThreshold }}
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: http
+            initialDelaySeconds: {{ .Values.operator.probes.readiness.initialDelaySeconds }}
+            periodSeconds: {{ .Values.operator.probes.readiness.periodSeconds }}
+            timeoutSeconds: {{ .Values.operator.probes.readiness.timeoutSeconds }}
+            failureThreshold: {{ .Values.operator.probes.readiness.failureThreshold }}
           resources:
             {{- toYaml .Values.operator.resources | nindent 12 }}
       {{- with .Values.operator.nodeSelector }}

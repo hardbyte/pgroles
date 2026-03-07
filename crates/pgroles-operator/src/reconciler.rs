@@ -38,6 +38,33 @@ const LOCK_CONTENTION_BASE_SECS: u64 = 10;
 /// Maximum jitter added to the base requeue delay on lock contention.
 const LOCK_CONTENTION_JITTER_SECS: u64 = 20;
 
+enum ReconcileOutcome {
+    Reconciled,
+    Suspended,
+    Conflict,
+    LockContention,
+}
+
+impl ReconcileOutcome {
+    fn result(&self) -> &'static str {
+        match self {
+            ReconcileOutcome::Reconciled => "success",
+            ReconcileOutcome::Suspended => "suspended",
+            ReconcileOutcome::Conflict => "conflict",
+            ReconcileOutcome::LockContention => "contention",
+        }
+    }
+
+    fn reason(&self) -> &'static str {
+        match self {
+            ReconcileOutcome::Reconciled => "Reconciled",
+            ReconcileOutcome::Suspended => "Suspended",
+            ReconcileOutcome::Conflict => "ConflictingPolicy",
+            ReconcileOutcome::LockContention => "LockContention",
+        }
+    }
+}
+
 /// Errors that can occur during reconciliation.
 #[derive(Debug, thiserror::Error)]
 pub enum ReconcileError {
@@ -196,6 +223,8 @@ async fn reconcile_apply(
     resource: &PostgresPolicy,
     ctx: &OperatorContext,
 ) -> Result<Action, ReconcileError> {
+    let reconcile_guard = ctx.observability.start_reconcile();
+
     // Derive database identity early so we can acquire the in-process lock.
     let namespace = resource.namespace().ok_or(ReconcileError::NoNamespace)?;
     let identity = DatabaseIdentity::new(
@@ -208,6 +237,11 @@ async fn reconcile_apply(
     let _db_lock = match ctx.try_lock_database(identity.as_str()).await {
         Some(guard) => guard,
         None => {
+            ctx.observability.record_lock_contention();
+            reconcile_guard.record_result(
+                ReconcileOutcome::LockContention.result(),
+                ReconcileOutcome::LockContention.reason(),
+            );
             return Err(ReconcileError::LockContention(
                 identity.as_str().to_string(),
                 "in-process lock held by another reconcile".to_string(),
@@ -216,16 +250,34 @@ async fn reconcile_apply(
     };
 
     match reconcile_apply_inner(resource, ctx, &identity).await {
-        Ok(action) => Ok(action),
+        Ok((action, outcome)) => {
+            reconcile_guard.record_result(outcome.result(), outcome.reason());
+            Ok(action)
+        }
         Err(ReconcileError::LockContention(db, reason)) => {
             // Lock contention is expected during normal multi-replica operation.
             // Re-raise without setting Degraded status to avoid false alarms.
+            ctx.observability.record_lock_contention();
+            reconcile_guard.record_result(
+                ReconcileOutcome::LockContention.result(),
+                ReconcileOutcome::LockContention.reason(),
+            );
             tracing::info!(database = %db, %reason, "lock contention — will requeue");
             Err(ReconcileError::LockContention(db, reason))
         }
         Err(err) => {
             let error_message = err.to_string();
             let error_reason = err.reason();
+            match error_reason {
+                "DatabaseConnectionFailed" => {
+                    ctx.observability.record_database_connection_failure()
+                }
+                "InvalidSpec" => ctx.observability.record_invalid_spec(),
+                "ConflictingPolicy" => ctx.observability.record_policy_conflict(),
+                "ApplyFailed" => ctx.observability.record_apply_result("error"),
+                _ => {}
+            }
+            reconcile_guard.record_result("error", error_reason);
             if let Err(status_err) = update_status(ctx, resource, |status| {
                 status.set_condition(ready_condition(false, error_reason, &error_message));
                 status.set_condition(degraded_condition(error_reason, &error_message));
@@ -248,7 +300,7 @@ async fn reconcile_apply_inner(
     resource: &PostgresPolicy,
     ctx: &OperatorContext,
     identity: &DatabaseIdentity,
-) -> Result<Action, ReconcileError> {
+) -> Result<(Action, ReconcileOutcome), ReconcileError> {
     let name = resource.name_any();
     let namespace = resource.namespace().ok_or(ReconcileError::NoNamespace)?;
 
@@ -273,7 +325,10 @@ async fn reconcile_apply_inner(
         })
         .await?;
         info!(name, namespace, "reconciliation suspended, requeuing");
-        return Ok(Action::requeue(requeue_interval));
+        return Ok((
+            Action::requeue(requeue_interval),
+            ReconcileOutcome::Suspended,
+        ));
     }
 
     info!(name, namespace, "starting reconciliation");
@@ -313,8 +368,12 @@ async fn reconcile_apply_inner(
             status.last_error = Some(conflict_message.clone());
         })
         .await?;
+        ctx.observability.record_policy_conflict();
         info!(name, namespace, %conflict_message, "reconciliation blocked by conflicting policy");
-        return Ok(Action::requeue(requeue_interval));
+        return Ok((
+            Action::requeue(requeue_interval),
+            ReconcileOutcome::Conflict,
+        ));
     }
 
     // 1. Convert CRD spec to core manifest.
@@ -388,7 +447,7 @@ async fn apply_under_lock(
     requeue_interval: Duration,
     name: &str,
     namespace: &str,
-) -> Result<Action, ReconcileError> {
+) -> Result<(Action, ReconcileOutcome), ReconcileError> {
     // 6. Inspect current state from the database.
     let has_database_grants = expanded
         .grants
@@ -437,14 +496,19 @@ async fn apply_under_lock(
         info!(name, namespace, count = changes.len(), "applying changes");
 
         let mut transaction = pool.begin().await?;
+        let mut statements_executed = 0usize;
         for change in &changes {
             for sql in pgroles_core::sql::render_statements(change) {
                 tracing::debug!(%sql, "executing");
                 sqlx::query(&sql).execute(transaction.as_mut()).await?;
+                statements_executed += 1;
             }
             accumulate_summary(&mut summary, change);
         }
         transaction.commit().await?;
+        ctx.observability.record_apply_result("success");
+        ctx.observability
+            .record_apply_statements(statements_executed);
 
         summary.total = summary.roles_created
             + summary.roles_altered
@@ -484,7 +548,10 @@ async fn apply_under_lock(
     })
     .await?;
 
-    Ok(Action::requeue(requeue_interval))
+    Ok((
+        Action::requeue(requeue_interval),
+        ReconcileOutcome::Reconciled,
+    ))
 }
 
 /// Cleanup on deletion — evict cached pool.

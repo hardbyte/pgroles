@@ -6,6 +6,8 @@ use std::sync::Arc;
 use sqlx::postgres::PgPool;
 use tokio::sync::{Mutex, RwLock};
 
+use crate::observability::OperatorObservability;
+
 #[derive(Clone)]
 struct CachedPool {
     resource_version: Option<String>,
@@ -65,21 +67,24 @@ pub struct OperatorContext {
 
     /// Cached database connection pools keyed by `"namespace/secret-name/secret-key"`.
     pool_cache: Arc<RwLock<HashMap<String, CachedPool>>>,
-
     /// In-process per-database reconciliation locks.
     ///
     /// Prevents concurrent reconcile loops from operating on the same database
     /// within a single operator replica. Cross-replica safety is provided by
     /// PostgreSQL advisory locks (see [`crate::advisory`]).
     database_locks: Arc<Mutex<HashMap<String, ()>>>,
+
+    /// Shared health/metrics state.
+    pub observability: OperatorObservability,
 }
 
 impl OperatorContext {
     /// Create a new operator context with an empty pool cache.
-    pub fn new(kube_client: kube::Client) -> Self {
+    pub fn new(kube_client: kube::Client, observability: OperatorObservability) -> Self {
         Self {
             kube_client,
             pool_cache: Arc::new(RwLock::new(HashMap::new())),
+            observability,
             database_locks: Arc::new(Mutex::new(HashMap::new())),
         }
     }

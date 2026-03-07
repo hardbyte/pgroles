@@ -60,6 +60,8 @@ diff(current, desired) → Vec<Change> → sql::render_all_with_context() → SQ
 - **pgroles-inspect** — Async database introspection via `sqlx`/`pg_catalog`. Version detection, cloud provider detection (RDS, Cloud SQL, AlloyDB, Azure), drop-role safety preflight.
 - **pgroles-cli** — Binary crate. Thin orchestration over core + inspect. Subcommands: `validate`, `diff`/`plan`, `apply`, `inspect`, `generate`.
 - **pgroles-operator** — Kubernetes operator (WIP). Reconciles `PostgresPolicy` CRDs (`pgroles.io/v1alpha1`). Has a `crdgen` binary for generating `k8s/crd.yaml`.
+  - Health endpoints: `/livez`, `/readyz`
+  - Metrics/telemetry: prefer OTLP export via OpenTelemetry Collector; do not add a built-in Prometheus scrape endpoint by default unless the change explicitly requires it.
 
 ### Diff Change Ordering
 
@@ -71,7 +73,7 @@ Four jobs in `.github/workflows/ci.yml`:
 1. **Lint** — `cargo fmt --check`, `clippy -D warnings`, CRD drift check
 2. **Unit Tests** — `cargo test --workspace`
 3. **Integration Tests** — PG 16/17/18 matrix, `cargo test --workspace -- --include-ignored`
-4. **E2E** — kind cluster, deploys operator, applies sample policy, verifies roles in database
+4. **E2E** — kind cluster, deploys operator plus an OpenTelemetry Collector, applies sample policy, verifies roles in database, and verifies OTLP metrics export
 
 ## Release and Containers
 
