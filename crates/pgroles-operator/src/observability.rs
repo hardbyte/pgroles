@@ -247,7 +247,76 @@ async fn readyz(State(observability): State<OperatorObservability>) -> impl Into
 
 #[cfg(test)]
 mod tests {
-    use super::otel_metrics_enabled;
+    use std::sync::Arc;
+
+    use axum::extract::State;
+    use axum::http::StatusCode;
+    use axum::response::IntoResponse;
+    use opentelemetry::metrics::MeterProvider;
+    use opentelemetry_sdk::metrics::data::{AggregatedMetrics, MetricData, ResourceMetrics};
+    use opentelemetry_sdk::metrics::{InMemoryMetricExporter, PeriodicReader, SdkMeterProvider};
+
+    use super::{
+        Metrics, OperatorObservability, ReconcileGuard, SERVICE_NAME, livez, otel_metrics_enabled,
+        readyz,
+    };
+
+    fn test_observability() -> (
+        OperatorObservability,
+        SdkMeterProvider,
+        InMemoryMetricExporter,
+    ) {
+        let exporter = InMemoryMetricExporter::default();
+        let provider = SdkMeterProvider::builder()
+            .with_reader(PeriodicReader::builder(exporter.clone()).build())
+            .build();
+        let meter = provider.meter(SERVICE_NAME);
+        let observability = OperatorObservability {
+            ready: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            metrics: Some(Arc::new(Metrics::new(provider.clone(), meter))),
+        };
+
+        (observability, provider, exporter)
+    }
+
+    fn metric_exists(metrics: &[ResourceMetrics], name: &str) -> bool {
+        metrics.iter().any(|resource_metrics| {
+            resource_metrics
+                .scope_metrics()
+                .flat_map(|scope_metrics| scope_metrics.metrics())
+                .any(|metric| metric.name() == name)
+        })
+    }
+
+    fn u64_sum_value(metrics: &[ResourceMetrics], name: &str) -> Option<u64> {
+        metrics
+            .iter()
+            .flat_map(|resource_metrics| resource_metrics.scope_metrics())
+            .flat_map(|scope_metrics| scope_metrics.metrics())
+            .find(|metric| metric.name() == name)
+            .and_then(|metric| match metric.data() {
+                AggregatedMetrics::U64(MetricData::Sum(sum)) => sum
+                    .data_points()
+                    .next()
+                    .map(|data_point| data_point.value()),
+                _ => None,
+            })
+    }
+
+    fn i64_sum_value(metrics: &[ResourceMetrics], name: &str) -> Option<i64> {
+        metrics
+            .iter()
+            .flat_map(|resource_metrics| resource_metrics.scope_metrics())
+            .flat_map(|scope_metrics| scope_metrics.metrics())
+            .find(|metric| metric.name() == name)
+            .and_then(|metric| match metric.data() {
+                AggregatedMetrics::I64(MetricData::Sum(sum)) => sum
+                    .data_points()
+                    .next()
+                    .map(|data_point| data_point.value()),
+                _ => None,
+            })
+    }
 
     #[test]
     fn otel_metrics_stay_disabled_without_endpoint() {
@@ -269,5 +338,55 @@ mod tests {
         unsafe {
             std::env::remove_var("OTEL_EXPORTER_OTLP_ENDPOINT");
         }
+    }
+
+    #[tokio::test]
+    async fn health_endpoints_reflect_readiness() {
+        let (observability, _provider, _exporter) = test_observability();
+
+        assert_eq!(livez().await, "ok");
+
+        let not_ready = readyz(State(observability.clone())).await.into_response();
+        assert_eq!(not_ready.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+        observability.mark_ready();
+        let ready = readyz(State(observability)).await.into_response();
+        assert_eq!(ready.status(), StatusCode::OK);
+    }
+
+    #[test]
+    fn metrics_are_recorded_and_flushed() {
+        let (observability, provider, exporter) = test_observability();
+
+        let guard: ReconcileGuard = observability.start_reconcile();
+        observability.record_policy_conflict();
+        observability.record_invalid_spec();
+        observability.record_database_connection_failure();
+        observability.record_apply_result("success");
+        observability.record_apply_statements(4);
+        guard.record_result("conflict", "ConflictingPolicy");
+
+        provider.force_flush().expect("flush should succeed");
+
+        let metrics = exporter
+            .get_finished_metrics()
+            .expect("metrics should be exported");
+
+        assert!(metric_exists(&metrics, "pgroles.reconcile.total"));
+        assert!(metric_exists(&metrics, "pgroles.reconcile.duration"));
+        assert_eq!(u64_sum_value(&metrics, "pgroles.policy.conflicts"), Some(1));
+        assert_eq!(
+            u64_sum_value(&metrics, "pgroles.invalid_spec.total"),
+            Some(1)
+        );
+        assert_eq!(
+            u64_sum_value(&metrics, "pgroles.database.connection_failures"),
+            Some(1)
+        );
+        assert_eq!(u64_sum_value(&metrics, "pgroles.apply.statements"), Some(4));
+        assert_eq!(
+            i64_sum_value(&metrics, "pgroles.reconcile.inflight"),
+            Some(0)
+        );
     }
 }

@@ -45,7 +45,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 futures = "0.3"
 axum = "0.8"
 opentelemetry = { version = "0.31", features = ["metrics"] }
-opentelemetry_sdk = { version = "0.31", features = ["metrics", "rt-tokio"] }
+opentelemetry_sdk = { version = "0.31", features = ["metrics", "rt-tokio", "testing"] }
 opentelemetry-otlp = { version = "0.31", features = ["metrics", "grpc-tonic"] }
 
 # Kubernetes
