@@ -13,6 +13,7 @@ permissions:
   contents: write
   packages: write
   id-token: write
+  attestations: write
 
 jobs:
   # ---------------------------------------------------------------------------
@@ -59,6 +60,7 @@ jobs:
       - uses: docker/setup-buildx-action@v4
 
       - name: Build and push
+        id: build-and-push
         uses: docker/build-push-action@v6
         with:
           context: .
@@ -68,6 +70,27 @@ jobs:
           platforms: linux/amd64,linux/arm64
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@v4
+
+      - name: Sign image with cosign
+        env:
+          TAGS: ${{ steps.meta.outputs.tags }}
+          DIGEST: ${{ steps.build-and-push.outputs.digest }}
+        run: |
+          images=""
+          for tag in ${TAGS}; do
+            images+="${tag}@${DIGEST} "
+          done
+          cosign sign --yes ${images}
+
+      - name: Attest build provenance
+        uses: actions/attest@v4
+        with:
+          subject-name: ${{ env.IMAGE_REGISTRY }}/${{ env.IMAGE_REPOSITORY }}/${{ env.IMAGE_NAME }}
+          subject-digest: ${{ steps.build-and-push.outputs.digest }}
+          push-to-registry: true
 
   docker-cli:
     name: Docker — CLI
@@ -110,6 +133,7 @@ jobs:
       - uses: docker/setup-buildx-action@v4
 
       - name: Build and push
+        id: build-and-push
         uses: docker/build-push-action@v6
         with:
           context: .
@@ -119,6 +143,27 @@ jobs:
           platforms: linux/amd64,linux/arm64
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@v4
+
+      - name: Sign image with cosign
+        env:
+          TAGS: ${{ steps.meta.outputs.tags }}
+          DIGEST: ${{ steps.build-and-push.outputs.digest }}
+        run: |
+          images=""
+          for tag in ${TAGS}; do
+            images+="${tag}@${DIGEST} "
+          done
+          cosign sign --yes ${images}
+
+      - name: Attest build provenance
+        uses: actions/attest@v4
+        with:
+          subject-name: ${{ env.IMAGE_REGISTRY }}/${{ env.IMAGE_REPOSITORY }}/${{ env.IMAGE_NAME }}
+          subject-digest: ${{ steps.build-and-push.outputs.digest }}
+          push-to-registry: true
 
   # ---------------------------------------------------------------------------
   # Cross-compile CLI binaries for GitHub Releases
@@ -183,7 +228,7 @@ jobs:
 
       - name: Install cross (Linux aarch64)
         if: matrix.target == 'aarch64-unknown-linux-musl'
-        run: cargo install cross --git https://github.com/cross-rs/cross
+        run: cargo install cross --git https://github.com/cross-rs/cross --tag v0.2.5 --locked
 
       - name: Build (native)
         if: matrix.target != 'aarch64-unknown-linux-musl'

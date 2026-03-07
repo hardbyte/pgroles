@@ -6,7 +6,7 @@
 # ---------------------------------------------------------------------------
 # Stage 1: Shared build base
 # ---------------------------------------------------------------------------
-FROM rust:1.89-alpine@sha256:4b800f2e72e04be908e5f634c504c741bd943b763d1d8ad7b096cc340e1b5b46 AS base
+FROM rust:1.94-alpine@sha256:ef7b340d4201444fa2757dfddfd4c03be9d2bde468de7b7a68b0e9fabb794334 AS base
 
 RUN apk add --no-cache musl-dev openssl-dev openssl-libs-static pkgconf
 
