@@ -3,22 +3,34 @@
 //! Uses `pg_try_advisory_lock` / `pg_advisory_unlock` to prevent concurrent
 //! inspect/diff/apply cycles against the same database, even when multiple
 //! operator replicas are running.
+//!
+//! Session-level advisory locks are bound to the connection that acquired them,
+//! so this module checks out a dedicated [`PoolConnection`] and holds it for
+//! the lifetime of the lock. Both acquire and release execute on the same
+//! underlying database session.
 
-use sqlx::PgPool;
+use sqlx::pool::PoolConnection;
+use sqlx::{PgPool, Postgres};
 
 /// A held advisory lock that must be explicitly released.
-#[derive(Debug)]
+///
+/// Holds a dedicated [`PoolConnection`] so that the lock acquire and release
+/// always run on the same PostgreSQL session (advisory locks are
+/// session-scoped).
 pub struct AdvisoryLock {
     key: i64,
-    pool: PgPool,
+    conn: PoolConnection<Postgres>,
 }
 
 impl AdvisoryLock {
     /// Release the advisory lock. Logs a warning on failure.
-    pub async fn release(self) {
+    ///
+    /// The unlock runs on the same connection that acquired the lock, ensuring
+    /// `pg_advisory_unlock` targets the correct session.
+    pub async fn release(mut self) {
         match sqlx::query_scalar::<_, bool>("SELECT pg_advisory_unlock($1)")
             .bind(self.key)
-            .fetch_one(&self.pool)
+            .fetch_one(&mut *self.conn)
             .await
         {
             Ok(true) => {
@@ -34,10 +46,16 @@ impl AdvisoryLock {
                 tracing::warn!(key = self.key, %err, "failed to release advisory lock");
             }
         }
+        // `self.conn` is returned to the pool on drop.
     }
 }
 
 /// Attempt to acquire a session-level advisory lock for the given database identity.
+///
+/// Checks out a dedicated connection from the pool and executes
+/// `pg_try_advisory_lock` on it. If the lock is acquired, the connection is
+/// kept inside the returned [`AdvisoryLock`] so that both acquire and release
+/// run on the same session.
 ///
 /// Returns `Ok(Some(AdvisoryLock))` if the lock was acquired, `Ok(None)` if it
 /// is already held by another session, or `Err` on query failure.
@@ -46,23 +64,23 @@ pub async fn try_acquire(
     database_identity: &str,
 ) -> Result<Option<AdvisoryLock>, sqlx::Error> {
     let key = advisory_lock_key(database_identity);
+
+    let mut conn = pool.acquire().await?;
     let acquired: bool = sqlx::query_scalar("SELECT pg_try_advisory_lock($1)")
         .bind(key)
-        .fetch_one(pool)
+        .fetch_one(&mut *conn)
         .await?;
 
     if acquired {
         tracing::info!(key, database_identity, "acquired advisory lock");
-        Ok(Some(AdvisoryLock {
-            key,
-            pool: pool.clone(),
-        }))
+        Ok(Some(AdvisoryLock { key, conn }))
     } else {
         tracing::info!(
             key,
             database_identity,
             "advisory lock contention — another session holds the lock"
         );
+        // `conn` is returned to the pool on drop — no lock was acquired.
         Ok(None)
     }
 }

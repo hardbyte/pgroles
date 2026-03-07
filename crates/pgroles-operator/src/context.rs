@@ -30,16 +30,35 @@ impl Drop for DatabaseLockGuard {
             tracing::debug!(database = %self.key, "released in-memory database lock");
         } else {
             // Spawn a task to clean up if the mutex is currently held.
+            // Use Handle::try_current() so we don't panic when dropped
+            // outside an active Tokio runtime (e.g. during shutdown).
             let key = self.key.clone();
             let locks = Arc::clone(&self.locks);
-            tokio::spawn(async move {
-                locks.lock().await.remove(&key);
-                tracing::debug!(database = %key, "released in-memory database lock (deferred)");
-            });
-            tracing::debug!(
-                database = %self.key,
-                "deferred in-memory database lock release to background task"
-            );
+            if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                handle.spawn(async move {
+                    locks.lock().await.remove(&key);
+                    tracing::debug!(database = %key, "released in-memory database lock (deferred)");
+                });
+                tracing::debug!(
+                    database = %self.key,
+                    "deferred in-memory database lock release to background task"
+                );
+            } else {
+                // No runtime available — fall back to synchronous cleanup
+                // via blocking_lock so the entry is still removed.
+                if let Ok(mut map) = self.locks.try_lock() {
+                    map.remove(&key);
+                    tracing::debug!(
+                        database = %key,
+                        "released in-memory database lock (fallback sync)"
+                    );
+                } else {
+                    tracing::warn!(
+                        database = %key,
+                        "could not release in-memory database lock — no runtime and mutex contended"
+                    );
+                }
+            }
         }
     }
 }
@@ -325,5 +344,130 @@ mod tests {
                 locks: Arc::clone(&self.database_locks),
             })
         }
+    }
+
+    #[tokio::test]
+    async fn try_lock_database_high_concurrency_same_db() {
+        // Spawn many tasks all racing to lock the same database.
+        let locks: Arc<Mutex<HashMap<String, ()>>> = Arc::new(Mutex::new(HashMap::new()));
+        let concurrency = 50;
+        let acquired_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let barrier = Arc::new(tokio::sync::Barrier::new(concurrency));
+
+        let mut handles = Vec::with_capacity(concurrency);
+        for _ in 0..concurrency {
+            let locks_clone = Arc::clone(&locks);
+            let count = Arc::clone(&acquired_count);
+            let bar = Arc::clone(&barrier);
+            handles.push(tokio::spawn(async move {
+                // Synchronize start so all tasks race at the same instant.
+                bar.wait().await;
+                let ctx = OperatorContextLockHelper {
+                    database_locks: locks_clone,
+                };
+                let guard = ctx.try_lock("contested-db").await;
+                if guard.is_some() {
+                    count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    // Hold lock briefly to let other tasks observe contention.
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+            }));
+        }
+
+        for h in handles {
+            h.await.unwrap();
+        }
+
+        // Exactly one task should have acquired the lock.
+        let total = acquired_count.load(std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(
+            total, 1,
+            "exactly one of {concurrency} concurrent tasks should acquire the lock, got {total}"
+        );
+    }
+
+    #[tokio::test]
+    async fn try_lock_database_high_concurrency_different_dbs() {
+        // Many tasks each locking a different database — all should succeed.
+        let locks: Arc<Mutex<HashMap<String, ()>>> = Arc::new(Mutex::new(HashMap::new()));
+        let concurrency = 50;
+        let acquired_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let barrier = Arc::new(tokio::sync::Barrier::new(concurrency));
+
+        let mut handles = Vec::with_capacity(concurrency);
+        for i in 0..concurrency {
+            let locks_clone = Arc::clone(&locks);
+            let count = Arc::clone(&acquired_count);
+            let bar = Arc::clone(&barrier);
+            handles.push(tokio::spawn(async move {
+                bar.wait().await;
+                let ctx = OperatorContextLockHelper {
+                    database_locks: locks_clone,
+                };
+                let db_name = format!("db-{i}");
+                let guard = ctx.try_lock(&db_name).await;
+                if guard.is_some() {
+                    count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                }
+            }));
+        }
+
+        for h in handles {
+            h.await.unwrap();
+        }
+
+        let total = acquired_count.load(std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(
+            total, concurrency,
+            "all {concurrency} tasks locking different dbs should succeed, got {total}"
+        );
+    }
+
+    #[tokio::test]
+    async fn try_lock_database_acquire_release_cycle_under_contention() {
+        // Repeatedly acquire and release the same database lock from many tasks.
+        // Each task attempts the lock in a loop until it succeeds, simulating
+        // the requeue-after-contention pattern used in the reconciler.
+        let locks: Arc<Mutex<HashMap<String, ()>>> = Arc::new(Mutex::new(HashMap::new()));
+        let concurrency = 20;
+        let success_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let barrier = Arc::new(tokio::sync::Barrier::new(concurrency));
+
+        let mut handles = Vec::with_capacity(concurrency);
+        for _ in 0..concurrency {
+            let locks_clone = Arc::clone(&locks);
+            let count = Arc::clone(&success_count);
+            let bar = Arc::clone(&barrier);
+            handles.push(tokio::spawn(async move {
+                bar.wait().await;
+                // Retry up to 100 times with a small sleep between attempts,
+                // simulating the jittered requeue pattern.
+                for _ in 0..100 {
+                    let ctx = OperatorContextLockHelper {
+                        database_locks: Arc::clone(&locks_clone),
+                    };
+                    if let Some(_guard) = ctx.try_lock("shared-db").await {
+                        count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        // Brief simulated work, then guard drops (releasing lock).
+                        tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+                        return;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+                }
+                // Should not reach here in practice — fail the test if we do.
+                panic!("task failed to acquire lock after 100 retries");
+            }));
+        }
+
+        for h in handles {
+            h.await.unwrap();
+        }
+
+        let total = success_count.load(std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(
+            total, concurrency,
+            "all {concurrency} tasks should eventually acquire the lock"
+        );
     }
 }

@@ -161,6 +161,16 @@ pub fn error_policy(
 
 /// Compute a requeue delay with jitter for lock contention back-off.
 fn requeue_with_jitter() -> Action {
+    let delay = jitter_delay();
+    tracing::debug!(delay_secs = delay.as_secs(), "requeue with jitter");
+    Action::requeue(delay)
+}
+
+/// Compute a jittered delay for lock contention back-off.
+///
+/// Returns a [`Duration`] in the range
+/// `[LOCK_CONTENTION_BASE_SECS, LOCK_CONTENTION_BASE_SECS + LOCK_CONTENTION_JITTER_SECS]`.
+fn jitter_delay() -> Duration {
     // Simple jitter: base + pseudo-random portion of the jitter window.
     // We combine subsecond nanos with a hash of the thread ID for better
     // entropy when multiple reconciles hit contention simultaneously.
@@ -175,9 +185,7 @@ fn requeue_with_jitter() -> Action {
         hasher.finish() as u32
     };
     let jitter_secs = ((nanos ^ thread_entropy) as u64) % (LOCK_CONTENTION_JITTER_SECS + 1);
-    let delay = Duration::from_secs(LOCK_CONTENTION_BASE_SECS + jitter_secs);
-    tracing::debug!(delay_secs = delay.as_secs(), "requeue with jitter");
-    Action::requeue(delay)
+    Duration::from_secs(LOCK_CONTENTION_BASE_SECS + jitter_secs)
 }
 
 /// Apply reconciliation — the main "ensure desired state" logic.
@@ -209,6 +217,12 @@ async fn reconcile_apply(
 
     match reconcile_apply_inner(resource, ctx, &identity).await {
         Ok(action) => Ok(action),
+        Err(ReconcileError::LockContention(db, reason)) => {
+            // Lock contention is expected during normal multi-replica operation.
+            // Re-raise without setting Degraded status to avoid false alarms.
+            tracing::info!(database = %db, %reason, "lock contention — will requeue");
+            Err(ReconcileError::LockContention(db, reason))
+        }
         Err(err) => {
             let error_message = err.to_string();
             let error_reason = err.reason();
@@ -924,10 +938,21 @@ mod tests {
 
     #[test]
     fn requeue_with_jitter_produces_bounded_delay() {
-        let action = requeue_with_jitter();
-        // We can't inspect the Duration inside Action directly, but we can
-        // verify it doesn't panic and returns a valid action.
-        let _ = format!("{action:?}");
+        // Run multiple times to exercise the jitter distribution.
+        let base = LOCK_CONTENTION_BASE_SECS;
+        let max = LOCK_CONTENTION_BASE_SECS + LOCK_CONTENTION_JITTER_SECS;
+        for _ in 0..20 {
+            let delay = jitter_delay();
+            let secs = delay.as_secs();
+            assert!(
+                secs >= base,
+                "jitter delay {secs}s should be at least base {base}s",
+            );
+            assert!(
+                secs <= max,
+                "jitter delay {secs}s should not exceed base+jitter {max}s",
+            );
+        }
     }
 
     #[test]
