@@ -752,6 +752,385 @@ mod tests {
     }
 
     #[test]
+    fn ready_condition_true_has_expected_shape() {
+        let cond = ready_condition(true, "Reconciled", "All changes applied");
+        assert_eq!(cond.condition_type, "Ready");
+        assert_eq!(cond.status, "True");
+        assert_eq!(cond.reason.as_deref(), Some("Reconciled"));
+        assert_eq!(cond.message.as_deref(), Some("All changes applied"));
+        assert!(cond.last_transition_time.is_some());
+    }
+
+    #[test]
+    fn ready_condition_false_has_expected_shape() {
+        let cond = ready_condition(false, "InvalidSpec", "bad manifest");
+        assert_eq!(cond.condition_type, "Ready");
+        assert_eq!(cond.status, "False");
+        assert_eq!(cond.reason.as_deref(), Some("InvalidSpec"));
+        assert_eq!(cond.message.as_deref(), Some("bad manifest"));
+    }
+
+    #[test]
+    fn degraded_condition_has_expected_shape() {
+        let cond = degraded_condition("InvalidSpec", "expansion failed");
+        assert_eq!(cond.condition_type, "Degraded");
+        assert_eq!(cond.status, "True");
+        assert_eq!(cond.reason.as_deref(), Some("InvalidSpec"));
+        assert_eq!(cond.message.as_deref(), Some("expansion failed"));
+        assert!(cond.last_transition_time.is_some());
+    }
+
+    #[test]
+    fn reconciling_condition_has_expected_shape() {
+        let cond = reconciling_condition("Reconciliation in progress");
+        assert_eq!(cond.condition_type, "Reconciling");
+        assert_eq!(cond.status, "True");
+        assert_eq!(cond.reason.as_deref(), Some("Reconciling"));
+        assert_eq!(cond.message.as_deref(), Some("Reconciliation in progress"));
+        assert!(cond.last_transition_time.is_some());
+    }
+
+    #[test]
+    fn conflict_condition_has_expected_shape() {
+        let cond = conflict_condition("ConflictingPolicy", "overlaps with ns/other");
+        assert_eq!(cond.condition_type, "Conflict");
+        assert_eq!(cond.status, "True");
+        assert_eq!(cond.reason.as_deref(), Some("ConflictingPolicy"));
+        assert_eq!(cond.message.as_deref(), Some("overlaps with ns/other"));
+        assert!(cond.last_transition_time.is_some());
+    }
+
+    #[test]
+    fn ownership_claims_no_overlap() {
+        let mut left = OwnershipClaims::default();
+        left.roles.insert("analytics".to_string());
+        left.schemas.insert("reporting".to_string());
+
+        let mut right = OwnershipClaims::default();
+        right.roles.insert("billing".to_string());
+        right.schemas.insert("payments".to_string());
+
+        assert!(!left.overlaps(&right));
+        let summary = left.overlap_summary(&right);
+        assert!(summary.is_empty());
+    }
+
+    #[test]
+    fn ownership_claims_partial_role_overlap() {
+        let mut left = OwnershipClaims::default();
+        left.roles.insert("analytics".to_string());
+        left.roles.insert("reporting-viewer".to_string());
+
+        let mut right = OwnershipClaims::default();
+        right.roles.insert("analytics".to_string());
+        right.roles.insert("other-role".to_string());
+
+        assert!(left.overlaps(&right));
+        let summary = left.overlap_summary(&right);
+        assert!(summary.contains("roles: analytics"));
+        assert!(!summary.contains("schemas"));
+    }
+
+    #[test]
+    fn ownership_claims_empty_is_disjoint() {
+        let left = OwnershipClaims::default();
+        let right = OwnershipClaims::default();
+        assert!(!left.overlaps(&right));
+    }
+
+    #[test]
+    fn database_identity_equality() {
+        let a = DatabaseIdentity::new("prod", "db-creds", "DATABASE_URL");
+        let b = DatabaseIdentity::new("prod", "db-creds", "DATABASE_URL");
+        let c = DatabaseIdentity::new("staging", "db-creds", "DATABASE_URL");
+        assert_eq!(a, b);
+        assert_ne!(a, c);
+    }
+
+    #[test]
+    fn database_identity_different_key() {
+        let a = DatabaseIdentity::new("prod", "db-creds", "DATABASE_URL");
+        let b = DatabaseIdentity::new("prod", "db-creds", "CUSTOM_URL");
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn status_default_has_empty_conditions() {
+        let status = PostgresPolicyStatus::default();
+        assert!(status.conditions.is_empty());
+        assert!(status.observed_generation.is_none());
+        assert!(status.last_attempted_generation.is_none());
+        assert!(status.last_successful_reconcile_time.is_none());
+        assert!(status.change_summary.is_none());
+        assert!(status.managed_database_identity.is_none());
+        assert!(status.owned_roles.is_empty());
+        assert!(status.owned_schemas.is_empty());
+        assert!(status.last_error.is_none());
+    }
+
+    #[test]
+    fn status_degraded_workflow_sets_ready_false_and_degraded_true() {
+        let mut status = PostgresPolicyStatus::default();
+
+        // Simulate a failed reconciliation: Ready=False + Degraded=True
+        status.set_condition(ready_condition(false, "InvalidSpec", "bad manifest"));
+        status.set_condition(degraded_condition("InvalidSpec", "bad manifest"));
+        status
+            .conditions
+            .retain(|c| c.condition_type != "Reconciling" && c.condition_type != "Paused");
+        status.change_summary = None;
+        status.last_error = Some("bad manifest".to_string());
+
+        // Verify Ready=False
+        let ready = status
+            .conditions
+            .iter()
+            .find(|c| c.condition_type == "Ready")
+            .expect("should have Ready condition");
+        assert_eq!(ready.status, "False");
+        assert_eq!(ready.reason.as_deref(), Some("InvalidSpec"));
+
+        // Verify Degraded=True
+        let degraded = status
+            .conditions
+            .iter()
+            .find(|c| c.condition_type == "Degraded")
+            .expect("should have Degraded condition");
+        assert_eq!(degraded.status, "True");
+        assert_eq!(degraded.reason.as_deref(), Some("InvalidSpec"));
+
+        // Verify last_error is set
+        assert_eq!(status.last_error.as_deref(), Some("bad manifest"));
+    }
+
+    #[test]
+    fn status_conflict_workflow() {
+        let mut status = PostgresPolicyStatus::default();
+
+        // Simulate a conflict
+        let msg = "policy ownership overlaps with staging/other on database target prod/db/URL";
+        status.set_condition(ready_condition(false, "ConflictingPolicy", msg));
+        status.set_condition(conflict_condition("ConflictingPolicy", msg));
+        status.set_condition(degraded_condition("ConflictingPolicy", msg));
+        status
+            .conditions
+            .retain(|c| c.condition_type != "Reconciling");
+        status.last_error = Some(msg.to_string());
+
+        // Verify Conflict=True
+        let conflict = status
+            .conditions
+            .iter()
+            .find(|c| c.condition_type == "Conflict")
+            .expect("should have Conflict condition");
+        assert_eq!(conflict.status, "True");
+        assert_eq!(conflict.reason.as_deref(), Some("ConflictingPolicy"));
+
+        // Verify Ready=False
+        let ready = status
+            .conditions
+            .iter()
+            .find(|c| c.condition_type == "Ready")
+            .expect("should have Ready condition");
+        assert_eq!(ready.status, "False");
+
+        // Verify Degraded=True
+        let degraded = status
+            .conditions
+            .iter()
+            .find(|c| c.condition_type == "Degraded")
+            .expect("should have Degraded condition");
+        assert_eq!(degraded.status, "True");
+    }
+
+    #[test]
+    fn status_successful_reconcile_records_generation_and_time() {
+        let mut status = PostgresPolicyStatus::default();
+        let generation = Some(3_i64);
+        let summary = ChangeSummary {
+            roles_created: 2,
+            total: 2,
+            ..Default::default()
+        };
+
+        // Simulate a successful reconciliation
+        status.set_condition(ready_condition(true, "Reconciled", "All changes applied"));
+        status.conditions.retain(|c| {
+            c.condition_type != "Reconciling"
+                && c.condition_type != "Degraded"
+                && c.condition_type != "Conflict"
+                && c.condition_type != "Paused"
+        });
+        status.observed_generation = generation;
+        status.last_attempted_generation = generation;
+        status.last_successful_reconcile_time = Some(now_rfc3339());
+        status.last_reconcile_time = Some(now_rfc3339());
+        status.change_summary = Some(summary);
+        status.last_error = None;
+
+        // Verify Ready=True
+        let ready = status
+            .conditions
+            .iter()
+            .find(|c| c.condition_type == "Ready")
+            .expect("should have Ready condition");
+        assert_eq!(ready.status, "True");
+        assert_eq!(ready.reason.as_deref(), Some("Reconciled"));
+
+        // Verify generation recorded
+        assert_eq!(status.observed_generation, Some(3));
+        assert_eq!(status.last_attempted_generation, Some(3));
+
+        // Verify timestamps set
+        assert!(status.last_successful_reconcile_time.is_some());
+        assert!(status.last_reconcile_time.is_some());
+
+        // Verify summary
+        let summary = status.change_summary.as_ref().unwrap();
+        assert_eq!(summary.roles_created, 2);
+        assert_eq!(summary.total, 2);
+
+        // Verify no error
+        assert!(status.last_error.is_none());
+
+        // Verify no Degraded/Conflict/Paused/Reconciling conditions
+        assert!(
+            status
+                .conditions
+                .iter()
+                .all(|c| c.condition_type != "Degraded"
+                    && c.condition_type != "Conflict"
+                    && c.condition_type != "Paused"
+                    && c.condition_type != "Reconciling")
+        );
+    }
+
+    #[test]
+    fn status_suspended_workflow() {
+        let mut status = PostgresPolicyStatus::default();
+        let generation = Some(2_i64);
+
+        // Simulate a suspended reconciliation
+        status.set_condition(paused_condition("Reconciliation suspended by spec"));
+        status.set_condition(ready_condition(
+            false,
+            "Suspended",
+            "Reconciliation suspended by spec",
+        ));
+        status
+            .conditions
+            .retain(|c| c.condition_type != "Reconciling");
+        status.last_attempted_generation = generation;
+        status.last_error = None;
+
+        // Verify Paused=True
+        let paused = status
+            .conditions
+            .iter()
+            .find(|c| c.condition_type == "Paused")
+            .expect("should have Paused condition");
+        assert_eq!(paused.status, "True");
+
+        // Verify Ready=False with Suspended reason
+        let ready = status
+            .conditions
+            .iter()
+            .find(|c| c.condition_type == "Ready")
+            .expect("should have Ready condition");
+        assert_eq!(ready.status, "False");
+        assert_eq!(ready.reason.as_deref(), Some("Suspended"));
+
+        // Verify no Reconciling condition
+        assert!(
+            !status
+                .conditions
+                .iter()
+                .any(|c| c.condition_type == "Reconciling")
+        );
+    }
+
+    #[test]
+    fn status_transitions_from_degraded_to_ready() {
+        let mut status = PostgresPolicyStatus::default();
+
+        // First, set degraded state
+        status.set_condition(ready_condition(false, "InvalidSpec", "error"));
+        status.set_condition(degraded_condition("InvalidSpec", "error"));
+        status.last_error = Some("error".to_string());
+
+        assert_eq!(status.conditions.len(), 2);
+
+        // Then, resolve to ready
+        status.set_condition(ready_condition(true, "Reconciled", "All changes applied"));
+        status.conditions.retain(|c| {
+            c.condition_type != "Reconciling"
+                && c.condition_type != "Degraded"
+                && c.condition_type != "Conflict"
+                && c.condition_type != "Paused"
+        });
+        status.last_error = None;
+
+        // Verify Ready=True
+        let ready = status
+            .conditions
+            .iter()
+            .find(|c| c.condition_type == "Ready")
+            .expect("should have Ready condition");
+        assert_eq!(ready.status, "True");
+
+        // Verify Degraded removed
+        assert!(
+            !status
+                .conditions
+                .iter()
+                .any(|c| c.condition_type == "Degraded")
+        );
+
+        // Verify only Ready condition remains
+        assert_eq!(status.conditions.len(), 1);
+
+        // Verify error cleared
+        assert!(status.last_error.is_none());
+    }
+
+    #[test]
+    fn change_summary_default_is_all_zero() {
+        let summary = ChangeSummary::default();
+        assert_eq!(summary.roles_created, 0);
+        assert_eq!(summary.roles_altered, 0);
+        assert_eq!(summary.roles_dropped, 0);
+        assert_eq!(summary.sessions_terminated, 0);
+        assert_eq!(summary.grants_added, 0);
+        assert_eq!(summary.grants_revoked, 0);
+        assert_eq!(summary.default_privileges_set, 0);
+        assert_eq!(summary.default_privileges_revoked, 0);
+        assert_eq!(summary.members_added, 0);
+        assert_eq!(summary.members_removed, 0);
+        assert_eq!(summary.total, 0);
+    }
+
+    #[test]
+    fn status_serializes_to_json() {
+        let mut status = PostgresPolicyStatus::default();
+        status.set_condition(ready_condition(true, "Reconciled", "done"));
+        status.observed_generation = Some(5);
+        status.managed_database_identity = Some("ns/secret/key".to_string());
+        status.owned_roles = vec!["role-a".to_string(), "role-b".to_string()];
+        status.owned_schemas = vec!["public".to_string()];
+        status.change_summary = Some(ChangeSummary {
+            roles_created: 1,
+            total: 1,
+            ..Default::default()
+        });
+
+        let json = serde_json::to_string(&status).expect("should serialize");
+        assert!(json.contains("\"Reconciled\""));
+        assert!(json.contains("\"observed_generation\":5"));
+        assert!(json.contains("\"role-a\""));
+        assert!(json.contains("\"ns/secret/key\""));
+    }
+
+    #[test]
     fn crd_spec_deserializes_from_yaml() {
         let yaml = r#"
 connection:
