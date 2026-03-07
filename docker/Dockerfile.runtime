@@ -1,0 +1,40 @@
+# syntax=docker/dockerfile:1.7
+
+ARG SELECT_IMAGE=alpine:3.22.2@sha256:4b7ce07002c69e8f3d704a9c5d6fd3053be500b7f1c69fc0d80990c2ad8dd412
+ARG RUNTIME_IMAGE=cgr.dev/chainguard/static@sha256:d6a97eb401cbc7c6d48be76ad81d7899b94303580859d396b52b67bc84ea7345
+
+FROM ${SELECT_IMAGE} AS select
+
+ARG TARGETARCH
+WORKDIR /out
+
+COPY dist/pgroles-x86_64-unknown-linux-musl /tmp/pgroles-amd64
+COPY dist/pgroles-aarch64-unknown-linux-musl /tmp/pgroles-arm64
+COPY dist/pgroles-operator-x86_64-unknown-linux-musl /tmp/pgroles-operator-amd64
+COPY dist/pgroles-operator-aarch64-unknown-linux-musl /tmp/pgroles-operator-arm64
+
+RUN case "${TARGETARCH}" in \
+      amd64) \
+        cp /tmp/pgroles-amd64 /out/pgroles && \
+        cp /tmp/pgroles-operator-amd64 /out/pgroles-operator ;; \
+      arm64) \
+        cp /tmp/pgroles-arm64 /out/pgroles && \
+        cp /tmp/pgroles-operator-arm64 /out/pgroles-operator ;; \
+      *) \
+        echo "unsupported TARGETARCH=${TARGETARCH}" >&2; exit 1 ;; \
+    esac && \
+    chmod 755 /out/pgroles /out/pgroles-operator
+
+FROM ${RUNTIME_IMAGE} AS cli-runtime
+
+COPY --from=select /out/pgroles /usr/local/bin/pgroles
+
+USER 65534
+ENTRYPOINT ["pgroles"]
+
+FROM ${RUNTIME_IMAGE} AS operator-runtime
+
+COPY --from=select /out/pgroles-operator /usr/local/bin/pgroles-operator
+
+USER 65534
+ENTRYPOINT ["pgroles-operator"]

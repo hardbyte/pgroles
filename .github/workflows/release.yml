@@ -20,6 +20,7 @@ jobs:
   # ---------------------------------------------------------------------------
   docker-operator:
     name: Docker — Operator
+    needs: [build-binaries]
     runs-on: ubuntu-latest
     env:
       IMAGE_NAME: pgroles-operator
@@ -47,6 +48,13 @@ jobs:
           username: ${{ github.repository_owner }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      - name: Download Linux binary artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: docker-binary-*
+          path: dist
+          merge-multiple: true
+
       - uses: docker/setup-qemu-action@v3
       - uses: docker/setup-buildx-action@v3
 
@@ -54,17 +62,16 @@ jobs:
         uses: docker/build-push-action@v6
         with:
           context: .
-          file: docker/Dockerfile
-          target: operator
+          file: docker/Dockerfile.runtime
+          target: operator-runtime
           push: true
           platforms: linux/amd64,linux/arm64
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
 
   docker-cli:
     name: Docker — CLI
+    needs: [build-binaries]
     runs-on: ubuntu-latest
     env:
       IMAGE_NAME: pgroles
@@ -92,6 +99,13 @@ jobs:
           username: ${{ github.repository_owner }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      - name: Download Linux binary artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: docker-binary-*
+          path: dist
+          merge-multiple: true
+
       - uses: docker/setup-qemu-action@v3
       - uses: docker/setup-buildx-action@v3
 
@@ -99,14 +113,12 @@ jobs:
         uses: docker/build-push-action@v6
         with:
           context: .
-          file: docker/Dockerfile
-          target: cli
+          file: docker/Dockerfile.runtime
+          target: cli-runtime
           push: true
           platforms: linux/amd64,linux/arm64
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
 
   # ---------------------------------------------------------------------------
   # Cross-compile CLI binaries for GitHub Releases
@@ -120,16 +132,40 @@ jobs:
         include:
           - target: x86_64-unknown-linux-musl
             os: ubuntu-latest
-            artifact: pgroles
+            package: pgroles-cli
+            binary: pgroles
+            release_asset: true
+            docker_asset: true
           - target: aarch64-unknown-linux-musl
             os: ubuntu-latest
-            artifact: pgroles
+            package: pgroles-cli
+            binary: pgroles
+            release_asset: true
+            docker_asset: true
           - target: x86_64-apple-darwin
             os: macos-latest
-            artifact: pgroles
+            package: pgroles-cli
+            binary: pgroles
+            release_asset: true
+            docker_asset: false
           - target: aarch64-apple-darwin
             os: macos-latest
-            artifact: pgroles
+            package: pgroles-cli
+            binary: pgroles
+            release_asset: true
+            docker_asset: false
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-latest
+            package: pgroles-operator
+            binary: pgroles-operator
+            release_asset: false
+            docker_asset: true
+          - target: aarch64-unknown-linux-musl
+            os: ubuntu-latest
+            package: pgroles-operator
+            binary: pgroles-operator
+            release_asset: false
+            docker_asset: true
     steps:
       - uses: actions/checkout@v4
 
@@ -151,28 +187,46 @@ jobs:
 
       - name: Build (native)
         if: matrix.target != 'aarch64-unknown-linux-musl'
-        run: cargo build --release --package pgroles-cli --target ${{ matrix.target }}
+        run: cargo build --release --package ${{ matrix.package }} --target ${{ matrix.target }}
 
       - name: Build (cross)
         if: matrix.target == 'aarch64-unknown-linux-musl'
-        run: cross build --release --package pgroles-cli --target ${{ matrix.target }}
+        run: cross build --release --package ${{ matrix.package }} --target ${{ matrix.target }}
 
       - name: Package binary
+        if: matrix.release_asset
         shell: bash
         run: |
           TAG="${GITHUB_REF#refs/tags/}"
           ARCHIVE="pgroles-${TAG}-${{ matrix.target }}"
           mkdir -p "${ARCHIVE}"
-          cp "target/${{ matrix.target }}/release/${{ matrix.artifact }}" "${ARCHIVE}/"
+          cp "target/${{ matrix.target }}/release/${{ matrix.binary }}" "${ARCHIVE}/"
           cp README.md LICENSE* "${ARCHIVE}/" 2>/dev/null || true
           tar czf "${ARCHIVE}.tar.gz" "${ARCHIVE}"
           echo "ARCHIVE=${ARCHIVE}.tar.gz" >> "$GITHUB_ENV"
 
-      - name: Upload artifact
+      - name: Upload release artifact
+        if: matrix.release_asset
         uses: actions/upload-artifact@v4
         with:
           name: binary-${{ matrix.target }}
           path: ${{ env.ARCHIVE }}
+
+      - name: Prepare Docker binary artifact
+        if: matrix.docker_asset
+        shell: bash
+        run: |
+          mkdir -p docker-dist
+          install -Dm755 \
+            "target/${{ matrix.target }}/release/${{ matrix.binary }}" \
+            "docker-dist/${{ matrix.binary }}-${{ matrix.target }}"
+
+      - name: Upload Docker binary artifact
+        if: matrix.docker_asset
+        uses: actions/upload-artifact@v4
+        with:
+          name: docker-binary-${{ matrix.binary }}-${{ matrix.target }}
+          path: docker-dist/${{ matrix.binary }}-${{ matrix.target }}
 
   # ---------------------------------------------------------------------------
   # Create GitHub Release with binaries
@@ -219,6 +273,14 @@ jobs:
 
       - name: Publish pgroles-inspect
         run: cargo publish --package pgroles-inspect --no-verify
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+
+      - name: Wait for crates.io index
+        run: sleep 30
+
+      - name: Publish pgroles-operator
+        run: cargo publish --package pgroles-operator --no-verify
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
 

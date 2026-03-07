@@ -1,10 +1,12 @@
-# Multi-stage build for pgroles binaries.
-# Produces a statically-linked musl binary in a minimal container.
+# syntax=docker/dockerfile:1.7
+
+# Multi-stage build for pgroles binaries from source.
+# Used for local builds and CI paths that build images directly from the repo.
 
 # ---------------------------------------------------------------------------
-# Stage 1: Build
+# Stage 1: Shared build base
 # ---------------------------------------------------------------------------
-FROM rust:1.89-alpine AS builder
+FROM rust:1.89-alpine@sha256:4b800f2e72e04be908e5f634c504c741bd943b763d1d8ad7b096cc340e1b5b46 AS base
 
 RUN apk add --no-cache musl-dev openssl-dev openssl-libs-static pkgconf
 
@@ -31,25 +33,43 @@ RUN mkdir -p crates/pgroles-core/src \
     && mkdir -p crates/pgroles-operator/src/bin \
     && echo "fn main() {}" > crates/pgroles-operator/src/bin/crdgen.rs
 
-# Pre-build dependencies (cached layer).
+# Pre-build dependency graph per binary target.
 ENV SQLX_OFFLINE=true
-RUN cargo build --release --workspace 2>/dev/null || true
 
-# Copy real source.
+FROM base AS deps-cli
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/usr/local/cargo/git \
+    --mount=type=cache,target=/build/target \
+    cargo build --release --package pgroles-cli 2>/dev/null || true
+
+FROM base AS deps-operator
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/usr/local/cargo/git \
+    --mount=type=cache,target=/build/target \
+    cargo build --release --package pgroles-operator 2>/dev/null || true
+
+FROM deps-cli AS builder-cli
 COPY crates/ crates/
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/usr/local/cargo/git \
+    --mount=type=cache,target=/build/target \
+    cargo build --release --package pgroles-cli && \
+    install -Dm755 /build/target/release/pgroles /out/pgroles
 
-# Touch source files so cargo knows to rebuild them.
-RUN find crates -name "*.rs" -exec touch {} +
-
-# Build release binaries.
-RUN cargo build --release --workspace
+FROM deps-operator AS builder-operator
+COPY crates/ crates/
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/usr/local/cargo/git \
+    --mount=type=cache,target=/build/target \
+    cargo build --release --package pgroles-operator && \
+    install -Dm755 /build/target/release/pgroles-operator /out/pgroles-operator
 
 # ---------------------------------------------------------------------------
 # Stage 2: Runtime — CLI
 # ---------------------------------------------------------------------------
-FROM cgr.dev/chainguard/static:latest AS cli
+FROM cgr.dev/chainguard/static@sha256:d6a97eb401cbc7c6d48be76ad81d7899b94303580859d396b52b67bc84ea7345 AS cli
 
-COPY --from=builder /build/target/release/pgroles /usr/local/bin/pgroles
+COPY --from=builder-cli /out/pgroles /usr/local/bin/pgroles
 
 USER 65534
 ENTRYPOINT ["pgroles"]
@@ -57,9 +77,9 @@ ENTRYPOINT ["pgroles"]
 # ---------------------------------------------------------------------------
 # Stage 3: Runtime — Operator
 # ---------------------------------------------------------------------------
-FROM cgr.dev/chainguard/static:latest AS operator
+FROM cgr.dev/chainguard/static@sha256:d6a97eb401cbc7c6d48be76ad81d7899b94303580859d396b52b67bc84ea7345 AS operator
 
-COPY --from=builder /build/target/release/pgroles-operator /usr/local/bin/pgroles-operator
+COPY --from=builder-operator /out/pgroles-operator /usr/local/bin/pgroles-operator
 
 USER 65534
 ENTRYPOINT ["pgroles-operator"]

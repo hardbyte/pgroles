@@ -52,3 +52,8 @@ schemars = "1"
 # Internal crates
 pgroles-core = { path = "crates/pgroles-core", version = "0.1.2" }
 pgroles-inspect = { path = "crates/pgroles-inspect", version = "0.1.2" }
+
+[profile.release]
+strip = "symbols"
+lto = "thin"
+codegen-units = 1
