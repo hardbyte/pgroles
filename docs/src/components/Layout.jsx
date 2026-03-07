@@ -17,6 +17,7 @@ const navigation = [
         links: [
             {title: 'Getting started', href: '/'},
             {title: 'Quick start', href: '/docs/quick-start'},
+            {title: 'pgroles & Terraform', href: '/docs/terraform'},
         ],
     },
     {
