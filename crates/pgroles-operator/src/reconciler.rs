@@ -288,7 +288,9 @@ fn pseudo_random_window(window_secs: u64) -> u64 {
 
 fn retry_class(error: &finalizer::Error<ReconcileError>) -> RetryClass {
     match error {
-        finalizer::Error::ApplyFailed(reconcile_error) => retry_class_for_reconcile_error(reconcile_error),
+        finalizer::Error::ApplyFailed(reconcile_error) => {
+            retry_class_for_reconcile_error(reconcile_error)
+        }
         finalizer::Error::CleanupFailed(_)
         | finalizer::Error::AddFinalizer(_)
         | finalizer::Error::RemoveFinalizer(_)
@@ -389,7 +391,8 @@ async fn reconcile_apply(
         Err(err) => {
             let error_message = err.to_string();
             let error_reason = err.reason();
-            let is_transient_failure = retry_class_for_reconcile_error(&err) == RetryClass::Transient;
+            let is_transient_failure =
+                retry_class_for_reconcile_error(&err) == RetryClass::Transient;
             match error_reason {
                 "DatabaseConnectionFailed" => {
                     ctx.observability.record_database_connection_failure()
