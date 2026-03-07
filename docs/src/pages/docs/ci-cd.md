@@ -5,6 +5,8 @@ description: Use pgroles as a drift gate in your CI/CD pipeline.
 
 pgroles integrates into CI/CD pipelines as a drift gate, a deployment step, or both. {% .lead %}
 
+For platform-specific setup (Cloud SQL Auth Proxy, RDS network access, etc.), see the [Google Cloud SQL](/docs/google-cloud-sql) or [AWS RDS](/docs/aws-rds) guides.
+
 ---
 
 ## Drift detection
@@ -17,9 +19,9 @@ pgroles integrates into CI/CD pipelines as a drift gate, a deployment step, or b
 | `2` | Drift detected — roles, grants, or memberships differ |
 | Other | Command or connectivity failure |
 
-### GitHub Actions
+## GitHub Actions
 
-Run drift detection on every PR to catch unexpected changes:
+### Drift check on PRs
 
 ```yaml
 jobs:
@@ -38,8 +40,6 @@ jobs:
 ```
 
 ### Apply on merge
-
-Apply role changes automatically when manifests are merged to main:
 
 ```yaml
 jobs:
@@ -89,24 +89,9 @@ Post the planned SQL changes as a PR comment for review:
             }
 ```
 
-## Output formats
-
-`pgroles diff` supports multiple output formats for different CI needs:
-
-```shell
-# Raw SQL (default) — human-readable, good for PR comments
-pgroles diff -f pgroles.yaml
-
-# JSON — machine-readable, good for programmatic processing
-pgroles diff -f pgroles.yaml --format json
-
-# Summary — high-level change counts
-pgroles diff -f pgroles.yaml --format summary
-```
-
 ## Docker-based pipelines
 
-If your CI doesn't have Rust/Cargo, use the published Docker image:
+If your CI doesn't have Rust/Cargo, use the published Docker image directly:
 
 ```yaml
 # GitLab CI
@@ -129,22 +114,27 @@ drift-check:
       diff -f /work/pgroles.yaml --exit-code
 ```
 
-## Multiple environments
+## Output formats
 
-Manage staging and production with separate manifests or the same manifest against different databases:
+`pgroles diff` supports multiple output formats:
 
 ```shell
-# Staging
+# Raw SQL (default) — human-readable, good for PR comments
+pgroles diff -f pgroles.yaml
+
+# JSON — machine-readable, good for programmatic processing
+pgroles diff -f pgroles.yaml --format json
+
+# Summary — high-level change counts
+pgroles diff -f pgroles.yaml --format summary
+```
+
+## Multiple environments
+
+Use the same manifest against different databases, or maintain separate manifests:
+
+```shell
+# Same manifest, different targets
 pgroles apply -f pgroles.yaml --database-url "$STAGING_DATABASE_URL"
-
-# Production (same manifest, different database)
 pgroles apply -f pgroles.yaml --database-url "$PROD_DATABASE_URL"
-```
-
-Or use environment-specific manifests if the role structures differ:
-
-```
-manifests/
-  staging.yaml
-  production.yaml
 ```

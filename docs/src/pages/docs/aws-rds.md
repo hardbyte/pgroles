@@ -1,9 +1,11 @@
 ---
 title: AWS RDS & Aurora
-description: Set up pgroles with Amazon RDS or Aurora PostgreSQL — from ECS, Lambda, CI pipelines, or the Kubernetes operator.
+description: Connect pgroles to Amazon RDS or Aurora PostgreSQL — connectivity, secrets, and ECS deployment.
 ---
 
-Run pgroles against Amazon RDS or Aurora PostgreSQL. This guide covers running the CLI from CI, as a scheduled ECS task, or using the Kubernetes operator on EKS. {% .lead %}
+Platform-specific guidance for running pgroles against Amazon RDS or Aurora PostgreSQL. {% .lead %}
+
+For general usage, see the [quick start](/docs/quick-start). For CI pipeline patterns, see [CI/CD integration](/docs/ci-cd). For the Kubernetes operator on EKS, see the [operator docs](/docs/operator).
 
 ---
 
@@ -22,42 +24,23 @@ postgres://postgres:PASSWORD@my-instance.abc123.us-east-1.rds.amazonaws.com:5432
 
 Store this in AWS Secrets Manager or SSM Parameter Store rather than hardcoding it.
 
-## Option 1: From CI (GitHub Actions)
+## Network access
 
-The simplest approach. Run pgroles as part of your deployment pipeline:
+RDS instances are typically in a private VPC. Your pgroles workload needs network access:
 
-```yaml
-jobs:
-  apply-roles:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
+- **ECS / EKS** — run in the same VPC or a peered VPC
+- **CI runners** — use a self-hosted runner in the VPC, AWS VPN/PrivateLink, or SSH tunneling
+- **Public access** — possible but not recommended for production
 
-      - name: Install pgroles
-        run: cargo install pgroles-cli
+## Scheduled ECS task
 
-      - name: Apply roles
-        run: pgroles apply -f pgroles.yaml
-        env:
-          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+Run pgroles on a schedule using an ECS Scheduled Task with Fargate. Build a custom image with your manifest baked in:
+
+```dockerfile
+FROM ghcr.io/hardbyte/pgroles:latest
+COPY pgroles.yaml /etc/pgroles/pgroles.yaml
+ENTRYPOINT ["pgroles", "apply", "-f", "/etc/pgroles/pgroles.yaml"]
 ```
-
-{% callout type="note" title="Network access" %}
-Your CI runner needs network access to the RDS instance. Options include a self-hosted runner in the VPC, an AWS VPN/PrivateLink setup, or making the instance publicly accessible (not recommended for production).
-{% /callout %}
-
-For drift detection as a PR check:
-
-```yaml
-      - name: Check for drift
-        run: pgroles diff -f pgroles.yaml --exit-code
-        env:
-          DATABASE_URL: ${{ secrets.DATABASE_URL }}
-```
-
-## Option 2: Scheduled ECS task
-
-Run pgroles on a schedule using an ECS Scheduled Task with Fargate. No infrastructure to manage.
 
 ### Task definition
 
@@ -71,8 +54,7 @@ Run pgroles on a schedule using an ECS Scheduled Task with Fargate. No infrastru
   "containerDefinitions": [
     {
       "name": "pgroles",
-      "image": "ghcr.io/hardbyte/pgroles:latest",
-      "command": ["apply", "-f", "/etc/pgroles/pgroles.yaml"],
+      "image": "ECR_REPO/pgroles-apply:latest",
       "secrets": [
         {
           "name": "DATABASE_URL",
@@ -91,14 +73,6 @@ Run pgroles on a schedule using an ECS Scheduled Task with Fargate. No infrastru
   ],
   "executionRoleArn": "arn:aws:iam::123456789:role/ecsTaskExecutionRole"
 }
-```
-
-To bake the manifest into the image:
-
-```dockerfile
-FROM ghcr.io/hardbyte/pgroles:latest
-COPY pgroles.yaml /etc/pgroles/pgroles.yaml
-ENTRYPOINT ["pgroles", "apply", "-f", "/etc/pgroles/pgroles.yaml"]
 ```
 
 ### Schedule with EventBridge
@@ -127,28 +101,24 @@ aws events put-targets \
   }]'
 ```
 
-## Option 3: Kubernetes operator on EKS
+## Kubernetes operator on EKS
 
-If you run EKS, deploy the operator via Helm:
+Deploy the operator via Helm and create a Secret with your RDS connection string:
 
 ```shell
 helm install pgroles-operator oci://ghcr.io/hardbyte/charts/pgroles-operator
-```
 
-Create a Secret with the RDS connection string:
-
-```shell
 kubectl create secret generic mydb-credentials \
   --from-literal=DATABASE_URL='postgres://postgres:PASSWORD@my-instance.abc123.us-east-1.rds.amazonaws.com:5432/mydb'
 ```
 
-Then apply a `PostgresPolicy` resource — see the [operator docs](/docs/operator) for the full CRD reference.
+See the [operator docs](/docs/operator) for the full `PostgresPolicy` CRD reference.
 
 {% callout type="note" title="Secrets Manager integration" %}
 For production, use the [AWS Secrets Store CSI Driver](https://docs.aws.amazon.com/secretsmanager/latest/userguide/integrating_csi_driver.html) to sync credentials from Secrets Manager into Kubernetes Secrets, rather than creating them manually.
 {% /callout %}
 
-## RDS IAM authentication
+## IAM database authentication
 
 If your roles use [RDS IAM database authentication](https://docs.aws.amazon.com/AmazonRDS/latest/UserGuide/UsingWithRDS.IAMDBAuth.html), declare the provider in your manifest:
 
