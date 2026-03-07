@@ -152,7 +152,7 @@ async fn reconcile_apply(
                 status.set_condition(degraded_condition(error_reason, &error_message));
                 status
                     .conditions
-                    .retain(|c| c.condition_type != "Reconciling");
+                    .retain(|c| c.condition_type != "Reconciling" && c.condition_type != "Paused");
                 status.change_summary = None;
                 status.last_error = Some(error_message.clone());
             })
