@@ -1,0 +1,16 @@
+---
+apiVersion: pgroles.io/v1alpha1
+kind: PostgresPolicy
+metadata:
+  name: conflicting-policy
+  namespace: default
+spec:
+  connection:
+    secretRef:
+      name: postgres-credentials
+  interval: "5m"
+
+  roles:
+    - name: analytics
+      login: true
+      comment: "Overlaps with the roles claimed by disjoint-policy"

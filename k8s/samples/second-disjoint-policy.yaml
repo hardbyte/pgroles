@@ -1,0 +1,23 @@
+---
+apiVersion: pgroles.io/v1alpha1
+kind: PostgresPolicy
+metadata:
+  name: second-disjoint-policy
+  namespace: default
+spec:
+  connection:
+    secretRef:
+      name: postgres-credentials
+  interval: "5m"
+
+  roles:
+    - name: reporting
+      login: true
+      comment: "Another non-overlapping same-database role"
+
+  grants:
+    - role: reporting
+      privileges: [CONNECT]
+      'on':
+        type: database
+        name: postgres

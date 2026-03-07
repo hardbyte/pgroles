@@ -103,11 +103,13 @@ The operator is intended to become a production controller, but that still requi
 
 ### 1. More realistic test coverage
 
-- Add E2E coverage for scenarios such as:
+- CI covers:
   - multiple policies targeting the same database with conflicting ownership
   - multiple non-overlapping policies targeting the same database
   - invalid specs
-  - missing or rotated secrets
+  - missing secrets
+- Remaining gaps:
+  - rotated secrets
   - insufficient database privileges
 - Add scale and load tests covering large manifests, many roles/grants, and many policies across multiple databases.
 - Add reconciliation concurrency tests to prove per-database serialization and backoff behavior.
@@ -142,9 +144,9 @@ spec:
     editor:
       grants:
         - privileges: [USAGE]
-          on: { type: schema }
+          'on': { type: schema }
         - privileges: [SELECT, INSERT, UPDATE, DELETE]
-          on: { type: table, name: "*" }
+          'on': { type: table, name: "*" }
       default_privileges:
         - privileges: [SELECT, INSERT, UPDATE, DELETE]
           on_type: table
@@ -161,7 +163,7 @@ spec:
   grants:
     - role: app-service
       privileges: [CONNECT]
-      on: { type: database, name: mydb }
+      'on': { type: database, name: mydb }
 
   memberships:
     - role: inventory-editor

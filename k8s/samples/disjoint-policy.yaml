@@ -1,0 +1,23 @@
+---
+apiVersion: pgroles.io/v1alpha1
+kind: PostgresPolicy
+metadata:
+  name: disjoint-policy
+  namespace: default
+spec:
+  connection:
+    secretRef:
+      name: postgres-credentials
+  interval: "5m"
+
+  roles:
+    - name: analytics
+      login: true
+      comment: "Disjoint same-database role"
+
+  grants:
+    - role: analytics
+      privileges: [CONNECT]
+      'on':
+        type: database
+        name: postgres

@@ -6,7 +6,7 @@
 use std::sync::Arc;
 
 use futures::StreamExt;
-use kube::runtime::Controller;
+use kube::runtime::{Controller, WatchStreamExt, predicates, reflector, watcher};
 use kube::{Api, Client};
 use tracing::info;
 
@@ -51,11 +51,17 @@ async fn main() -> anyhow::Result<()> {
 
     // Watch all PostgresPolicy resources across all namespaces.
     let policies: Api<PostgresPolicy> = Api::all(client);
+    let (reader, writer) = reflector::store();
+    let policy_stream = watcher(policies.clone(), watcher::Config::default())
+        .default_backoff()
+        .reflect(writer)
+        .applied_objects()
+        .predicate_filter(predicates::generation, Default::default());
 
     info!("starting controller");
     observability.mark_ready();
 
-    Controller::new(policies, kube::runtime::watcher::Config::default())
+    Controller::for_stream(policy_stream, reader)
         .shutdown_on_signal()
         .run(reconcile, error_policy, ctx)
         .for_each(|result| async move {

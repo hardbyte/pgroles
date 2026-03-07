@@ -49,7 +49,7 @@ opentelemetry_sdk = { version = "0.31", features = ["metrics", "rt-tokio", "test
 opentelemetry-otlp = { version = "0.31", features = ["metrics", "grpc-tonic"] }
 
 # Kubernetes
-kube = { version = "3.0.1", features = ["runtime", "derive", "client"] }
+kube = { version = "3.0.1", features = ["runtime", "derive", "client", "unstable-runtime"] }
 k8s-openapi = { version = "0.27", features = ["latest", "schemars"] }
 schemars = "1"
 
