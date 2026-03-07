@@ -90,6 +90,10 @@ The operator is intended to become a production controller, but that still requi
 - Reconciliation is serialized per database target:
   - in-process locking prevents concurrent reconciles within one operator replica
   - PostgreSQL advisory locking prevents concurrent reconciles across multiple replicas
+- Retry behavior is failure-aware:
+  - transient operational failures use exponential backoff with jitter
+  - invalid specs, conflicts, and unsafe role-drop workflows fall back to the normal reconcile interval
+  - lock contention keeps its own short retry path
 - The operator exposes:
   - `/livez`
   - `/readyz`
@@ -97,13 +101,7 @@ The operator is intended to become a production controller, but that still requi
 
 ### Remaining work
 
-### 1. Error-aware retry discipline
-
-- Replace the fixed retry interval with exponential backoff and jitter for transient failures.
-- Avoid aggressive retries for invalid specs or policy conflicts.
-- Keep lock contention on a separate low-noise path from actual reconcile failures.
-
-### 2. More realistic test coverage
+### 1. More realistic test coverage
 
 - Add E2E coverage for scenarios such as:
   - multiple policies targeting the same database with conflicting ownership
@@ -114,7 +112,7 @@ The operator is intended to become a production controller, but that still requi
 - Add scale and load tests covering large manifests, many roles/grants, and many policies across multiple databases.
 - Add reconciliation concurrency tests to prove per-database serialization and backoff behavior.
 
-### 3. API hardening toward production use
+### 2. API hardening toward production use
 
 - Carry these semantics into the next CRD revision rather than leaving them as controller-only conventions.
 - Promote the API only after conflict detection, richer status, probes, metrics, retry behavior, and realistic load tests are all in place.
@@ -245,6 +243,7 @@ status:
       lastTransitionTime: "2026-03-06T10:30:00Z"
   observedGeneration: 3
   lastReconcileTime: "2026-03-06T10:30:00Z"
+  transientFailureCount: 0
   changeSummary:
     rolesCreated: 2
     rolesAltered: 0
@@ -266,7 +265,11 @@ status:
 | `Reconciling` | `True` while a reconciliation is in progress |
 | `Degraded` | `True` when the last reconciliation failed (includes error detail) |
 
-On failure, the operator requeues after 60 seconds.
+On failure, the operator chooses a retry path based on the failure mode:
+
+- lock contention: short jittered retry
+- transient operational failures: exponential backoff with jitter
+- invalid specs, conflicts, and unsafe role-drop blockers: normal reconcile interval
 
 ## RBAC
 

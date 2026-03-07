@@ -215,6 +215,10 @@ pub struct PostgresPolicyStatus {
     /// Last reconcile error message, if any.
     #[serde(default)]
     pub last_error: Option<String>,
+
+    /// Consecutive transient operational failures used for exponential backoff.
+    #[serde(default)]
+    pub transient_failure_count: i32,
 }
 
 /// A condition on the `PostgresPolicy` resource.

@@ -38,6 +38,12 @@ const LOCK_CONTENTION_BASE_SECS: u64 = 10;
 /// Maximum jitter added to the base requeue delay on lock contention.
 const LOCK_CONTENTION_JITTER_SECS: u64 = 20;
 
+/// Base requeue delay when transient operational failures occur.
+const TRANSIENT_BACKOFF_BASE_SECS: u64 = 5;
+
+/// Maximum requeue delay for transient operational failures.
+const TRANSIENT_BACKOFF_MAX_SECS: u64 = 300;
+
 enum ReconcileOutcome {
     Reconciled,
     Suspended,
@@ -63,6 +69,13 @@ impl ReconcileOutcome {
             ReconcileOutcome::LockContention => "LockContention",
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RetryClass {
+    Slow,
+    LockContention,
+    Transient,
 }
 
 /// Errors that can occur during reconciliation.
@@ -173,17 +186,43 @@ pub async fn reconcile(
 
 /// Error handler — called when reconcile returns an error.
 pub fn error_policy(
-    _resource: Arc<PostgresPolicy>,
+    resource: Arc<PostgresPolicy>,
     error: &finalizer::Error<ReconcileError>,
     _ctx: Arc<OperatorContext>,
 ) -> Action {
-    // Lock contention is expected and should not be logged as an error.
-    if let finalizer::Error::ApplyFailed(ReconcileError::LockContention(db, reason)) = error {
-        tracing::info!(database = %db, reason = %reason, "requeuing due to lock contention");
-        return requeue_with_jitter();
+    retry_action(&resource, error)
+}
+
+fn retry_action(resource: &PostgresPolicy, error: &finalizer::Error<ReconcileError>) -> Action {
+    match retry_class(error) {
+        RetryClass::LockContention => {
+            if let finalizer::Error::ApplyFailed(ReconcileError::LockContention(db, reason)) = error
+            {
+                tracing::info!(database = %db, reason = %reason, "requeuing due to lock contention");
+            }
+            requeue_with_jitter()
+        }
+        RetryClass::Slow => {
+            let delay = slow_retry_delay(resource);
+            tracing::info!(
+                delay_secs = delay.as_secs(),
+                error = %error,
+                "requeuing on normal interval for non-transient failure"
+            );
+            Action::requeue(delay)
+        }
+        RetryClass::Transient => {
+            let attempts = next_transient_failure_count(resource);
+            let delay = transient_backoff_delay(attempts);
+            tracing::warn!(
+                attempts,
+                delay_secs = delay.as_secs(),
+                error = %error,
+                "requeuing with exponential backoff after transient failure"
+            );
+            Action::requeue(delay)
+        }
     }
-    tracing::error!(%error, "reconciliation failed, requeuing in 60s");
-    Action::requeue(Duration::from_secs(60))
 }
 
 /// Compute a requeue delay with jitter for lock contention back-off.
@@ -213,6 +252,79 @@ fn jitter_delay() -> Duration {
     };
     let jitter_secs = ((nanos ^ thread_entropy) as u64) % (LOCK_CONTENTION_JITTER_SECS + 1);
     Duration::from_secs(LOCK_CONTENTION_BASE_SECS + jitter_secs)
+}
+
+fn transient_backoff_delay(attempts: u32) -> Duration {
+    let exponent = attempts.saturating_sub(1).min(10);
+    let base_delay = TRANSIENT_BACKOFF_BASE_SECS
+        .saturating_mul(1_u64 << exponent)
+        .min(TRANSIENT_BACKOFF_MAX_SECS);
+    let remaining_headroom = TRANSIENT_BACKOFF_MAX_SECS.saturating_sub(base_delay);
+    let jitter_window = remaining_headroom.min((base_delay / 2).max(1));
+    let jitter_secs = if jitter_window == 0 {
+        0
+    } else {
+        pseudo_random_window(jitter_window)
+    };
+    Duration::from_secs((base_delay + jitter_secs).min(TRANSIENT_BACKOFF_MAX_SECS))
+}
+
+fn pseudo_random_window(window_secs: u64) -> u64 {
+    if window_secs == 0 {
+        return 0;
+    }
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .subsec_nanos();
+    let thread_entropy = {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        std::thread::current().id().hash(&mut hasher);
+        hasher.finish() as u32
+    };
+    ((nanos ^ thread_entropy) as u64) % (window_secs + 1)
+}
+
+fn retry_class(error: &finalizer::Error<ReconcileError>) -> RetryClass {
+    match error {
+        finalizer::Error::ApplyFailed(reconcile_error) => match reconcile_error {
+            ReconcileError::LockContention(_, _) => RetryClass::LockContention,
+            ReconcileError::ManifestExpansion(_)
+            | ReconcileError::InvalidInterval(_, _)
+            | ReconcileError::ConflictingPolicy(_)
+            | ReconcileError::UnsafeRoleDrops(_)
+            | ReconcileError::NoNamespace => RetryClass::Slow,
+            ReconcileError::Context(context) => match context.as_ref() {
+                ContextError::SecretMissing { .. } => RetryClass::Slow,
+                ContextError::SecretFetch { .. } | ContextError::DatabaseConnect { .. } => {
+                    RetryClass::Transient
+                }
+            },
+            ReconcileError::Inspect(_) | ReconcileError::SqlExec(_) | ReconcileError::Kube(_) => {
+                RetryClass::Transient
+            }
+        },
+        finalizer::Error::CleanupFailed(_)
+        | finalizer::Error::AddFinalizer(_)
+        | finalizer::Error::RemoveFinalizer(_)
+        | finalizer::Error::UnnamedObject
+        | finalizer::Error::InvalidFinalizer => RetryClass::Transient,
+    }
+}
+
+fn next_transient_failure_count(resource: &PostgresPolicy) -> u32 {
+    resource
+        .status
+        .as_ref()
+        .map(|status| status.transient_failure_count.max(0) as u32)
+        .unwrap_or(0)
+        .saturating_add(1)
+}
+
+fn slow_retry_delay(resource: &PostgresPolicy) -> Duration {
+    parse_interval(&resource.spec.interval)
+        .unwrap_or_else(|_| Duration::from_secs(DEFAULT_REQUEUE_SECS))
 }
 
 /// Apply reconciliation — the main "ensure desired state" logic.
@@ -268,6 +380,17 @@ async fn reconcile_apply(
         Err(err) => {
             let error_message = err.to_string();
             let error_reason = err.reason();
+            let is_transient_failure = matches!(
+                &err,
+                ReconcileError::Context(context)
+                    if matches!(
+                        context.as_ref(),
+                        ContextError::SecretFetch { .. } | ContextError::DatabaseConnect { .. }
+                    )
+            ) || matches!(
+                &err,
+                ReconcileError::Inspect(_) | ReconcileError::SqlExec(_) | ReconcileError::Kube(_)
+            );
             match error_reason {
                 "DatabaseConnectionFailed" => {
                     ctx.observability.record_database_connection_failure()
@@ -286,6 +409,11 @@ async fn reconcile_apply(
                     .retain(|c| c.condition_type != "Reconciling" && c.condition_type != "Paused");
                 status.change_summary = None;
                 status.last_error = Some(error_message.clone());
+                if is_transient_failure {
+                    status.transient_failure_count += 1;
+                } else {
+                    status.transient_failure_count = 0;
+                }
             })
             .await
             {
@@ -322,6 +450,7 @@ async fn reconcile_apply_inner(
                 .retain(|c| c.condition_type != "Reconciling");
             status.last_attempted_generation = generation;
             status.last_error = None;
+            status.transient_failure_count = 0;
         })
         .await?;
         info!(name, namespace, "reconciliation suspended, requeuing");
@@ -366,6 +495,7 @@ async fn reconcile_apply_inner(
                 .retain(|c| c.condition_type != "Reconciling");
             status.change_summary = None;
             status.last_error = Some(conflict_message.clone());
+            status.transient_failure_count = 0;
         })
         .await?;
         ctx.observability.record_policy_conflict();
@@ -545,6 +675,7 @@ async fn apply_under_lock(
         status.last_reconcile_time = Some(crate::crd::now_rfc3339());
         status.change_summary = Some(summary);
         status.last_error = None;
+        status.transient_failure_count = 0;
     })
     .await?;
 
@@ -710,6 +841,35 @@ impl ReconcileError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::crd::{ConnectionSpec, PostgresPolicySpec, SecretReference};
+
+    fn test_policy(interval: &str, transient_failure_count: i32) -> Arc<PostgresPolicy> {
+        let spec = PostgresPolicySpec {
+            connection: ConnectionSpec {
+                secret_ref: SecretReference {
+                    name: "db-credentials".to_string(),
+                },
+                secret_key: "DATABASE_URL".to_string(),
+            },
+            interval: interval.to_string(),
+            suspend: false,
+            default_owner: None,
+            profiles: Default::default(),
+            schemas: Vec::new(),
+            roles: Vec::new(),
+            grants: Vec::new(),
+            default_privileges: Vec::new(),
+            memberships: Vec::new(),
+            retirements: Vec::new(),
+        };
+        let mut resource = PostgresPolicy::new("example", spec);
+        resource.metadata.namespace = Some("default".to_string());
+        resource.status = Some(PostgresPolicyStatus {
+            transient_failure_count,
+            ..Default::default()
+        });
+        Arc::new(resource)
+    }
 
     #[test]
     fn parse_interval_minutes() {
@@ -1032,6 +1192,102 @@ mod tests {
         assert!(
             base + jitter <= 60,
             "total max contention delay should not exceed error_policy's 60s"
+        );
+    }
+
+    #[test]
+    fn transient_backoff_delay_is_bounded_and_caps() {
+        for _ in 0..20 {
+            let first = transient_backoff_delay(1).as_secs();
+            assert!((TRANSIENT_BACKOFF_BASE_SECS..=7).contains(&first));
+
+            let fourth = transient_backoff_delay(4).as_secs();
+            assert!((40..=60).contains(&fourth));
+
+            let capped = transient_backoff_delay(10).as_secs();
+            assert_eq!(capped, TRANSIENT_BACKOFF_MAX_SECS);
+        }
+    }
+
+    #[test]
+    fn slow_retry_delay_uses_policy_interval() {
+        let resource = test_policy("7m", 0);
+        assert_eq!(slow_retry_delay(&resource), Duration::from_secs(420));
+    }
+
+    #[test]
+    fn slow_retry_delay_falls_back_on_invalid_interval() {
+        let resource = test_policy("nope", 0);
+        assert_eq!(
+            slow_retry_delay(&resource),
+            Duration::from_secs(DEFAULT_REQUEUE_SECS)
+        );
+    }
+
+    #[test]
+    fn retry_classifies_lock_contention_separately() {
+        let error = finalizer::Error::ApplyFailed(ReconcileError::LockContention(
+            "default/db-credentials/DATABASE_URL".into(),
+            "lock held".into(),
+        ));
+        assert_eq!(retry_class(&error), RetryClass::LockContention);
+    }
+
+    #[test]
+    fn retry_classifies_invalid_spec_as_slow() {
+        let error = finalizer::Error::ApplyFailed(ReconcileError::InvalidInterval(
+            "oops".into(),
+            "bad interval".into(),
+        ));
+        assert_eq!(retry_class(&error), RetryClass::Slow);
+    }
+
+    #[test]
+    fn retry_classifies_secret_missing_as_slow() {
+        let error = finalizer::Error::ApplyFailed(ReconcileError::Context(Box::new(
+            crate::context::ContextError::SecretMissing {
+                name: "db-credentials".into(),
+                key: "DATABASE_URL".into(),
+            },
+        )));
+        assert_eq!(retry_class(&error), RetryClass::Slow);
+    }
+
+    #[test]
+    fn retry_classifies_database_connect_as_transient() {
+        let error = finalizer::Error::ApplyFailed(ReconcileError::Context(Box::new(
+            crate::context::ContextError::DatabaseConnect {
+                source: sqlx::Error::PoolTimedOut,
+            },
+        )));
+        assert_eq!(retry_class(&error), RetryClass::Transient);
+    }
+
+    #[test]
+    fn error_policy_uses_normal_interval_for_invalid_spec() {
+        let resource = test_policy("11m", 0);
+        let error = finalizer::Error::ApplyFailed(ReconcileError::InvalidInterval(
+            "oops".into(),
+            "bad interval".into(),
+        ));
+        assert_eq!(
+            retry_action(&resource, &error),
+            Action::requeue(Duration::from_secs(660))
+        );
+    }
+
+    #[test]
+    fn error_policy_uses_exponential_backoff_for_transient_failures() {
+        let resource = test_policy("5m", 3);
+        let error = finalizer::Error::ApplyFailed(ReconcileError::Context(Box::new(
+            crate::context::ContextError::DatabaseConnect {
+                source: sqlx::Error::PoolTimedOut,
+            },
+        )));
+        let action = retry_action(&resource, &error);
+        assert!(
+            (40..=60).any(|secs| action == Action::requeue(Duration::from_secs(secs))),
+            "expected transient retry between 40s and 60s, got {action:?}"
         );
     }
 }

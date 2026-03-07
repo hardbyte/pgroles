@@ -680,6 +680,12 @@
                       "type": "string"
                     },
                     "type": "array"
+                  },
+                  "transient_failure_count": {
+                    "default": 0,
+                    "description": "Consecutive transient operational failures used for exponential backoff.",
+                    "format": "int32",
+                    "type": "integer"
                   }
                 },
                 "type": "object"
