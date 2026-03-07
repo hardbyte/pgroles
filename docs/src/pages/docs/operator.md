@@ -78,6 +78,68 @@ The operator runs as `nobody` (UID 65534) with a read-only root filesystem, no c
 - Validate and review the manifest with the CLI before handing it to the operator.
 - Treat deletion as "stop managing", not "revert the database".
 
+## Production roadmap
+
+The operator is intended to become a production controller, but that requires stricter ownership, observability, and failure-handling semantics than the current `v1alpha1` shape. The near-term roadmap is:
+
+### 1. Safe multi-policy ownership for the same database
+
+- Add a canonical database identity to each policy target so the operator can determine when multiple `PostgresPolicy` resources point at the same database.
+- Add explicit management scope so ownership is unambiguous:
+  - managed role names
+  - managed schema names
+  - generated role patterns
+- Reject overlapping policies by default rather than allowing last-writer-wins behavior.
+- Reconcile multiple policies for the same database only when their managed scopes are provably disjoint.
+
+### 2. Clear invalid-config and conflict handling
+
+- Distinguish invalid spec errors from transient operational failures.
+- Surface conflict and validation outcomes through status conditions rather than hot-looping retries.
+- Extend status to include:
+  - `lastAttemptedGeneration`
+  - `lastSuccessfulReconcileTime`
+  - `lastError`
+  - managed database identity
+  - owned role/schema summary
+
+### 3. Per-database serialization and retry discipline
+
+- Serialize reconciliation for the same database target inside the controller.
+- Add PostgreSQL advisory locking as a second layer of protection against multi-replica races.
+- Replace the fixed retry interval with exponential backoff and jitter for transient failures.
+- Avoid aggressive retries for invalid specs or policy conflicts.
+
+### 4. Production probes and metrics
+
+- Add HTTP endpoints for:
+  - `/livez`
+  - `/readyz`
+  - `/metrics`
+- Keep readiness tied to controller health rather than the success of any one policy.
+- Export Prometheus metrics for:
+  - reconcile duration and result
+  - database connection failures
+  - lock contention
+  - change counts by type
+  - invalid spec/conflict totals
+
+### 5. More realistic test coverage
+
+- Add E2E coverage for:
+  - multiple policies targeting the same database with conflicting ownership
+  - multiple non-overlapping policies targeting the same database
+  - invalid specs
+  - missing or rotated secrets
+  - insufficient database privileges
+- Add scale and load tests covering large manifests, many roles/grants, and many policies across multiple databases.
+- Add reconciliation concurrency tests to prove per-database serialization and backoff behavior.
+
+### 6. API hardening toward production use
+
+- Carry these semantics into the next CRD revision rather than leaving them as controller-only conventions.
+- Promote the API only after conflict detection, richer status, probes, metrics, retry behavior, and realistic load tests are all in place.
+
 ## Custom resource
 
 A `PostgresPolicy` spec mirrors the CLI manifest format with added Kubernetes-specific fields for connection and scheduling.
