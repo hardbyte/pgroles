@@ -36,11 +36,11 @@ For local development or custom packaging, the operator crate is also published 
 cargo install pgroles-operator
 ```
 
-If you are embedding the reconciler or CRD types in another Rust project:
+If you are embedding the reconciler or CRD types in another Rust project, pin the current release in your `Cargo.toml`:
 
 ```toml
 [dependencies]
-pgroles-operator = "0.1.2"
+pgroles-operator = "<current-release>"
 ```
 
 ### Configuration

@@ -20,7 +20,7 @@ Library:
 
 ```toml
 [dependencies]
-pgroles-operator = "0.1.2"
+pgroles-operator = "<current-release>"
 ```
 
 Binary:

@@ -43,7 +43,7 @@ Download pre-built binaries from the [releases page](https://github.com/hardbyte
 ## Docker
 
 ```shell
-docker run --rm ghcr.io/hardbyte/pgroles:0.1.2 --help
+docker run --rm ghcr.io/hardbyte/pgroles --help
 ```
 
 Published container images are multi-arch for `linux/amd64` and `linux/arm64`.
