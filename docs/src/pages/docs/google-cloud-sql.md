@@ -121,7 +121,7 @@ availableSecrets:
 
 ## IAM database authentication
 
-If your roles use [Cloud SQL IAM database authentication](https://cloud.google.com/sql/docs/postgres/iam-authentication), declare the provider in your manifest:
+Cloud SQL supports [IAM database authentication](https://cloud.google.com/sql/docs/postgres/iam-authentication) for individual users, service accounts, and groups. Declare the provider in your manifest:
 
 ```yaml
 auth_providers:
@@ -129,7 +129,17 @@ auth_providers:
     project: my-gcp-project
 ```
 
-IAM-authenticated roles in Cloud SQL follow the naming convention `user@project.iam` for service accounts:
+### Role naming conventions
+
+Cloud SQL maps IAM principals to PostgreSQL roles with specific naming rules:
+
+| IAM principal | PostgreSQL role name | Example |
+| --- | --- | --- |
+| User | Full email address | `"kai@example.com"` |
+| Service account | Email without `.gserviceaccount.com` | `"my-sa@my-project.iam"` |
+| Group | Full group email address | `"editors@example.com"` |
+
+### Service accounts
 
 ```yaml
 roles:
@@ -137,3 +147,28 @@ roles:
     login: true
     comment: "IAM-authenticated service account"
 ```
+
+### IAM groups
+
+[IAM group authentication](https://cloud.google.com/sql/docs/postgres/add-manage-iam-users) lets you grant database privileges to a Cloud Identity group. All group members inherit the grants automatically on first login — you don't need to add individual members to your manifest.
+
+```yaml
+roles:
+  - name: "backend-team@example.com"
+    login: false
+    comment: "Cloud Identity group — members authenticate individually"
+
+grants:
+  - role: "backend-team@example.com"
+    privileges: [USAGE]
+    on: { type: schema, name: app }
+  - role: "backend-team@example.com"
+    privileges: [SELECT, INSERT, UPDATE]
+    on: { type: table, schema: app, name: "*" }
+```
+
+When a group member logs in for the first time, Cloud SQL creates their individual PostgreSQL role automatically and grants them the group's privileges.
+
+{% callout type="note" title="Group membership propagation" %}
+Changes to Cloud Identity group membership take about 15 minutes to propagate. However, changes to the group's database privileges take effect immediately.
+{% /callout %}
