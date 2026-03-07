@@ -119,8 +119,7 @@ mod tests {
 
     #[test]
     fn advisory_lock_key_is_positive() {
-        // wrapping_abs ensures non-negative (except i64::MIN → i64::MIN,
-        // but that's astronomically unlikely for a hash).
+        // The `hash >> 1` conversion guarantees a non-negative i64.
         let key = advisory_lock_key("prod/db-creds/DATABASE_URL");
         assert!(key >= 0, "advisory lock key should be non-negative");
     }
