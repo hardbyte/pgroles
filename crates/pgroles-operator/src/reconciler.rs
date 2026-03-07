@@ -14,8 +14,8 @@ use tracing::info;
 
 use crate::context::{ContextError, OperatorContext};
 use crate::crd::{
-    ChangeSummary, PostgresPolicy, PostgresPolicyStatus, degraded_condition, ready_condition,
-    reconciling_condition,
+    ChangeSummary, DatabaseIdentity, PostgresPolicy, PostgresPolicyStatus, conflict_condition,
+    degraded_condition, ready_condition, reconciling_condition,
 };
 
 /// Finalizer name for PostgresPolicy resources.
@@ -50,6 +50,9 @@ pub enum ReconcileError {
 
     #[error("invalid interval \"{0}\": {1}")]
     InvalidInterval(String, String),
+
+    #[error("{0}")]
+    ConflictingPolicy(String),
 }
 
 /// Parse a duration string like "5m", "1h", "30s", "2h30m".
@@ -184,6 +187,39 @@ async fn reconcile_apply_inner(
     })
     .await?;
 
+    let identity = DatabaseIdentity::new(
+        &namespace,
+        &spec.connection.secret_ref.name,
+        &spec.connection.secret_key,
+    );
+    let ownership = spec.ownership_claims()?;
+    update_status(ctx, resource, |status| {
+        status.managed_database_identity = Some(identity.as_str().to_string());
+        status.owned_roles = ownership.roles.iter().cloned().collect();
+        status.owned_schemas = ownership.schemas.iter().cloned().collect();
+    })
+    .await?;
+
+    if let Some(conflict_message) =
+        detect_policy_conflict(ctx, resource, &identity, &ownership).await?
+    {
+        update_status(ctx, resource, |status| {
+            status.set_condition(ready_condition(
+                false,
+                "ConflictingPolicy",
+                &conflict_message,
+            ));
+            status.set_condition(conflict_condition("ConflictingPolicy", &conflict_message));
+            status.set_condition(degraded_condition("ConflictingPolicy", &conflict_message));
+            status
+                .conditions
+                .retain(|c| c.condition_type != "Reconciling");
+            status.change_summary = None;
+        })
+        .await?;
+        return Err(ReconcileError::ConflictingPolicy(conflict_message));
+    }
+
     // 1. Convert CRD spec to core manifest.
     let manifest = spec.to_policy_manifest();
 
@@ -286,9 +322,11 @@ async fn reconcile_apply_inner(
     update_status(ctx, resource, |status| {
         status.set_condition(ready_condition(true, "Reconciled", "All changes applied"));
         // Clear any previous "Reconciling" or "Degraded" conditions.
-        status
-            .conditions
-            .retain(|c| c.condition_type != "Reconciling" && c.condition_type != "Degraded");
+        status.conditions.retain(|c| {
+            c.condition_type != "Reconciling"
+                && c.condition_type != "Degraded"
+                && c.condition_type != "Conflict"
+        });
         status.observed_generation = generation;
         status.last_reconcile_time = Some(crate::crd::now_rfc3339());
         status.change_summary = Some(summary);
@@ -373,6 +411,56 @@ where
     .await?;
 
     Ok(())
+}
+
+async fn detect_policy_conflict(
+    ctx: &OperatorContext,
+    resource: &PostgresPolicy,
+    identity: &DatabaseIdentity,
+    ownership: &crate::crd::OwnershipClaims,
+) -> Result<Option<String>, ReconcileError> {
+    let api: Api<PostgresPolicy> = Api::all(ctx.kube_client.clone());
+    let policies = api.list(&Default::default()).await?;
+
+    let this_ns = resource.namespace().ok_or(ReconcileError::NoNamespace)?;
+    let this_name = resource.name_any();
+
+    let mut conflicts = Vec::new();
+    for other in policies {
+        let other_ns = match other.namespace() {
+            Some(ns) => ns,
+            None => continue,
+        };
+        let other_name = other.name_any();
+        if other_ns == this_ns && other_name == this_name {
+            continue;
+        }
+
+        let other_identity = DatabaseIdentity::new(
+            &other_ns,
+            &other.spec.connection.secret_ref.name,
+            &other.spec.connection.secret_key,
+        );
+        if &other_identity != identity {
+            continue;
+        }
+
+        let other_ownership = other.spec.ownership_claims()?;
+        if ownership.overlaps(&other_ownership) {
+            let overlap = ownership.overlap_summary(&other_ownership);
+            conflicts.push(format!("{other_ns}/{other_name} ({overlap})"));
+        }
+    }
+
+    if conflicts.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(format!(
+            "policy ownership overlaps with {} on database target {}",
+            conflicts.join(", "),
+            identity.as_str()
+        )))
+    }
 }
 
 // ---------------------------------------------------------------------------

@@ -7,6 +7,7 @@
 use kube::CustomResource;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeSet;
 
 use pgroles_core::manifest::{
     DefaultPrivilege, Grant, Membership, ObjectType, Privilege, RoleRetirement, SchemaBinding,
@@ -190,6 +191,18 @@ pub struct PostgresPolicyStatus {
     /// Summary of changes applied in the last reconciliation.
     #[serde(default)]
     pub change_summary: Option<ChangeSummary>,
+
+    /// Canonical identity of the managed database target.
+    #[serde(default)]
+    pub managed_database_identity: Option<String>,
+
+    /// Roles claimed by this policy's declared ownership scope.
+    #[serde(default)]
+    pub owned_roles: Vec<String>,
+
+    /// Schemas claimed by this policy's declared ownership scope.
+    #[serde(default)]
+    pub owned_schemas: Vec<String>,
 }
 
 /// A condition on the `PostgresPolicy` resource.
@@ -229,6 +242,49 @@ pub struct ChangeSummary {
     pub members_added: i32,
     pub members_removed: i32,
     pub total: i32,
+}
+
+/// Canonical target identity for conflict detection between policies.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct DatabaseIdentity(String);
+
+impl DatabaseIdentity {
+    pub fn new(namespace: &str, secret_name: &str, secret_key: &str) -> Self {
+        Self(format!("{namespace}/{secret_name}/{secret_key}"))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+/// Conservative ownership claims for a policy.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct OwnershipClaims {
+    pub roles: BTreeSet<String>,
+    pub schemas: BTreeSet<String>,
+}
+
+impl OwnershipClaims {
+    pub fn overlaps(&self, other: &Self) -> bool {
+        !self.roles.is_disjoint(&other.roles) || !self.schemas.is_disjoint(&other.schemas)
+    }
+
+    pub fn overlap_summary(&self, other: &Self) -> String {
+        let overlapping_roles: Vec<_> = self.roles.intersection(&other.roles).cloned().collect();
+        let overlapping_schemas: Vec<_> =
+            self.schemas.intersection(&other.schemas).cloned().collect();
+
+        let mut parts = Vec::new();
+        if !overlapping_roles.is_empty() {
+            parts.push(format!("roles: {}", overlapping_roles.join(", ")));
+        }
+        if !overlapping_schemas.is_empty() {
+            parts.push(format!("schemas: {}", overlapping_schemas.join(", ")));
+        }
+
+        parts.join("; ")
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -323,6 +379,55 @@ impl PostgresPolicySpec {
             retirements: self.retirements.clone(),
         }
     }
+
+    /// Derive a conservative ownership claim set from the policy spec.
+    ///
+    /// This intentionally claims all declared/expanded roles and all referenced
+    /// schemas so overlapping policies are rejected safely.
+    pub fn ownership_claims(
+        &self,
+    ) -> Result<OwnershipClaims, pgroles_core::manifest::ManifestError> {
+        let manifest = self.to_policy_manifest();
+        let expanded = pgroles_core::manifest::expand_manifest(&manifest)?;
+
+        let mut roles: BTreeSet<String> = expanded.roles.into_iter().map(|r| r.name).collect();
+        let mut schemas: BTreeSet<String> = self.schemas.iter().map(|s| s.name.clone()).collect();
+
+        roles.extend(manifest.retirements.into_iter().map(|r| r.role));
+        roles.extend(manifest.grants.iter().map(|g| g.role.clone()));
+        roles.extend(
+            manifest
+                .default_privileges
+                .iter()
+                .flat_map(|dp| dp.grant.iter().filter_map(|grant| grant.role.clone())),
+        );
+        roles.extend(manifest.memberships.iter().map(|m| m.role.clone()));
+        roles.extend(
+            manifest
+                .memberships
+                .iter()
+                .flat_map(|m| m.members.iter().map(|member| member.name.clone())),
+        );
+
+        schemas.extend(
+            manifest
+                .grants
+                .iter()
+                .filter_map(|g| match g.on.object_type {
+                    ObjectType::Database => None,
+                    ObjectType::Schema => g.on.name.clone(),
+                    _ => g.on.schema.clone(),
+                }),
+        );
+        schemas.extend(
+            manifest
+                .default_privileges
+                .iter()
+                .map(|dp| dp.schema.clone()),
+        );
+
+        Ok(OwnershipClaims { roles, schemas })
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -407,6 +512,17 @@ pub fn reconciling_condition(message: &str) -> PolicyCondition {
 pub fn degraded_condition(reason: &str, message: &str) -> PolicyCondition {
     PolicyCondition {
         condition_type: "Degraded".to_string(),
+        status: "True".to_string(),
+        reason: Some(reason.to_string()),
+        message: Some(message.to_string()),
+        last_transition_time: Some(now_rfc3339()),
+    }
+}
+
+/// Helper to create a "Conflict" condition.
+pub fn conflict_condition(reason: &str, message: &str) -> PolicyCondition {
+    PolicyCondition {
+        condition_type: "Conflict".to_string(),
         status: "True".to_string(),
         reason: Some(reason.to_string()),
         message: Some(message.to_string()),
@@ -510,6 +626,88 @@ mod tests {
         status.set_condition(degraded_condition("Error", "something broke"));
 
         assert_eq!(status.conditions.len(), 2);
+    }
+
+    #[test]
+    fn ownership_claims_include_expanded_roles_and_schemas() {
+        let mut profiles = std::collections::HashMap::new();
+        profiles.insert(
+            "editor".to_string(),
+            ProfileSpec {
+                login: Some(false),
+                grants: vec![],
+                default_privileges: vec![],
+            },
+        );
+
+        let spec = PostgresPolicySpec {
+            connection: ConnectionSpec {
+                secret_ref: SecretReference {
+                    name: "pg-secret".to_string(),
+                },
+                secret_key: "DATABASE_URL".to_string(),
+            },
+            interval: "5m".to_string(),
+            suspend: false,
+            default_owner: None,
+            profiles,
+            schemas: vec![SchemaBinding {
+                name: "inventory".to_string(),
+                profiles: vec!["editor".to_string()],
+                role_pattern: "{schema}-{profile}".to_string(),
+                owner: None,
+            }],
+            roles: vec![RoleSpec {
+                name: "app-service".to_string(),
+                login: Some(true),
+                superuser: None,
+                createdb: None,
+                createrole: None,
+                inherit: None,
+                replication: None,
+                bypassrls: None,
+                connection_limit: None,
+                comment: None,
+            }],
+            grants: vec![],
+            default_privileges: vec![],
+            memberships: vec![],
+            retirements: vec![RoleRetirement {
+                role: "legacy-app".to_string(),
+                reassign_owned_to: None,
+                drop_owned: false,
+                terminate_sessions: false,
+            }],
+        };
+
+        let claims = spec.ownership_claims().unwrap();
+        assert!(claims.roles.contains("inventory-editor"));
+        assert!(claims.roles.contains("app-service"));
+        assert!(claims.roles.contains("legacy-app"));
+        assert!(claims.schemas.contains("inventory"));
+    }
+
+    #[test]
+    fn ownership_overlap_summary_reports_roles_and_schemas() {
+        let mut left = OwnershipClaims::default();
+        left.roles.insert("analytics".to_string());
+        left.schemas.insert("reporting".to_string());
+
+        let mut right = OwnershipClaims::default();
+        right.roles.insert("analytics".to_string());
+        right.schemas.insert("reporting".to_string());
+        right.schemas.insert("other".to_string());
+
+        assert!(left.overlaps(&right));
+        let summary = left.overlap_summary(&right);
+        assert!(summary.contains("roles: analytics"));
+        assert!(summary.contains("schemas: reporting"));
+    }
+
+    #[test]
+    fn database_identity_uses_namespace_secret_and_key() {
+        let identity = DatabaseIdentity::new("prod", "db-creds", "DATABASE_URL");
+        assert_eq!(identity.as_str(), "prod/db-creds/DATABASE_URL");
     }
 
     #[test]
