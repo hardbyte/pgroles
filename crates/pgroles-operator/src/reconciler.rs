@@ -217,7 +217,8 @@ async fn reconcile_apply_inner(
             status.change_summary = None;
         })
         .await?;
-        return Err(ReconcileError::ConflictingPolicy(conflict_message));
+        info!(name, namespace, %conflict_message, "reconciliation blocked by conflicting policy");
+        return Ok(Action::requeue(requeue_interval));
     }
 
     // 1. Convert CRD spec to core manifest.
@@ -394,8 +395,8 @@ where
     let name = resource.name_any();
 
     let api: Api<PostgresPolicy> = Api::namespaced(ctx.kube_client.clone(), &namespace);
-
-    let mut status = resource.status.clone().unwrap_or_default();
+    let latest = api.get(&name).await?;
+    let mut status = latest.status.unwrap_or_default();
 
     mutate(&mut status);
 
