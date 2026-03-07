@@ -129,10 +129,21 @@ jobs:
         run: |
           kubectl wait --for=condition=ready pod/postgres-0 --timeout=90s
 
+      - uses: docker/setup-buildx-action@v3
+
       - name: Build operator image and load into kind
-        run: |
-          docker build --target operator -t pgroles-operator:e2e -f docker/Dockerfile .
-          kind load docker-image pgroles-operator:e2e --name pgroles-e2e
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/Dockerfile
+          target: operator
+          load: true
+          tags: pgroles-operator:e2e
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Load image into kind
+        run: kind load docker-image pgroles-operator:e2e --name pgroles-e2e
 
       - name: Deploy operator
         run: |
