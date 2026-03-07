@@ -31,9 +31,12 @@ const navigation = [
         ],
     },
     {
-        title: 'Kubernetes',
+        title: 'Deployment',
         links: [
-            {title: 'Operator', href: '/docs/operator'},
+            {title: 'CI/CD integration', href: '/docs/ci-cd'},
+            {title: 'Google Cloud SQL', href: '/docs/google-cloud-sql'},
+            {title: 'AWS RDS & Aurora', href: '/docs/aws-rds'},
+            {title: 'Kubernetes operator', href: '/docs/operator'},
         ],
     },
     {
