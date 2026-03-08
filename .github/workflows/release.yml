@@ -169,7 +169,7 @@ jobs:
   # Cross-compile CLI binaries for GitHub Releases
   # ---------------------------------------------------------------------------
   build-binaries:
-    name: Build — ${{ matrix.target }}
+    name: Build — ${{ matrix.binary }} — ${{ matrix.target }}
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -217,6 +217,9 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
+
+      - name: Ensure target is installed
+        run: rustup target add ${{ matrix.target }}
 
       - uses: Swatinem/rust-cache@v2
         with:

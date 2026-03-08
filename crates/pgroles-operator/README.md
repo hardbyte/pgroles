@@ -16,13 +16,18 @@ resources.
 
 ## Install
 
-This crate is maintained in-repo.
+From crates.io:
+
+```toml
+[dependencies]
+pgroles-operator = "0.1.4"
+```
 
 Library from source:
 
 ```toml
 [dependencies]
-pgroles-operator = { git = "https://github.com/hardbyte/pgroles", tag = "v0.1.3" }
+pgroles-operator = { git = "https://github.com/hardbyte/pgroles", tag = "v0.1.4" }
 ```
 
 ## Intended Audience

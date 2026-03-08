@@ -12,6 +12,7 @@
 [![crates.io - pgroles-cli](https://img.shields.io/crates/v/pgroles-cli)](https://crates.io/crates/pgroles-cli)
 [![crates.io - pgroles-core](https://img.shields.io/crates/v/pgroles-core)](https://crates.io/crates/pgroles-core)
 [![crates.io - pgroles-inspect](https://img.shields.io/crates/v/pgroles-inspect)](https://crates.io/crates/pgroles-inspect)
+[![crates.io - pgroles-operator](https://img.shields.io/crates/v/pgroles-operator)](https://crates.io/crates/pgroles-operator)
 [![Helm Chart OCI](https://img.shields.io/badge/helm-ghcr.io%2Fhardbyte%2Fcharts-informational)](https://github.com/hardbyte/pgroles/pkgs/container/charts%2Fpgroles-operator)
 
 </div>
@@ -109,7 +110,7 @@ cargo install pgroles-cli
 - [`pgroles-cli`](https://crates.io/crates/pgroles-cli) — end-user CLI
 - [`pgroles-core`](https://crates.io/crates/pgroles-core) — manifest model, diff engine, SQL rendering
 - [`pgroles-inspect`](https://crates.io/crates/pgroles-inspect) — database inspection and managed-provider detection
-- `pgroles-operator` — operator crate in this repository; see the [operator docs](https://hardbyte.github.io/pgroles/docs/operator/) for source consumption
+- [`pgroles-operator`](https://crates.io/crates/pgroles-operator) — Kubernetes operator crate, controller runtime, and CRD types
 
 **Docker:**
 ```bash
