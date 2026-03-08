@@ -158,11 +158,11 @@ CI covers:
 - Kubernetes Event delivery for warning and recovery transitions
 - OTLP metrics export through an in-cluster Collector
 - generated load policies across 2 databases with 30 schemas / 60 generated roles
+- scheduled fairness/load coverage across 5 policies, 3 databases, 100 schemas, and 200 generated roles with repeated secret churn
 
 Remaining gaps:
 
-- higher-scale reconcile/load coverage
-- more explicit fairness/concurrency testing under churn
+- higher-scale reconcile/load coverage beyond the scheduled workflow profile
 
 ## Relationship to the CLI
 

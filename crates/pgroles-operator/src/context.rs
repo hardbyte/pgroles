@@ -4,10 +4,24 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use kube::runtime::events::Recorder;
-use sqlx::postgres::PgPool;
+use std::time::Duration;
+
+use sqlx::postgres::{PgPool, PgPoolOptions};
 use tokio::sync::{Mutex, RwLock};
 
 use crate::observability::OperatorObservability;
+
+/// Minimum pool size required for reconciliation.
+///
+/// One connection is held for the session-scoped advisory lock while the
+/// reconcile loop performs inspection and apply work on the pool.
+const POOL_MAX_CONNECTIONS: u32 = 5;
+
+/// Bound how long a reconcile waits for a pooled connection before surfacing
+/// a transient database connectivity failure.
+const POOL_ACQUIRE_TIMEOUT_SECS: u64 = 10;
+
+const _: () = assert!(POOL_MAX_CONNECTIONS >= 2);
 
 #[derive(Clone)]
 struct CachedPool {
@@ -176,8 +190,13 @@ impl OperatorContext {
                 key: secret_key.to_string(),
             })?;
 
-        // Create pool.
-        let pool = PgPool::connect(&database_url)
+        // Create pool with explicit sizing. Reconciliation holds one dedicated
+        // connection for PostgreSQL advisory locking and needs additional pool
+        // capacity for inspection/apply queries.
+        let pool = PgPoolOptions::new()
+            .max_connections(POOL_MAX_CONNECTIONS)
+            .acquire_timeout(Duration::from_secs(POOL_ACQUIRE_TIMEOUT_SECS))
+            .connect(&database_url)
             .await
             .map_err(|err| ContextError::DatabaseConnect { source: err })?;
 

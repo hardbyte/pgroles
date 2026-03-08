@@ -1,0 +1,295 @@
+name: Operator Fairness and Load
+
+on:
+  schedule:
+    - cron: '23 3 * * *'
+  workflow_dispatch:
+
+permissions:
+  actions: read
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  SQLX_OFFLINE: "true"
+
+concurrency:
+  group: operator-fairness-load
+  cancel-in-progress: false
+
+jobs:
+  decide:
+    name: Decide whether to run
+    runs-on: ubuntu-latest
+    outputs:
+      should_run: ${{ steps.decide.outputs.should_run }}
+      reason: ${{ steps.decide.outputs.reason }}
+    steps:
+      - uses: actions/github-script@v7
+        id: decide
+        with:
+          script: |
+            if (context.eventName === 'workflow_dispatch') {
+              core.setOutput('should_run', 'true');
+              core.setOutput('reason', 'manual dispatch');
+              return;
+            }
+
+            const { owner, repo } = context.repo;
+            const runs = await github.paginate(github.rest.actions.listWorkflowRuns, {
+              owner,
+              repo,
+              workflow_id: 'operator-fairness-load.yml',
+              branch: 'main',
+              status: 'completed',
+              per_page: 100,
+            });
+
+            const previousSuccess = runs.find(
+              (run) => run.id !== context.runId && run.conclusion === 'success',
+            );
+
+            if (!previousSuccess) {
+              core.setOutput('should_run', 'true');
+              core.setOutput('reason', 'first successful run for this workflow');
+              return;
+            }
+
+            if (previousSuccess.head_sha === context.sha) {
+              core.setOutput('should_run', 'false');
+              core.setOutput(
+                'reason',
+                `main unchanged since last successful fairness/load run (${context.sha.slice(0, 7)})`,
+              );
+              return;
+            }
+
+            core.setOutput('should_run', 'true');
+            core.setOutput(
+              'reason',
+              `main changed from ${previousSuccess.head_sha.slice(0, 7)} to ${context.sha.slice(0, 7)}`,
+            );
+
+      - name: Summary
+        run: |
+          echo "Decision: ${{ steps.decide.outputs.reason }}" >> "$GITHUB_STEP_SUMMARY"
+
+  skipped:
+    name: Skipped
+    needs: decide
+    if: needs.decide.outputs.should_run != 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Explain skip
+        run: |
+          echo "Skipping fairness/load run: ${{ needs.decide.outputs.reason }}" >> "$GITHUB_STEP_SUMMARY"
+
+  fairness-load:
+    name: Fairness and Load
+    needs: decide
+    if: needs.decide.outputs.should_run == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build operator binary
+        run: cargo build -p pgroles-operator
+
+      - name: Stage operator binary for E2E image
+        run: |
+          mkdir -p dist
+          install -Dm755 -s target/debug/pgroles-operator dist/pgroles-operator-e2e
+
+      - name: Install kind
+        run: |
+          [ -f /usr/local/bin/kind ] || {
+            curl -Lo /usr/local/bin/kind https://kind.sigs.k8s.io/dl/v0.24.0/kind-linux-amd64
+            echo "b89aada5a39d620da3fcd16435b7f28d858927dd53f92cbac77686b0588b600d  /usr/local/bin/kind" | sha256sum -c -
+            chmod +x /usr/local/bin/kind
+          }
+
+      - name: Create kind cluster
+        run: kind create cluster --name pgroles-fairness --wait 60s
+
+      - name: Install CRD
+        run: kubectl apply -f k8s/crd.yaml
+
+      - name: Deploy dev PostgreSQL
+        run: |
+          kubectl apply -f k8s/dev/postgres.yaml
+          kubectl rollout status statefulset/postgres --timeout=120s
+
+      - name: Wait for PostgreSQL readiness
+        run: kubectl wait --for=condition=ready pod/postgres-0 --timeout=90s
+
+      - name: Seed databases and secrets
+        run: |
+          kubectl exec -i postgres-0 -- psql -v ON_ERROR_STOP=1 -U postgres -d postgres <<'SQL'
+          CREATE DATABASE loadtest;
+          CREATE DATABASE churntest;
+          SQL
+
+          kubectl create secret generic loadtest-postgres-credentials \
+            --from-literal=DATABASE_URL='postgres://postgres:devpassword@postgres.default.svc.cluster.local:5432/loadtest' \
+            --dry-run=client -o yaml | kubectl apply -f -
+
+          kubectl create secret generic churntest-postgres-credentials \
+            --from-literal=DATABASE_URL='postgres://postgres:devpassword@postgres.default.svc.cluster.local:5432/churntest' \
+            --dry-run=client -o yaml | kubectl apply -f -
+
+      - name: Build operator image and load into kind
+        run: |
+          docker build -f docker/Dockerfile.e2e -t pgroles-operator:fairness dist
+          kind load docker-image pgroles-operator:fairness --name pgroles-fairness
+
+      - name: Deploy operator
+        run: |
+          kubectl apply -f k8s/deploy/namespace.yaml
+          kubectl apply -f k8s/deploy/rbac.yaml
+
+          sed 's|ghcr.io/hardbyte/pgroles-operator:latest|pgroles-operator:fairness|' \
+            k8s/deploy/deployment.yaml | \
+            sed 's|imagePullPolicy:.*|imagePullPolicy: Never|' | \
+            kubectl apply -f -
+
+          kubectl -n pgroles-system rollout status deployment/pgroles-operator --timeout=60s
+
+      - name: Run fairness and load scenarios
+        run: |
+          wait_for_ready_true() {
+            policy="$1"
+            attempts="${2:-90}"
+            sleep_secs="${3:-5}"
+            for i in $(seq 1 "$attempts"); do
+              status="$(kubectl get pgr "$policy" -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}' 2>/dev/null || true)"
+              if [ "$status" = "True" ]; then
+                echo "$policy reached Ready=True"
+                return 0
+              fi
+              echo "Waiting for $policy Ready=True... (attempt $i/$attempts)"
+              sleep "$sleep_secs"
+            done
+            echo "::error::$policy did not reach Ready=True"
+            kubectl get pgr "$policy" -o yaml || true
+            kubectl -n pgroles-system logs deployment/pgroles-operator --tail=200 || true
+            return 1
+          }
+
+          wait_for_ready_reason() {
+            policy="$1"
+            expected_reason="$2"
+            attempts="${3:-60}"
+            sleep_secs="${4:-5}"
+            for i in $(seq 1 "$attempts"); do
+              status="$(kubectl get pgr "$policy" -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}' 2>/dev/null || true)"
+              reason="$(kubectl get pgr "$policy" -o jsonpath='{.status.conditions[?(@.type=="Ready")].reason}' 2>/dev/null || true)"
+              if [ "$status" = "False" ] && [ "$reason" = "$expected_reason" ]; then
+                echo "$policy reached Ready=False with reason=$expected_reason"
+                return 0
+              fi
+              echo "Waiting for $policy Ready=False/$expected_reason... (attempt $i/$attempts)"
+              sleep "$sleep_secs"
+            done
+            echo "::error::$policy did not reach Ready=False with reason=$expected_reason"
+            kubectl get pgr "$policy" -o yaml || true
+            kubectl -n pgroles-system logs deployment/pgroles-operator --tail=200 || true
+            return 1
+          }
+
+          create_objects() {
+            db="$1"
+            prefix="$2"
+            count="$3"
+            {
+              echo "BEGIN;"
+              for i in $(seq -w 1 "$count"); do
+                echo "CREATE SCHEMA IF NOT EXISTS ${prefix}_${i};"
+                echo "CREATE TABLE IF NOT EXISTS ${prefix}_${i}.items (id integer generated always as identity primary key, name text not null);"
+                echo "CREATE SEQUENCE IF NOT EXISTS ${prefix}_${i}.audit_seq;"
+              done
+              echo "COMMIT;"
+            } | kubectl exec -i postgres-0 -- psql -v ON_ERROR_STOP=1 -U postgres -d "$db"
+          }
+
+          bash scripts/generate-load-policy.sh 20 /tmp/fair-a.yaml fair-a postgres-credentials faira
+          bash scripts/generate-load-policy.sh 20 /tmp/fair-b.yaml fair-b postgres-credentials fairb
+          bash scripts/generate-load-policy.sh 20 /tmp/fair-c.yaml fair-c postgres-credentials fairc
+          bash scripts/generate-load-policy.sh 20 /tmp/load-a.yaml load-a loadtest-postgres-credentials loada
+          bash scripts/generate-load-policy.sh 20 /tmp/churn-a.yaml churn-a churntest-postgres-credentials churna
+
+          create_objects postgres faira 20
+          create_objects postgres fairb 20
+          create_objects postgres fairc 20
+          create_objects loadtest loada 20
+          create_objects churntest churna 20
+
+          fairness_start="$(date +%s)"
+          kubectl apply -f /tmp/fair-a.yaml
+          kubectl apply -f /tmp/fair-b.yaml
+          kubectl apply -f /tmp/fair-c.yaml
+          kubectl apply -f /tmp/load-a.yaml
+          kubectl apply -f /tmp/churn-a.yaml
+
+          wait_for_ready_true fair-a
+          wait_for_ready_true fair-b
+          wait_for_ready_true fair-c
+          wait_for_ready_true load-a
+          wait_for_ready_true churn-a
+          initial_elapsed="$(( $(date +%s) - fairness_start ))"
+
+          for cycle in 1 2 3; do
+            kubectl create secret generic postgres-credentials \
+              --from-literal=DATABASE_URL='postgres://postgres:devpassword@postgres.default.svc.cluster.local:15432/postgres' \
+              --dry-run=client -o yaml | kubectl apply -f -
+
+            wait_for_ready_reason fair-a DatabaseConnectionFailed
+            wait_for_ready_reason fair-b DatabaseConnectionFailed
+            wait_for_ready_reason fair-c DatabaseConnectionFailed
+            wait_for_ready_true load-a 20 3
+            wait_for_ready_true churn-a 20 3
+
+            kubectl create secret generic postgres-credentials \
+              --from-literal=DATABASE_URL='postgres://postgres:devpassword@postgres.default.svc.cluster.local:5432/postgres' \
+              --dry-run=client -o yaml | kubectl apply -f -
+
+            wait_for_ready_true fair-a
+            wait_for_ready_true fair-b
+            wait_for_ready_true fair-c
+            echo "Completed shared-secret churn cycle $cycle"
+          done
+
+          kubectl create secret generic churntest-postgres-credentials \
+            --from-literal=DATABASE_URL='postgres://postgres:devpassword@postgres.default.svc.cluster.local:15432/churntest' \
+            --dry-run=client -o yaml | kubectl apply -f -
+          wait_for_ready_reason churn-a DatabaseConnectionFailed
+          wait_for_ready_true fair-a 20 3
+          wait_for_ready_true load-a 20 3
+
+          kubectl create secret generic churntest-postgres-credentials \
+            --from-literal=DATABASE_URL='postgres://postgres:devpassword@postgres.default.svc.cluster.local:5432/churntest' \
+            --dry-run=client -o yaml | kubectl apply -f -
+          wait_for_ready_true churn-a
+
+          total_elapsed="$(( $(date +%s) - fairness_start ))"
+          printf 'Scheduled fairness/load workflow converged in %ss across %s policies, %s databases, %s schemas, and %s generated roles\n' \
+            "$total_elapsed" "5" "3" "100" "200" >> "$GITHUB_STEP_SUMMARY"
+          printf 'Initial convergence completed in %ss before churn cycles\n' "$initial_elapsed" >> "$GITHUB_STEP_SUMMARY"
+
+          postgres_role_count="$(
+            printf '%s\n' "SELECT count(*) FROM pg_roles WHERE rolname ~ '^(fair[abc]_[0-9]{2}|loada_[0-9]{2}|churna_[0-9]{2})-(editor|viewer)$';" \
+              | kubectl exec -i postgres-0 -- psql -U postgres -tA
+          )"
+          test "$postgres_role_count" = "200"
+
+          kubectl exec postgres-0 -- psql -U postgres -d postgres -tAc "SELECT has_schema_privilege('faira_01-editor', 'faira_01', 'USAGE');" | grep -qx "t"
+          kubectl exec postgres-0 -- psql -U postgres -d postgres -tAc "SELECT has_table_privilege('fairc_20-viewer', 'fairc_20.items', 'SELECT');" | grep -qx "t"
+          kubectl exec postgres-0 -- psql -U postgres -d loadtest -tAc "SELECT has_sequence_privilege('loada_05-editor', 'loada_05.audit_seq', 'USAGE');" | grep -qx "t"
+          kubectl exec postgres-0 -- psql -U postgres -d churntest -tAc "SELECT has_table_privilege('churna_10-viewer', 'churna_10.items', 'SELECT');" | grep -qx "t"
+
+      - name: Cleanup
+        if: always()
+        run: kind delete cluster --name pgroles-fairness

@@ -116,8 +116,7 @@ The operator is intended to become a production controller, but that still requi
   - rotated secrets and connection recovery after secret repair
   - transition-based Kubernetes Event delivery for warning and recovery states
 - Remaining gaps:
-  - broader scale and load tests covering larger manifests, more roles/grants, and more policies across multiple databases
-  - reconciliation concurrency tests that prove per-database serialization and backoff behavior under churn
+  - broader scale and load tests beyond the scheduled fairness/load profile
 
 Current validated profile in default CI:
 
@@ -125,6 +124,15 @@ Current validated profile in default CI:
 - 30 managed schemas total
 - 60 generated roles total
 - schema, table, and sequence privilege checks on both database targets
+
+Scheduled fairness/load coverage on `main` additionally exercises:
+
+- 5 generated policies across 3 databases
+- 100 managed schemas total
+- 200 generated roles total
+- repeated shared-secret churn across 3 same-database policies
+- targeted secret churn on a separate database to verify isolation
+- latency reporting in the workflow summary for initial convergence and full churn completion
 
 ### 2. API hardening toward production use
 
