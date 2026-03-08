@@ -5,7 +5,7 @@ description: Running pgroles against Amazon RDS or Aurora PostgreSQL.
 
 What you need to know about pgroles on RDS and Aurora — auto-detection, attribute restrictions, IAM authentication, and the Docker image interface. {% .lead %}
 
-For general usage, see the [quick start](/docs/quick-start). For CI pipeline patterns, see [CI/CD integration](/docs/ci-cd). For the Kubernetes operator, see the [operator docs](/docs/operator).
+For general usage, see the [quick start](./quick-start). For CI pipeline patterns, see [CI/CD integration](./ci-cd). For the Kubernetes operator, see the [operator docs](./operator).
 
 ---
 
@@ -64,7 +64,7 @@ kubectl create secret generic mydb-credentials \
   --from-literal=DATABASE_URL='postgres://postgres:PASSWORD@my-instance.abc123.us-east-1.rds.amazonaws.com:5432/mydb'
 ```
 
-See the [operator docs](/docs/operator) for the full `PostgresPolicy` CRD reference.
+See the [operator docs](./operator) for the full `PostgresPolicy` CRD reference.
 
 {% callout type="note" title="Secrets Manager integration" %}
 For production, use the [AWS Secrets Store CSI Driver](https://docs.aws.amazon.com/secretsmanager/latest/userguide/integrating_csi_driver.html) to sync credentials from Secrets Manager into Kubernetes Secrets, rather than creating them manually.

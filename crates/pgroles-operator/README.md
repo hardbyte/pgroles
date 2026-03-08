@@ -16,17 +16,13 @@ resources.
 
 ## Install
 
-Library:
+This crate is maintained in-repo.
+
+Library from source:
 
 ```toml
 [dependencies]
-pgroles-operator = "<current-release>"
-```
-
-Binary:
-
-```bash
-cargo install pgroles-operator
+pgroles-operator = { git = "https://github.com/hardbyte/pgroles", tag = "v0.1.3" }
 ```
 
 ## Intended Audience

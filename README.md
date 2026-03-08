@@ -1,4 +1,20 @@
+<p align="center">
+  <img alt="pgroles logo" src="https://raw.githubusercontent.com/hardbyte/pgroles/main/docs/public/logo.svg" width="140" />
+</p>
+
 # pgroles
+
+<div align="center">
+
+[![CI](https://github.com/hardbyte/pgroles/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/hardbyte/pgroles/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/hardbyte/pgroles?sort=semver)](https://github.com/hardbyte/pgroles/releases)
+[![Docs](https://img.shields.io/badge/docs-github_pages-blue)](https://hardbyte.github.io/pgroles/)
+[![crates.io - pgroles-cli](https://img.shields.io/crates/v/pgroles-cli)](https://crates.io/crates/pgroles-cli)
+[![crates.io - pgroles-core](https://img.shields.io/crates/v/pgroles-core)](https://crates.io/crates/pgroles-core)
+[![crates.io - pgroles-inspect](https://img.shields.io/crates/v/pgroles-inspect)](https://crates.io/crates/pgroles-inspect)
+[![Helm Chart OCI](https://img.shields.io/badge/helm-ghcr.io%2Fhardbyte%2Fcharts-informational)](https://github.com/hardbyte/pgroles/pkgs/container/charts%2Fpgroles-operator)
+
+</div>
 
 Declarative PostgreSQL access control. Define roles, grants, and memberships in YAML — pgroles diffs against your live database and generates the exact SQL to converge it.
 
@@ -84,10 +100,16 @@ pgroles apply -f pgroles.yaml --database-url postgres://...
 
 **Pre-built binaries** from [GitHub Releases](https://github.com/hardbyte/pgroles/releases) (Linux x86_64/aarch64, macOS x86_64/aarch64).
 
-**Cargo:**
+**Cargo CLI:**
 ```bash
 cargo install pgroles-cli
 ```
+
+**Rust crates:**
+- [`pgroles-cli`](https://crates.io/crates/pgroles-cli) — end-user CLI
+- [`pgroles-core`](https://crates.io/crates/pgroles-core) — manifest model, diff engine, SQL rendering
+- [`pgroles-inspect`](https://crates.io/crates/pgroles-inspect) — database inspection and managed-provider detection
+- `pgroles-operator` — operator crate in this repository; see the [operator docs](https://hardbyte.github.io/pgroles/docs/operator/) for source consumption
 
 **Docker:**
 ```bash
@@ -109,7 +131,14 @@ docker run --rm ghcr.io/hardbyte/pgroles --help
 
 ## Documentation
 
-Full docs covering the [manifest format](https://hardbyte.github.io/pgroles/docs/manifest-format), [profiles](https://hardbyte.github.io/pgroles/docs/profiles), [grants](https://hardbyte.github.io/pgroles/docs/grants), [CLI reference](https://hardbyte.github.io/pgroles/docs/cli), and the [Kubernetes operator](https://hardbyte.github.io/pgroles/docs/operator) are at [hardbyte.github.io/pgroles](https://hardbyte.github.io/pgroles/).
+Full documentation is published at [hardbyte.github.io/pgroles](https://hardbyte.github.io/pgroles/).
+
+- [Quick start](https://hardbyte.github.io/pgroles/docs/quick-start/)
+- [Installation](https://hardbyte.github.io/pgroles/docs/installation/)
+- [Manifest format](https://hardbyte.github.io/pgroles/docs/manifest-format/)
+- [CLI reference](https://hardbyte.github.io/pgroles/docs/cli/)
+- [Kubernetes operator](https://hardbyte.github.io/pgroles/docs/operator/)
+- [Operator architecture](https://hardbyte.github.io/pgroles/docs/operator-architecture/)
 
 ## License
 

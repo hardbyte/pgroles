@@ -5,7 +5,7 @@ description: Use pgroles as a drift gate in your CI/CD pipeline.
 
 pgroles integrates into CI/CD pipelines as a drift gate, a deployment step, or both. {% .lead %}
 
-For Cloud SQL or RDS connectivity setup (auth proxies, VPC access, IAM authentication), see the [Google Cloud SQL](/docs/google-cloud-sql) or [AWS RDS](/docs/aws-rds) guides.
+For Cloud SQL or RDS connectivity setup (auth proxies, VPC access, IAM authentication), see the [Google Cloud SQL](./google-cloud-sql) or [AWS RDS](./aws-rds) guides.
 
 ---
 
