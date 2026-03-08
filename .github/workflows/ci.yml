@@ -178,7 +178,12 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       - name: Build binaries
-        run: cargo build --workspace
+        run: cargo build -p pgroles-operator
+
+      - name: Stage operator binary for E2E image
+        run: |
+          mkdir -p dist
+          install -Dm755 -s target/debug/pgroles-operator dist/pgroles-operator-e2e
 
       - name: Install kind
         run: |
@@ -207,6 +212,7 @@ jobs:
         run: |
           kubectl exec -i postgres-0 -- psql -v ON_ERROR_STOP=1 -U postgres -d postgres <<'SQL'
           SET password_encryption = 'scram-sha-256';
+          CREATE DATABASE loadtest;
           CREATE TABLE IF NOT EXISTS public.inventory_items (
             id integer generated always as identity primary key,
             name text not null
@@ -239,18 +245,12 @@ jobs:
             --from-literal=DATABASE_URL='postgres://limited_operator:limitedpassword@postgres.default.svc.cluster.local:5432/postgres' \
             --dry-run=client -o yaml | kubectl apply -f -
 
-      - uses: docker/setup-buildx-action@v4
+          kubectl create secret generic loadtest-postgres-credentials \
+            --from-literal=DATABASE_URL='postgres://postgres:devpassword@postgres.default.svc.cluster.local:5432/loadtest' \
+            --dry-run=client -o yaml | kubectl apply -f -
 
       - name: Build operator image and load into kind
-        uses: docker/build-push-action@v6
-        with:
-          context: .
-          file: docker/Dockerfile
-          target: operator
-          load: true
-          tags: pgroles-operator:e2e
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+        run: docker build -f docker/Dockerfile.e2e -t pgroles-operator:e2e dist
 
       - name: Load image into kind
         run: kind load docker-image pgroles-operator:e2e --name pgroles-e2e
@@ -302,14 +302,16 @@ jobs:
         run: |
           wait_for_ready_true() {
             policy="$1"
-            for i in $(seq 1 30); do
+            attempts="${2:-30}"
+            sleep_secs="${3:-3}"
+            for i in $(seq 1 "$attempts"); do
               status="$(kubectl get pgr "$policy" -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}' 2>/dev/null || true)"
               if [ "$status" = "True" ]; then
                 echo "$policy reached Ready=True"
                 return 0
               fi
-              echo "Waiting for $policy Ready=True... (attempt $i/30)"
-              sleep 3
+              echo "Waiting for $policy Ready=True... (attempt $i/$attempts)"
+              sleep "$sleep_secs"
             done
             echo "::error::$policy did not reach Ready=True"
             kubectl get pgr "$policy" -o yaml || true
@@ -394,6 +396,56 @@ jobs:
             --from-literal=DATABASE_URL='postgres://postgres:devpassword@postgres.default.svc.cluster.local:5432/postgres' \
             --dry-run=client -o yaml | kubectl apply -f -
           wait_for_ready_true rotated-secret-policy
+
+          bash scripts/generate-load-policy.sh 20 /tmp/load-policy.yaml load-policy postgres-credentials loada
+          bash scripts/generate-load-policy.sh 10 /tmp/load-policy-secondary.yaml load-policy-secondary loadtest-postgres-credentials loadb
+          {
+            echo "BEGIN;"
+            for i in $(seq -w 1 20); do
+              echo "CREATE SCHEMA IF NOT EXISTS loada_${i};"
+              echo "CREATE TABLE IF NOT EXISTS loada_${i}.items (id integer generated always as identity primary key, name text not null);"
+              echo "CREATE SEQUENCE IF NOT EXISTS loada_${i}.audit_seq;"
+            done
+            echo "COMMIT;"
+          } | kubectl exec -i postgres-0 -- psql -v ON_ERROR_STOP=1 -U postgres -d postgres
+
+          {
+            echo "BEGIN;"
+            for i in $(seq -w 1 10); do
+              echo "CREATE SCHEMA IF NOT EXISTS loadb_${i};"
+              echo "CREATE TABLE IF NOT EXISTS loadb_${i}.items (id integer generated always as identity primary key, name text not null);"
+              echo "CREATE SEQUENCE IF NOT EXISTS loadb_${i}.audit_seq;"
+            done
+            echo "COMMIT;"
+          } | kubectl exec -i postgres-0 -- psql -v ON_ERROR_STOP=1 -U postgres -d loadtest
+
+          load_start="$(date +%s)"
+          kubectl apply -f /tmp/load-policy.yaml
+          kubectl apply -f /tmp/load-policy-secondary.yaml
+          wait_for_ready_true load-policy 60 5
+          wait_for_ready_true load-policy-secondary 60 5
+          load_elapsed="$(( $(date +%s) - load_start ))"
+          printf 'Generated load policies reconciled in %ss across %s databases, %s schemas, and %s generated roles\n' \
+            "$load_elapsed" "2" "$((20 + 10))" "$(((20 + 10) * 2))" >> "$GITHUB_STEP_SUMMARY"
+
+          load_role_count="$(
+            printf '%s\n' "SELECT count(*) FROM pg_roles WHERE rolname ~ '^loada_[0-9]{2}-(editor|viewer)$';" \
+              | kubectl exec -i postgres-0 -- psql -U postgres -tA
+          )"
+          test "$load_role_count" = "40"
+
+          secondary_load_role_count="$(
+            printf '%s\n' "SELECT count(*) FROM pg_roles WHERE rolname ~ '^loadb_[0-9]{2}-(editor|viewer)$';" \
+              | kubectl exec -i postgres-0 -- psql -U postgres -tA
+          )"
+          test "$secondary_load_role_count" = "20"
+
+          kubectl exec postgres-0 -- psql -U postgres -d postgres -tAc "SELECT has_schema_privilege('loada_01-editor', 'loada_01', 'USAGE');" | grep -qx "t"
+          kubectl exec postgres-0 -- psql -U postgres -d postgres -tAc "SELECT has_table_privilege('loada_20-viewer', 'loada_20.items', 'SELECT');" | grep -qx "t"
+          kubectl exec postgres-0 -- psql -U postgres -d postgres -tAc "SELECT has_sequence_privilege('loada_10-editor', 'loada_10.audit_seq', 'USAGE');" | grep -qx "t"
+          kubectl exec postgres-0 -- psql -U postgres -d loadtest -tAc "SELECT has_schema_privilege('loadb_01-editor', 'loadb_01', 'USAGE');" | grep -qx "t"
+          kubectl exec postgres-0 -- psql -U postgres -d loadtest -tAc "SELECT has_table_privilege('loadb_10-viewer', 'loadb_10.items', 'SELECT');" | grep -qx "t"
+          kubectl exec postgres-0 -- psql -U postgres -d loadtest -tAc "SELECT has_sequence_privilege('loadb_05-editor', 'loadb_05.audit_seq', 'USAGE');" | grep -qx "t"
 
       - name: Verify OTLP metrics reach the collector
         run: |

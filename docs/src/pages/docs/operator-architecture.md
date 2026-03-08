@@ -149,6 +149,7 @@ CI covers:
 - insufficient database privileges
 - secret rotation and recovery
 - OTLP metrics export through an in-cluster Collector
+- generated load policies across 2 databases with 30 schemas / 60 generated roles
 
 Remaining gaps:
 

@@ -802,7 +802,21 @@ async fn detect_policy_conflict(
     let api: Api<PostgresPolicy> = Api::all(ctx.kube_client.clone());
     let policies = api.list(&Default::default()).await?;
 
-    let this_ns = resource.namespace().ok_or(ReconcileError::NoNamespace)?;
+    Ok(detect_policy_conflict_in_list(
+        resource,
+        identity,
+        ownership,
+        policies.into_iter(),
+    ))
+}
+
+fn detect_policy_conflict_in_list(
+    resource: &PostgresPolicy,
+    identity: &DatabaseIdentity,
+    ownership: &crate::crd::OwnershipClaims,
+    policies: impl IntoIterator<Item = PostgresPolicy>,
+) -> Option<String> {
+    let this_ns = resource.namespace()?;
     let this_name = resource.name_any();
 
     let mut conflicts = Vec::new();
@@ -825,7 +839,18 @@ async fn detect_policy_conflict(
             continue;
         }
 
-        let other_ownership = other.spec.ownership_claims()?;
+        let other_ownership = match other.spec.ownership_claims() {
+            Ok(claims) => claims,
+            Err(error) => {
+                tracing::warn!(
+                    policy = %format!("{other_ns}/{other_name}"),
+                    database = %identity.as_str(),
+                    %error,
+                    "skipping conflict detection for invalid peer policy"
+                );
+                continue;
+            }
+        };
         if ownership.overlaps(&other_ownership) {
             let overlap = ownership.overlap_summary(&other_ownership);
             conflicts.push(format!("{other_ns}/{other_name} ({overlap})"));
@@ -833,13 +858,13 @@ async fn detect_policy_conflict(
     }
 
     if conflicts.is_empty() {
-        Ok(None)
+        None
     } else {
-        Ok(Some(format!(
+        Some(format!(
             "policy ownership overlaps with {} on database target {}",
             conflicts.join(", "),
             identity.as_str()
-        )))
+        ))
     }
 }
 
@@ -884,7 +909,7 @@ impl ReconcileError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::crd::{ConnectionSpec, PostgresPolicySpec, SecretReference};
+    use crate::crd::{ConnectionSpec, PostgresPolicySpec, RoleSpec, SecretReference};
     use sqlx::error::{DatabaseError, ErrorKind};
     use std::borrow::Cow;
     use std::error::Error as StdError;
@@ -963,6 +988,76 @@ mod tests {
             ..Default::default()
         });
         Arc::new(resource)
+    }
+
+    fn test_policy_with_spec(name: &str, spec: PostgresPolicySpec) -> PostgresPolicy {
+        let mut resource = PostgresPolicy::new(name, spec);
+        resource.metadata.namespace = Some("default".to_string());
+        resource
+    }
+
+    fn valid_role_policy(name: &str, role_name: &str, secret_name: &str) -> PostgresPolicy {
+        test_policy_with_spec(
+            name,
+            PostgresPolicySpec {
+                connection: ConnectionSpec {
+                    secret_ref: SecretReference {
+                        name: secret_name.to_string(),
+                    },
+                    secret_key: "DATABASE_URL".to_string(),
+                },
+                interval: "5m".to_string(),
+                suspend: false,
+                default_owner: None,
+                profiles: Default::default(),
+                schemas: Vec::new(),
+                roles: vec![RoleSpec {
+                    name: role_name.to_string(),
+                    login: Some(true),
+                    superuser: None,
+                    createdb: None,
+                    createrole: None,
+                    inherit: None,
+                    replication: None,
+                    bypassrls: None,
+                    connection_limit: None,
+                    comment: None,
+                }],
+                grants: Vec::new(),
+                default_privileges: Vec::new(),
+                memberships: Vec::new(),
+                retirements: Vec::new(),
+            },
+        )
+    }
+
+    fn invalid_profile_policy(name: &str, secret_name: &str) -> PostgresPolicy {
+        test_policy_with_spec(
+            name,
+            PostgresPolicySpec {
+                connection: ConnectionSpec {
+                    secret_ref: SecretReference {
+                        name: secret_name.to_string(),
+                    },
+                    secret_key: "DATABASE_URL".to_string(),
+                },
+                interval: "5m".to_string(),
+                suspend: false,
+                default_owner: None,
+                profiles: Default::default(),
+                schemas: vec![pgroles_core::manifest::SchemaBinding {
+                    name: "reporting".to_string(),
+                    profiles: vec!["missing-profile".to_string()],
+                    role_pattern: "{schema}-{profile}".to_string(),
+                    owner: None,
+                }],
+                roles: Vec::new(),
+                grants: Vec::new(),
+                default_privileges: Vec::new(),
+                memberships: Vec::new(),
+                retirements: Vec::new(),
+            },
+        )
     }
 
     #[test]
@@ -1461,5 +1556,39 @@ mod tests {
             (40..=60).any(|secs| action == Action::requeue(Duration::from_secs(secs))),
             "expected transient retry between 40s and 60s, got {action:?}"
         );
+    }
+
+    #[test]
+    fn conflict_detection_ignores_invalid_peer_policies() {
+        let resource = valid_role_policy("valid-policy", "analytics", "shared-db-secret");
+        let identity = DatabaseIdentity::new("default", "shared-db-secret", "DATABASE_URL");
+        let ownership = resource.spec.ownership_claims().unwrap();
+        let invalid_peer = invalid_profile_policy("invalid-peer", "shared-db-secret");
+
+        let conflict =
+            detect_policy_conflict_in_list(&resource, &identity, &ownership, vec![invalid_peer]);
+
+        assert_eq!(conflict, None);
+    }
+
+    #[test]
+    fn conflict_detection_still_reports_overlapping_valid_peers() {
+        let resource = valid_role_policy("valid-policy", "analytics", "shared-db-secret");
+        let identity = DatabaseIdentity::new("default", "shared-db-secret", "DATABASE_URL");
+        let ownership = resource.spec.ownership_claims().unwrap();
+        let overlapping_peer =
+            valid_role_policy("overlapping-peer", "analytics", "shared-db-secret");
+        let invalid_peer = invalid_profile_policy("invalid-peer", "shared-db-secret");
+
+        let conflict = detect_policy_conflict_in_list(
+            &resource,
+            &identity,
+            &ownership,
+            vec![invalid_peer, overlapping_peer],
+        );
+
+        let conflict = conflict.expect("expected overlapping peer to be reported");
+        assert!(conflict.contains("overlapping-peer"));
+        assert!(conflict.contains("roles: analytics"));
     }
 }

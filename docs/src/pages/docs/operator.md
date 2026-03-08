@@ -113,8 +113,15 @@ The operator is intended to become a production controller, but that still requi
   - insufficient database privileges
   - rotated secrets and connection recovery after secret repair
 - Remaining gaps:
-  - scale and load tests covering large manifests, many roles/grants, and many policies across multiple databases
+  - broader scale and load tests covering larger manifests, more roles/grants, and more policies across multiple databases
   - reconciliation concurrency tests that prove per-database serialization and backoff behavior under churn
+
+Current validated profile in default CI:
+
+- generated policies spanning 2 databases
+- 30 managed schemas total
+- 60 generated roles total
+- schema, table, and sequence privilege checks on both database targets
 
 ### 2. API hardening toward production use
 
