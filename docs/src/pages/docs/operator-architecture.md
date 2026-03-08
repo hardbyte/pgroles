@@ -155,6 +155,7 @@ CI covers:
 - missing secrets
 - insufficient database privileges
 - secret rotation and recovery
+- Kubernetes Event delivery for warning and recovery transitions
 - OTLP metrics export through an in-cluster Collector
 - generated load policies across 2 databases with 30 schemas / 60 generated roles
 

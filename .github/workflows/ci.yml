@@ -357,6 +357,30 @@ jobs:
             return 1
           }
 
+          wait_for_event_reason() {
+            policy="$1"
+            expected_reason="$2"
+            namespace="${3:-default}"
+            for i in $(seq 1 30); do
+              events="$(
+                kubectl get events.events.k8s.io -n "$namespace" \
+                  -o jsonpath='{range .items[*]}{.regarding.name}{"\t"}{.reason}{"\n"}{end}' \
+                  2>/dev/null || true
+              )"
+              if printf '%s\n' "$events" | grep -Fxq "$policy	$expected_reason"; then
+                echo "$policy emitted Event reason=$expected_reason"
+                return 0
+              fi
+              echo "Waiting for $policy Event/$expected_reason... (attempt $i/30)"
+              sleep 3
+            done
+            echo "::error::$policy did not emit Event reason=$expected_reason"
+            kubectl get events.events.k8s.io -n "$namespace" || true
+            kubectl describe pgr "$policy" || true
+            kubectl -n pgroles-system logs deployment/pgroles-operator --tail=200 || true
+            return 1
+          }
+
           kubectl delete pgr basic-policy --wait=true
 
           kubectl apply -f k8s/samples/disjoint-policy.yaml
@@ -381,12 +405,14 @@ jobs:
 
           kubectl apply -f k8s/samples/conflicting-policy.yaml
           wait_for_ready_reason conflicting-policy ConflictingPolicy
+          wait_for_event_reason conflicting-policy ConflictDetected
 
           kubectl apply -f k8s/samples/invalid-policy.yaml
           wait_for_ready_reason invalid-policy InvalidSpec
 
           kubectl apply -f k8s/samples/missing-secret-policy.yaml
           wait_for_ready_reason missing-secret-policy SecretFetchFailed
+          wait_for_event_reason missing-secret-policy SecretFetchFailed
 
           kubectl apply -f k8s/samples/insufficient-privileges-policy.yaml
           wait_for_ready_reason insufficient-privileges-policy InsufficientPrivileges
@@ -408,6 +434,7 @@ jobs:
             --from-literal=DATABASE_URL='postgres://postgres:devpassword@postgres.default.svc.cluster.local:5432/postgres' \
             --dry-run=client -o yaml | kubectl apply -f -
           wait_for_ready_true rotated-secret-policy
+          wait_for_event_reason rotated-secret-policy Recovered
 
           bash scripts/generate-load-policy.sh 20 /tmp/load-policy.yaml load-policy postgres-credentials loada
           bash scripts/generate-load-policy.sh 10 /tmp/load-policy-secondary.yaml load-policy-secondary loadtest-postgres-credentials loadb

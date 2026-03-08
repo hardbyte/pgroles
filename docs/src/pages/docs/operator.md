@@ -114,6 +114,7 @@ The operator is intended to become a production controller, but that still requi
   - missing secrets
   - insufficient database privileges
   - rotated secrets and connection recovery after secret repair
+  - transition-based Kubernetes Event delivery for warning and recovery states
 - Remaining gaps:
   - broader scale and load tests covering larger manifests, more roles/grants, and more policies across multiple databases
   - reconciliation concurrency tests that prove per-database serialization and backoff behavior under churn
