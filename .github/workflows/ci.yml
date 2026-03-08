@@ -205,7 +205,7 @@ jobs:
 
       - name: Seed PostgreSQL objects for grant reconciliation
         run: |
-          kubectl exec postgres-0 -- psql -v ON_ERROR_STOP=1 -U postgres -d postgres <<'SQL'
+          kubectl exec -i postgres-0 -- psql -v ON_ERROR_STOP=1 -U postgres -d postgres <<'SQL'
           SET password_encryption = 'scram-sha-256';
           CREATE TABLE IF NOT EXISTS public.inventory_items (
             id integer generated always as identity primary key,
