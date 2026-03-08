@@ -7,7 +7,7 @@ The pgroles operator watches `PostgresPolicy` custom resources and continuously 
 
 ---
 
-For the internal controller design, see the [operator architecture](/docs/operator-architecture) page.
+For the internal controller design, see the [operator architecture](./operator-architecture) page.
 
 ## Overview
 
@@ -34,11 +34,11 @@ helm install pgroles-operator oci://ghcr.io/hardbyte/charts/pgroles-operator
 
 The operator source crate lives in this repository, but it is not yet published on crates.io.
 
-If you are embedding the reconciler or CRD types in another Rust project from source, pin the current release in your `Cargo.toml`:
+If you are embedding the reconciler or CRD types in another Rust project from source, depend on the repository directly in your `Cargo.toml`:
 
 ```toml
 [dependencies]
-pgroles-operator = "<current-release>"
+pgroles-operator = { git = "https://github.com/hardbyte/pgroles", tag = "v0.1.2" }
 ```
 
 ### Configuration

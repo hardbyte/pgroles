@@ -18,7 +18,7 @@ Terraform is great at creating infrastructure — the database instance, VPC, IA
 - **Convergence** — Terraform manages what's in your `.tf` files. If someone manually adds a `GRANT` via psql, Terraform doesn't know about it and won't revoke it. pgroles treats the manifest as the entire desired state and revokes anything not declared.
 - **Profiles vs combinatorial resources** — 3 schemas × 2 profiles requires 18+ Terraform resources with `depends_on` wiring. In pgroles, define profiles once and bind them to schemas.
 - **Default privileges** — Terraform's `postgresql_grant` only covers *existing* tables at plan time. pgroles pairs wildcard grants with default privileges so future tables are covered too.
-- **Role removal** — Terraform's `postgresql_role` can't cleanly drop a role that owns objects. pgroles has explicit [retirements](/docs/manifest-format) with `reassign_owned_to`, `drop_owned`, and `terminate_sessions`.
+- **Role removal** — Terraform's `postgresql_role` can't cleanly drop a role that owns objects. pgroles has explicit [retirements](./manifest-format) with `reassign_owned_to`, `drop_owned`, and `terminate_sessions`.
 - **Managed PostgreSQL awareness** — Terraform's PostgreSQL provider doesn't know about cloud provider limitations. pgroles detects `rds_superuser`, `cloudsqlsuperuser`, and `azure_pg_admin` and warns when your manifest requests unsupported attributes.
 
 **Choose Terraform alone if:** you manage a handful of roles with straightforward grants and no repeating schema patterns.
