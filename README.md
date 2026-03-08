@@ -108,7 +108,7 @@ cargo install pgroles-cli
 - [`pgroles-cli`](https://crates.io/crates/pgroles-cli) — end-user CLI
 - [`pgroles-core`](https://crates.io/crates/pgroles-core) — manifest model, diff engine, SQL rendering
 - [`pgroles-inspect`](https://crates.io/crates/pgroles-inspect) — database inspection and managed-provider detection
-- `pgroles-operator` — source crate in this repo; not yet published on crates.io
+- `pgroles-operator` — source crate in this repo; not yet available on crates.io in the current released version
 
 **Docker:**
 ```bash

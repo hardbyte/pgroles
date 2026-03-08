@@ -16,13 +16,13 @@ resources.
 
 ## Install
 
-This crate is maintained in-repo and is not yet published on crates.io.
+This crate is maintained in-repo. It is publishable and included in the release workflow, but it is not yet available on crates.io in the current released version.
 
 Library from source:
 
 ```toml
 [dependencies]
-pgroles-operator = "<current-release>"
+pgroles-operator = { git = "https://github.com/hardbyte/pgroles", tag = "v0.1.2" }
 ```
 
 ## Intended Audience
