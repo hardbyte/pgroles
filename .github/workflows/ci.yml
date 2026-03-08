@@ -205,29 +205,32 @@ jobs:
 
       - name: Seed PostgreSQL objects for grant reconciliation
         run: |
-          kubectl exec postgres-0 -- psql -U postgres -d postgres <<'SQL'
+          kubectl exec postgres-0 -- psql -v ON_ERROR_STOP=1 -U postgres -d postgres <<'SQL'
           CREATE TABLE IF NOT EXISTS public.inventory_items (
             id integer generated always as identity primary key,
             name text not null
           );
           CREATE SEQUENCE IF NOT EXISTS public.audit_seq;
-          DO $$
-          BEGIN
-            IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'limited_operator') THEN
-              CREATE ROLE limited_operator LOGIN PASSWORD 'limitedpassword';
-            ELSE
-              ALTER ROLE limited_operator WITH LOGIN PASSWORD 'limitedpassword';
-            END IF;
-            ALTER ROLE limited_operator
-              NOSUPERUSER
-              NOCREATEDB
-              NOCREATEROLE
-              INHERIT
-              NOREPLICATION
-              NOBYPASSRLS;
-          END
-          $$;
+          DROP ROLE IF EXISTS limited_operator;
+          CREATE ROLE limited_operator LOGIN PASSWORD 'limitedpassword';
+          ALTER ROLE limited_operator
+            NOSUPERUSER
+            NOCREATEDB
+            NOCREATEROLE
+            INHERIT
+            NOREPLICATION
+            NOBYPASSRLS;
+          GRANT CONNECT ON DATABASE postgres TO limited_operator;
           SQL
+
+      - name: Verify limited-privilege role can authenticate
+        run: |
+          kubectl exec postgres-0 -- env PGPASSWORD=limitedpassword \
+            psql -v ON_ERROR_STOP=1 \
+            -h postgres.default.svc.cluster.local \
+            -U limited_operator \
+            -d postgres \
+            -c 'SELECT current_user;' | tee /dev/stderr | grep -q 'limited_operator'
 
       - name: Create limited-privilege database secret
         run: |
