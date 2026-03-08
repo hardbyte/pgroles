@@ -1,4 +1,5 @@
 import { Callout } from '@/components/Callout'
+import { OperatorArchitectureDiagram } from '@/components/OperatorArchitectureDiagram'
 import { QuickLink, QuickLinks } from '@/components/QuickLinks'
 
 const tags = {
@@ -41,8 +42,11 @@ const tags = {
       icon: { type: String },
       href: { type: String },
     },
+  },
+  'operator-architecture-diagram': {
+    selfClosing: true,
+    render: OperatorArchitectureDiagram,
   }
-
 }
 
 export default tags

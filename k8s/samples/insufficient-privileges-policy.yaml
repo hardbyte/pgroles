@@ -1,0 +1,16 @@
+---
+apiVersion: pgroles.io/v1alpha1
+kind: PostgresPolicy
+metadata:
+  name: insufficient-privileges-policy
+  namespace: default
+spec:
+  connection:
+    secretRef:
+      name: limited-postgres-credentials
+  interval: "5m"
+
+  roles:
+    - name: insufficient-privileges-user
+      login: true
+      comment: "Should fail because the management role lacks CREATEROLE"

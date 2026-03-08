@@ -21,57 +21,7 @@ The important difference is that the operator has to do this continuously, safel
 
 ## Control-plane diagram
 
-```text
-                        Kubernetes API
-  +---------------------------------------------------------------+
-  |                                                               |
-  |   PostgresPolicy CRDs          Secrets           Status        |
-  |          |                      |                 ^            |
-  +----------|----------------------|-----------------|------------+
-             |                      |                 |
-             v                      v                 |
-        +---------------------------------------------------+
-        |                 pgroles-operator                  |
-        |                                                   |
-        |  Watchers                                         |
-        |  - PostgresPolicy generation changes              |
-        |  - Secret resourceVersion changes                 |
-        |                                                   |
-        |  Reconcile pipeline                               |
-        |  - load CR spec                                   |
-        |  - fetch database URL from Secret                 |
-        |  - build/refresh sqlx pool                        |
-        |  - expand manifest                                |
-        |  - inspect database                               |
-        |  - diff desired vs current                        |
-        |  - apply SQL in one transaction                   |
-        |  - patch status conditions + summary              |
-        |                                                   |
-        |  Safety controls                                  |
-        |  - ownership conflict detection                   |
-        |  - in-process per-database lock                   |
-        |  - PostgreSQL advisory lock                       |
-        |  - error-aware retry/backoff                      |
-        |                                                   |
-        |  Observability                                    |
-        |  - /livez                                         |
-        |  - /readyz                                        |
-        |  - OTLP metrics                                   |
-        +--------------------------|------------------------+
-                                   |
-                                   v
-                         +--------------------+
-                         |    PostgreSQL      |
-                         | roles / grants /   |
-                         | defaults / members |
-                         +--------------------+
-                                   |
-                                   v
-                         +--------------------+
-                         | OTel Collector     |
-                         | metrics pipeline   |
-                         +--------------------+
-```
+{% operator-architecture-diagram /%}
 
 ## Main components
 
@@ -196,12 +146,12 @@ CI covers:
 - same-database conflicting policies
 - invalid specs
 - missing secrets
+- insufficient database privileges
 - secret rotation and recovery
 - OTLP metrics export through an in-cluster Collector
 
 Remaining gaps:
 
-- insufficient PostgreSQL privilege scenarios
 - higher-scale reconcile/load coverage
 - more explicit fairness/concurrency testing under churn
 

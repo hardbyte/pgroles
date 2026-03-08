@@ -211,7 +211,29 @@ jobs:
             name text not null
           );
           CREATE SEQUENCE IF NOT EXISTS public.audit_seq;
+          DO $$
+          BEGIN
+            IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'limited_operator') THEN
+              CREATE ROLE limited_operator LOGIN PASSWORD 'limitedpassword';
+            ELSE
+              ALTER ROLE limited_operator WITH LOGIN PASSWORD 'limitedpassword';
+            END IF;
+            ALTER ROLE limited_operator
+              NOSUPERUSER
+              NOCREATEDB
+              NOCREATEROLE
+              INHERIT
+              NOREPLICATION
+              NOBYPASSRLS;
+          END
+          $$;
           SQL
+
+      - name: Create limited-privilege database secret
+        run: |
+          kubectl create secret generic limited-postgres-credentials \
+            --from-literal=DATABASE_URL='postgres://limited_operator:limitedpassword@postgres.default.svc.cluster.local:5432/postgres' \
+            --dry-run=client -o yaml | kubectl apply -f -
 
       - uses: docker/setup-buildx-action@v4
 
@@ -310,6 +332,24 @@ jobs:
             return 1
           }
 
+          wait_for_last_error_contains() {
+            policy="$1"
+            expected_substring="$2"
+            for i in $(seq 1 30); do
+              last_error="$(kubectl get pgr "$policy" -o jsonpath='{.status.lastError}' 2>/dev/null || true)"
+              if printf '%s' "$last_error" | grep -Fq "$expected_substring"; then
+                echo "$policy reported expected error substring: $expected_substring"
+                return 0
+              fi
+              echo "Waiting for $policy lastError to contain '$expected_substring'... (attempt $i/30)"
+              sleep 3
+            done
+            echo "::error::$policy lastError did not contain $expected_substring"
+            kubectl get pgr "$policy" -o yaml || true
+            kubectl -n pgroles-system logs deployment/pgroles-operator --tail=200 || true
+            return 1
+          }
+
           kubectl delete pgr basic-policy --wait=true
 
           kubectl apply -f k8s/samples/disjoint-policy.yaml
@@ -328,6 +368,11 @@ jobs:
 
           kubectl apply -f k8s/samples/missing-secret-policy.yaml
           wait_for_ready_reason missing-secret-policy SecretFetchFailed
+
+          kubectl apply -f k8s/samples/insufficient-privileges-policy.yaml
+          wait_for_ready_reason insufficient-privileges-policy InsufficientPrivileges
+          wait_for_last_error_contains insufficient-privileges-policy "permission denied"
+          ! kubectl exec postgres-0 -- psql -U postgres -tAc "SELECT 1 FROM pg_roles WHERE rolname = 'insufficient-privileges-user'" | grep -qx "1"
 
           kubectl create secret generic rotating-postgres-credentials \
             --from-literal=DATABASE_URL='postgres://postgres:devpassword@postgres.default.svc.cluster.local:5432/postgres' \

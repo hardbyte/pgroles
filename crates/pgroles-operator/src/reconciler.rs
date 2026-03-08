@@ -44,6 +44,9 @@ const TRANSIENT_BACKOFF_BASE_SECS: u64 = 5;
 /// Maximum requeue delay for transient operational failures.
 const TRANSIENT_BACKOFF_MAX_SECS: u64 = 300;
 
+/// SQLSTATE returned by PostgreSQL for insufficient privileges.
+const SQLSTATE_INSUFFICIENT_PRIVILEGE: &str = "42501";
+
 enum ReconcileOutcome {
     Reconciled,
     Suspended,
@@ -318,10 +321,36 @@ fn retry_class_for_reconcile_error(error: &ReconcileError) -> RetryClass {
             }
             ContextError::DatabaseConnect { .. } => RetryClass::Transient,
         },
-        ReconcileError::Inspect(_) | ReconcileError::SqlExec(_) | ReconcileError::Kube(_) => {
-            RetryClass::Transient
+        ReconcileError::Inspect(error) => {
+            if inspect_error_is_non_transient(error) {
+                RetryClass::Slow
+            } else {
+                RetryClass::Transient
+            }
         }
+        ReconcileError::SqlExec(error) => {
+            if sqlx_error_is_non_transient(error) {
+                RetryClass::Slow
+            } else {
+                RetryClass::Transient
+            }
+        }
+        ReconcileError::Kube(_) => RetryClass::Transient,
     }
+}
+
+fn inspect_error_is_non_transient(error: &pgroles_inspect::InspectError) -> bool {
+    match error {
+        pgroles_inspect::InspectError::Database(error) => sqlx_error_is_non_transient(error),
+    }
+}
+
+fn sqlx_error_is_non_transient(error: &sqlx::Error) -> bool {
+    error
+        .as_database_error()
+        .and_then(|database_error| database_error.code())
+        .as_deref()
+        == Some(SQLSTATE_INSUFFICIENT_PRIVILEGE)
 }
 
 fn next_transient_failure_count(resource: &PostgresPolicy) -> u32 {
@@ -827,8 +856,20 @@ impl ReconcileError {
                 ContextError::SecretMissing { .. } => "SecretMissing",
                 ContextError::DatabaseConnect { .. } => "DatabaseConnectionFailed",
             },
-            ReconcileError::Inspect(_) => "DatabaseInspectionFailed",
-            ReconcileError::SqlExec(_) => "ApplyFailed",
+            ReconcileError::Inspect(error) => {
+                if inspect_error_is_non_transient(error) {
+                    "InsufficientPrivileges"
+                } else {
+                    "DatabaseInspectionFailed"
+                }
+            }
+            ReconcileError::SqlExec(error) => {
+                if sqlx_error_is_non_transient(error) {
+                    "InsufficientPrivileges"
+                } else {
+                    "ApplyFailed"
+                }
+            }
             ReconcileError::UnsafeRoleDrops(_) => "UnsafeRoleDrops",
             ReconcileError::Kube(_) => "KubernetesApiError",
             ReconcileError::NoNamespace => "InvalidResource",
@@ -844,6 +885,57 @@ impl ReconcileError {
 mod tests {
     use super::*;
     use crate::crd::{ConnectionSpec, PostgresPolicySpec, SecretReference};
+    use sqlx::error::{DatabaseError, ErrorKind};
+    use std::borrow::Cow;
+    use std::error::Error as StdError;
+    use std::fmt;
+
+    #[derive(Debug)]
+    struct TestDatabaseError {
+        message: String,
+        code: Option<&'static str>,
+    }
+
+    impl fmt::Display for TestDatabaseError {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.write_str(&self.message)
+        }
+    }
+
+    impl StdError for TestDatabaseError {}
+
+    impl DatabaseError for TestDatabaseError {
+        fn message(&self) -> &str {
+            &self.message
+        }
+
+        fn code(&self) -> Option<Cow<'_, str>> {
+            self.code.map(Cow::Borrowed)
+        }
+
+        fn as_error(&self) -> &(dyn StdError + Send + Sync + 'static) {
+            self
+        }
+
+        fn as_error_mut(&mut self) -> &mut (dyn StdError + Send + Sync + 'static) {
+            self
+        }
+
+        fn into_error(self: Box<Self>) -> Box<dyn StdError + Send + Sync + 'static> {
+            self
+        }
+
+        fn kind(&self) -> ErrorKind {
+            ErrorKind::Other
+        }
+    }
+
+    fn insufficient_privilege_sqlx_error() -> sqlx::Error {
+        sqlx::Error::Database(Box::new(TestDatabaseError {
+            message: "permission denied to create role".to_string(),
+            code: Some(SQLSTATE_INSUFFICIENT_PRIVILEGE),
+        }))
+    }
 
     fn test_policy(interval: &str, transient_failure_count: i32) -> Arc<PostgresPolicy> {
         let spec = PostgresPolicySpec {
@@ -1129,6 +1221,20 @@ mod tests {
     }
 
     #[test]
+    fn error_reason_sql_exec_insufficient_privileges() {
+        let err = ReconcileError::SqlExec(insufficient_privilege_sqlx_error());
+        assert_eq!(err.reason(), "InsufficientPrivileges");
+    }
+
+    #[test]
+    fn error_reason_inspect_insufficient_privileges() {
+        let err = ReconcileError::Inspect(pgroles_inspect::InspectError::Database(
+            insufficient_privilege_sqlx_error(),
+        ));
+        assert_eq!(err.reason(), "InsufficientPrivileges");
+    }
+
+    #[test]
     fn error_display_includes_details() {
         let err = ReconcileError::InvalidInterval("5x".into(), "unknown unit 'x'".into());
         let msg = err.to_string();
@@ -1311,6 +1417,22 @@ mod tests {
             },
         )));
         assert_eq!(retry_class(&error), RetryClass::Transient);
+    }
+
+    #[test]
+    fn retry_classifies_sql_exec_insufficient_privilege_as_slow() {
+        let error = finalizer::Error::ApplyFailed(ReconcileError::SqlExec(
+            insufficient_privilege_sqlx_error(),
+        ));
+        assert_eq!(retry_class(&error), RetryClass::Slow);
+    }
+
+    #[test]
+    fn retry_classifies_inspect_insufficient_privilege_as_slow() {
+        let error = finalizer::Error::ApplyFailed(ReconcileError::Inspect(
+            pgroles_inspect::InspectError::Database(insufficient_privilege_sqlx_error()),
+        ));
+        assert_eq!(retry_class(&error), RetryClass::Slow);
     }
 
     #[test]
