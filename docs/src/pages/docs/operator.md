@@ -108,6 +108,7 @@ The operator is intended to become a production controller, but that still requi
 - CI covers:
   - multiple policies targeting the same database with conflicting ownership
   - multiple non-overlapping policies targeting the same database
+  - shared-secret churn across multiple policies targeting the same database
   - invalid specs
   - missing secrets
   - insufficient database privileges

@@ -367,6 +367,18 @@ jobs:
           wait_for_ready_true second-disjoint-policy
           kubectl exec postgres-0 -- psql -U postgres -tAc "SELECT rolname FROM pg_roles WHERE rolname = 'reporting'" | grep -qx "reporting"
 
+          kubectl create secret generic postgres-credentials \
+            --from-literal=DATABASE_URL='postgres://postgres:devpassword@postgres.default.svc.cluster.local:15432/postgres' \
+            --dry-run=client -o yaml | kubectl apply -f -
+          wait_for_ready_reason disjoint-policy DatabaseConnectionFailed
+          wait_for_ready_reason second-disjoint-policy DatabaseConnectionFailed
+
+          kubectl create secret generic postgres-credentials \
+            --from-literal=DATABASE_URL='postgres://postgres:devpassword@postgres.default.svc.cluster.local:5432/postgres' \
+            --dry-run=client -o yaml | kubectl apply -f -
+          wait_for_ready_true disjoint-policy
+          wait_for_ready_true second-disjoint-policy
+
           kubectl apply -f k8s/samples/conflicting-policy.yaml
           wait_for_ready_reason conflicting-policy ConflictingPolicy
 

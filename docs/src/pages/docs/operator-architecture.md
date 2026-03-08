@@ -143,6 +143,7 @@ CI covers:
 
 - happy-path reconciliation in kind
 - same-database disjoint policies
+- same-database disjoint policies recovering through shared-secret churn
 - same-database conflicting policies
 - invalid specs
 - missing secrets
