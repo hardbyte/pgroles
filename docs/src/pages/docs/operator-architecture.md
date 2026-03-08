@@ -137,6 +137,12 @@ pgroles-operator -> OpenTelemetry Collector -> metrics backend
 
 The operator deliberately does not default to a built-in Prometheus scrape endpoint.
 
+For object-local debugging, the controller also emits transition-based Kubernetes Events for notable status changes such as conflicts, suspend/resume, recovery, secret failures, database connectivity failures, and insufficient privileges. The intended split is:
+
+- status: current state of the policy
+- Events: notable transitions visible in `kubectl describe`
+- OTLP metrics: fleet-level trends and alerting
+
 ## Current CI coverage
 
 CI covers:
@@ -149,6 +155,7 @@ CI covers:
 - missing secrets
 - insufficient database privileges
 - secret rotation and recovery
+- Kubernetes Event delivery for warning and recovery transitions
 - OTLP metrics export through an in-cluster Collector
 - generated load policies across 2 databases with 30 schemas / 60 generated roles
 

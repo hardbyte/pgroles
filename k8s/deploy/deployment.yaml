@@ -30,6 +30,10 @@ spec:
               value: "info,pgroles_operator=debug"
             - name: OPERATOR_HTTP_ADDR
               value: "0.0.0.0:8080"
+            - name: CONTROLLER_POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
           readinessProbe:
             httpGet:
               path: /readyz

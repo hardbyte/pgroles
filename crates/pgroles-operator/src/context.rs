@@ -3,6 +3,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use kube::runtime::events::Recorder;
 use sqlx::postgres::PgPool;
 use tokio::sync::{Mutex, RwLock};
 
@@ -65,6 +66,9 @@ pub struct OperatorContext {
     /// Kubernetes client for API calls.
     pub kube_client: kube::Client,
 
+    /// Kubernetes Event recorder for transition-based policy Events.
+    pub event_recorder: Recorder,
+
     /// Cached database connection pools keyed by `"namespace/secret-name/secret-key"`.
     pool_cache: Arc<RwLock<HashMap<String, CachedPool>>>,
     /// In-process per-database reconciliation locks.
@@ -80,9 +84,14 @@ pub struct OperatorContext {
 
 impl OperatorContext {
     /// Create a new operator context with an empty pool cache.
-    pub fn new(kube_client: kube::Client, observability: OperatorObservability) -> Self {
+    pub fn new(
+        kube_client: kube::Client,
+        observability: OperatorObservability,
+        event_recorder: Recorder,
+    ) -> Self {
         Self {
             kube_client,
+            event_recorder,
             pool_cache: Arc::new(RwLock::new(HashMap::new())),
             observability,
             database_locks: Arc::new(Mutex::new(HashMap::new())),

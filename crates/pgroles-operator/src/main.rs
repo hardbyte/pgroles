@@ -8,6 +8,7 @@ use std::sync::Arc;
 
 use futures::{StreamExt, stream};
 use k8s_openapi::api::core::v1::Secret;
+use kube::runtime::events::{Recorder, Reporter};
 use kube::runtime::reflector::ObjectRef;
 use kube::runtime::{Controller, WatchStreamExt, predicates, reflector, watcher};
 use kube::{Api, Client, Resource, ResourceExt};
@@ -62,8 +63,20 @@ async fn main() -> anyhow::Result<()> {
         }
     });
 
+    let event_recorder = Recorder::new(
+        client.clone(),
+        Reporter {
+            controller: "pgroles-operator".to_string(),
+            instance: std::env::var("CONTROLLER_POD_NAME").ok(),
+        },
+    );
+
     // Create the shared operator context.
-    let ctx = Arc::new(OperatorContext::new(client.clone(), observability.clone()));
+    let ctx = Arc::new(OperatorContext::new(
+        client.clone(),
+        observability.clone(),
+        event_recorder,
+    ));
 
     // Watch all PostgresPolicy resources across all namespaces.
     let policies: Api<PostgresPolicy> = Api::all(client.clone());

@@ -24,8 +24,8 @@ rules:
   - apiGroups: [""]
     resources: ["secrets"]
     verbs: ["get", "list", "watch"]
-  # Emit events for observability
-  - apiGroups: [""]
+  # Emit events for kubectl describe / operational debugging
+  - apiGroups: ["events.k8s.io"]
     resources: ["events"]
     verbs: ["create", "patch"]
 ---
