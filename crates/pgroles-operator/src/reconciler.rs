@@ -14,6 +14,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use crate::events::publish_status_events;
 use kube::ResourceExt;
 use kube::api::{Api, Patch, PatchParams};
 use kube::runtime::controller::Action;
@@ -775,7 +776,8 @@ where
 
     let api: Api<PostgresPolicy> = Api::namespaced(ctx.kube_client.clone(), &namespace);
     let latest = api.get(&name).await?;
-    let mut status = latest.status.unwrap_or_default();
+    let old_status = latest.status.clone();
+    let mut status = old_status.clone().unwrap_or_default();
 
     mutate(&mut status);
 
@@ -789,6 +791,12 @@ where
         &Patch::Merge(&patch),
     )
     .await?;
+
+    if let Err(error) =
+        publish_status_events(&ctx.event_recorder, &latest, old_status.as_ref(), &status).await
+    {
+        tracing::warn!(policy = %format!("{namespace}/{name}"), %error, "failed to publish Kubernetes Events");
+    }
 
     Ok(())
 }

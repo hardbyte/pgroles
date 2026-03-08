@@ -100,6 +100,7 @@ The operator is intended to become a production controller, but that still requi
   - `/livez`
   - `/readyz`
 - Metrics are exported via OpenTelemetry OTLP with the OpenTelemetry Collector as the intended Kubernetes sink.
+- Transition-based Kubernetes Events are emitted for notable policy state changes.
 
 ### Remaining work
 
@@ -197,6 +198,8 @@ kubectl create secret generic mydb-credentials \
 
 The operator reads the Secret from the same namespace as the `PostgresPolicy` resource. When the Secret's `resourceVersion` changes (e.g. credential rotation), the operator automatically reconnects with updated credentials.
 
+The controller also emits Kubernetes Events for notable state transitions. These are intended for `kubectl describe` and quick operational debugging, not as a durable audit trail or alerting mechanism.
+
 ## Reconciliation
 
 {% operator-reconciliation-diagram /%}
@@ -241,6 +244,18 @@ operator:
 ```
 
 The intended deployment model is operator -> OpenTelemetry Collector -> your metrics backend.
+
+The operator also emits transition-based Kubernetes Events such as:
+
+- `ConflictDetected`
+- `ConflictResolved`
+- `Suspended`
+- `Reconciled`
+- `Recovered`
+- `SecretFetchFailed`
+- `DatabaseConnectionFailed`
+- `InsufficientPrivileges`
+- `UnsafeRoleDropsBlocked`
 
 ### Deletion behaviour
 
