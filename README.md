@@ -9,10 +9,6 @@
 [![CI](https://github.com/hardbyte/pgroles/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/hardbyte/pgroles/actions/workflows/ci.yml)
 [![Release](https://img.shields.io/github/v/release/hardbyte/pgroles?sort=semver)](https://github.com/hardbyte/pgroles/releases)
 [![Docs](https://img.shields.io/badge/docs-github_pages-blue)](https://hardbyte.github.io/pgroles/)
-[![crates.io - pgroles-cli](https://img.shields.io/crates/v/pgroles-cli)](https://crates.io/crates/pgroles-cli)
-[![crates.io - pgroles-core](https://img.shields.io/crates/v/pgroles-core)](https://crates.io/crates/pgroles-core)
-[![crates.io - pgroles-inspect](https://img.shields.io/crates/v/pgroles-inspect)](https://crates.io/crates/pgroles-inspect)
-[![crates.io - pgroles-operator](https://img.shields.io/crates/v/pgroles-operator)](https://crates.io/crates/pgroles-operator)
 [![Helm Chart OCI](https://img.shields.io/badge/helm-ghcr.io%2Fhardbyte%2Fcharts-informational)](https://github.com/hardbyte/pgroles/pkgs/container/charts%2Fpgroles-operator)
 
 </div>
