@@ -219,6 +219,16 @@ The controller also emits Kubernetes Events for notable state transitions. These
 
 ## Reconciliation
 
+The operator reconciles on three paths:
+
+- `PostgresPolicy` spec changes
+- referenced Secret changes
+- the normal periodic `interval`
+
+Each reconcile inspects the current database state, computes a diff from the policy, and then either applies it or publishes a non-mutating plan depending on `spec.mode`. Same-database policies are serialized, and status-only updates do not retrigger the controller.
+
+Use this page for the external behavior and operating model. For the internal controller pipeline and locking model, see the [operator architecture](./operator-architecture) page.
+
 {% operator-reconciliation-diagram /%}
 
 ### Insufficient privileges
