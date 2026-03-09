@@ -165,9 +165,9 @@ CI covers:
 - generated load policies across 2 databases with 30 schemas / 60 generated roles
 - scheduled fairness/load coverage across 5 policies, 3 databases, 100 schemas, and 200 generated roles with repeated secret churn
 
-Remaining gaps:
+Further hardening work:
 
-- higher-scale reconcile/load coverage beyond the scheduled workflow profile
+- broader scale and long-run validation beyond the current scheduled workflow profile
 
 ## Relationship to the CLI
 
