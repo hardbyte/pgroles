@@ -25,6 +25,30 @@ Terraform is great at creating infrastructure — the database instance, VPC, IA
 
 **Choose both if:** you have multiple schemas with repeating privilege patterns, need convergent enforcement, or want a CI drift gate for database access control.
 
+## Atlas
+
+[Atlas](https://atlasgo.io) by Ariga is a mature, well-funded schema management tool with a growing community and broad database support. If you need a single tool to manage your entire PostgreSQL schema — tables, indexes, types, and access control together — Atlas is worth serious consideration.
+
+Atlas covers roles, grants, and permissions via its HCL schema format, and has genuine strengths that pgroles does not match:
+
+- **Row-level security** — Atlas manages `CREATE POLICY` with `USING` and `CHECK` expressions as first-class HCL blocks. pgroles does not touch RLS at all.
+- **Column-level grants** — Atlas can grant privileges on individual columns; pgroles operates at the object level.
+- **Password and secret management** — Atlas integrates with AWS Secrets Manager, GCP Secret Manager, and HashiCorp Vault for injecting role passwords at deploy time. pgroles does not manage passwords.
+- **Unified schema + security** — If you already use Atlas for DDL migrations, keeping role definitions in the same HCL file and the same workflow is a natural fit.
+- **Multi-database** — Atlas supports MySQL, SQL Server, ClickHouse, and others with the same model. pgroles is PostgreSQL-only.
+- **Ecosystem depth** — Native GitHub Actions, GitLab components, CircleCI orbs, Bitbucket, and Azure DevOps integrations, plus the Atlas Schema Registry for plan storage and pre-approval workflows.
+
+**Where pgroles differs:**
+
+- **Default privileges** — `ALTER DEFAULT PRIVILEGES` is not supported by Atlas. This is the most important mechanism for ensuring that future tables, sequences, and functions created in a schema automatically inherit the correct permissions. Without it, every new migration that adds a table requires a follow-up grant step. pgroles manages default privileges as a first-class concept.
+- **Role retirement** — pgroles has explicit retirement declarations with `reassign_owned_to`, `drop_owned`, and `terminate_sessions` preflight checks. Atlas has no ownership management.
+- **Pricing** — Atlas's role and permission management is a Pro feature (paid subscription). pgroles is open source.
+- **Composability** — pgroles is deliberately narrow in scope. It manages what lives in `pg_roles` and `pg_catalog` — nothing else. This makes it easy to drop in alongside an existing DDL migration workflow without conflict.
+
+**Choose Atlas if:** you want a single tool for your entire schema lifecycle including RLS, column-level grants, and secret-managed passwords — and you don't need default privilege management.
+
+**Choose pgroles if:** default privileges are important to you, you want open-source tooling, or you want to manage roles independently from your DDL migrations.
+
 ## ldap2pg
 
 [ldap2pg](https://github.com/dalibo/ldap2pg) by Dalibo is the most established tool in this space — actively maintained, well-documented, and battle-tested in enterprise environments. It syncs PostgreSQL roles and privileges from LDAP/Active Directory or static YAML definitions.
