@@ -19,7 +19,7 @@ The operator brings the same convergent model as the CLI into Kubernetes. Instea
 - Finalizer-based cleanup on resource deletion
 
 {% callout title="Production-focused controller" %}
-The operator is no longer an experimental proof of concept. It is intended for production use, but the API is still `v1alpha1` and the remaining roadmap items are primarily about broader test coverage and API hardening rather than basic controller viability.
+The operator is intended for production use. The current API is still `v1alpha1`, so the remaining work is primarily around API hardening and lifecycle polish rather than basic controller viability.
 {% /callout %}
 
 ## Installation
@@ -83,7 +83,7 @@ The operator runs as `nobody` (UID 65534) with a read-only root filesystem, no c
 
 ## Production roadmap
 
-The operator is intended to become a production controller, but that still requires stricter retry and test semantics than the current `v1alpha1` shape.
+The operator now has the production-readiness foundations on `main`. The remaining work is mostly about API evolution and maintaining the stronger validation profile already in CI.
 
 ### Implemented foundations
 
@@ -103,23 +103,20 @@ The operator is intended to become a production controller, but that still requi
 - Metrics are exported via OpenTelemetry OTLP with the OpenTelemetry Collector as the intended Kubernetes sink.
 - Transition-based Kubernetes Events are emitted for notable policy state changes.
 
-### Remaining work
+### Current validation profile
 
-### 1. More realistic test coverage
+CI covers:
 
-- CI covers:
-  - multiple policies targeting the same database with conflicting ownership
-  - multiple non-overlapping policies targeting the same database
-  - shared-secret churn across multiple policies targeting the same database
-  - invalid specs
-  - missing secrets
-  - insufficient database privileges
-  - rotated secrets and connection recovery after secret repair
-  - transition-based Kubernetes Event delivery for warning and recovery states
-- Remaining gaps:
-  - broader scale and load tests beyond the scheduled fairness/load profile
+- multiple policies targeting the same database with conflicting ownership
+- multiple non-overlapping policies targeting the same database
+- shared-secret churn across multiple policies targeting the same database
+- invalid specs
+- missing secrets
+- insufficient database privileges
+- rotated secrets and connection recovery after secret repair
+- transition-based Kubernetes Event delivery for warning and recovery states
 
-Current validated profile in default CI:
+Default PR CI validates:
 
 - generated policies spanning 2 databases
 - 30 managed schemas total
@@ -135,10 +132,11 @@ Scheduled fairness/load coverage on `main` additionally exercises:
 - targeted secret churn on a separate database to verify isolation
 - latency reporting in the workflow summary for initial convergence and full churn completion
 
-### 2. API hardening toward production use
+### Remaining work
 
-- Carry these semantics into the next CRD revision rather than leaving them as controller-only conventions.
-- Promote the API only after conflict detection, richer status, probes, metrics, retry behavior, and realistic load tests are all in place.
+- Carry the current controller semantics into the next CRD revision rather than leaving them as implementation-only conventions.
+- Promote the API beyond `v1alpha1` only after the compatibility and upgrade story is explicit.
+- Keep the validation profile current as the manifest surface and operator behavior evolve.
 
 ## Custom resource
 
