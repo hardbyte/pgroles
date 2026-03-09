@@ -19,7 +19,7 @@ The operator brings the same convergent model as the CLI into Kubernetes. Instea
 - Finalizer-based cleanup on resource deletion
 
 {% callout title="Production-focused controller" %}
-The operator is no longer an experimental proof of concept. It is intended for production use, but the API is still `v1alpha1` and the remaining roadmap items are primarily about broader test coverage and API hardening rather than basic controller viability.
+The operator is intended for production use. The current API is still `v1alpha1`, so the remaining work is primarily around API hardening and lifecycle polish rather than basic controller viability.
 {% /callout %}
 
 ## Installation
@@ -83,7 +83,7 @@ The operator runs as `nobody` (UID 65534) with a read-only root filesystem, no c
 
 ## Production roadmap
 
-The operator is intended to become a production controller, but that still requires stricter retry and test semantics than the current `v1alpha1` shape.
+The operator now has the production-readiness foundations on `main`. The remaining work is mostly about API evolution and maintaining the stronger validation profile already in CI.
 
 ### Implemented foundations
 
@@ -103,23 +103,20 @@ The operator is intended to become a production controller, but that still requi
 - Metrics are exported via OpenTelemetry OTLP with the OpenTelemetry Collector as the intended Kubernetes sink.
 - Transition-based Kubernetes Events are emitted for notable policy state changes.
 
-### Remaining work
+### Current validation profile
 
-### 1. More realistic test coverage
+CI covers:
 
-- CI covers:
-  - multiple policies targeting the same database with conflicting ownership
-  - multiple non-overlapping policies targeting the same database
-  - shared-secret churn across multiple policies targeting the same database
-  - invalid specs
-  - missing secrets
-  - insufficient database privileges
-  - rotated secrets and connection recovery after secret repair
-  - transition-based Kubernetes Event delivery for warning and recovery states
-- Remaining gaps:
-  - broader scale and load tests beyond the scheduled fairness/load profile
+- multiple policies targeting the same database with conflicting ownership
+- multiple non-overlapping policies targeting the same database
+- shared-secret churn across multiple policies targeting the same database
+- invalid specs
+- missing secrets
+- insufficient database privileges
+- rotated secrets and connection recovery after secret repair
+- transition-based Kubernetes Event delivery for warning and recovery states
 
-Current validated profile in default CI:
+Default PR CI validates:
 
 - generated policies spanning 2 databases
 - 30 managed schemas total
@@ -135,10 +132,11 @@ Scheduled fairness/load coverage on `main` additionally exercises:
 - targeted secret churn on a separate database to verify isolation
 - latency reporting in the workflow summary for initial convergence and full churn completion
 
-### 2. API hardening toward production use
+### Remaining work
 
-- Carry these semantics into the next CRD revision rather than leaving them as controller-only conventions.
-- Promote the API only after conflict detection, richer status, probes, metrics, retry behavior, and realistic load tests are all in place.
+- Carry the current controller semantics into the next CRD revision rather than leaving them as implementation-only conventions.
+- Promote the API beyond `v1alpha1` only after the compatibility and upgrade story is explicit.
+- Keep the validation profile current as the manifest surface and operator behavior evolve.
 
 ## Custom resource
 
@@ -158,6 +156,7 @@ spec:
 
   interval: "5m"   # reconciliation interval (supports 5m, 1h, 30s, 1h30m)
   suspend: false   # set true to pause reconciliation
+  mode: apply      # apply changes, or use plan for non-mutating drift preview
 
   default_owner: app_owner
 
@@ -166,11 +165,19 @@ spec:
       grants:
         - privileges: [USAGE]
           'on': { type: schema }
-        - privileges: [SELECT, INSERT, UPDATE, DELETE]
+        - privileges: [SELECT, INSERT, UPDATE, DELETE, REFERENCES, TRIGGER]
           'on': { type: table, name: "*" }
+        - privileges: [USAGE, SELECT, UPDATE]
+          'on': { type: sequence, name: "*" }
+        - privileges: [EXECUTE]
+          'on': { type: function, name: "*" }
       default_privileges:
-        - privileges: [SELECT, INSERT, UPDATE, DELETE]
+        - privileges: [SELECT, INSERT, UPDATE, DELETE, REFERENCES, TRIGGER]
           on_type: table
+        - privileges: [USAGE, SELECT, UPDATE]
+          on_type: sequence
+        - privileges: [EXECUTE]
+          on_type: function
 
   schemas:
     - name: inventory
@@ -212,6 +219,16 @@ The controller also emits Kubernetes Events for notable state transitions. These
 
 ## Reconciliation
 
+The operator reconciles on three paths:
+
+- `PostgresPolicy` spec changes
+- referenced Secret changes
+- the normal periodic `interval`
+
+Each reconcile inspects the current database state, computes a diff from the policy, and then either applies it or publishes a non-mutating plan depending on `spec.mode`. Same-database policies are serialized, and status-only updates do not retrigger the controller.
+
+Use this page for the external behavior and operating model. For the internal controller pipeline and locking model, see the [operator architecture](./operator-architecture) page.
+
 {% operator-reconciliation-diagram /%}
 
 ### Insufficient privileges
@@ -222,7 +239,7 @@ Current behavior:
 
 - `Ready=False`
 - reason `InsufficientPrivileges`
-- `lastError` contains the PostgreSQL error message, for example `permission denied to create role`
+- `last_error` contains the PostgreSQL error message, for example `permission denied to create role`
 - the policy retries on its normal reconcile interval rather than exponential transient backoff
 
 This is the expected state when the database credential is valid but under-privileged for the requested manifest.
@@ -234,6 +251,34 @@ The `interval` field controls how often the operator re-reconciles, even when th
 ### Suspending
 
 Set `suspend: true` to pause reconciliation without deleting the resource. The operator will skip the resource until `suspend` is set back to `false`.
+
+### Plan mode
+
+Set `mode: plan` to let the operator inspect the database, compute the diff, and publish the planned SQL without executing it.
+
+```yaml
+spec:
+  connection:
+    secretRef:
+      name: postgres-credentials
+  mode: plan
+  roles:
+    - name: preview-user
+      login: true
+```
+
+Plan mode is useful when you want the operator to stay in-cluster but you are not ready to trust it with mutations yet.
+
+Current behavior in `plan` mode:
+
+- the operator connects to the database and computes the full diff normally
+- no SQL is executed
+- `status.change_summary` records the pending changes
+- `status.planned_sql` stores the rendered SQL, truncated if needed for status size safety
+- `Ready=True` with reason `Planned`
+- `Drifted=True` when changes are pending, `Drifted=False` when the database is already in sync
+
+Use `suspend` when you want the controller to stop reconciling entirely. Use `plan` when you want it to keep inspecting and showing you what it would do.
 
 ### Health and telemetry
 
@@ -263,6 +308,8 @@ The operator also emits transition-based Kubernetes Events such as:
 - `Reconciled`
 - `Recovered`
 - `SecretFetchFailed`
+- `DriftDetected`
+- `PlanClean`
 - `DatabaseConnectionFailed`
 - `InsufficientPrivileges`
 - `UnsafeRoleDropsBlocked`
@@ -282,20 +329,20 @@ status:
       status: "True"
       reason: Reconciled
       message: "Applied 5 changes"
-      lastTransitionTime: "2026-03-06T10:30:00Z"
-  observedGeneration: 3
-  lastReconcileTime: "2026-03-06T10:30:00Z"
-  transientFailureCount: 0
-  changeSummary:
-    rolesCreated: 2
-    rolesAltered: 0
-    rolesDropped: 0
-    grantsAdded: 3
-    grantsRevoked: 0
-    defaultPrivilegesSet: 2
-    defaultPrivilegesRevoked: 0
-    membersAdded: 1
-    membersRemoved: 0
+      last_transition_time: "2026-03-06T10:30:00Z"
+  observed_generation: 3
+  last_reconcile_time: "2026-03-06T10:30:00Z"
+  transient_failure_count: 0
+  change_summary:
+    roles_created: 2
+    roles_altered: 0
+    roles_dropped: 0
+    grants_added: 3
+    grants_revoked: 0
+    default_privileges_set: 2
+    default_privileges_revoked: 0
+    members_added: 1
+    members_removed: 0
     total: 8
 ```
 
@@ -311,8 +358,8 @@ status:
     - type: Degraded
       status: "True"
       reason: InsufficientPrivileges
-  lastError: "error returned from database: permission denied to create role"
-  transientFailureCount: 0
+  last_error: "error returned from database: permission denied to create role"
+  transient_failure_count: 0
 ```
 
 ### Conditions
@@ -320,6 +367,7 @@ status:
 | Type | Meaning |
 | --- | --- |
 | `Ready` | `True` when the last reconciliation succeeded |
+| `Drifted` | `True` when `plan` mode found pending changes |
 | `Reconciling` | `True` while a reconciliation is in progress |
 | `Degraded` | `True` when the last reconciliation failed (includes error detail) |
 

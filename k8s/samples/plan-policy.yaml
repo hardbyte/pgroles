@@ -1,0 +1,23 @@
+apiVersion: pgroles.io/v1alpha1
+kind: PostgresPolicy
+metadata:
+  name: plan-policy
+  namespace: default
+spec:
+  connection:
+    secretRef:
+      name: postgres-credentials
+  interval: "5m"
+  mode: plan
+
+  roles:
+    - name: plan-preview-user
+      login: true
+      comment: "Preview-only role"
+
+  grants:
+    - role: plan-preview-user
+      privileges: [CONNECT]
+      'on':
+        type: database
+        name: postgres

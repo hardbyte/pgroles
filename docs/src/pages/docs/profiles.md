@@ -40,6 +40,35 @@ profiles:
 
 Note that the schema name is **not specified** in profile grants -- it gets filled in during expansion.
 
+## Common application bundles
+
+For application writer roles, table privileges rarely stand alone. If the application inserts into identity or serial-backed tables, it usually also needs sequence privileges. If the schema has trigger-driven routines, it often needs `EXECUTE` on functions too.
+
+This is a good default bundle for an application writer profile:
+
+```yaml
+profiles:
+  app_writer:
+    grants:
+      - privileges: [USAGE]
+        on: { type: schema }
+      - privileges: [SELECT, INSERT, UPDATE, DELETE, REFERENCES, TRIGGER]
+        on: { type: table, name: "*" }
+      - privileges: [USAGE, SELECT, UPDATE]
+        on: { type: sequence, name: "*" }
+      - privileges: [EXECUTE]
+        on: { type: function, name: "*" }
+    default_privileges:
+      - privileges: [SELECT, INSERT, UPDATE, DELETE, REFERENCES, TRIGGER]
+        on_type: table
+      - privileges: [USAGE, SELECT, UPDATE]
+        on_type: sequence
+      - privileges: [EXECUTE]
+        on_type: function
+```
+
+Use a narrower profile if you know the role does not need writes, sequence access, or function execution. The important point is to make the bundle explicit instead of granting tables and forgetting the related object types.
+
 ## Binding profiles to schemas
 
 The `schemas` section binds profiles to schemas:

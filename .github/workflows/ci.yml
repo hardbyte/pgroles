@@ -319,20 +319,45 @@ jobs:
             return 1
           }
 
-          wait_for_ready_reason() {
+          wait_for_ready_status_reason() {
             policy="$1"
-            expected_reason="$2"
+            expected_status="$2"
+            expected_reason="$3"
             for i in $(seq 1 30); do
               status="$(kubectl get pgr "$policy" -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}' 2>/dev/null || true)"
               reason="$(kubectl get pgr "$policy" -o jsonpath='{.status.conditions[?(@.type=="Ready")].reason}' 2>/dev/null || true)"
-              if [ "$status" = "False" ] && [ "$reason" = "$expected_reason" ]; then
-                echo "$policy reached Ready=False with reason=$expected_reason"
+              if [ "$status" = "$expected_status" ] && [ "$reason" = "$expected_reason" ]; then
+                echo "$policy reached Ready=$expected_status with reason=$expected_reason"
                 return 0
               fi
-              echo "Waiting for $policy Ready=False/$expected_reason... (attempt $i/30)"
+              echo "Waiting for $policy Ready=$expected_status/$expected_reason... (attempt $i/30)"
               sleep 3
             done
-            echo "::error::$policy did not reach Ready=False with reason=$expected_reason"
+            echo "::error::$policy did not reach Ready=$expected_status with reason=$expected_reason"
+            kubectl get pgr "$policy" -o yaml || true
+            kubectl -n pgroles-system logs deployment/pgroles-operator --tail=200 || true
+            return 1
+          }
+
+          wait_for_ready_reason() {
+            policy="$1"
+            expected_reason="$2"
+            wait_for_ready_status_reason "$policy" "False" "$expected_reason"
+          }
+
+          wait_for_drift_status() {
+            policy="$1"
+            expected_status="$2"
+            for i in $(seq 1 30); do
+              status="$(kubectl get pgr "$policy" -o jsonpath='{.status.conditions[?(@.type=="Drifted")].status}' 2>/dev/null || true)"
+              if [ "$status" = "$expected_status" ]; then
+                echo "$policy reached Drifted=$expected_status"
+                return 0
+              fi
+              echo "Waiting for $policy Drifted=$expected_status... (attempt $i/30)"
+              sleep 3
+            done
+            echo "::error::$policy did not reach Drifted=$expected_status"
             kubectl get pgr "$policy" -o yaml || true
             kubectl -n pgroles-system logs deployment/pgroles-operator --tail=200 || true
             return 1
@@ -419,6 +444,14 @@ jobs:
           wait_for_last_error_contains insufficient-privileges-policy "permission denied to create role"
           ! kubectl exec postgres-0 -- psql -U postgres -tAc "SELECT 1 FROM pg_roles WHERE rolname = 'insufficient-privileges-user'" | grep -qx "1"
 
+          kubectl apply -f k8s/samples/plan-policy.yaml
+          wait_for_ready_status_reason plan-policy True Planned
+          wait_for_drift_status plan-policy True
+          kubectl get pgr plan-policy -o jsonpath='{.status.last_reconcile_mode}' | grep -qx "plan"
+          kubectl get pgr plan-policy -o jsonpath='{.status.planned_sql}' | grep -q 'CREATE ROLE \"plan-preview-user\"'
+          ! kubectl exec postgres-0 -- psql -U postgres -tAc "SELECT 1 FROM pg_roles WHERE rolname = 'plan-preview-user'" | grep -qx "1"
+          wait_for_event_reason plan-policy DriftDetected
+
           kubectl create secret generic rotating-postgres-credentials \
             --from-literal=DATABASE_URL='postgres://postgres:devpassword@postgres.default.svc.cluster.local:5432/postgres' \
             --dry-run=client -o yaml | kubectl apply -f -
@@ -489,10 +522,10 @@ jobs:
       - name: Verify OTLP metrics reach the collector
         run: |
           for i in $(seq 1 30); do
-            LOGS="$(kubectl -n pgroles-system logs deployment/otel-collector --tail=200 2>/dev/null || true)"
-            printf '%s\n' "$LOGS" | grep -q 'pgroles.reconcile.total' && \
-            printf '%s\n' "$LOGS" | grep -q 'pgroles.policy.conflicts\|pgroles.apply.total\|pgroles.apply.statements' && \
-            printf '%s\n' "$LOGS" | grep -q 'pgroles-operator' && {
+            LOGS="$(kubectl -n pgroles-system logs deployment/otel-collector --tail=2000 2>/dev/null || true)"
+            printf '%s\n' "$LOGS" | grep -q 'pgroles.policy.conflicts\|pgroles.apply.total\|pgroles.plan.total' && \
+            printf '%s\n' "$LOGS" | grep -q 'pgroles.apply.statements\|pgroles.plan.changes' && \
+            printf '%s\n' "$LOGS" | grep -q '"otelcol.component.kind": "exporter"' && {
               echo "Collector received operator metrics"
               exit 0
             }

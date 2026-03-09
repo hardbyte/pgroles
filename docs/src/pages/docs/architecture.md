@@ -46,34 +46,11 @@ The command-line interface. Thin wrapper that:
 
 ### pgroles-operator
 
-*(Work in progress)* A Kubernetes operator that reconciles `PostgresPolicy` custom resources against PostgreSQL databases.
+A Kubernetes operator that reconciles `PostgresPolicy` custom resources against PostgreSQL databases using the same core manifest, diff, and SQL engine as the CLI.
 
 ## Data flow
 
-```
-YAML manifest
-    |
-    v
-parse_manifest() --> PolicyManifest
-    |
-    v
-expand_manifest() --> ExpandedManifest  (profiles x schemas resolved)
-    |
-    v
-RoleGraph::from_expanded() --> RoleGraph (desired state)
-
-Database
-    |
-    v
-inspect() --> RoleGraph (current state)
-    |
-    +--> detect_pg_version() --> SqlContext
-
-diff(current, desired) --> Vec<Change>
-    |
-    v
-sql::render_all_with_context() --> SQL script
-```
+{% workspace-data-flow-diagram /%}
 
 ## Convergent diff model
 

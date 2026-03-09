@@ -44,6 +44,10 @@ pub struct PostgresPolicySpec {
     #[serde(default)]
     pub suspend: bool,
 
+    /// Reconciliation mode: `apply` executes SQL, `plan` computes drift only.
+    #[serde(default)]
+    pub mode: PolicyMode,
+
     /// Default owner for ALTER DEFAULT PRIVILEGES (e.g. "app_owner").
     #[serde(default)]
     pub default_owner: Option<String>,
@@ -79,6 +83,15 @@ pub struct PostgresPolicySpec {
 
 fn default_interval() -> String {
     "5m".to_string()
+}
+
+/// Policy reconcile mode.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum PolicyMode {
+    #[default]
+    Apply,
+    Plan,
 }
 
 /// Database connection configuration.
@@ -199,6 +212,18 @@ pub struct PostgresPolicyStatus {
     /// Summary of changes applied in the last reconciliation.
     #[serde(default)]
     pub change_summary: Option<ChangeSummary>,
+
+    /// The reconciliation mode used for the last successful reconcile.
+    #[serde(default)]
+    pub last_reconcile_mode: Option<PolicyMode>,
+
+    /// Planned SQL for the last successful plan-mode reconcile.
+    #[serde(default)]
+    pub planned_sql: Option<String>,
+
+    /// Whether `planned_sql` was truncated to fit safely in status.
+    #[serde(default)]
+    pub planned_sql_truncated: bool,
 
     /// Canonical identity of the managed database target.
     #[serde(default)]
@@ -557,6 +582,17 @@ pub fn conflict_condition(reason: &str, message: &str) -> PolicyCondition {
     }
 }
 
+/// Helper to create a "Drifted" condition.
+pub fn drifted_condition(status: bool, reason: &str, message: &str) -> PolicyCondition {
+    PolicyCondition {
+        condition_type: "Drifted".to_string(),
+        status: if status { "True" } else { "False" }.to_string(),
+        reason: Some(reason.to_string()),
+        message: Some(message.to_string()),
+        last_transition_time: Some(now_rfc3339()),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -589,6 +625,7 @@ mod tests {
             },
             interval: "5m".to_string(),
             suspend: false,
+            mode: PolicyMode::Apply,
             default_owner: Some("app_owner".to_string()),
             profiles: std::collections::HashMap::new(),
             schemas: vec![],
@@ -684,6 +721,7 @@ mod tests {
             },
             interval: "5m".to_string(),
             suspend: false,
+            mode: PolicyMode::Apply,
             default_owner: None,
             profiles,
             schemas: vec![SchemaBinding {

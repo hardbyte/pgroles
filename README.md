@@ -31,11 +31,19 @@ profiles:
     grants:
       - privileges: [USAGE]
         on: { type: schema }
-      - privileges: [SELECT, INSERT, UPDATE, DELETE]
+      - privileges: [SELECT, INSERT, UPDATE, DELETE, REFERENCES, TRIGGER]
         on: { type: table, name: "*" }
+      - privileges: [USAGE, SELECT, UPDATE]
+        on: { type: sequence, name: "*" }
+      - privileges: [EXECUTE]
+        on: { type: function, name: "*" }
     default_privileges:
-      - privileges: [SELECT, INSERT, UPDATE, DELETE]
+      - privileges: [SELECT, INSERT, UPDATE, DELETE, REFERENCES, TRIGGER]
         on_type: table
+      - privileges: [USAGE, SELECT, UPDATE]
+        on_type: sequence
+      - privileges: [EXECUTE]
+        on_type: function
 
   viewer:
     grants:
@@ -70,8 +78,14 @@ CREATE ROLE "inventory-editor"
 
 GRANT USAGE ON SCHEMA "inventory"
   TO "inventory-editor";
-GRANT SELECT, INSERT, UPDATE, DELETE
+GRANT SELECT, INSERT, UPDATE, DELETE, REFERENCES, TRIGGER
   ON ALL TABLES IN SCHEMA "inventory"
+  TO "inventory-editor";
+GRANT USAGE, SELECT, UPDATE
+  ON ALL SEQUENCES IN SCHEMA "inventory"
+  TO "inventory-editor";
+GRANT EXECUTE
+  ON ALL FUNCTIONS IN SCHEMA "inventory"
   TO "inventory-editor";
 
 -- Roles removed from the manifest get cleaned up:
@@ -121,6 +135,7 @@ docker run --rm ghcr.io/hardbyte/pgroles --help
 
 - **Convergent** — the manifest is the desired state. Missing roles get created, extra roles get dropped, drifted grants get fixed.
 - **Profiles** — define privilege templates once, apply them across schemas. Each `schema x profile` pair becomes a role.
+- **Safer privilege bundles** — common application profiles can pair table, sequence, and function privileges so identity columns and trigger-driven routines are covered together.
 - **Brownfield adoption** — `pgroles generate` introspects an existing database and produces a manifest you can refine.
 - **Drift detection** — `pgroles diff --exit-code` returns exit code 2 on drift, designed for CI gates.
 - **Safe role removal** — preflight checks for owned objects, active sessions, and dependencies before dropping roles. Explicit `retirements` declare cleanup steps.
@@ -129,6 +144,7 @@ docker run --rm ghcr.io/hardbyte/pgroles --help
   ```bash
   helm install pgroles-operator oci://ghcr.io/hardbyte/charts/pgroles-operator
   ```
+  Use `spec.mode: plan` to inspect drift without executing SQL.
 
 ## Documentation
 

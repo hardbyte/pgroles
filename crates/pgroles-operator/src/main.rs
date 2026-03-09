@@ -141,7 +141,7 @@ async fn main() -> anyhow::Result<()> {
 mod tests {
     use super::policy_trigger_hash;
     use pgroles_operator::crd::{
-        ConnectionSpec, PostgresPolicy, PostgresPolicySpec, SecretReference,
+        ConnectionSpec, PolicyMode, PostgresPolicy, PostgresPolicySpec, SecretReference,
     };
 
     fn test_policy() -> PostgresPolicy {
@@ -154,6 +154,7 @@ mod tests {
             },
             interval: "5m".to_string(),
             suspend: false,
+            mode: PolicyMode::Apply,
             default_owner: None,
             profiles: Default::default(),
             schemas: Vec::new(),

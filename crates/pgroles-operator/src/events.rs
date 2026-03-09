@@ -63,7 +63,29 @@ fn derive_status_events(
         ));
     }
 
-    if ready_became_true(old_status, new_status) {
+    if transitioned_to_true(old_status, new_status, "Drifted") {
+        let note = condition_message(new_status, "Drifted")
+            .unwrap_or_else(|| "Planned changes are pending review".to_string());
+        events.push(event(
+            EventType::Normal,
+            "DriftDetected",
+            "StatusTransition",
+            note,
+        ));
+    }
+
+    if plan_became_clean(old_status, new_status) {
+        let note = condition_message(new_status, "Drifted")
+            .unwrap_or_else(|| "Plan computed; database already matches desired state".to_string());
+        events.push(event(
+            EventType::Normal,
+            "PlanClean",
+            "StatusTransition",
+            note,
+        ));
+    }
+
+    if ready_became_true(old_status, new_status) && !is_planned_ready(new_status) {
         let reason = if had_ready_condition(old_status) {
             "Recovered"
         } else {
@@ -165,6 +187,25 @@ fn ready_became_true(
     !was_ready(old_status) && condition_is_true(Some(new_status), "Ready")
 }
 
+fn is_planned_ready(status: &PostgresPolicyStatus) -> bool {
+    condition(status, "Ready").and_then(|ready| ready.reason.as_deref()) == Some("Planned")
+}
+
+fn plan_became_clean(
+    old_status: Option<&PostgresPolicyStatus>,
+    new_status: &PostgresPolicyStatus,
+) -> bool {
+    if !is_planned_ready(new_status) || condition_is_true(Some(new_status), "Drifted") {
+        return false;
+    }
+
+    !is_planned_ready_status(old_status) || condition_is_true(old_status, "Drifted")
+}
+
+fn is_planned_ready_status(status: Option<&PostgresPolicyStatus>) -> bool {
+    status.map(is_planned_ready).unwrap_or(false)
+}
+
 fn noteworthy_failure_reason(
     old_status: Option<&PostgresPolicyStatus>,
     new_status: &PostgresPolicyStatus,
@@ -201,7 +242,10 @@ fn noteworthy_failure_reason(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::crd::{PostgresPolicyStatus, conflict_condition, paused_condition, ready_condition};
+    use crate::crd::{
+        PostgresPolicyStatus, conflict_condition, drifted_condition, paused_condition,
+        ready_condition,
+    };
 
     fn reasons(events: &[Event]) -> Vec<&str> {
         events.iter().map(|event| event.reason.as_str()).collect()
@@ -318,5 +362,29 @@ mod tests {
 
         let events = derive_status_events(Some(&old_status), &new_status);
         assert_eq!(reasons(&events), vec!["InsufficientPrivileges"]);
+    }
+
+    #[test]
+    fn emits_drift_detected_for_plan_mode_with_pending_changes() {
+        let mut status = PostgresPolicyStatus::default();
+        status.set_condition(ready_condition(true, "Planned", "Plan computed"));
+        status.set_condition(drifted_condition(
+            true,
+            "DriftDetected",
+            "2 planned change(s) pending review",
+        ));
+
+        let events = derive_status_events(None, &status);
+        assert_eq!(reasons(&events), vec!["DriftDetected"]);
+    }
+
+    #[test]
+    fn emits_plan_clean_when_plan_mode_has_no_pending_changes() {
+        let mut status = PostgresPolicyStatus::default();
+        status.set_condition(ready_condition(true, "Planned", "Plan computed"));
+        status.set_condition(drifted_condition(false, "InSync", "No pending changes"));
+
+        let events = derive_status_events(None, &status);
+        assert_eq!(reasons(&events), vec!["PlanClean"]);
     }
 }

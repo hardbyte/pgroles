@@ -265,6 +265,15 @@
                     },
                     "type": "array"
                   },
+                  "mode": {
+                    "default": "apply",
+                    "description": "Reconciliation mode: `apply` executes SQL, `plan` computes drift only.",
+                    "enum": [
+                      "apply",
+                      "plan"
+                    ],
+                    "type": "string"
+                  },
                   "profiles": {
                     "additionalProperties": {
                       "description": "A reusable privilege profile (CRD-compatible version).\n\nThis mirrors `pgroles_core::manifest::Profile` but derives `JsonSchema`.",
@@ -644,6 +653,16 @@
                     "nullable": true,
                     "type": "string"
                   },
+                  "last_reconcile_mode": {
+                    "description": "The reconciliation mode used for the last successful reconcile.",
+                    "enum": [
+                      "apply",
+                      "plan",
+                      null
+                    ],
+                    "nullable": true,
+                    "type": "string"
+                  },
                   "last_reconcile_time": {
                     "description": "Deprecated alias retained for compatibility with older status readers.",
                     "nullable": true,
@@ -680,6 +699,16 @@
                       "type": "string"
                     },
                     "type": "array"
+                  },
+                  "planned_sql": {
+                    "description": "Planned SQL for the last successful plan-mode reconcile.",
+                    "nullable": true,
+                    "type": "string"
+                  },
+                  "planned_sql_truncated": {
+                    "default": false,
+                    "description": "Whether `planned_sql` was truncated to fit safely in status.",
+                    "type": "boolean"
                   },
                   "transient_failure_count": {
                     "default": 0,

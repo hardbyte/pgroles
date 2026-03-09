@@ -30,6 +30,8 @@ struct Metrics {
     reconcile_total: Counter<u64>,
     reconcile_duration_ms: Histogram<u64>,
     reconcile_inflight: UpDownCounter<i64>,
+    plan_total: Counter<u64>,
+    plan_changes_total: Counter<u64>,
     lock_contention_total: Counter<u64>,
     policy_conflicts_total: Counter<u64>,
     invalid_spec_total: Counter<u64>,
@@ -89,6 +91,23 @@ impl OperatorObservability {
     pub fn record_lock_contention(&self) {
         if let Some(metrics) = &self.metrics {
             metrics.lock_contention_total.add(1, &[]);
+        }
+    }
+
+    pub fn record_plan_result(&self, result: &str) {
+        if let Some(metrics) = &self.metrics {
+            metrics
+                .plan_total
+                .add(1, &[KeyValue::new("result", result.to_string())]);
+        }
+    }
+
+    pub fn record_planned_changes(&self, changes: usize) {
+        if changes == 0 {
+            return;
+        }
+        if let Some(metrics) = &self.metrics {
+            metrics.plan_changes_total.add(changes as u64, &[]);
         }
     }
 
@@ -215,6 +234,14 @@ impl Metrics {
             reconcile_inflight: meter
                 .i64_up_down_counter("pgroles.reconcile.inflight")
                 .with_description("In-flight reconciliations")
+                .build(),
+            plan_total: meter
+                .u64_counter("pgroles.plan.total")
+                .with_description("Successful plan-mode reconciliations by result")
+                .build(),
+            plan_changes_total: meter
+                .u64_counter("pgroles.plan.changes")
+                .with_description("Planned changes discovered during plan-mode reconciliations")
                 .build(),
             lock_contention_total: meter
                 .u64_counter("pgroles.lock_contention.total")
@@ -379,6 +406,8 @@ mod tests {
         observability.record_policy_conflict();
         observability.record_invalid_spec();
         observability.record_database_connection_failure();
+        observability.record_plan_result("drift");
+        observability.record_planned_changes(2);
         observability.record_apply_result("success");
         observability.record_apply_statements(4);
         guard.record_result("conflict", "ConflictingPolicy");
@@ -391,6 +420,8 @@ mod tests {
 
         assert!(metric_exists(&metrics, "pgroles.reconcile.total"));
         assert!(metric_exists(&metrics, "pgroles.reconcile.duration"));
+        assert_eq!(u64_sum_value(&metrics, "pgroles.plan.total"), Some(1));
+        assert_eq!(u64_sum_value(&metrics, "pgroles.plan.changes"), Some(2));
         assert_eq!(
             u64_sum_value(&metrics, "pgroles.lock_contention.total"),
             Some(1)

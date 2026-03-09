@@ -23,8 +23,9 @@ use tracing::info;
 
 use crate::context::{ContextError, OperatorContext};
 use crate::crd::{
-    ChangeSummary, DatabaseIdentity, PostgresPolicy, PostgresPolicyStatus, conflict_condition,
-    degraded_condition, paused_condition, ready_condition, reconciling_condition,
+    ChangeSummary, DatabaseIdentity, PolicyMode, PostgresPolicy, PostgresPolicyStatus,
+    conflict_condition, degraded_condition, drifted_condition, paused_condition, ready_condition,
+    reconciling_condition,
 };
 
 /// Finalizer name for PostgresPolicy resources.
@@ -48,8 +49,12 @@ const TRANSIENT_BACKOFF_MAX_SECS: u64 = 300;
 /// SQLSTATE returned by PostgreSQL for insufficient privileges.
 const SQLSTATE_INSUFFICIENT_PRIVILEGE: &str = "42501";
 
+/// Maximum amount of rendered planned SQL stored in status.
+const MAX_PLANNED_SQL_STATUS_BYTES: usize = 16 * 1024;
+
 enum ReconcileOutcome {
     Reconciled,
+    Planned,
     Suspended,
     Conflict,
     LockContention,
@@ -59,6 +64,7 @@ impl ReconcileOutcome {
     fn result(&self) -> &'static str {
         match self {
             ReconcileOutcome::Reconciled => "success",
+            ReconcileOutcome::Planned => "planned",
             ReconcileOutcome::Suspended => "suspended",
             ReconcileOutcome::Conflict => "conflict",
             ReconcileOutcome::LockContention => "contention",
@@ -68,6 +74,7 @@ impl ReconcileOutcome {
     fn reason(&self) -> &'static str {
         match self {
             ReconcileOutcome::Reconciled => "Reconciled",
+            ReconcileOutcome::Planned => "Planned",
             ReconcileOutcome::Suspended => "Suspended",
             ReconcileOutcome::Conflict => "ConflictingPolicy",
             ReconcileOutcome::LockContention => "LockContention",
@@ -436,10 +443,14 @@ async fn reconcile_apply(
             if let Err(status_err) = update_status(ctx, resource, |status| {
                 status.set_condition(ready_condition(false, error_reason, &error_message));
                 status.set_condition(degraded_condition(error_reason, &error_message));
-                status
-                    .conditions
-                    .retain(|c| c.condition_type != "Reconciling" && c.condition_type != "Paused");
+                status.conditions.retain(|c| {
+                    c.condition_type != "Reconciling"
+                        && c.condition_type != "Paused"
+                        && c.condition_type != "Drifted"
+                });
                 status.change_summary = None;
+                status.planned_sql = None;
+                status.planned_sql_truncated = false;
                 status.last_error = Some(error_message.clone());
                 if is_transient_failure {
                     status.transient_failure_count += 1;
@@ -479,9 +490,11 @@ async fn reconcile_apply_inner(
             ));
             status
                 .conditions
-                .retain(|c| c.condition_type != "Reconciling");
+                .retain(|c| c.condition_type != "Reconciling" && c.condition_type != "Drifted");
             status.last_attempted_generation = generation;
             status.last_error = None;
+            status.planned_sql = None;
+            status.planned_sql_truncated = false;
             status.transient_failure_count = 0;
         })
         .await?;
@@ -497,7 +510,9 @@ async fn reconcile_apply_inner(
     // Update status to "Reconciling".
     update_status(ctx, resource, |status| {
         status.set_condition(reconciling_condition("Reconciliation in progress"));
-        status.conditions.retain(|c| c.condition_type != "Paused");
+        status
+            .conditions
+            .retain(|c| c.condition_type != "Paused" && c.condition_type != "Drifted");
         status.last_attempted_generation = generation;
         status.last_error = None;
     })
@@ -524,8 +539,10 @@ async fn reconcile_apply_inner(
             status.set_condition(degraded_condition("ConflictingPolicy", &conflict_message));
             status
                 .conditions
-                .retain(|c| c.condition_type != "Reconciling");
+                .retain(|c| c.condition_type != "Reconciling" && c.condition_type != "Drifted");
             status.change_summary = None;
+            status.planned_sql = None;
+            status.planned_sql_truncated = false;
             status.last_error = Some(conflict_message.clone());
             status.transient_failure_count = 0;
         })
@@ -649,9 +666,70 @@ async fn apply_under_lock(
         ));
     }
 
-    // 8. Apply changes.
-    let mut summary = ChangeSummary::default();
+    let summary = summarize_changes(&changes);
+    let sql_ctx = detect_sql_context(pool).await?;
+    let (planned_sql, planned_sql_truncated) = render_plan_sql_for_status(&changes, &sql_ctx);
 
+    if resource.spec.mode == PolicyMode::Plan {
+        let drift_detected = !changes.is_empty();
+        let ready_message = if drift_detected {
+            format!("Plan computed; {} change(s) pending", summary.total)
+        } else {
+            "Plan computed; database already matches desired state".to_string()
+        };
+        let drift_reason = if drift_detected {
+            "DriftDetected"
+        } else {
+            "InSync"
+        };
+        let drift_message = if drift_detected {
+            format!("{} planned change(s) pending review", summary.total)
+        } else {
+            "No pending changes".to_string()
+        };
+
+        ctx.observability
+            .record_plan_result(if drift_detected { "drift" } else { "clean" });
+        ctx.observability
+            .record_planned_changes(summary.total.max(0) as usize);
+
+        update_status(ctx, resource, |status| {
+            status.set_condition(ready_condition(true, "Planned", &ready_message));
+            status.set_condition(drifted_condition(
+                drift_detected,
+                drift_reason,
+                &drift_message,
+            ));
+            status.conditions.retain(|c| {
+                c.condition_type != "Reconciling"
+                    && c.condition_type != "Degraded"
+                    && c.condition_type != "Conflict"
+                    && c.condition_type != "Paused"
+            });
+            status.observed_generation = generation;
+            status.last_attempted_generation = generation;
+            status.last_successful_reconcile_time = Some(crate::crd::now_rfc3339());
+            status.last_reconcile_time = Some(crate::crd::now_rfc3339());
+            status.change_summary = Some(summary.clone());
+            status.last_reconcile_mode = Some(PolicyMode::Plan);
+            status.planned_sql = planned_sql.clone();
+            status.planned_sql_truncated = planned_sql_truncated;
+            status.last_error = None;
+            status.transient_failure_count = 0;
+        })
+        .await?;
+
+        info!(
+            name,
+            namespace,
+            total = summary.total,
+            drift_detected,
+            "plan reconciliation complete"
+        );
+        return Ok((Action::requeue(requeue_interval), ReconcileOutcome::Planned));
+    }
+
+    // 8. Apply changes.
     if changes.is_empty() {
         info!(name, namespace, "no changes needed");
     } else {
@@ -660,28 +738,16 @@ async fn apply_under_lock(
         let mut transaction = pool.begin().await?;
         let mut statements_executed = 0usize;
         for change in &changes {
-            for sql in pgroles_core::sql::render_statements(change) {
+            for sql in pgroles_core::sql::render_statements_with_context(change, &sql_ctx) {
                 tracing::debug!(%sql, "executing");
                 sqlx::query(&sql).execute(transaction.as_mut()).await?;
                 statements_executed += 1;
             }
-            accumulate_summary(&mut summary, change);
         }
         transaction.commit().await?;
         ctx.observability.record_apply_result("success");
         ctx.observability
             .record_apply_statements(statements_executed);
-
-        summary.total = summary.roles_created
-            + summary.roles_altered
-            + summary.roles_dropped
-            + summary.sessions_terminated
-            + summary.grants_added
-            + summary.grants_revoked
-            + summary.default_privileges_set
-            + summary.default_privileges_revoked
-            + summary.members_added
-            + summary.members_removed;
 
         info!(
             name,
@@ -694,6 +760,7 @@ async fn apply_under_lock(
     // 9. Update status to Ready.
     update_status(ctx, resource, |status| {
         status.set_condition(ready_condition(true, "Reconciled", "All changes applied"));
+        status.set_condition(drifted_condition(false, "InSync", "No pending changes"));
         // Clear any previous "Reconciling" or "Degraded" conditions.
         status.conditions.retain(|c| {
             c.condition_type != "Reconciling"
@@ -706,6 +773,9 @@ async fn apply_under_lock(
         status.last_successful_reconcile_time = Some(crate::crd::now_rfc3339());
         status.last_reconcile_time = Some(crate::crd::now_rfc3339());
         status.change_summary = Some(summary);
+        status.last_reconcile_mode = Some(PolicyMode::Apply);
+        status.planned_sql = None;
+        status.planned_sql_truncated = false;
         status.last_error = None;
         status.transient_failure_count = 0;
     })
@@ -760,6 +830,63 @@ fn accumulate_summary(summary: &mut ChangeSummary, change: &pgroles_core::diff::
         Change::AddMember { .. } => summary.members_added += 1,
         Change::RemoveMember { .. } => summary.members_removed += 1,
     }
+}
+
+fn summarize_changes(changes: &[pgroles_core::diff::Change]) -> ChangeSummary {
+    let mut summary = ChangeSummary::default();
+    for change in changes {
+        accumulate_summary(&mut summary, change);
+    }
+    summary.total = summary.roles_created
+        + summary.roles_altered
+        + summary.roles_dropped
+        + summary.sessions_terminated
+        + summary.grants_added
+        + summary.grants_revoked
+        + summary.default_privileges_set
+        + summary.default_privileges_revoked
+        + summary.members_added
+        + summary.members_removed;
+    summary
+}
+
+async fn detect_sql_context(
+    pool: &sqlx::PgPool,
+) -> Result<pgroles_core::sql::SqlContext, ReconcileError> {
+    let pg_version = pgroles_inspect::detect_pg_version(pool).await?;
+    Ok(pgroles_core::sql::SqlContext::from_version_num(
+        pg_version.version_num,
+    ))
+}
+
+fn render_plan_sql_for_status(
+    changes: &[pgroles_core::diff::Change],
+    sql_ctx: &pgroles_core::sql::SqlContext,
+) -> (Option<String>, bool) {
+    if changes.is_empty() {
+        return (None, false);
+    }
+
+    let rendered = pgroles_core::sql::render_all_with_context(changes, sql_ctx);
+    let (truncated, did_truncate) = truncate_status_text(&rendered, MAX_PLANNED_SQL_STATUS_BYTES);
+    (Some(truncated), did_truncate)
+}
+
+fn truncate_status_text(text: &str, max_bytes: usize) -> (String, bool) {
+    if text.len() <= max_bytes {
+        return (text.to_string(), false);
+    }
+
+    let marker = "\n-- truncated for status --";
+    let target_len = max_bytes.saturating_sub(marker.len());
+    let mut end = target_len.min(text.len());
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+
+    let mut truncated = text[..end].to_string();
+    truncated.push_str(marker);
+    (truncated, true)
 }
 
 /// Patch the status sub-resource of a PostgresPolicy.
@@ -917,7 +1044,7 @@ impl ReconcileError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::crd::{ConnectionSpec, PostgresPolicySpec, RoleSpec, SecretReference};
+    use crate::crd::{ConnectionSpec, PolicyMode, PostgresPolicySpec, RoleSpec, SecretReference};
     use sqlx::error::{DatabaseError, ErrorKind};
     use std::borrow::Cow;
     use std::error::Error as StdError;
@@ -980,6 +1107,7 @@ mod tests {
             },
             interval: interval.to_string(),
             suspend: false,
+            mode: PolicyMode::Apply,
             default_owner: None,
             profiles: Default::default(),
             schemas: Vec::new(),
@@ -1016,6 +1144,7 @@ mod tests {
                 },
                 interval: "5m".to_string(),
                 suspend: false,
+                mode: PolicyMode::Apply,
                 default_owner: None,
                 profiles: Default::default(),
                 schemas: Vec::new(),
@@ -1051,6 +1180,7 @@ mod tests {
                 },
                 interval: "5m".to_string(),
                 suspend: false,
+                mode: PolicyMode::Apply,
                 default_owner: None,
                 profiles: Default::default(),
                 schemas: vec![pgroles_core::manifest::SchemaBinding {
@@ -1149,6 +1279,42 @@ mod tests {
         assert_eq!(summary.roles_created, 1);
         assert_eq!(summary.grants_added, 1);
         assert_eq!(summary.sessions_terminated, 1);
+    }
+
+    #[test]
+    fn summarize_changes_sets_total() {
+        use pgroles_core::diff::Change;
+        use pgroles_core::model::RoleState;
+
+        let changes = vec![
+            Change::CreateRole {
+                name: "test".to_string(),
+                state: RoleState::default(),
+            },
+            Change::Grant {
+                role: "test".to_string(),
+                object_type: pgroles_core::manifest::ObjectType::Schema,
+                schema: None,
+                name: Some("public".to_string()),
+                privileges: [pgroles_core::manifest::Privilege::Usage]
+                    .into_iter()
+                    .collect(),
+            },
+        ];
+
+        let summary = summarize_changes(&changes);
+        assert_eq!(summary.roles_created, 1);
+        assert_eq!(summary.grants_added, 1);
+        assert_eq!(summary.total, 2);
+    }
+
+    #[test]
+    fn truncate_status_text_marks_truncation() {
+        let text = "x".repeat(MAX_PLANNED_SQL_STATUS_BYTES + 32);
+        let (truncated, did_truncate) = truncate_status_text(&text, MAX_PLANNED_SQL_STATUS_BYTES);
+        assert!(did_truncate);
+        assert!(truncated.len() <= MAX_PLANNED_SQL_STATUS_BYTES);
+        assert!(truncated.ends_with("-- truncated for status --"));
     }
 
     #[test]

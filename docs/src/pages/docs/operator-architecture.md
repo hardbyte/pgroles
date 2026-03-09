@@ -14,7 +14,7 @@ The operator is a Kubernetes controller around the same core model as the CLI:
 1. read desired state from a `PostgresPolicy`
 2. inspect live PostgreSQL state
 3. compute a convergent diff
-4. apply changes in a single transaction
+4. either apply changes in a single transaction or publish a non-mutating plan
 5. write status back to Kubernetes
 
 The important difference is that the operator has to do this continuously, safely, and in the presence of concurrent policy updates, secret changes, and transient infrastructure failures.
@@ -31,6 +31,7 @@ The important difference is that the operator has to do this continuously, safel
 
 - Secret-based connection lookup
 - reconciliation interval
+- reconciliation mode (`apply` or `plan`)
 - suspend/pause behavior
 
 The controller converts the CRD into the same manifest types used by the CLI, so both paths share expansion, diffing, and SQL rendering semantics.
@@ -66,7 +67,7 @@ PostgresPolicy
   -> live database inspection
   -> diff engine
   -> SQL rendering
-  -> transaction apply
+  -> apply transaction or plan-only status update
   -> status patch
 ```
 
@@ -105,6 +106,7 @@ That keeps the operator from hammering the Kubernetes API or the database during
 The operator writes status conditions and summaries back to the `PostgresPolicy`, including:
 
 - `Ready`
+- `Drifted`
 - `Reconciling`
 - `Degraded`
 - `Conflict`
@@ -119,6 +121,8 @@ It also records:
 - last error
 - transient failure count
 - change summary
+- last reconcile mode
+- planned SQL (truncated when needed for status size safety)
 
 This is the main operator-facing debugging surface for SREs.
 
@@ -137,7 +141,7 @@ pgroles-operator -> OpenTelemetry Collector -> metrics backend
 
 The operator deliberately does not default to a built-in Prometheus scrape endpoint.
 
-For object-local debugging, the controller also emits transition-based Kubernetes Events for notable status changes such as conflicts, suspend/resume, recovery, secret failures, database connectivity failures, and insufficient privileges. The intended split is:
+For object-local debugging, the controller also emits transition-based Kubernetes Events for notable status changes such as conflicts, suspend/resume, plan-mode drift detection, recovery, secret failures, database connectivity failures, and insufficient privileges. The intended split is:
 
 - status: current state of the policy
 - Events: notable transitions visible in `kubectl describe`
@@ -156,13 +160,14 @@ CI covers:
 - insufficient database privileges
 - secret rotation and recovery
 - Kubernetes Event delivery for warning and recovery transitions
+- plan-mode drift detection without SQL execution
 - OTLP metrics export through an in-cluster Collector
 - generated load policies across 2 databases with 30 schemas / 60 generated roles
 - scheduled fairness/load coverage across 5 policies, 3 databases, 100 schemas, and 200 generated roles with repeated secret churn
 
-Remaining gaps:
+Further hardening work:
 
-- higher-scale reconcile/load coverage beyond the scheduled workflow profile
+- broader scale and long-run validation beyond the current scheduled workflow profile
 
 ## Relationship to the CLI
 
