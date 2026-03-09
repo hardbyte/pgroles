@@ -525,7 +525,7 @@ jobs:
             LOGS="$(kubectl -n pgroles-system logs deployment/otel-collector --tail=200 2>/dev/null || true)"
             printf '%s\n' "$LOGS" | grep -q 'pgroles.reconcile.total' && \
             printf '%s\n' "$LOGS" | grep -q 'pgroles.policy.conflicts\|pgroles.apply.total\|pgroles.apply.statements\|pgroles.plan.total\|pgroles.plan.changes' && \
-            printf '%s\n' "$LOGS" | grep -q 'pgroles-operator' && {
+            printf '%s\n' "$LOGS" | grep -q '"otelcol.component.kind": "exporter"' && {
               echo "Collector received operator metrics"
               exit 0
             }
