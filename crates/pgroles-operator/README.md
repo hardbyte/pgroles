@@ -20,14 +20,14 @@ From crates.io:
 
 ```toml
 [dependencies]
-pgroles-operator = "0.1.5"
+pgroles-operator = "<current-release>"
 ```
 
 Library from source:
 
 ```toml
 [dependencies]
-pgroles-operator = { git = "https://github.com/hardbyte/pgroles", tag = "v0.1.5" }
+pgroles-operator = { git = "https://github.com/hardbyte/pgroles" }
 ```
 
 ## Intended Audience

@@ -36,14 +36,14 @@ Install from crates.io:
 
 ```toml
 [dependencies]
-pgroles-operator = "0.1.5"
+pgroles-operator = "<current-release>"
 ```
 
 If you are embedding the reconciler or CRD types directly from source, depend on the repository in your `Cargo.toml`:
 
 ```toml
 [dependencies]
-pgroles-operator = { git = "https://github.com/hardbyte/pgroles", tag = "v0.1.5" }
+pgroles-operator = { git = "https://github.com/hardbyte/pgroles" }
 ```
 
 ### Configuration
