@@ -178,4 +178,4 @@ That split is intentional:
 - the CLI is the easiest way to validate and review manifests
 - the operator is the right place to enforce drift correction continuously inside Kubernetes
 
-For the external user model, see the [operator guide](./operator). For the shared workspace structure, see the general [architecture](./architecture) page.
+For the external user model, see the [operator guide](/docs/operator). For the shared workspace structure, see the general [architecture](/docs/architecture) page.

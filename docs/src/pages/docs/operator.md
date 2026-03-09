@@ -7,7 +7,7 @@ The pgroles operator watches `PostgresPolicy` custom resources and continuously 
 
 ---
 
-For the internal controller design, see the [operator architecture](./operator-architecture) page.
+For the internal controller design, see the [operator architecture](/docs/operator-architecture) page.
 
 ## Overview
 
@@ -227,7 +227,7 @@ The operator reconciles on three paths:
 
 Each reconcile inspects the current database state, computes a diff from the policy, and then either applies it or publishes a non-mutating plan depending on `spec.mode`. Same-database policies are serialized, and status-only updates do not retrigger the controller.
 
-Use this page for the external behavior and operating model. For the internal controller pipeline and locking model, see the [operator architecture](./operator-architecture) page.
+Use this page for the external behavior and operating model. For the internal controller pipeline and locking model, see the [operator architecture](/docs/operator-architecture) page.
 
 {% operator-reconciliation-diagram /%}
 

@@ -5,7 +5,7 @@ description: Running pgroles against Cloud SQL for PostgreSQL.
 
 What you need to know about pgroles on Cloud SQL — auto-detection, attribute restrictions, IAM authentication, and the Docker image interface. {% .lead %}
 
-For general usage, see the [quick start](./quick-start). For CI pipeline patterns, see [CI/CD integration](./ci-cd). For the Kubernetes operator, see the [operator docs](./operator).
+For general usage, see the [quick start](/docs/quick-start). For CI pipeline patterns, see [CI/CD integration](/docs/ci-cd). For the Kubernetes operator, see the [operator docs](/docs/operator).
 
 ---
 
@@ -110,4 +110,4 @@ kubectl create secret generic mydb-credentials \
   --from-literal=DATABASE_URL='postgres://postgres:PASSWORD@127.0.0.1:5432/mydb'
 ```
 
-With [Workload Identity](https://cloud.google.com/kubernetes-engine/docs/how-to/workload-identity), run the [Cloud SQL Auth Proxy](https://cloud.google.com/sql/docs/postgres/sql-proxy) as a sidecar or standalone Deployment in the same namespace. See the [operator docs](./operator) for the full `PostgresPolicy` CRD reference.
+With [Workload Identity](https://cloud.google.com/kubernetes-engine/docs/how-to/workload-identity), run the [Cloud SQL Auth Proxy](https://cloud.google.com/sql/docs/postgres/sql-proxy) as a sidecar or standalone Deployment in the same namespace. See the [operator docs](/docs/operator) for the full `PostgresPolicy` CRD reference.
