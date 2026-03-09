@@ -7,25 +7,25 @@ export function Navigation({ navigation, className }) {
 
   return (
     <nav className={clsx('text-base lg:text-sm', className)}>
-      <ul role="list" className="space-y-9">
+      <ul role="list" className="space-y-8">
         {navigation.map((section) => (
           <li key={section.title}>
-            <h2 className="font-display font-medium text-slate-900 dark:text-white">
+            <h2 className="font-display text-[11px] font-semibold uppercase tracking-[0.22em] text-stone-500 dark:text-stone-400">
               {section.title}
             </h2>
             <ul
               role="list"
-              className="mt-2 space-y-2 border-l-2 border-slate-100 dark:border-slate-800 lg:mt-4 lg:space-y-4 lg:border-slate-200"
+              className="mt-3 space-y-1.5 border-l border-stone-300/90 dark:border-stone-700 lg:mt-4"
             >
               {section.links.map((link) => (
                 <li key={link.href} className="relative">
                   <Link
                     href={link.href}
                     className={clsx(
-                      'block w-full pl-3.5 before:pointer-events-none before:absolute before:-left-1 before:top-1/2 before:h-1.5 before:w-1.5 before:-translate-y-1/2 before:rounded-full',
+                      'block w-full rounded-r-lg py-1.5 pl-4 pr-3 transition before:pointer-events-none before:absolute before:-left-px before:top-0 before:h-full before:w-px',
                       link.href === router.pathname
-                        ? 'font-semibold text-sky-500 before:bg-sky-500'
-                        : 'text-slate-500 before:hidden before:bg-slate-300 hover:text-slate-600 hover:before:block dark:text-slate-400 dark:before:bg-slate-700 dark:hover:text-slate-300'
+                        ? 'bg-amber-50/80 font-semibold text-amber-800 before:bg-amber-500 dark:bg-stone-900 dark:text-amber-300 dark:before:bg-amber-400'
+                        : 'text-stone-600 before:hidden before:bg-stone-400 hover:bg-stone-100/80 hover:text-stone-900 hover:before:block dark:text-stone-400 dark:before:bg-stone-600 dark:hover:bg-stone-900/70 dark:hover:text-stone-200'
                     )}
                   >
                     {link.title}

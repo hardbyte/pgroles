@@ -1,10 +1,27 @@
 import Head from 'next/head'
+import { IBM_Plex_Mono, IBM_Plex_Sans, Space_Grotesk } from 'next/font/google'
 import { slugifyWithCounter } from '@sindresorhus/slugify'
 
 import { Layout } from '@/components/Layout'
 
 import 'focus-visible'
 import '@/styles/tailwind.css'
+
+const sans = IBM_Plex_Sans({
+  subsets: ['latin'],
+  variable: '--font-sans',
+})
+
+const display = Space_Grotesk({
+  subsets: ['latin'],
+  variable: '--font-display',
+})
+
+const mono = IBM_Plex_Mono({
+  subsets: ['latin'],
+  weight: ['400', '500', '600'],
+  variable: '--font-mono',
+})
 
 function getNodeText(node) {
   let text = ''
@@ -62,7 +79,7 @@ export default function App({ Component, pageProps }) {
     : []
 
   return (
-    <>
+    <div className={`${sans.variable} ${display.variable} ${mono.variable}`}>
       <Head>
         <title>{pageTitle}</title>
         {description && <meta name="description" content={description} />}
@@ -70,6 +87,6 @@ export default function App({ Component, pageProps }) {
       <Layout title={title} tableOfContents={tableOfContents}>
         <Component {...pageProps} />
       </Layout>
-    </>
+    </div>
   )
 }

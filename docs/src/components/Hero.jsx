@@ -1,206 +1,137 @@
-import React, { Fragment, useState } from 'react'
-import Image from 'next/image'
-import clsx from 'clsx'
-import Highlight, { defaultProps } from 'prism-react-renderer'
-
 import { Button } from '@/components/Button'
-import { HeroBackground } from '@/components/HeroBackground'
-import blurCyanImage from '@/images/blur-cyan.png'
-import blurIndigoImage from '@/images/blur-indigo.png'
 
-const tabs = [
-  { name: 'pgroles.yaml', isActive: true, codeLanguage: 'yaml', code: `default_owner: app_owner
-
-profiles:
-  editor:
+const manifestSnippet = `profiles:
+  writer:
     grants:
       - privileges: [USAGE]
         on: { type: schema }
-      - privileges: [SELECT, INSERT, UPDATE, DELETE]
+      - privileges: [SELECT, INSERT, UPDATE, DELETE, TRIGGER]
         on: { type: table, name: "*" }
-    default_privileges:
-      - privileges: [SELECT, INSERT, UPDATE, DELETE]
-        on_type: table
+      - privileges: [USAGE, SELECT, UPDATE]
+        on: { type: sequence, name: "*" }`
 
-schemas:
-  - name: inventory
-    profiles: [editor]
+const planSnippet = `Plan: 4 change(s)
+  1 role(s) to create
+  2 grant(s) to add
+  1 default privilege(s) to set`
 
-roles:
-  - name: app-service
-    login: true` },
-  { name: 'pgroles diff', isActive: true, codeLanguage: 'sql', code: `CREATE ROLE "inventory-editor"
-  NOLOGIN NOSUPERUSER INHERIT;
-COMMENT ON ROLE "inventory-editor"
-  IS 'Generated from profile editor';
-
-CREATE ROLE "app-service"
-  LOGIN NOSUPERUSER INHERIT;
-
-GRANT USAGE ON SCHEMA "inventory"
-  TO "inventory-editor";
-GRANT SELECT, INSERT, UPDATE, DELETE
-  ON ALL TABLES IN SCHEMA "inventory"
-  TO "inventory-editor";
-
-ALTER DEFAULT PRIVILEGES
-  FOR ROLE "app_owner"
-  IN SCHEMA "inventory"
-  GRANT SELECT, INSERT, UPDATE, DELETE
-  ON TABLES TO "inventory-editor";` },
-]
-
-function TrafficLightsIcon(props) {
-  return (
-    <svg aria-hidden="true" viewBox="0 0 42 10" fill="none" {...props}>
-      <circle cx="5" cy="5" r="4.5" />
-      <circle cx="21" cy="5" r="4.5" />
-      <circle cx="37" cy="5" r="4.5" />
-    </svg>
-  )
-}
+const statusSnippet = `status:
+  conditions:
+    - type: Ready
+      status: "True"
+      reason: Planned
+    - type: Drifted
+      status: "True"`
 
 export function Hero() {
-  const [currentTab, setCurrentTab] = useState(tabs[0]);
-
   return (
-    <div className="overflow-hidden bg-slate-900 dark:-mb-32 dark:mt-[-4.5rem] dark:pb-32 dark:pt-[4.5rem] dark:lg:mt-[-4.75rem] dark:lg:pt-[4.75rem]">
-      <div className="py-16 sm:px-2 lg:relative lg:py-20 lg:px-0">
-        <div className="mx-auto grid max-w-2xl grid-cols-1 items-center gap-y-16 gap-x-8 px-4 lg:max-w-8xl lg:grid-cols-2 lg:px-8 xl:gap-x-16 xl:px-12">
-          <div className="relative z-10 md:text-center lg:text-left">
-            <Image
-              className="absolute bottom-full right-full -mr-72 -mb-56 opacity-50"
-              src={blurCyanImage}
-              alt=""
-              width={530}
-              height={530}
-              unoptimized
-              priority
-            />
-            <div className="relative">
-              <p className="inline bg-gradient-to-r from-indigo-200 via-sky-400 to-indigo-200 bg-clip-text font-display text-5xl tracking-tight text-transparent">
-                Declarative PostgreSQL role and privilege management.
-              </p>
-              <p className="mt-3 text-2xl tracking-tight text-slate-400">
-                One YAML file. Every role, grant, and privilege in your database — defined, diffed, and applied.
-              </p>
-              <div className="mt-8 flex gap-4 md:justify-center lg:justify-start">
-                <Button href="/docs/quick-start">Get started</Button>
-                <Button href="https://github.com/hardbyte/pgroles" variant="secondary">
-                  View on GitHub
-                </Button>
-              </div>
+    <div className="relative overflow-hidden bg-stone-100 text-stone-900 dark:bg-stone-950 dark:text-stone-100">
+      <div className="absolute inset-0 bg-[radial-gradient(circle_at_top_left,rgba(245,158,11,0.18),transparent_24%),radial-gradient(circle_at_82%_12%,rgba(20,184,166,0.12),transparent_24%),linear-gradient(180deg,rgba(255,255,255,0.98),rgba(245,245,244,0.96))] dark:bg-[radial-gradient(circle_at_top_left,rgba(245,158,11,0.28),transparent_26%),radial-gradient(circle_at_78%_8%,rgba(20,184,166,0.2),transparent_24%),linear-gradient(180deg,rgba(12,10,9,0.96),rgba(12,10,9,0.92))]" />
+      <div className="absolute inset-0 opacity-[0.08] [background-image:linear-gradient(rgba(28,25,23,0.08)_1px,transparent_1px),linear-gradient(90deg,rgba(28,25,23,0.08)_1px,transparent_1px)] [background-size:28px_28px] dark:opacity-[0.08] dark:[background-image:linear-gradient(rgba(255,255,255,0.14)_1px,transparent_1px),linear-gradient(90deg,rgba(255,255,255,0.14)_1px,transparent_1px)]" />
+      <div className="absolute inset-x-0 bottom-0 h-20 bg-[linear-gradient(180deg,rgba(245,245,244,0)_0%,rgba(245,245,244,0.94)_86%,rgb(245,245,244)_100%)] dark:h-24 dark:bg-[linear-gradient(180deg,rgba(12,10,9,0)_0%,rgba(12,10,9,0.92)_88%,rgb(12,10,9)_100%)]" />
+
+      <div className="relative py-14 sm:px-2 lg:py-16">
+        <div className="mx-auto grid max-w-8xl grid-cols-1 gap-10 px-4 lg:grid-cols-[0.94fr,1.06fr] lg:gap-12 lg:px-8 xl:px-12">
+          <div className="max-w-xl">
+            <div className="flex flex-wrap gap-2 text-[11px] font-semibold uppercase tracking-[0.2em] text-stone-500 dark:text-stone-300">
+              <span className="rounded-full border border-stone-300 bg-white/90 px-3 py-1 shadow-sm dark:border-stone-700 dark:bg-stone-900/60 dark:shadow-none">CLI</span>
+              <span className="rounded-full border border-stone-300 bg-white/90 px-3 py-1 shadow-sm dark:border-stone-700 dark:bg-stone-900/60 dark:shadow-none">Operator</span>
+              <span className="rounded-full border border-amber-300 bg-amber-50 px-3 py-1 text-amber-900 shadow-sm dark:border-amber-500/40 dark:bg-amber-500/10 dark:text-amber-200 dark:shadow-none">Plan before apply</span>
             </div>
+
+            <h1 className="mt-5 max-w-2xl font-display text-[2.8rem] leading-[1.02] tracking-[-0.04em] text-stone-950 sm:text-[3.35rem] dark:text-stone-50">
+              Treat PostgreSQL access like a control plane, not a pile of grants.
+            </h1>
+
+            <p className="mt-5 max-w-xl text-lg leading-8 text-stone-700 dark:text-stone-300">
+              Define roles, memberships, schema profiles, and default privileges once. Review the exact SQL plan, then let pgroles converge the database and keep drift visible.
+            </p>
+
+            <div className="mt-8 flex flex-wrap gap-4">
+              <Button href="/docs/quick-start">Start with a diff</Button>
+              <Button href="/docs/operator" variant="secondary">
+                Explore the operator
+              </Button>
+            </div>
+
+            <dl className="mt-9 grid gap-5 border-t border-stone-300/90 pt-5 dark:border-stone-800/90 sm:grid-cols-3">
+              <Stat label="Convergent model" value="Manifest is truth" />
+              <Stat label="Preview path" value="CLI diff + operator plan" />
+              <Stat label="Runtime" value="CI, OTLP, Kubernetes" />
+            </dl>
           </div>
-          <div className="relative lg:static xl:pl-10">
-            <div className="absolute inset-x-[-50vw] -top-32 -bottom-48 [mask-image:linear-gradient(transparent,white,white)] dark:[mask-image:linear-gradient(transparent,white,transparent)] lg:left-[calc(50%+14rem)] lg:right-0 lg:-top-32 lg:-bottom-32 lg:[mask-image:none] lg:dark:[mask-image:linear-gradient(white,white,transparent)]">
-              <HeroBackground className="absolute top-1/2 left-1/2 -translate-y-1/2 -translate-x-1/2 lg:left-0 lg:translate-x-0 lg:translate-y-[-60%]" />
-            </div>
-            <div className="relative">
-              <Image
-                className="absolute -top-64 -right-64"
-                src={blurCyanImage}
-                alt=""
-                width={530}
-                height={530}
-                unoptimized
-                priority
+
+          <div className="grid gap-4 lg:pt-3">
+            <ConsoleCard
+              title="Policy manifest"
+              eyebrow="Desired state"
+              tone="amber"
+              code={manifestSnippet}
+            />
+            <div className="grid gap-4 lg:grid-cols-[0.92fr,1.08fr]">
+              <ConsoleCard
+                title="Diff summary"
+                eyebrow="Change plan"
+                tone="teal"
+                code={planSnippet}
               />
-              <Image
-                className="absolute -bottom-40 -right-44"
-                src={blurIndigoImage}
-                alt=""
-                width={567}
-                height={567}
-                unoptimized
-                priority
+              <ConsoleCard
+                title="Operator status"
+                eyebrow="Control plane"
+                tone="stone"
+                code={statusSnippet}
               />
-              <div className="absolute inset-0 rounded-2xl bg-gradient-to-tr from-sky-300 via-sky-300/70 to-blue-300 opacity-10 blur-lg" />
-              <div className="absolute inset-0 rounded-2xl bg-gradient-to-tr from-sky-300 via-sky-300/70 to-blue-300 opacity-10" />
-              <div className="relative rounded-2xl bg-[#0A101F]/80 ring-1 ring-white/10 backdrop-blur">
-                <div className="absolute -top-px left-20 right-11 h-px bg-gradient-to-r from-sky-300/0 via-sky-300/70 to-sky-300/0" />
-                <div className="absolute -bottom-px left-11 right-20 h-px bg-gradient-to-r from-blue-400/0 via-blue-400 to-blue-400/0" />
-                <div className="pl-4 pt-4">
-                  <TrafficLightsIcon className="h-2.5 w-auto stroke-slate-500/30" />
-                  <div className="mt-4 flex space-x-2 text-xs">
-                    {tabs.map((tab) => (
-                      <div
-                        key={tab.name}
-                        className={clsx(
-                          'flex h-6 rounded-full',
-                          tab.name === currentTab.name
-                            ? 'bg-gradient-to-r from-sky-400/30 via-sky-400 to-sky-400/30 p-px font-medium text-sky-300'
-                            : 'text-slate-500'
-                        )}
-                      >
-                        <div
-                          className={clsx(
-                            'flex items-center rounded-full px-2.5',
-                            tab.name === currentTab.name && 'bg-slate-800 cursor-pointer'
-                          )}
-                          onClick={() => setCurrentTab(tab)}
-                        >
-                          {tab.name}
-                        </div>
-                      </div>
-                    ))}
-                  </div>
-                  <div className="mt-6 flex items-start px-1 text-sm">
-                    <div
-                      aria-hidden="true"
-                      className="select-none border-r border-slate-300/5 pr-4 font-mono text-slate-600"
-                    >
-                      {Array.from({
-                        length: currentTab.code.split('\n').length,
-                      }).map((_, index) => (
-                        <Fragment key={index}>
-                          {(index + 1).toString().padStart(2, '0')}
-                          <br />
-                        </Fragment>
-                      ))}
-                    </div>
-                    <Highlight
-                      {...defaultProps}
-                      code={currentTab.code}
-                      language={currentTab.codeLanguage}
-                      theme={undefined}
-                    >
-                      {({
-                        className,
-                        style,
-                        tokens,
-                        getLineProps,
-                        getTokenProps,
-                      }) => (
-                        <pre
-                          className={clsx(
-                            className,
-                            'flex overflow-x-auto pb-6'
-                          )}
-                          style={style}
-                        >
-                          <code className="px-4">
-                            {tokens.map((line, lineIndex) => (
-                              <div key={lineIndex} {...getLineProps({ line })}>
-                                {line.map((token, tokenIndex) => (
-                                  <span
-                                    key={tokenIndex}
-                                    {...getTokenProps({ token })}
-                                  />
-                                ))}
-                              </div>
-                            ))}
-                          </code>
-                        </pre>
-                      )}
-                    </Highlight>
-                  </div>
-                </div>
-              </div>
             </div>
           </div>
         </div>
       </div>
+    </div>
+  )
+}
+
+function Stat({ label, value }) {
+  return (
+    <div>
+      <dt className="text-[11px] font-semibold uppercase tracking-[0.2em] text-stone-500 dark:text-stone-400">{label}</dt>
+      <dd className="mt-2 font-display text-base text-stone-900 dark:text-stone-100">{value}</dd>
+    </div>
+  )
+}
+
+function ConsoleCard({ eyebrow, title, code, tone }) {
+  const tones = {
+    amber:
+      'border-amber-300/80 bg-white/88 shadow-[0_24px_50px_-34px_rgba(217,119,6,0.18)] dark:border-amber-500/30 dark:bg-stone-950/70 dark:shadow-[0_24px_50px_-34px_rgba(245,158,11,0.32)]',
+    teal:
+      'border-teal-300/80 bg-white/88 shadow-[0_24px_50px_-34px_rgba(13,148,136,0.16)] dark:border-teal-500/30 dark:bg-stone-950/70 dark:shadow-[0_24px_50px_-34px_rgba(20,184,166,0.28)]',
+    stone:
+      'border-stone-300/90 bg-stone-50/92 shadow-[0_24px_50px_-36px_rgba(28,25,23,0.15)] dark:border-stone-700 dark:!bg-stone-950/88 dark:shadow-[0_24px_50px_-38px_rgba(255,255,255,0.07)]',
+  }
+
+  const accents = {
+    amber: 'bg-amber-500 dark:bg-amber-400',
+    teal: 'bg-teal-500 dark:bg-teal-400',
+    stone: 'bg-stone-500 dark:bg-stone-400',
+  }
+
+  return (
+    <div className={`rounded-[1.45rem] border p-4 backdrop-blur ${tones[tone]}`}>
+      <div className="flex items-center justify-between gap-4">
+        <div>
+          <p className="m-0 text-[11px] font-semibold uppercase tracking-[0.22em] text-stone-500 dark:text-stone-400">
+            {eyebrow}
+          </p>
+          <p className="mt-2 font-display text-lg text-stone-950 dark:text-stone-50">{title}</p>
+        </div>
+        <div className="flex gap-1.5">
+          <span className={`h-2.5 w-2.5 rounded-full ${accents[tone]}`} />
+          <span className="h-2.5 w-2.5 rounded-full bg-stone-300 dark:bg-stone-700" />
+          <span className="h-2.5 w-2.5 rounded-full bg-stone-300 dark:bg-stone-700" />
+        </div>
+      </div>
+      <pre className="mt-4 overflow-x-auto rounded-[1.2rem] border border-stone-200 bg-stone-950 p-4 font-mono text-[13px] leading-6 text-stone-200 dark:border-stone-800">
+        <code>{code}</code>
+      </pre>
     </div>
   )
 }

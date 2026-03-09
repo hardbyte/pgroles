@@ -77,19 +77,20 @@ function Header({navigation}) {
     return (
         <header
             className={clsx(
-                'sticky top-0 z-50 flex flex-wrap items-center justify-between bg-white px-4 py-5 shadow-md shadow-slate-900/5 transition duration-500 dark:shadow-none sm:px-6 lg:px-8',
+                'sticky top-0 z-50 flex flex-wrap items-center justify-between border-b px-4 py-4 transition duration-300 sm:px-6 lg:px-8',
                 isScrolled
-                    ? 'dark:bg-slate-900/95 dark:backdrop-blur dark:[@supports(backdrop-filter:blur(0))]:bg-slate-900/75'
-                    : 'dark:bg-transparent'
+                    ? 'border-stone-300 bg-stone-50/92 shadow-[0_10px_30px_-24px_rgba(28,25,23,0.55)] backdrop-blur dark:border-stone-800 dark:bg-stone-950/88 dark:shadow-none'
+                    : 'border-transparent bg-stone-100/90 dark:bg-stone-950'
             )}
         >
+            <div className="pointer-events-none absolute inset-x-0 top-0 h-px bg-[linear-gradient(90deg,transparent,rgba(245,158,11,0.6),rgba(20,184,166,0.45),transparent)]" />
             <div className="mr-6 flex lg:hidden">
                 <MobileNavigation navigation={navigation}/>
             </div>
             <div className="relative flex flex-grow basis-0 items-center">
                 <Link href="/" aria-label="Home page">
                     <Logomark className="h-9 w-9 lg:hidden"/>
-                    <Logo className="hidden h-9 w-auto fill-slate-700 dark:fill-sky-100 lg:block"/>
+                    <Logo className="hidden lg:flex"/>
                 </Link>
             </div>
             <div className="-my-5 mr-6 sm:mr-8 md:mr-0">
@@ -99,7 +100,7 @@ function Header({navigation}) {
                 <ThemeSelector className="relative z-10"/>
                 <Link href="https://github.com/hardbyte/pgroles" className="group" aria-label="GitHub">
                     <GitHubIcon
-                        className="h-6 w-6 fill-slate-400 group-hover:fill-slate-500 dark:group-hover:fill-slate-300"/>
+                        className="h-6 w-6 fill-stone-500 transition group-hover:fill-amber-600 dark:fill-stone-400 dark:group-hover:fill-amber-300"/>
                 </Link>
             </div>
         </header>
@@ -179,31 +180,28 @@ export function Layout({children, title, tableOfContents}) {
 
             {isHomePage && <Hero/>}
 
+            <div className="relative bg-stone-100 text-stone-900 dark:bg-stone-950 dark:text-stone-100">
             <div className="relative mx-auto flex max-w-8xl justify-center sm:px-2 lg:px-8 xl:px-12">
                 <div className="hidden lg:relative lg:block lg:flex-none">
-                    <div className="absolute inset-y-0 right-0 w-[50vw] bg-slate-50 dark:hidden"/>
-                    <div
-                        className="absolute top-16 bottom-0 right-0 hidden h-12 w-px bg-gradient-to-t from-slate-800 dark:block"/>
-                    <div className="absolute top-28 bottom-0 right-0 hidden w-px bg-slate-800 dark:block"/>
                     <div
                         className="sticky top-[4.5rem] -ml-0.5 h-[calc(100vh-4.5rem)] overflow-y-auto overflow-x-hidden py-16 pl-0.5">
                         <Navigation
                             navigation={navigation}
-                            className="w-64 pr-8 xl:w-72 xl:pr-16"
+                            className="w-64 rounded-r-[2rem] border-r border-stone-300/80 bg-stone-50/70 pr-8 shadow-[8px_0_24px_-24px_rgba(28,25,23,0.3)] xl:w-72 xl:pr-16 dark:border-stone-800 dark:bg-stone-950/40 dark:shadow-none"
                         />
                     </div>
                 </div>
                 <div className="min-w-0 max-w-2xl flex-auto px-4 py-16 lg:max-w-none lg:pr-0 lg:pl-8 xl:px-16">
                     <article>
                         {(title || section) && (
-                            <header className="mb-9 space-y-1">
+                            <header className="mb-10 space-y-2">
                                 {section && (
-                                    <p className="font-display text-sm font-medium text-sky-500">
+                                    <p className="font-display text-[11px] font-semibold uppercase tracking-[0.22em] text-amber-700 dark:text-amber-300">
                                         {section.title}
                                     </p>
                                 )}
                                 {title && (
-                                    <h1 className="font-display text-3xl tracking-tight text-slate-900 dark:text-white">
+                                    <h1 className="font-display text-4xl tracking-[-0.03em] text-stone-950 dark:text-stone-100">
                                         {title}
                                     </h1>
                                 )}
@@ -211,16 +209,16 @@ export function Layout({children, title, tableOfContents}) {
                         )}
                         <Prose>{children}</Prose>
                     </article>
-                    <dl className="mt-12 flex border-t border-slate-200 pt-6 dark:border-slate-800">
+                    <dl className="mt-12 flex border-t border-stone-300 pt-6 dark:border-stone-800">
                         {previousPage && (
                             <div>
-                                <dt className="font-display text-sm font-medium text-slate-900 dark:text-white">
+                                <dt className="font-display text-[11px] font-semibold uppercase tracking-[0.2em] text-stone-500 dark:text-stone-400">
                                     Previous
                                 </dt>
                                 <dd className="mt-1">
                                     <Link
                                         href={previousPage.href}
-                                        className="text-base font-semibold text-slate-500 hover:text-slate-600 dark:text-slate-400 dark:hover:text-slate-300"
+                                        className="text-base font-semibold text-stone-700 hover:text-amber-700 dark:text-stone-300 dark:hover:text-amber-300"
                                     >
                                         <span aria-hidden="true">&larr;</span> {previousPage.title}
                                     </Link>
@@ -229,13 +227,13 @@ export function Layout({children, title, tableOfContents}) {
                         )}
                         {nextPage && (
                             <div className="ml-auto text-right">
-                                <dt className="font-display text-sm font-medium text-slate-900 dark:text-white">
+                                <dt className="font-display text-[11px] font-semibold uppercase tracking-[0.2em] text-stone-500 dark:text-stone-400">
                                     Next
                                 </dt>
                                 <dd className="mt-1">
                                     <Link
                                         href={nextPage.href}
-                                        className="text-base font-semibold text-slate-500 hover:text-slate-600 dark:text-slate-400 dark:hover:text-slate-300"
+                                        className="text-base font-semibold text-stone-700 hover:text-amber-700 dark:text-stone-300 dark:hover:text-amber-300"
                                     >
                                         {nextPage.title} <span aria-hidden="true">&rarr;</span>
                                     </Link>
@@ -246,12 +244,12 @@ export function Layout({children, title, tableOfContents}) {
                 </div>
                 <div
                     className="hidden xl:sticky xl:top-[4.5rem] xl:-mr-6 xl:block xl:h-[calc(100vh-4.5rem)] xl:flex-none xl:overflow-y-auto xl:py-16 xl:pr-6">
-                    <nav aria-labelledby="on-this-page-title" className="w-56">
+                    <nav aria-labelledby="on-this-page-title" className="w-56 rounded-[1.75rem] border border-stone-300/80 bg-white/80 p-5 shadow-[0_18px_40px_-34px_rgba(28,25,23,0.45)] dark:border-stone-700 dark:bg-stone-900/80 dark:shadow-none">
                         {tableOfContents.length > 0 && (
                             <>
                                 <h2
                                     id="on-this-page-title"
-                                    className="font-display text-sm font-medium text-slate-900 dark:text-white"
+                                    className="font-display text-[11px] font-semibold uppercase tracking-[0.22em] text-stone-500 dark:text-stone-400"
                                 >
                                     On this page
                                 </h2>
@@ -263,8 +261,8 @@ export function Layout({children, title, tableOfContents}) {
                                                     href={`#${section.id}`}
                                                     className={clsx(
                                                         isActive(section)
-                                                            ? 'text-sky-500'
-                                                            : 'font-normal text-slate-500 hover:text-slate-700 dark:text-slate-400 dark:hover:text-slate-300'
+                                                            ? 'text-amber-700 dark:text-amber-300'
+                                                            : 'font-normal text-stone-600 hover:text-stone-900 dark:text-stone-400 dark:hover:text-stone-200'
                                                     )}
                                                 >
                                                     {section.title}
@@ -273,7 +271,7 @@ export function Layout({children, title, tableOfContents}) {
                                             {section.children.length > 0 && (
                                                 <ol
                                                     role="list"
-                                                    className="mt-2 space-y-3 pl-5 text-slate-500 dark:text-slate-400"
+                                                    className="mt-2 space-y-3 pl-5 text-stone-500 dark:text-stone-500"
                                                 >
                                                     {section.children.map((subSection) => (
                                                         <li key={subSection.id}>
@@ -281,8 +279,8 @@ export function Layout({children, title, tableOfContents}) {
                                                                 href={`#${subSection.id}`}
                                                                 className={
                                                                     isActive(subSection)
-                                                                        ? 'text-sky-500'
-                                                                        : 'hover:text-slate-600 dark:hover:text-slate-300'
+                                                                        ? 'text-amber-700 dark:text-amber-300'
+                                                                        : 'hover:text-stone-900 dark:hover:text-stone-200'
                                                                 }
                                                             >
                                                                 {subSection.title}
@@ -298,6 +296,7 @@ export function Layout({children, title, tableOfContents}) {
                         )}
                     </nav>
                 </div>
+            </div>
             </div>
         </>
     )

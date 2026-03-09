@@ -4,9 +4,9 @@ import clsx from 'clsx'
 
 const styles = {
   primary:
-    'rounded-full bg-sky-300 py-2 px-4 text-sm font-semibold text-slate-900 hover:bg-sky-200 focus:outline-none focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-sky-300/50 active:bg-sky-500',
+    'rounded-lg border border-amber-300 bg-amber-300 px-4 py-2 text-sm font-semibold text-stone-950 shadow-[0_14px_30px_-22px_rgba(217,119,6,0.7)] transition hover:-translate-y-px hover:bg-amber-200 focus:outline-none focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-amber-500/60 active:translate-y-0 active:bg-amber-400',
   secondary:
-    'rounded-full bg-slate-800 py-2 px-4 text-sm font-medium text-white hover:bg-slate-700 focus:outline-none focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-white/50 active:text-slate-400',
+    'rounded-lg border border-stone-700/70 bg-stone-900/55 px-4 py-2 text-sm font-medium text-stone-100 transition hover:border-stone-500 hover:bg-stone-900/70 focus:outline-none focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-stone-500/50 active:text-stone-300',
 }
 
 export function Button({ variant = 'primary', className, href, icon, ...props }) {
