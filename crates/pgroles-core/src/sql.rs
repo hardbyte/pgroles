@@ -278,7 +278,6 @@ fn render_grant(
     let privilege_list = format_privileges(privileges);
     render_privilege_statements(
         "GRANT",
-        "TO",
         role,
         &privilege_list,
         object_type,
@@ -299,7 +298,6 @@ fn render_revoke(
     let privilege_list = format_privileges(privileges);
     render_privilege_statements(
         "REVOKE",
-        "FROM",
         role,
         &privilege_list,
         object_type,
@@ -311,7 +309,6 @@ fn render_revoke(
 
 fn render_privilege_statements(
     action: &str,
-    subject_preposition: &str,
     role: &str,
     privilege_list: &str,
     object_type: ObjectType,
@@ -319,6 +316,7 @@ fn render_privilege_statements(
     name: Option<&str>,
     ctx: &SqlContext,
 ) -> Vec<String> {
+    let subject_preposition = if action == "GRANT" { "TO" } else { "FROM" };
     if matches!(
         object_type,
         ObjectType::Table | ObjectType::View | ObjectType::MaterializedView
