@@ -200,8 +200,8 @@ async fn cmd_diff(
     let pool = connect_db(database_url).await?;
     let current = inspect_current(&pool, &validated).await?;
 
-    let resolved_passwords = resolve_passwords(&validated.expanded)
-        .context("failed to resolve role passwords")?;
+    let resolved_passwords =
+        resolve_passwords(&validated.expanded).context("failed to resolve role passwords")?;
 
     let changes = inject_password_changes(
         apply_role_retirements(
@@ -259,8 +259,8 @@ async fn cmd_apply(file: &Path, database_url: &str, dry_run: bool) -> Result<()>
 
     let current = inspect_current(&pool, &validated).await?;
 
-    let resolved_passwords = resolve_passwords(&validated.expanded)
-        .context("failed to resolve role passwords")?;
+    let resolved_passwords =
+        resolve_passwords(&validated.expanded).context("failed to resolve role passwords")?;
 
     let changes = inject_password_changes(
         apply_role_retirements(

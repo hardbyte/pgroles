@@ -271,14 +271,10 @@ pub fn resolve_passwords(
 /// Errors that can occur during password resolution.
 #[derive(Debug, thiserror::Error)]
 pub enum PasswordResolutionError {
-    #[error(
-        "environment variable \"{env_var}\" for role \"{role}\" password is not set"
-    )]
+    #[error("environment variable \"{env_var}\" for role \"{role}\" password is not set")]
     MissingEnvVar { role: String, env_var: String },
 
-    #[error(
-        "environment variable \"{env_var}\" for role \"{role}\" password is empty"
-    )]
+    #[error("environment variable \"{env_var}\" for role \"{role}\" password is empty")]
     EmptyPassword { role: String, env_var: String },
 }
 
@@ -312,7 +308,9 @@ pub fn inject_password_changes(
     // Insert SetPassword immediately after CreateRole for new roles.
     for change in changes {
         let create_name = if let Change::CreateRole { name, .. } = &change {
-            resolved_passwords.get(name.as_str()).map(|pw| (name.clone(), pw.clone()))
+            resolved_passwords
+                .get(name.as_str())
+                .map(|pw| (name.clone(), pw.clone()))
         } else {
             None
         };

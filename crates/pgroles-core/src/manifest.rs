@@ -33,7 +33,9 @@ pub enum ManifestError {
     #[error("retirement entry for role \"{role}\" cannot reassign ownership to itself")]
     RetirementSelfReassign { role: String },
 
-    #[error("role \"{role}\" has a password but login is not enabled — password will have no effect")]
+    #[error(
+        "role \"{role}\" has a password but login is not enabled — password will have no effect"
+    )]
     PasswordWithoutLogin { role: String },
 }
 
@@ -1052,7 +1054,10 @@ roles:
         assert_eq!(manifest.roles.len(), 1);
         let role = &manifest.roles[0];
         assert!(role.password.is_some());
-        assert_eq!(role.password.as_ref().unwrap().from_env, "APP_SERVICE_PASSWORD");
+        assert_eq!(
+            role.password.as_ref().unwrap().from_env,
+            "APP_SERVICE_PASSWORD"
+        );
         assert_eq!(
             role.password_valid_until,
             Some("2025-12-31T00:00:00Z".to_string())

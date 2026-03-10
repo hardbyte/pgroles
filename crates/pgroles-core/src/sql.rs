@@ -1163,10 +1163,7 @@ memberships:
             ))],
         };
         let sql = render(&change);
-        assert_eq!(
-            sql,
-            "ALTER ROLE \"r1\" VALID UNTIL '2025-06-01T00:00:00Z';"
-        );
+        assert_eq!(sql, "ALTER ROLE \"r1\" VALID UNTIL '2025-06-01T00:00:00Z';");
     }
 
     #[test]
