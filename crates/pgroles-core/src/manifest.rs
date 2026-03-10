@@ -32,6 +32,9 @@ pub enum ManifestError {
 
     #[error("retirement entry for role \"{role}\" cannot reassign ownership to itself")]
     RetirementSelfReassign { role: String },
+
+    #[error("role \"{role}\" has a password but login is not enabled — password will have no effect")]
+    PasswordWithoutLogin { role: String },
 }
 
 // ---------------------------------------------------------------------------
@@ -283,6 +286,26 @@ pub struct RoleDefinition {
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub comment: Option<String>,
+
+    /// Password source for this role. Passwords are never stored in the manifest
+    /// directly — only a reference to an environment variable is allowed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub password: Option<PasswordSource>,
+
+    /// Password expiration timestamp (ISO 8601, e.g. "2025-12-31T00:00:00Z").
+    /// Maps to PostgreSQL's `VALID UNTIL` clause.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub password_valid_until: Option<String>,
+}
+
+/// Source for a role password. Passwords are never stored in YAML manifests.
+///
+/// This follows the same security model as `DATABASE_URL` — secrets come from
+/// the runtime environment, not from configuration files.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct PasswordSource {
+    /// Name of the environment variable containing the password.
+    pub from_env: String,
 }
 
 /// A concrete grant on a specific object or wildcard.
@@ -441,6 +464,8 @@ pub fn expand_manifest(manifest: &PolicyManifest) -> Result<ExpandedManifest, Ma
                     "Generated from profile '{profile_name}' for schema '{}'",
                     schema_binding.name
                 )),
+                password: None,
+                password_valid_until: None,
             });
 
             // Expand profile grants — fill in schema
@@ -534,6 +559,15 @@ pub fn expand_manifest(manifest: &PolicyManifest) -> Result<ExpandedManifest, Ma
             });
         }
         seen_retirements.insert(retirement.role.clone());
+    }
+
+    // Validate: password on a non-login role is an error.
+    for role in &roles {
+        if role.password.is_some() && role.login == Some(false) {
+            return Err(ManifestError::PasswordWithoutLogin {
+                role: role.name.clone(),
+            });
+        }
     }
 
     Ok(ExpandedManifest {
@@ -1002,5 +1036,58 @@ roles:
 "#;
         let manifest = parse_manifest(yaml).unwrap();
         assert!(manifest.auth_providers.is_empty());
+    }
+
+    #[test]
+    fn parse_role_with_password_source() {
+        let yaml = r#"
+roles:
+  - name: app-service
+    login: true
+    password:
+      from_env: APP_SERVICE_PASSWORD
+    password_valid_until: "2025-12-31T00:00:00Z"
+"#;
+        let manifest = parse_manifest(yaml).unwrap();
+        assert_eq!(manifest.roles.len(), 1);
+        let role = &manifest.roles[0];
+        assert!(role.password.is_some());
+        assert_eq!(role.password.as_ref().unwrap().from_env, "APP_SERVICE_PASSWORD");
+        assert_eq!(
+            role.password_valid_until,
+            Some("2025-12-31T00:00:00Z".to_string())
+        );
+    }
+
+    #[test]
+    fn parse_role_without_password() {
+        let yaml = r#"
+roles:
+  - name: app-service
+    login: true
+"#;
+        let manifest = parse_manifest(yaml).unwrap();
+        assert!(manifest.roles[0].password.is_none());
+        assert!(manifest.roles[0].password_valid_until.is_none());
+    }
+
+    #[test]
+    fn reject_password_on_nologin_role() {
+        let yaml = r#"
+roles:
+  - name: nologin-role
+    login: false
+    password:
+      from_env: SOME_PASSWORD
+"#;
+        let manifest = parse_manifest(yaml).unwrap();
+        let result = expand_manifest(&manifest);
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("login is not enabled")
+        );
     }
 }

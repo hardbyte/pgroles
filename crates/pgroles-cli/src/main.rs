@@ -11,7 +11,8 @@ use tracing::info;
 use pgroles_cli::{
     PlanSummary, apply_role_retirements, compute_plan, format_plan_json,
     format_plan_sql_with_context, format_role_graph_summary, format_validation_result,
-    planned_role_drops, read_manifest_file, validate_manifest,
+    inject_password_changes, planned_role_drops, read_manifest_file, resolve_passwords,
+    validate_manifest,
 };
 use pgroles_inspect::{InspectConfig, inspect_drop_role_safety};
 
@@ -199,9 +200,15 @@ async fn cmd_diff(
     let pool = connect_db(database_url).await?;
     let current = inspect_current(&pool, &validated).await?;
 
-    let changes = apply_role_retirements(
-        compute_plan(&current, &validated.desired),
-        &validated.manifest.retirements,
+    let resolved_passwords = resolve_passwords(&validated.expanded)
+        .context("failed to resolve role passwords")?;
+
+    let changes = inject_password_changes(
+        apply_role_retirements(
+            compute_plan(&current, &validated.desired),
+            &validated.manifest.retirements,
+        ),
+        &resolved_passwords,
     );
     let drop_safety = inspect_drop_safety(&pool, &changes, &validated.manifest.retirements).await?;
     let summary = PlanSummary::from_changes(&changes);
@@ -252,9 +259,15 @@ async fn cmd_apply(file: &Path, database_url: &str, dry_run: bool) -> Result<()>
 
     let current = inspect_current(&pool, &validated).await?;
 
-    let changes = apply_role_retirements(
-        compute_plan(&current, &validated.desired),
-        &validated.manifest.retirements,
+    let resolved_passwords = resolve_passwords(&validated.expanded)
+        .context("failed to resolve role passwords")?;
+
+    let changes = inject_password_changes(
+        apply_role_retirements(
+            compute_plan(&current, &validated.desired),
+            &validated.manifest.retirements,
+        ),
+        &resolved_passwords,
     );
 
     // Validate changes against privilege level.

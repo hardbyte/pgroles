@@ -25,6 +25,10 @@ pub struct RoleState {
     pub bypassrls: bool,
     pub connection_limit: i32,
     pub comment: Option<String>,
+    /// Password expiration timestamp (ISO 8601). Maps to PostgreSQL `VALID UNTIL`.
+    /// `None` means no expiration (PostgreSQL default).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub password_valid_until: Option<String>,
 }
 
 impl Default for RoleState {
@@ -39,6 +43,7 @@ impl Default for RoleState {
             bypassrls: false,
             connection_limit: -1, // unlimited
             comment: None,
+            password_valid_until: None,
         }
     }
 }
@@ -60,6 +65,7 @@ impl RoleState {
                 .connection_limit
                 .unwrap_or(defaults.connection_limit),
             comment: definition.comment.clone(),
+            password_valid_until: definition.password_valid_until.clone(),
         }
     }
 
@@ -90,6 +96,11 @@ impl RoleState {
         if self.connection_limit != other.connection_limit {
             changes.push(RoleAttribute::ConnectionLimit(other.connection_limit));
         }
+        if self.password_valid_until != other.password_valid_until {
+            changes.push(RoleAttribute::ValidUntil(
+                other.password_valid_until.clone(),
+            ));
+        }
         changes
     }
 }
@@ -105,6 +116,8 @@ pub enum RoleAttribute {
     Replication(bool),
     Bypassrls(bool),
     ConnectionLimit(i32),
+    /// Password expiration change. `None` removes the expiration (`VALID UNTIL 'infinity'`).
+    ValidUntil(Option<String>),
 }
 
 // ---------------------------------------------------------------------------
@@ -348,6 +361,8 @@ mod tests {
             bypassrls: None,
             connection_limit: Some(10),
             comment: Some("test role".to_string()),
+            password: None,
+            password_valid_until: Some("2025-12-31T00:00:00Z".to_string()),
         };
         let state = RoleState::from_definition(&definition);
         assert!(state.login);
@@ -357,6 +372,10 @@ mod tests {
         assert!(!state.inherit); // overridden
         assert_eq!(state.connection_limit, 10);
         assert_eq!(state.comment, Some("test role".to_string()));
+        assert_eq!(
+            state.password_valid_until,
+            Some("2025-12-31T00:00:00Z".to_string())
+        );
     }
 
     #[test]

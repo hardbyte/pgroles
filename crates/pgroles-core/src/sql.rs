@@ -150,6 +150,7 @@ pub fn render_statements_with_context(change: &Change, ctx: &SqlContext) -> Vec<
         Change::ReassignOwned { from_role, to_role } => render_reassign_owned(from_role, to_role),
         Change::DropOwned { role } => render_drop_owned(role),
         Change::TerminateSessions { role } => render_terminate_sessions(role),
+        Change::SetPassword { name, password } => render_set_password(name, password),
         Change::DropRole { name } => vec![format!("DROP ROLE {};", quote_ident(name))],
     }
 }
@@ -186,6 +187,10 @@ fn render_create_role(name: &str, state: &RoleState) -> Vec<String> {
 
     if state.connection_limit != -1 {
         options.push(format!("CONNECTION LIMIT {}", state.connection_limit));
+    }
+
+    if let Some(valid_until) = &state.password_valid_until {
+        options.push(format!("VALID UNTIL {}", quote_literal(valid_until)));
     }
 
     let _ = write!(sql, " {}", options.join(" "));
@@ -239,6 +244,10 @@ fn render_alter_role(name: &str, attributes: &[RoleAttribute]) -> Vec<String> {
             RoleAttribute::ConnectionLimit(v) => {
                 options.push(format!("CONNECTION LIMIT {v}"));
             }
+            RoleAttribute::ValidUntil(v) => match v {
+                Some(ts) => options.push(format!("VALID UNTIL {}", quote_literal(ts))),
+                None => options.push("VALID UNTIL 'infinity'".to_string()),
+            },
         }
     }
     vec![format!(
@@ -614,6 +623,14 @@ fn render_terminate_sessions(role: &str) -> Vec<String> {
     vec![format!(
         "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE usename = {} AND pid <> pg_backend_pid();",
         quote_literal(role)
+    )]
+}
+
+fn render_set_password(name: &str, password: &str) -> Vec<String> {
+    vec![format!(
+        "ALTER ROLE {} PASSWORD {};",
+        quote_ident(name),
+        quote_literal(password)
     )]
 }
 
@@ -1100,5 +1117,65 @@ memberships:
         {
             eprintln!("--- Generated SQL ---\n{sql}\n--- End ---");
         }
+    }
+
+    #[test]
+    fn render_set_password() {
+        let change = Change::SetPassword {
+            name: "app-service".to_string(),
+            password: "s3cret!".to_string(),
+        };
+        let sql = render(&change);
+        assert_eq!(sql, "ALTER ROLE \"app-service\" PASSWORD 's3cret!';");
+    }
+
+    #[test]
+    fn render_set_password_escapes_quotes() {
+        let change = Change::SetPassword {
+            name: "r1".to_string(),
+            password: "pass'word".to_string(),
+        };
+        let sql = render(&change);
+        assert_eq!(sql, "ALTER ROLE \"r1\" PASSWORD 'pass''word';");
+    }
+
+    #[test]
+    fn render_create_role_with_valid_until() {
+        let change = Change::CreateRole {
+            name: "expiring-role".to_string(),
+            state: RoleState {
+                login: true,
+                password_valid_until: Some("2025-12-31T00:00:00Z".to_string()),
+                ..RoleState::default()
+            },
+        };
+        let sql = render(&change);
+        assert!(sql.contains("LOGIN"));
+        assert!(sql.contains("VALID UNTIL '2025-12-31T00:00:00Z'"));
+    }
+
+    #[test]
+    fn render_alter_role_valid_until_set() {
+        let change = Change::AlterRole {
+            name: "r1".to_string(),
+            attributes: vec![RoleAttribute::ValidUntil(Some(
+                "2025-06-01T00:00:00Z".to_string(),
+            ))],
+        };
+        let sql = render(&change);
+        assert_eq!(
+            sql,
+            "ALTER ROLE \"r1\" VALID UNTIL '2025-06-01T00:00:00Z';"
+        );
+    }
+
+    #[test]
+    fn render_alter_role_valid_until_remove() {
+        let change = Change::AlterRole {
+            name: "r1".to_string(),
+            attributes: vec![RoleAttribute::ValidUntil(None)],
+        };
+        let sql = render(&change);
+        assert_eq!(sql, "ALTER ROLE \"r1\" VALID UNTIL 'infinity';");
     }
 }

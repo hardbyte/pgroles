@@ -88,6 +88,21 @@ pub fn apply_role_retirements(changes: Vec<Change>, retirements: &[RoleRetiremen
     diff::apply_role_retirements(changes, retirements)
 }
 
+/// Resolve password sources from environment variables for roles that declare them.
+pub fn resolve_passwords(
+    expanded: &ExpandedManifest,
+) -> Result<std::collections::BTreeMap<String, String>> {
+    diff::resolve_passwords(&expanded.roles).map_err(|err| anyhow::anyhow!("{err}"))
+}
+
+/// Inject `SetPassword` changes into a plan for roles with resolved passwords.
+pub fn inject_password_changes(
+    changes: Vec<Change>,
+    resolved_passwords: &std::collections::BTreeMap<String, String>,
+) -> Vec<Change> {
+    diff::inject_password_changes(changes, resolved_passwords)
+}
+
 // ---------------------------------------------------------------------------
 // Output formatting
 // ---------------------------------------------------------------------------
@@ -123,6 +138,7 @@ pub struct PlanSummary {
     pub default_privileges_revoked: usize,
     pub members_added: usize,
     pub members_removed: usize,
+    pub passwords_set: usize,
 }
 
 impl PlanSummary {
@@ -144,6 +160,7 @@ impl PlanSummary {
                 Change::RevokeDefaultPrivilege { .. } => summary.default_privileges_revoked += 1,
                 Change::AddMember { .. } => summary.members_added += 1,
                 Change::RemoveMember { .. } => summary.members_removed += 1,
+                Change::SetPassword { .. } => summary.passwords_set += 1,
             }
         }
         summary
@@ -164,6 +181,7 @@ impl PlanSummary {
             + self.default_privileges_revoked
             + self.members_added
             + self.members_removed
+            + self.passwords_set
     }
 
     /// True if the plan has no changes.
@@ -197,6 +215,7 @@ impl std::fmt::Display for PlanSummary {
             ),
             ("membership(s) to add", self.members_added),
             ("membership(s) to remove", self.members_removed),
+            ("password(s) to set", self.passwords_set),
         ];
 
         for (label, count) in items {

@@ -18,6 +18,8 @@ pub struct RoleRow {
     pub rolconnlimit: i32,
     /// Comment from pg_shdescription (NULL if none).
     pub comment: Option<String>,
+    /// Password expiration from pg_roles.rolvaliduntil (NULL if no expiration).
+    pub rolvaliduntil: Option<String>,
 }
 
 impl RoleRow {
@@ -33,6 +35,7 @@ impl RoleRow {
             bypassrls: self.rolbypassrls,
             connection_limit: self.rolconnlimit,
             comment: self.comment.clone(),
+            password_valid_until: self.rolvaliduntil.clone(),
         }
     }
 }
@@ -67,7 +70,10 @@ pub async fn fetch_roles(
                     r.rolreplication,
                     r.rolbypassrls,
                     r.rolconnlimit,
-                    d.description AS comment
+                    d.description AS comment,
+                    CASE WHEN r.rolvaliduntil IS NOT NULL
+                         THEN to_char(r.rolvaliduntil AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"')
+                         ELSE NULL END AS rolvaliduntil
                 FROM pg_roles r
                 LEFT JOIN pg_shdescription d
                     ON d.objoid = r.oid
@@ -93,7 +99,10 @@ pub async fn fetch_roles(
                     r.rolreplication,
                     r.rolbypassrls,
                     r.rolconnlimit,
-                    d.description AS comment
+                    d.description AS comment,
+                    CASE WHEN r.rolvaliduntil IS NOT NULL
+                         THEN to_char(r.rolvaliduntil AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"')
+                         ELSE NULL END AS rolvaliduntil
                 FROM pg_roles r
                 LEFT JOIN pg_shdescription d
                     ON d.objoid = r.oid

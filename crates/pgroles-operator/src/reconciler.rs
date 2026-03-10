@@ -829,6 +829,7 @@ fn accumulate_summary(summary: &mut ChangeSummary, change: &pgroles_core::diff::
         Change::RevokeDefaultPrivilege { .. } => summary.default_privileges_revoked += 1,
         Change::AddMember { .. } => summary.members_added += 1,
         Change::RemoveMember { .. } => summary.members_removed += 1,
+        Change::SetPassword { .. } => summary.passwords_set += 1,
     }
 }
 
@@ -846,7 +847,8 @@ fn summarize_changes(changes: &[pgroles_core::diff::Change]) -> ChangeSummary {
         + summary.default_privileges_set
         + summary.default_privileges_revoked
         + summary.members_added
-        + summary.members_removed;
+        + summary.members_removed
+        + summary.passwords_set;
     summary
 }
 
@@ -1159,6 +1161,8 @@ mod tests {
                     bypassrls: None,
                     connection_limit: None,
                     comment: None,
+                    password: None,
+                    password_valid_until: None,
                 }],
                 grants: Vec::new(),
                 default_privileges: Vec::new(),
