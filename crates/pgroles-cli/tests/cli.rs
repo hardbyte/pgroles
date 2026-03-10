@@ -198,6 +198,157 @@ fn validate_default_file_not_found() {
 }
 
 // =========================================================================
+// --mode flag parsing
+// =========================================================================
+
+#[test]
+fn diff_accepts_mode_authoritative() {
+    let manifest_file = write_temp_manifest(VALID_MINIMAL);
+
+    // Should parse without error (will fail on DB connect, not on arg parsing)
+    pgroles_cmd()
+        .env_remove("DATABASE_URL")
+        .args([
+            "diff",
+            "--file",
+            manifest_file.path().to_str().unwrap(),
+            "--database-url",
+            "postgres://localhost/test",
+            "--mode",
+            "authoritative",
+        ])
+        .assert()
+        .failure()
+        // Fails on DB connect, not on arg parsing — proving the flag was accepted
+        .stderr(predicate::str::contains("database-url").not())
+        .stderr(predicate::str::contains("invalid value").not());
+}
+
+#[test]
+fn diff_accepts_mode_additive() {
+    let manifest_file = write_temp_manifest(VALID_MINIMAL);
+
+    pgroles_cmd()
+        .env_remove("DATABASE_URL")
+        .args([
+            "diff",
+            "--file",
+            manifest_file.path().to_str().unwrap(),
+            "--database-url",
+            "postgres://localhost/test",
+            "--mode",
+            "additive",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("invalid value").not());
+}
+
+#[test]
+fn diff_accepts_mode_adopt() {
+    let manifest_file = write_temp_manifest(VALID_MINIMAL);
+
+    pgroles_cmd()
+        .env_remove("DATABASE_URL")
+        .args([
+            "diff",
+            "--file",
+            manifest_file.path().to_str().unwrap(),
+            "--database-url",
+            "postgres://localhost/test",
+            "--mode",
+            "adopt",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("invalid value").not());
+}
+
+#[test]
+fn diff_rejects_invalid_mode() {
+    let manifest_file = write_temp_manifest(VALID_MINIMAL);
+
+    pgroles_cmd()
+        .env_remove("DATABASE_URL")
+        .args([
+            "diff",
+            "--file",
+            manifest_file.path().to_str().unwrap(),
+            "--database-url",
+            "postgres://localhost/test",
+            "--mode",
+            "yolo",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("invalid value"));
+}
+
+#[test]
+fn apply_accepts_mode_additive() {
+    let manifest_file = write_temp_manifest(VALID_MINIMAL);
+
+    pgroles_cmd()
+        .env_remove("DATABASE_URL")
+        .args([
+            "apply",
+            "--file",
+            manifest_file.path().to_str().unwrap(),
+            "--database-url",
+            "postgres://localhost/test",
+            "--mode",
+            "additive",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("invalid value").not());
+}
+
+#[test]
+fn apply_accepts_mode_adopt() {
+    let manifest_file = write_temp_manifest(VALID_MINIMAL);
+
+    pgroles_cmd()
+        .env_remove("DATABASE_URL")
+        .args([
+            "apply",
+            "--file",
+            manifest_file.path().to_str().unwrap(),
+            "--database-url",
+            "postgres://localhost/test",
+            "--mode",
+            "adopt",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("invalid value").not());
+}
+
+#[test]
+fn diff_help_shows_mode_flag() {
+    pgroles_cmd()
+        .args(["diff", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("--mode"))
+        .stdout(predicate::str::contains("authoritative"))
+        .stdout(predicate::str::contains("additive"))
+        .stdout(predicate::str::contains("adopt"));
+}
+
+#[test]
+fn apply_help_shows_mode_flag() {
+    pgroles_cmd()
+        .args(["apply", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("--mode"))
+        .stdout(predicate::str::contains("authoritative"))
+        .stdout(predicate::str::contains("additive"))
+        .stdout(predicate::str::contains("adopt"));
+}
+
+// =========================================================================
 // Global CLI behaviour
 // =========================================================================
 

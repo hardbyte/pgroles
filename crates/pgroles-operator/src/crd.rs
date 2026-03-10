@@ -48,6 +48,15 @@ pub struct PostgresPolicySpec {
     #[serde(default)]
     pub mode: PolicyMode,
 
+    /// Convergence strategy: how aggressively to converge the database.
+    ///
+    /// - `authoritative` (default): full convergence — anything not in the
+    ///   manifest is revoked/dropped.
+    /// - `additive`: only grant, never revoke — safe for incremental adoption.
+    /// - `adopt`: manage declared roles fully, but never drop undeclared roles.
+    #[serde(default)]
+    pub reconciliation_mode: CrdReconciliationMode,
+
     /// Default owner for ALTER DEFAULT PRIVILEGES (e.g. "app_owner").
     #[serde(default)]
     pub default_owner: Option<String>,
@@ -92,6 +101,29 @@ pub enum PolicyMode {
     #[default]
     Apply,
     Plan,
+}
+
+/// Convergence strategy for how aggressively to converge the database.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum CrdReconciliationMode {
+    /// Full convergence — the manifest is the entire truth.
+    #[default]
+    Authoritative,
+    /// Only grant, never revoke — safe for incremental adoption.
+    Additive,
+    /// Manage declared roles fully, but never drop undeclared roles.
+    Adopt,
+}
+
+impl From<CrdReconciliationMode> for pgroles_core::diff::ReconciliationMode {
+    fn from(crd: CrdReconciliationMode) -> Self {
+        match crd {
+            CrdReconciliationMode::Authoritative => pgroles_core::diff::ReconciliationMode::Authoritative,
+            CrdReconciliationMode::Additive => pgroles_core::diff::ReconciliationMode::Additive,
+            CrdReconciliationMode::Adopt => pgroles_core::diff::ReconciliationMode::Adopt,
+        }
+    }
 }
 
 /// Database connection configuration.
@@ -646,6 +678,7 @@ mod tests {
             interval: "5m".to_string(),
             suspend: false,
             mode: PolicyMode::Apply,
+            reconciliation_mode: CrdReconciliationMode::default(),
             default_owner: Some("app_owner".to_string()),
             profiles: std::collections::HashMap::new(),
             schemas: vec![],
@@ -744,6 +777,7 @@ mod tests {
             interval: "5m".to_string(),
             suspend: false,
             mode: PolicyMode::Apply,
+            reconciliation_mode: CrdReconciliationMode::default(),
             default_owner: None,
             profiles,
             schemas: vec![SchemaBinding {

@@ -14,6 +14,7 @@ use pgroles_cli::{
     inject_password_changes, planned_role_drops, read_manifest_file, resolve_passwords,
     validate_manifest,
 };
+use pgroles_core::diff::{ReconciliationMode, filter_changes};
 use pgroles_inspect::{InspectConfig, inspect_drop_role_safety};
 
 // ---------------------------------------------------------------------------
@@ -56,6 +57,14 @@ enum Commands {
         #[arg(long, default_value = "sql")]
         format: OutputFormat,
 
+        /// Reconciliation mode: how aggressively to converge the database.
+        ///
+        /// - authoritative: full convergence — anything not in the manifest is revoked/dropped (default).
+        /// - additive: only grant, never revoke — safe for incremental adoption.
+        /// - adopt: manage declared roles fully, but never drop undeclared roles.
+        #[arg(long, default_value = "authoritative")]
+        mode: CliReconciliationMode,
+
         /// Exit with code 2 when drift is detected (useful for CI gates).
         #[arg(long, default_value_t = true, overrides_with = "no_exit_code")]
         exit_code: bool,
@@ -78,6 +87,14 @@ enum Commands {
         /// Print the SQL that would be executed without actually running it.
         #[arg(long)]
         dry_run: bool,
+
+        /// Reconciliation mode: how aggressively to converge the database.
+        ///
+        /// - authoritative: full convergence — anything not in the manifest is revoked/dropped (default).
+        /// - additive: only grant, never revoke — safe for incremental adoption.
+        /// - adopt: manage declared roles fully, but never drop undeclared roles.
+        #[arg(long, default_value = "authoritative")]
+        mode: CliReconciliationMode,
     },
 
     /// Inspect the current database state for managed roles and privileges.
@@ -111,6 +128,24 @@ enum OutputFormat {
     Sql,
     Summary,
     Json,
+}
+
+/// CLI wrapper for `ReconciliationMode` — clap derives the `ValueEnum` from this.
+#[derive(Clone, Debug, clap::ValueEnum)]
+enum CliReconciliationMode {
+    Authoritative,
+    Additive,
+    Adopt,
+}
+
+impl From<CliReconciliationMode> for ReconciliationMode {
+    fn from(cli: CliReconciliationMode) -> Self {
+        match cli {
+            CliReconciliationMode::Authoritative => ReconciliationMode::Authoritative,
+            CliReconciliationMode::Additive => ReconciliationMode::Additive,
+            CliReconciliationMode::Adopt => ReconciliationMode::Adopt,
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -152,15 +187,17 @@ async fn run(cli: Cli) -> Result<ExitCode> {
             file,
             database_url,
             format,
+            mode,
             exit_code,
             no_exit_code,
-        } => cmd_diff(&file, &database_url, &format, exit_code && !no_exit_code).await,
+        } => cmd_diff(&file, &database_url, &format, mode.into(), exit_code && !no_exit_code).await,
         Commands::Apply {
             file,
             database_url,
             dry_run,
+            mode,
         } => {
-            cmd_apply(&file, &database_url, dry_run).await?;
+            cmd_apply(&file, &database_url, dry_run, mode.into()).await?;
             Ok(ExitCode::SUCCESS)
         }
         Commands::Inspect { file, database_url } => {
@@ -192,6 +229,7 @@ async fn cmd_diff(
     file: &Path,
     database_url: &str,
     format: &OutputFormat,
+    mode: ReconciliationMode,
     use_exit_code: bool,
 ) -> Result<ExitCode> {
     let yaml = read_manifest_file(file)?;
@@ -202,11 +240,14 @@ async fn cmd_diff(
 
     let resolved_passwords =
         resolve_passwords(&validated.expanded).context("failed to resolve role passwords")?;
-
+    info!(%mode, "reconciliation mode");
     let changes = inject_password_changes(
-        apply_role_retirements(
-            compute_plan(&current, &validated.desired),
-            &validated.manifest.retirements,
+        filter_changes(
+            apply_role_retirements(
+                compute_plan(&current, &validated.desired),
+                &validated.manifest.retirements,
+            ),
+            mode,
         ),
         &resolved_passwords,
     );
@@ -246,7 +287,7 @@ async fn cmd_diff(
     }
 }
 
-async fn cmd_apply(file: &Path, database_url: &str, dry_run: bool) -> Result<()> {
+async fn cmd_apply(file: &Path, database_url: &str, dry_run: bool, mode: ReconciliationMode) -> Result<()> {
     let yaml = read_manifest_file(file)?;
     let validated = validate_manifest(&yaml)?;
 
@@ -263,11 +304,14 @@ async fn cmd_apply(file: &Path, database_url: &str, dry_run: bool) -> Result<()>
 
     let resolved_passwords =
         resolve_passwords(&validated.expanded).context("failed to resolve role passwords")?;
-
+    info!(%mode, "reconciliation mode");
     let changes = inject_password_changes(
-        apply_role_retirements(
-            compute_plan(&current, &validated.desired),
-            &validated.manifest.retirements,
+        filter_changes(
+            apply_role_retirements(
+                compute_plan(&current, &validated.desired),
+                &validated.manifest.retirements,
+            ),
+            mode,
         ),
         &resolved_passwords,
     );

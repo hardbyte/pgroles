@@ -642,6 +642,81 @@ schemas:
     }
 
     // -----------------------------------------------------------------------
+    // ReconciliationMode integration through compute_plan + filter
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn additive_mode_filters_revokes_from_plan() {
+        use pgroles_core::diff::{ReconciliationMode, filter_changes};
+        use pgroles_core::model::RoleState;
+
+        let validated = validate_manifest(PROFILE_MANIFEST).unwrap();
+
+        let mut current = validated.desired.clone();
+        current
+            .roles
+            .insert("stale-role".to_string(), RoleState::default());
+
+        let changes = compute_plan(&current, &validated.desired);
+        assert!(changes.iter().any(|c| matches!(
+            c,
+            pgroles_core::diff::Change::DropRole { name } if name == "stale-role"
+        )));
+
+        let filtered = filter_changes(changes, ReconciliationMode::Additive);
+        assert!(
+            !filtered.iter().any(|c| matches!(
+                c,
+                pgroles_core::diff::Change::DropRole { .. }
+            )),
+            "additive mode should filter out DropRole"
+        );
+    }
+
+    #[test]
+    fn adopt_mode_filters_drops_but_keeps_revokes() {
+        use pgroles_core::diff::{ReconciliationMode, filter_changes};
+        use pgroles_core::manifest::{ObjectType, Privilege};
+        use pgroles_core::model::{GrantKey, GrantState, RoleState};
+        use std::collections::BTreeSet;
+
+        let validated = validate_manifest(MINIMAL_MANIFEST).unwrap();
+
+        let mut current = validated.desired.clone();
+        current
+            .roles
+            .insert("stale-role".to_string(), RoleState::default());
+        current.grants.insert(
+            GrantKey {
+                role: "analytics".to_string(),
+                object_type: ObjectType::Table,
+                schema: Some("public".to_string()),
+                name: Some("*".to_string()),
+            },
+            GrantState {
+                privileges: BTreeSet::from([Privilege::Select]),
+            },
+        );
+
+        let changes = compute_plan(&current, &validated.desired);
+
+        let filtered = filter_changes(changes, ReconciliationMode::Adopt);
+        assert!(
+            !filtered.iter().any(|c| matches!(
+                c,
+                pgroles_core::diff::Change::DropRole { .. }
+            )),
+            "adopt mode should filter out DropRole"
+        );
+        assert!(
+            filtered.iter().any(|c| matches!(
+                c,
+                pgroles_core::diff::Change::Revoke { .. }
+            )),
+            "adopt mode should keep Revoke changes"
+        );
+    }
+    // -----------------------------------------------------------------------
     // format_plan_json
     // -----------------------------------------------------------------------
 

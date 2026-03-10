@@ -114,6 +114,106 @@ pub enum Change {
 }
 
 // ---------------------------------------------------------------------------
+// Reconciliation modes
+// ---------------------------------------------------------------------------
+
+/// Controls how aggressively pgroles converges the database to the manifest.
+///
+/// The diff engine always computes the full set of changes. The reconciliation
+/// mode acts as a **post-filter** on the resulting `Vec<Change>`, stripping
+/// out changes that the operator does not want applied.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize)]
+pub enum ReconciliationMode {
+    /// Full convergence — the manifest is the entire truth.
+    ///
+    /// All changes (creates, alters, grants, revokes, drops) are applied.
+    /// Anything present in the database but absent from the manifest is
+    /// revoked or dropped.
+    #[default]
+    Authoritative,
+
+    /// Only grant, never revoke — safe for incremental adoption.
+    ///
+    /// Additive mode filters out all destructive changes:
+    /// - `Revoke` / `RevokeDefaultPrivilege`
+    /// - `RemoveMember`
+    /// - `DropRole` and its retirement steps (`TerminateSessions`,
+    ///   `ReassignOwned`, `DropOwned`)
+    ///
+    /// Use this when onboarding pgroles into an existing environment where
+    /// you want to guarantee that no existing access is removed.
+    Additive,
+
+    /// Manage declared resources fully, but never drop undeclared roles.
+    ///
+    /// Adopt mode is identical to authoritative **except** that it filters out
+    /// `DropRole` and associated retirement steps (`TerminateSessions`,
+    /// `ReassignOwned`, `DropOwned`). Revokes within the managed scope are
+    /// still applied.
+    ///
+    /// Use this for brownfield onboarding where you want full privilege
+    /// convergence for declared roles but don't want pgroles to drop roles
+    /// it doesn't know about.
+    Adopt,
+}
+
+impl std::fmt::Display for ReconciliationMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ReconciliationMode::Authoritative => write!(f, "authoritative"),
+            ReconciliationMode::Additive => write!(f, "additive"),
+            ReconciliationMode::Adopt => write!(f, "adopt"),
+        }
+    }
+}
+
+/// Filter a list of changes according to the reconciliation mode.
+///
+/// - **Authoritative**: returns all changes unmodified.
+/// - **Additive**: strips revokes, membership removals, role drops, and
+///   retirement cleanup steps.
+/// - **Adopt**: strips role drops and retirement cleanup steps, but keeps
+///   revokes and membership removals.
+pub fn filter_changes(changes: Vec<Change>, mode: ReconciliationMode) -> Vec<Change> {
+    match mode {
+        ReconciliationMode::Authoritative => changes,
+        ReconciliationMode::Additive => changes
+            .into_iter()
+            .filter(|change| !is_destructive(change))
+            .collect(),
+        ReconciliationMode::Adopt => changes
+            .into_iter()
+            .filter(|change| !is_role_drop_or_retirement(change))
+            .collect(),
+    }
+}
+
+/// Returns `true` for any change that removes access or drops a role.
+fn is_destructive(change: &Change) -> bool {
+    matches!(
+        change,
+        Change::Revoke { .. }
+            | Change::RevokeDefaultPrivilege { .. }
+            | Change::RemoveMember { .. }
+            | Change::DropRole { .. }
+            | Change::DropOwned { .. }
+            | Change::ReassignOwned { .. }
+            | Change::TerminateSessions { .. }
+    )
+}
+
+/// Returns `true` for role drops and their associated retirement cleanup steps.
+fn is_role_drop_or_retirement(change: &Change) -> bool {
+    matches!(
+        change,
+        Change::DropRole { .. }
+            | Change::DropOwned { .. }
+            | Change::ReassignOwned { .. }
+            | Change::TerminateSessions { .. }
+    )
+}
+
+// ---------------------------------------------------------------------------
 // Diff function
 // ---------------------------------------------------------------------------
 
@@ -943,6 +1043,226 @@ memberships:
         let no_changes = diff(&desired, &desired);
         assert!(no_changes.is_empty());
     }
+
+    // -----------------------------------------------------------------------
+    // filter_changes — ReconciliationMode tests
+    // -----------------------------------------------------------------------
+
+    /// Build a representative change list covering every Change variant.
+    fn all_change_variants() -> Vec<Change> {
+        vec![
+            Change::CreateRole {
+                name: "new-role".to_string(),
+                state: RoleState::default(),
+            },
+            Change::AlterRole {
+                name: "altered-role".to_string(),
+                attributes: vec![RoleAttribute::Login(true)],
+            },
+            Change::SetComment {
+                name: "commented-role".to_string(),
+                comment: Some("hello".to_string()),
+            },
+            Change::Grant {
+                role: "r1".to_string(),
+                privileges: BTreeSet::from([Privilege::Select]),
+                object_type: ObjectType::Table,
+                schema: Some("public".to_string()),
+                name: Some("*".to_string()),
+            },
+            Change::Revoke {
+                role: "r1".to_string(),
+                privileges: BTreeSet::from([Privilege::Insert]),
+                object_type: ObjectType::Table,
+                schema: Some("public".to_string()),
+                name: Some("*".to_string()),
+            },
+            Change::SetDefaultPrivilege {
+                owner: "owner".to_string(),
+                schema: "public".to_string(),
+                on_type: ObjectType::Table,
+                grantee: "r1".to_string(),
+                privileges: BTreeSet::from([Privilege::Select]),
+            },
+            Change::RevokeDefaultPrivilege {
+                owner: "owner".to_string(),
+                schema: "public".to_string(),
+                on_type: ObjectType::Table,
+                grantee: "r1".to_string(),
+                privileges: BTreeSet::from([Privilege::Delete]),
+            },
+            Change::AddMember {
+                role: "editors".to_string(),
+                member: "user@example.com".to_string(),
+                inherit: true,
+                admin: false,
+            },
+            Change::RemoveMember {
+                role: "editors".to_string(),
+                member: "old@example.com".to_string(),
+            },
+            Change::TerminateSessions {
+                role: "retired-role".to_string(),
+            },
+            Change::ReassignOwned {
+                from_role: "retired-role".to_string(),
+                to_role: "successor".to_string(),
+            },
+            Change::DropOwned {
+                role: "retired-role".to_string(),
+            },
+            Change::DropRole {
+                name: "retired-role".to_string(),
+            },
+        ]
+    }
+
+    #[test]
+    fn filter_authoritative_keeps_all_changes() {
+        let changes = all_change_variants();
+        let original_len = changes.len();
+        let filtered = filter_changes(changes, ReconciliationMode::Authoritative);
+        assert_eq!(filtered.len(), original_len);
+    }
+
+    #[test]
+    fn filter_additive_keeps_only_constructive_changes() {
+        let filtered = filter_changes(all_change_variants(), ReconciliationMode::Additive);
+
+        // Should keep: CreateRole, AlterRole, SetComment, Grant, SetDefaultPrivilege, AddMember
+        assert_eq!(filtered.len(), 6);
+
+        // Verify no destructive changes remain
+        for change in &filtered {
+            assert!(
+                !matches!(
+                    change,
+                    Change::Revoke { .. }
+                        | Change::RevokeDefaultPrivilege { .. }
+                        | Change::RemoveMember { .. }
+                        | Change::DropRole { .. }
+                        | Change::DropOwned { .. }
+                        | Change::ReassignOwned { .. }
+                        | Change::TerminateSessions { .. }
+                ),
+                "additive mode should not contain destructive change: {change:?}"
+            );
+        }
+
+        // Verify constructive changes are present
+        assert!(filtered.iter().any(|c| matches!(c, Change::CreateRole { .. })));
+        assert!(filtered.iter().any(|c| matches!(c, Change::AlterRole { .. })));
+        assert!(filtered.iter().any(|c| matches!(c, Change::SetComment { .. })));
+        assert!(filtered.iter().any(|c| matches!(c, Change::Grant { .. })));
+        assert!(filtered
+            .iter()
+            .any(|c| matches!(c, Change::SetDefaultPrivilege { .. })));
+        assert!(filtered.iter().any(|c| matches!(c, Change::AddMember { .. })));
+    }
+
+    #[test]
+    fn filter_adopt_keeps_revokes_but_not_drops() {
+        let filtered = filter_changes(all_change_variants(), ReconciliationMode::Adopt);
+
+        // Should keep everything except: DropRole, DropOwned, ReassignOwned, TerminateSessions
+        assert_eq!(filtered.len(), 9);
+
+        // Verify no role-drop/retirement changes remain
+        for change in &filtered {
+            assert!(
+                !matches!(
+                    change,
+                    Change::DropRole { .. }
+                        | Change::DropOwned { .. }
+                        | Change::ReassignOwned { .. }
+                        | Change::TerminateSessions { .. }
+                ),
+                "adopt mode should not contain drop/retirement change: {change:?}"
+            );
+        }
+
+        // Verify revokes ARE still present (unlike additive)
+        assert!(filtered.iter().any(|c| matches!(c, Change::Revoke { .. })));
+        assert!(filtered
+            .iter()
+            .any(|c| matches!(c, Change::RevokeDefaultPrivilege { .. })));
+        assert!(filtered
+            .iter()
+            .any(|c| matches!(c, Change::RemoveMember { .. })));
+    }
+
+    #[test]
+    fn filter_additive_with_empty_input() {
+        let filtered = filter_changes(vec![], ReconciliationMode::Additive);
+        assert!(filtered.is_empty());
+    }
+
+    #[test]
+    fn filter_additive_only_destructive_changes_yields_empty() {
+        let changes = vec![
+            Change::Revoke {
+                role: "r1".to_string(),
+                privileges: BTreeSet::from([Privilege::Select]),
+                object_type: ObjectType::Table,
+                schema: Some("public".to_string()),
+                name: Some("*".to_string()),
+            },
+            Change::DropRole {
+                name: "old-role".to_string(),
+            },
+        ];
+        let filtered = filter_changes(changes, ReconciliationMode::Additive);
+        assert!(filtered.is_empty());
+    }
+
+    #[test]
+    fn filter_adopt_preserves_ordering() {
+        let changes = vec![
+            Change::CreateRole {
+                name: "new-role".to_string(),
+                state: RoleState::default(),
+            },
+            Change::Grant {
+                role: "new-role".to_string(),
+                privileges: BTreeSet::from([Privilege::Select]),
+                object_type: ObjectType::Table,
+                schema: Some("public".to_string()),
+                name: Some("*".to_string()),
+            },
+            Change::Revoke {
+                role: "existing-role".to_string(),
+                privileges: BTreeSet::from([Privilege::Insert]),
+                object_type: ObjectType::Table,
+                schema: Some("public".to_string()),
+                name: Some("*".to_string()),
+            },
+            Change::DropRole {
+                name: "old-role".to_string(),
+            },
+        ];
+
+        let filtered = filter_changes(changes, ReconciliationMode::Adopt);
+        assert_eq!(filtered.len(), 3);
+        assert!(matches!(&filtered[0], Change::CreateRole { name, .. } if name == "new-role"));
+        assert!(matches!(&filtered[1], Change::Grant { .. }));
+        assert!(matches!(&filtered[2], Change::Revoke { .. }));
+    }
+
+    #[test]
+    fn reconciliation_mode_display() {
+        assert_eq!(ReconciliationMode::Authoritative.to_string(), "authoritative");
+        assert_eq!(ReconciliationMode::Additive.to_string(), "additive");
+        assert_eq!(ReconciliationMode::Adopt.to_string(), "adopt");
+    }
+
+    #[test]
+    fn reconciliation_mode_default_is_authoritative() {
+        assert_eq!(ReconciliationMode::default(), ReconciliationMode::Authoritative);
+    }
+
+    // -----------------------------------------------------------------------
+    // apply_role_retirements tests
+    // -----------------------------------------------------------------------
 
     #[test]
     fn apply_role_retirements_inserts_cleanup_before_drop() {

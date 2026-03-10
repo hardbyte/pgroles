@@ -650,10 +650,17 @@ async fn apply_under_lock(
             );
     let current = pgroles_inspect::inspect(pool, &inspect_config).await?;
 
-    // 7. Compute diff + inject password changes from K8s Secrets.
-    let mut changes = pgroles_core::diff::apply_role_retirements(
-        pgroles_core::diff::diff(&current, desired),
-        &manifest.retirements,
+    // 7. Compute diff, filter by reconciliation mode, then inject password
+    // changes resolved from Kubernetes Secrets.
+    let reconciliation_mode: pgroles_core::diff::ReconciliationMode =
+        resource.spec.reconciliation_mode.into();
+    tracing::info!(%reconciliation_mode, "reconciliation mode");
+    let mut changes = pgroles_core::diff::filter_changes(
+        pgroles_core::diff::apply_role_retirements(
+            pgroles_core::diff::diff(&current, desired),
+            &manifest.retirements,
+        ),
+        reconciliation_mode,
     );
 
     let resolved_passwords = resolve_passwords_from_secrets(ctx, resource, namespace).await?;
@@ -1158,7 +1165,10 @@ impl ReconcileError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::crd::{ConnectionSpec, PolicyMode, PostgresPolicySpec, RoleSpec, SecretReference};
+    use crate::crd::{
+        ConnectionSpec, CrdReconciliationMode, PolicyMode, PostgresPolicySpec, RoleSpec,
+        SecretReference,
+    };
     use sqlx::error::{DatabaseError, ErrorKind};
     use std::borrow::Cow;
     use std::error::Error as StdError;
@@ -1222,6 +1232,7 @@ mod tests {
             interval: interval.to_string(),
             suspend: false,
             mode: PolicyMode::Apply,
+            reconciliation_mode: CrdReconciliationMode::default(),
             default_owner: None,
             profiles: Default::default(),
             schemas: Vec::new(),
@@ -1259,6 +1270,7 @@ mod tests {
                 interval: "5m".to_string(),
                 suspend: false,
                 mode: PolicyMode::Apply,
+                reconciliation_mode: CrdReconciliationMode::default(),
                 default_owner: None,
                 profiles: Default::default(),
                 schemas: Vec::new(),
@@ -1297,6 +1309,7 @@ mod tests {
                 interval: "5m".to_string(),
                 suspend: false,
                 mode: PolicyMode::Apply,
+                reconciliation_mode: CrdReconciliationMode::default(),
                 default_owner: None,
                 profiles: Default::default(),
                 schemas: vec![pgroles_core::manifest::SchemaBinding {
