@@ -15,7 +15,7 @@
 
 Declarative PostgreSQL access control. Define roles, grants, and memberships in YAML — pgroles diffs against your live database and generates the exact SQL to converge it.
 
-Anything not in the manifest gets revoked or dropped. Same model as Terraform, applied to PostgreSQL.
+By default, anything not in the manifest gets revoked or dropped. Same model as Terraform, applied to PostgreSQL. For incremental adoption, use `--mode additive` to only grant and never revoke, or `--mode adopt` to manage declared roles fully without dropping undeclared ones.
 
 ## How it works
 
@@ -130,6 +130,7 @@ docker run --rm ghcr.io/hardbyte/pgroles --help
 ## Features
 
 - **Convergent** — the manifest is the desired state. Missing roles get created, extra roles get dropped, drifted grants get fixed.
+- **Reconciliation modes** — `--mode authoritative` (default) for full convergence, `--mode additive` to only grant and never revoke, `--mode adopt` to manage declared roles without dropping undeclared ones. Additive mode is the safest way to start using pgroles on an existing database.
 - **Profiles** — define privilege templates once, apply them across schemas. Each `schema x profile` pair becomes a role.
 - **Safer privilege bundles** — common application profiles can pair table, sequence, and function privileges so identity columns and trigger-driven routines are covered together.
 - **Brownfield adoption** — `pgroles generate` introspects an existing database and produces a manifest you can refine.
