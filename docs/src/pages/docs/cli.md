@@ -40,6 +40,7 @@ pgroles plan --database-url postgres://localhost/mydb
 | `-f`, `--file` | Manifest file path (default: `pgroles.yaml`) |
 | `--database-url` | PostgreSQL connection string (or `DATABASE_URL` env) |
 | `--format` | Output format: `sql` (default), `summary`, or `json` |
+| `--mode` | Reconciliation mode: `authoritative` (default), `additive`, or `adopt` |
 | `--exit-code` | Exit with code 2 when drift is detected (default: `true`) |
 
 The `sql` format prints the full SQL script. The `summary` format shows counts of each change type. The `json` format outputs the change list as a JSON array, suitable for CI/CD pipelines and programmatic consumption.
@@ -98,6 +99,7 @@ pgroles apply --database-url postgres://localhost/mydb --dry-run
 |---|---|
 | `-f`, `--file` | Manifest file path (default: `pgroles.yaml`) |
 | `--database-url` | PostgreSQL connection string (or `DATABASE_URL` env) |
+| `--mode` | Reconciliation mode: `authoritative` (default), `additive`, or `adopt` |
 | `--dry-run` | Print the SQL without executing it |
 
 `apply` executes the plan inside a single database transaction. Individual changes may still render to multiple SQL statements internally, but the whole apply either commits or rolls back together.
@@ -175,6 +177,42 @@ The generated manifest is a flat snapshot of the current state. After generating
 
 {% callout type="warning" title="Treat generated manifests as authoritative input" %}
 `generate` is best used as a starting point for brownfield adoption. Before applying the generated manifest in production, review it like any other infrastructure policy because once committed it becomes the desired state.
+{% /callout %}
+
+## Reconciliation modes
+
+The `--mode` flag controls how aggressively pgroles converges the database. Both `diff` and `apply` accept this flag.
+
+### authoritative (default)
+
+Full convergence. Anything not in the manifest is revoked or dropped. This is the standard GitOps model — the manifest is the single source of truth.
+
+```shell
+pgroles apply --database-url postgres://localhost/mydb --mode authoritative
+```
+
+### additive
+
+Only grant, never revoke. New roles, grants, memberships, and default privileges are created, but nothing is removed. This is the safest mode for incremental adoption — start managing roles without risking disruption to existing access.
+
+```shell
+pgroles apply --database-url postgres://localhost/mydb --mode additive
+```
+
+Additive mode filters out: `REVOKE`, `REVOKE DEFAULT PRIVILEGE`, `REMOVE MEMBER`, `DROP ROLE`, `DROP OWNED`, `REASSIGN OWNED`, and `TERMINATE SESSIONS`.
+
+### adopt
+
+Manage declared roles fully (including revoking excess grants within their scope), but never drop undeclared roles. This is the middle ground — you get full convergence for roles in the manifest, but roles outside the manifest are left untouched.
+
+```shell
+pgroles apply --database-url postgres://localhost/mydb --mode adopt
+```
+
+Adopt mode filters out: `DROP ROLE`, `DROP OWNED`, `REASSIGN OWNED`, and `TERMINATE SESSIONS`. Revokes and membership removals for managed roles still apply.
+
+{% callout type="note" title="Adoption path" %}
+A common adoption path is: start with `--mode additive` to verify the manifest produces the right grants, then move to `--mode adopt` to start revoking excess grants within managed roles, and finally switch to `--mode authoritative` when you're confident the manifest is complete.
 {% /callout %}
 
 ## Change ordering

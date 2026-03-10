@@ -134,6 +134,20 @@ pgroles diff -f pgroles.yaml --format json
 pgroles diff -f pgroles.yaml --format summary
 ```
 
+## Reconciliation modes
+
+Use `--mode` to control how aggressively pgroles converges each environment:
+
+```shell
+# Staging: full convergence
+pgroles apply -f pgroles.yaml --database-url "$STAGING_DATABASE_URL" --mode authoritative
+
+# Production: additive only during initial rollout
+pgroles apply -f pgroles.yaml --database-url "$PROD_DATABASE_URL" --mode additive
+```
+
+See the [CLI reconciliation modes](/docs/cli#reconciliation-modes) reference for all three modes and a recommended adoption path.
+
 ## Multiple environments
 
 Use the same manifest against different databases, or maintain separate manifests:

@@ -156,6 +156,7 @@ spec:
   interval: "5m"   # reconciliation interval (supports 5m, 1h, 30s, 1h30m)
   suspend: false   # set true to pause reconciliation
   mode: apply      # apply changes, or use plan for non-mutating drift preview
+  reconciliation_mode: authoritative  # authoritative | additive | adopt
 
   default_owner: app_owner
 
@@ -300,6 +301,26 @@ Current behavior in `plan` mode:
 - `Drifted=True` when changes are pending, `Drifted=False` when the database is already in sync
 
 Use `suspend` when you want the controller to stop reconciling entirely. Use `plan` when you want it to keep inspecting and showing you what it would do.
+
+### Reconciliation mode
+
+The `reconciliation_mode` field controls how aggressively the operator converges the database, independent of `mode` (which controls whether changes are applied or only planned).
+
+```yaml
+spec:
+  connection:
+    secretRef:
+      name: postgres-credentials
+  reconciliation_mode: additive  # only grant, never revoke
+```
+
+| Value | Behavior |
+| --- | --- |
+| `authoritative` (default) | Full convergence — anything not in the manifest is revoked or dropped |
+| `additive` | Only grant, never revoke — safe for incremental adoption |
+| `adopt` | Manage declared roles fully, but never drop undeclared roles |
+
+This is the same behavior as the CLI `--mode` flag. See the [CLI reconciliation modes](/docs/cli#reconciliation-modes) section for detailed semantics.
 
 ### Health and telemetry
 
