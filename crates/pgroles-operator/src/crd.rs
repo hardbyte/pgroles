@@ -430,6 +430,7 @@ impl PostgresPolicySpec {
     ) -> Result<OwnershipClaims, pgroles_core::manifest::ManifestError> {
         let manifest = self.to_policy_manifest();
         let expanded = pgroles_core::manifest::expand_manifest(&manifest)?;
+        pgroles_core::manifest::validate_semantics(&expanded)?;
 
         let mut roles: BTreeSet<String> = expanded.roles.into_iter().map(|r| r.name).collect();
         let mut schemas: BTreeSet<String> = self.schemas.iter().map(|s| s.name.clone()).collect();

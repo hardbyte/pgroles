@@ -33,9 +33,15 @@ pub fn parse(yaml: &str) -> Result<PolicyManifest> {
 }
 
 /// Parse, validate, and expand a manifest YAML string into an `ExpandedManifest`.
+///
+/// After structural expansion, runs semantic validation which accumulates all
+/// independent errors so users can fix everything in one pass.
 pub fn parse_and_expand(yaml: &str) -> Result<ExpandedManifest> {
     let policy_manifest = parse(yaml)?;
-    manifest::expand_manifest(&policy_manifest).map_err(|err| anyhow::anyhow!("{err}"))
+    let expanded =
+        manifest::expand_manifest(&policy_manifest).map_err(|err| anyhow::anyhow!("{err}"))?;
+    manifest::validate_semantics(&expanded).map_err(format_validation_error)?;
+    Ok(expanded)
 }
 
 /// Full validation: parse, expand, and build a RoleGraph from a manifest string.
@@ -44,6 +50,7 @@ pub fn validate_manifest(yaml: &str) -> Result<ValidatedManifest> {
     let policy_manifest = parse(yaml)?;
     let expanded =
         manifest::expand_manifest(&policy_manifest).map_err(|err| anyhow::anyhow!("{err}"))?;
+    manifest::validate_semantics(&expanded).map_err(format_validation_error)?;
 
     let default_owner = policy_manifest.default_owner.as_deref();
     let desired = RoleGraph::from_expanded(&expanded, default_owner)
@@ -54,6 +61,23 @@ pub fn validate_manifest(yaml: &str) -> Result<ValidatedManifest> {
         expanded,
         desired,
     })
+}
+
+/// Format a `ManifestError` (possibly `ValidationErrors`) into a user-friendly message.
+fn format_validation_error(err: manifest::ManifestError) -> anyhow::Error {
+    match &err {
+        manifest::ManifestError::ValidationErrors(errors) => {
+            let mut msg = format!(
+                "manifest validation failed with {} error(s):\n",
+                errors.len()
+            );
+            for (i, e) in errors.iter().enumerate() {
+                msg.push_str(&format!("  {}. {e}\n", i + 1));
+            }
+            anyhow::anyhow!("{msg}")
+        }
+        _ => anyhow::anyhow!("{err}"),
+    }
 }
 
 /// The result of successfully validating a manifest.

@@ -560,6 +560,7 @@ async fn reconcile_apply_inner(
 
     // 2. Expand the manifest (profiles × schemas → concrete roles/grants).
     let expanded = pgroles_core::manifest::expand_manifest(&manifest)?;
+    pgroles_core::manifest::validate_semantics(&expanded)?;
 
     // 3. Build desired RoleGraph from expanded manifest.
     let default_owner = manifest.default_owner.as_deref();

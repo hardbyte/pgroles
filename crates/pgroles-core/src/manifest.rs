@@ -32,6 +32,87 @@ pub enum ManifestError {
 
     #[error("retirement entry for role \"{role}\" cannot reassign ownership to itself")]
     RetirementSelfReassign { role: String },
+
+    #[error("manifest has {} validation error(s)", .0.len())]
+    ValidationErrors(Vec<ManifestError>),
+
+    #[error("privilege {privilege} is not valid for {object_type} in {context}")]
+    InvalidPrivilegeForObject {
+        privilege: Privilege,
+        object_type: ObjectType,
+        context: String,
+    },
+
+    #[error(
+        "default privileges do not support object type {object_type} in schema \"{schema}\" \
+         (only tables, sequences, functions, types, and schemas are supported)"
+    )]
+    UnsupportedDefaultPrivilegeObjectType {
+        object_type: ObjectType,
+        schema: String,
+    },
+
+    #[error("database grant for role \"{role}\" must not specify a schema (got \"{schema}\")")]
+    DatabaseGrantWithSchema { role: String, schema: String },
+
+    #[error("wildcard name \"*\" is not supported for {object_type} in {context}")]
+    UnsupportedWildcardObjectType {
+        object_type: ObjectType,
+        context: String,
+    },
+
+    #[error("role name must not be empty")]
+    EmptyRoleName,
+
+    #[error("connection_limit for role \"{role}\" must be >= -1, got {value}")]
+    InvalidConnectionLimit { role: String, value: i32 },
+}
+
+// ---------------------------------------------------------------------------
+// Semantic validation helpers
+// ---------------------------------------------------------------------------
+
+/// Valid privileges per object type, derived from PostgreSQL's `acl.h`
+/// `ACL_ALL_RIGHTS_*` macros.
+///
+/// Source: <https://github.com/postgres/postgres/blob/master/src/include/utils/acl.h>
+///
+/// Note: PG17 added MAINTAIN for relations — we omit it since pgroles targets PG14+.
+fn valid_privileges_for(object_type: ObjectType) -> &'static [Privilege] {
+    use Privilege::*;
+    match object_type {
+        // ACL_ALL_RIGHTS_RELATION
+        ObjectType::Table => &[
+            Select, Insert, Update, Delete, Truncate, References, Trigger,
+        ],
+        // Views: same as tables minus TRUNCATE
+        ObjectType::View => &[Select, Insert, Update, Delete, References, Trigger],
+        // Materialized views: SELECT only (refresh is DDL, not a privilege)
+        ObjectType::MaterializedView => &[Select],
+        // ACL_ALL_RIGHTS_SEQUENCE
+        ObjectType::Sequence => &[Select, Update, Usage],
+        // ACL_ALL_RIGHTS_FUNCTION
+        ObjectType::Function => &[Execute],
+        // ACL_ALL_RIGHTS_NAMESPACE
+        ObjectType::Schema => &[Create, Usage],
+        // ACL_ALL_RIGHTS_DATABASE
+        ObjectType::Database => &[Create, Connect, Temporary],
+        // ACL_ALL_RIGHTS_TYPE
+        ObjectType::Type => &[Usage],
+    }
+}
+
+/// PostgreSQL supports `ALTER DEFAULT PRIVILEGES` only for these object types.
+/// Schema support requires PG15+.
+fn supports_default_privileges(object_type: ObjectType) -> bool {
+    matches!(
+        object_type,
+        ObjectType::Table
+            | ObjectType::Sequence
+            | ObjectType::Function
+            | ObjectType::Type
+            | ObjectType::Schema
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -545,6 +626,120 @@ pub fn expand_manifest(manifest: &PolicyManifest) -> Result<ExpandedManifest, Ma
 }
 
 // ---------------------------------------------------------------------------
+// Semantic validation (post-expansion, accumulates all errors)
+// ---------------------------------------------------------------------------
+
+/// Validate semantic rules that PostgreSQL would reject at runtime.
+///
+/// Unlike `expand_manifest()` which fails fast on structural errors, this
+/// function accumulates all independent semantic errors so users can fix
+/// everything in one pass.
+pub fn validate_semantics(manifest: &ExpandedManifest) -> Result<(), ManifestError> {
+    let mut errors: Vec<ManifestError> = Vec::new();
+
+    // -- Validate grants -------------------------------------------------------
+    for grant in &manifest.grants {
+        let context = format!("grant for role \"{}\"", grant.role);
+
+        if grant.role.is_empty() {
+            errors.push(ManifestError::EmptyRoleName);
+        }
+
+        // Database grant must not have a schema field.
+        if grant.on.object_type == ObjectType::Database
+            && let Some(schema) = &grant.on.schema
+        {
+            errors.push(ManifestError::DatabaseGrantWithSchema {
+                role: grant.role.clone(),
+                schema: schema.clone(),
+            });
+        }
+
+        // Wildcard on unsupported object types.
+        if grant.on.name.as_deref() == Some("*") {
+            match grant.on.object_type {
+                ObjectType::Schema | ObjectType::Database | ObjectType::Type => {
+                    errors.push(ManifestError::UnsupportedWildcardObjectType {
+                        object_type: grant.on.object_type,
+                        context: context.clone(),
+                    });
+                }
+                _ => {}
+            }
+        }
+
+        // Privilege/object type combinations.
+        let valid = valid_privileges_for(grant.on.object_type);
+        for priv_item in &grant.privileges {
+            if !valid.contains(priv_item) {
+                errors.push(ManifestError::InvalidPrivilegeForObject {
+                    privilege: *priv_item,
+                    object_type: grant.on.object_type,
+                    context: context.clone(),
+                });
+            }
+        }
+    }
+
+    // -- Validate default privileges -------------------------------------------
+    for dp in &manifest.default_privileges {
+        for dp_grant in &dp.grant {
+            let context = format!(
+                "default privilege in schema \"{}\"{}",
+                dp.schema,
+                dp_grant
+                    .role
+                    .as_ref()
+                    .map(|r| format!(" for role \"{r}\""))
+                    .unwrap_or_default()
+            );
+
+            // Unsupported object type for default privileges.
+            if !supports_default_privileges(dp_grant.on_type) {
+                errors.push(ManifestError::UnsupportedDefaultPrivilegeObjectType {
+                    object_type: dp_grant.on_type,
+                    schema: dp.schema.clone(),
+                });
+            }
+
+            // Privilege/object type combinations.
+            let valid = valid_privileges_for(dp_grant.on_type);
+            for priv_item in &dp_grant.privileges {
+                if !valid.contains(priv_item) {
+                    errors.push(ManifestError::InvalidPrivilegeForObject {
+                        privilege: *priv_item,
+                        object_type: dp_grant.on_type,
+                        context: context.clone(),
+                    });
+                }
+            }
+        }
+    }
+
+    // -- Validate role definitions ---------------------------------------------
+    for role in &manifest.roles {
+        if role.name.is_empty() {
+            errors.push(ManifestError::EmptyRoleName);
+        }
+        if let Some(limit) = role.connection_limit
+            && limit < -1
+        {
+            errors.push(ManifestError::InvalidConnectionLimit {
+                role: role.name.clone(),
+                value: limit,
+            });
+        }
+    }
+
+    // -- Return ----------------------------------------------------------------
+    match errors.len() {
+        0 => Ok(()),
+        1 => Err(errors.remove(0)),
+        _ => Err(ManifestError::ValidationErrors(errors)),
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -1002,5 +1197,417 @@ roles:
 "#;
         let manifest = parse_manifest(yaml).unwrap();
         assert!(manifest.auth_providers.is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // Semantic validation tests
+    // -----------------------------------------------------------------------
+
+    /// Helper: parse, expand, then validate semantics.
+    fn expand_and_validate(yaml: &str) -> Result<ExpandedManifest, ManifestError> {
+        let manifest = parse_manifest(yaml)?;
+        let expanded = expand_manifest(&manifest)?;
+        validate_semantics(&expanded)?;
+        Ok(expanded)
+    }
+
+    #[test]
+    fn reject_execute_on_table() {
+        let yaml = r#"
+roles:
+  - name: app
+grants:
+  - role: app
+    privileges: [EXECUTE]
+    on: { type: table, schema: public, name: "*" }
+"#;
+        let result = expand_and_validate(yaml);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("EXECUTE"));
+        assert!(err.contains("table"));
+    }
+
+    #[test]
+    fn reject_select_on_function() {
+        let yaml = r#"
+roles:
+  - name: app
+grants:
+  - role: app
+    privileges: [SELECT]
+    on: { type: function, schema: public, name: "my_func()" }
+"#;
+        let result = expand_and_validate(yaml);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("SELECT"));
+        assert!(err.contains("function"));
+    }
+
+    #[test]
+    fn reject_truncate_on_view() {
+        let yaml = r#"
+roles:
+  - name: app
+grants:
+  - role: app
+    privileges: [TRUNCATE]
+    on: { type: view, schema: public, name: "my_view" }
+"#;
+        let result = expand_and_validate(yaml);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("TRUNCATE"));
+        assert!(err.contains("view"));
+    }
+
+    #[test]
+    fn reject_insert_on_materialized_view() {
+        let yaml = r#"
+roles:
+  - name: app
+grants:
+  - role: app
+    privileges: [INSERT]
+    on: { type: materialized_view, schema: public, name: "my_matview" }
+"#;
+        let result = expand_and_validate(yaml);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("INSERT"));
+        assert!(err.contains("materialized_view"));
+    }
+
+    #[test]
+    fn reject_connect_on_schema() {
+        let yaml = r#"
+roles:
+  - name: app
+grants:
+  - role: app
+    privileges: [CONNECT]
+    on: { type: schema, name: "public" }
+"#;
+        let result = expand_and_validate(yaml);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("CONNECT"));
+        assert!(err.contains("schema"));
+    }
+
+    #[test]
+    fn reject_invalid_privilege_in_profile_grant() {
+        let yaml = r#"
+profiles:
+  bad:
+    grants:
+      - privileges: [EXECUTE]
+        on: { type: table, name: "*" }
+schemas:
+  - name: myschema
+    profiles: [bad]
+"#;
+        let result = expand_and_validate(yaml);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("EXECUTE"));
+        assert!(err.contains("table"));
+    }
+
+    #[test]
+    fn reject_invalid_privilege_in_default_privilege() {
+        let yaml = r#"
+roles:
+  - name: app
+default_privileges:
+  - schema: public
+    grant:
+      - role: app
+        privileges: [DELETE]
+        on_type: sequence
+"#;
+        let result = expand_and_validate(yaml);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("DELETE"));
+        assert!(err.contains("sequence"));
+    }
+
+    #[test]
+    fn reject_default_privilege_on_view() {
+        let yaml = r#"
+roles:
+  - name: app
+default_privileges:
+  - schema: public
+    grant:
+      - role: app
+        privileges: [SELECT]
+        on_type: view
+"#;
+        let result = expand_and_validate(yaml);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("view"));
+        assert!(err.contains("default privileges do not support"));
+    }
+
+    #[test]
+    fn reject_default_privilege_on_database() {
+        let yaml = r#"
+roles:
+  - name: app
+default_privileges:
+  - schema: public
+    grant:
+      - role: app
+        privileges: [CONNECT]
+        on_type: database
+"#;
+        let result = expand_and_validate(yaml);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("database"));
+    }
+
+    #[test]
+    fn reject_database_grant_with_schema() {
+        let yaml = r#"
+roles:
+  - name: app
+grants:
+  - role: app
+    privileges: [CONNECT]
+    on: { type: database, schema: public, name: "mydb" }
+"#;
+        let result = expand_and_validate(yaml);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("must not specify a schema"));
+    }
+
+    #[test]
+    fn reject_wildcard_on_type() {
+        let yaml = r#"
+roles:
+  - name: app
+grants:
+  - role: app
+    privileges: [USAGE]
+    on: { type: type, schema: public, name: "*" }
+"#;
+        let result = expand_and_validate(yaml);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("wildcard"));
+        assert!(err.contains("type"));
+    }
+
+    #[test]
+    fn reject_empty_role_name() {
+        let yaml = r#"
+roles:
+  - name: ""
+"#;
+        let result = expand_and_validate(yaml);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("must not be empty"));
+    }
+
+    #[test]
+    fn reject_connection_limit_below_minus_one() {
+        let yaml = r#"
+roles:
+  - name: app
+    connection_limit: -2
+"#;
+        let result = expand_and_validate(yaml);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("connection_limit"));
+        assert!(err.contains("-2"));
+    }
+
+    #[test]
+    fn accept_valid_privilege_combos() {
+        let yaml = r#"
+roles:
+  - name: app
+    login: true
+    connection_limit: 10
+
+grants:
+  - role: app
+    privileges: [SELECT, INSERT, UPDATE, DELETE, TRUNCATE, REFERENCES, TRIGGER]
+    on: { type: table, schema: public, name: "*" }
+  - role: app
+    privileges: [SELECT, INSERT, UPDATE, DELETE, REFERENCES, TRIGGER]
+    on: { type: view, schema: public, name: "my_view" }
+  - role: app
+    privileges: [SELECT]
+    on: { type: materialized_view, schema: public, name: "my_matview" }
+  - role: app
+    privileges: [SELECT, UPDATE, USAGE]
+    on: { type: sequence, schema: public, name: "*" }
+  - role: app
+    privileges: [EXECUTE]
+    on: { type: function, schema: public, name: "*" }
+  - role: app
+    privileges: [CREATE, USAGE]
+    on: { type: schema, name: "public" }
+  - role: app
+    privileges: [CREATE, CONNECT, TEMPORARY]
+    on: { type: database, name: "mydb" }
+  - role: app
+    privileges: [USAGE]
+    on: { type: type, schema: public, name: "my_type" }
+
+default_privileges:
+  - schema: public
+    grant:
+      - role: app
+        privileges: [SELECT]
+        on_type: table
+      - role: app
+        privileges: [USAGE]
+        on_type: sequence
+      - role: app
+        privileges: [EXECUTE]
+        on_type: function
+      - role: app
+        privileges: [USAGE]
+        on_type: type
+"#;
+        let result = expand_and_validate(yaml);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn multiple_errors_accumulated() {
+        let yaml = r#"
+roles:
+  - name: app
+    connection_limit: -5
+grants:
+  - role: app
+    privileges: [EXECUTE]
+    on: { type: table, schema: public, name: "*" }
+  - role: app
+    privileges: [SELECT]
+    on: { type: function, schema: public, name: "*" }
+default_privileges:
+  - schema: public
+    grant:
+      - role: app
+        privileges: [SELECT]
+        on_type: view
+"#;
+        let result = expand_and_validate(yaml);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        // Should be a ValidationErrors with multiple errors
+        match err {
+            ManifestError::ValidationErrors(errors) => {
+                // At least 3 errors: EXECUTE on table, SELECT on function, view default priv,
+                // connection_limit -5
+                assert!(
+                    errors.len() >= 3,
+                    "expected at least 3 errors, got {}",
+                    errors.len()
+                );
+            }
+            _ => panic!("expected ValidationErrors, got: {err}"),
+        }
+    }
+
+    #[test]
+    fn accept_connection_limit_minus_one() {
+        let yaml = r#"
+roles:
+  - name: app
+    connection_limit: -1
+"#;
+        assert!(expand_and_validate(yaml).is_ok());
+    }
+
+    #[test]
+    fn accept_connection_limit_zero() {
+        let yaml = r#"
+roles:
+  - name: app
+    connection_limit: 0
+"#;
+        assert!(expand_and_validate(yaml).is_ok());
+    }
+
+    #[test]
+    fn reject_default_privilege_on_materialized_view() {
+        let yaml = r#"
+roles:
+  - name: app
+default_privileges:
+  - schema: public
+    grant:
+      - role: app
+        privileges: [SELECT]
+        on_type: materialized_view
+"#;
+        let result = expand_and_validate(yaml);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("materialized_view"));
+    }
+
+    #[test]
+    fn reject_wildcard_on_schema() {
+        let yaml = r#"
+roles:
+  - name: app
+grants:
+  - role: app
+    privileges: [USAGE]
+    on: { type: schema, name: "*" }
+"#;
+        let result = expand_and_validate(yaml);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("wildcard"));
+    }
+
+    #[test]
+    fn reject_wildcard_on_database() {
+        let yaml = r#"
+roles:
+  - name: app
+grants:
+  - role: app
+    privileges: [CONNECT]
+    on: { type: database, name: "*" }
+"#;
+        let result = expand_and_validate(yaml);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("wildcard"));
+    }
+
+    #[test]
+    fn reject_invalid_privilege_in_profile_default_privilege() {
+        let yaml = r#"
+profiles:
+  bad:
+    default_privileges:
+      - privileges: [DELETE]
+        on_type: sequence
+schemas:
+  - name: myschema
+    profiles: [bad]
+"#;
+        let result = expand_and_validate(yaml);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("DELETE"));
+        assert!(err.contains("sequence"));
     }
 }

@@ -35,6 +35,7 @@ The following features have been implemented:
 - **PG version detection** — `SqlContext` adapts SQL generation based on server version. PG 16+ uses `WITH INHERIT`/`WITH ADMIN`; PG 14–15 falls back to legacy `WITH ADMIN OPTION`.
 - **Cloud provider detection** — Detects `rds_superuser`, `cloudsqlsuperuser`, `azure_pg_admin` memberships and validates planned changes against privilege level.
 - **Cloud auth provider schema** — `auth_providers` manifest field for declaring Cloud SQL IAM, RDS IAM, and Azure AD providers (informational metadata).
+- **Manifest semantic validation** — Validates privilege/object-type combinations, default privilege object types, object target field rules, connection limits, and empty role names. Errors are accumulated so users can fix all issues in one pass. Privilege matrix derived from PostgreSQL's `acl.h`.
 
 ## Phase 1: Safety and Semantic Validation
 
@@ -48,11 +49,11 @@ The following features have been implemented:
   - next decide whether session termination should ever be an explicit opt-in workflow
   - next document the current single-database boundary for retirement cleanup more clearly
 - Expand manifest semantic validation:
-  - top-level default privileges must declare `grant.role`
-  - object target combinations should be checked for required/forbidden fields
-  - unsupported default privilege object types should be rejected
-  - privilege/object combinations should be validated early
-  - validate that declared default privilege owners have CREATE privileges on the schema
+  - ~~top-level default privileges must declare `grant.role`~~ — done
+  - ~~object target combinations should be checked for required/forbidden fields~~ — done
+  - ~~unsupported default privilege object types should be rejected~~ — done
+  - ~~privilege/object combinations should be validated early~~ — done
+  - validate that declared default privilege owners have CREATE privileges on the schema (requires DB state — deferred)
 - Keep transactional apply as the default execution model.
 - Keep membership flag changes covered by regression tests; the current remove-then-add behavior is acceptable because apply is transactional.
 - Broaden function grant coverage, especially for overloaded signatures and inspect/render parity.
