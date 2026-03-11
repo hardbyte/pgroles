@@ -350,6 +350,73 @@ fn inspect_missing_database_url() {
 }
 
 // =========================================================================
+// validate subcommand — password validation errors
+// =========================================================================
+
+#[test]
+fn validate_rejects_password_on_nologin_role() {
+    let manifest_file = write_temp_manifest(
+        r#"
+roles:
+  - name: no_login_role
+    password:
+      from_env: SOME_VAR
+"#,
+    );
+
+    pgroles_cmd()
+        .args(["validate", "--file", manifest_file.path().to_str().unwrap()])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("no_login_role"))
+        .stderr(predicate::str::contains("password").or(predicate::str::contains("login")));
+}
+
+#[test]
+fn validate_rejects_invalid_password_valid_until() {
+    let manifest_file = write_temp_manifest(
+        r#"
+roles:
+  - name: expiring_role
+    login: true
+    password:
+      from_env: SOME_VAR
+    password_valid_until: "2025-13-01"
+"#,
+    );
+
+    pgroles_cmd()
+        .args(["validate", "--file", manifest_file.path().to_str().unwrap()])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("expiring_role"))
+        .stderr(
+            predicate::str::contains("password_valid_until")
+                .or(predicate::str::contains("ISO 8601")),
+        );
+}
+
+#[test]
+fn validate_accepts_role_with_password() {
+    let manifest_file = write_temp_manifest(
+        r#"
+roles:
+  - name: good_role
+    login: true
+    password:
+      from_env: SOME_VAR
+    password_valid_until: "2026-12-31T00:00:00Z"
+"#,
+    );
+
+    pgroles_cmd()
+        .args(["validate", "--file", manifest_file.path().to_str().unwrap()])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Manifest is valid"));
+}
+
+// =========================================================================
 // diff/apply/inspect with invalid manifest (should fail before DB connect)
 // =========================================================================
 

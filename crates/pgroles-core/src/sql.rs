@@ -1140,6 +1140,59 @@ memberships:
     }
 
     #[test]
+    fn render_set_password_with_backslash() {
+        let change = Change::SetPassword {
+            name: "r1".to_string(),
+            password: r"pass\word".to_string(),
+        };
+        let sql = render(&change);
+        assert_eq!(sql, r#"ALTER ROLE "r1" PASSWORD 'pass\word';"#);
+    }
+
+    #[test]
+    fn render_set_password_with_dollar_signs() {
+        let change = Change::SetPassword {
+            name: "r1".to_string(),
+            password: "pa$$word".to_string(),
+        };
+        let sql = render(&change);
+        assert_eq!(sql, "ALTER ROLE \"r1\" PASSWORD 'pa$$word';");
+    }
+
+    #[test]
+    fn render_set_password_with_unicode() {
+        let change = Change::SetPassword {
+            name: "r1".to_string(),
+            password: "pässwörd_日本語".to_string(),
+        };
+        let sql = render(&change);
+        assert_eq!(sql, "ALTER ROLE \"r1\" PASSWORD 'pässwörd_日本語';");
+    }
+
+    #[test]
+    fn render_set_password_with_newline() {
+        let change = Change::SetPassword {
+            name: "r1".to_string(),
+            password: "line1\nline2".to_string(),
+        };
+        let sql = render(&change);
+        // Newlines are passed through in single-quoted strings — PostgreSQL handles them.
+        assert_eq!(sql, "ALTER ROLE \"r1\" PASSWORD 'line1\nline2';");
+    }
+
+    #[test]
+    fn quote_literal_with_backslash() {
+        // PostgreSQL standard_conforming_strings=on (default since 9.1):
+        // backslashes are literal in standard strings.
+        assert_eq!(quote_literal(r"back\slash"), r"'back\slash'");
+    }
+
+    #[test]
+    fn quote_literal_with_multiple_quotes() {
+        assert_eq!(quote_literal("it's a 'test'"), "'it''s a ''test'''");
+    }
+
+    #[test]
     fn render_create_role_with_valid_until() {
         let change = Change::CreateRole {
             name: "expiring-role".to_string(),

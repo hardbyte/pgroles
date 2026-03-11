@@ -1046,6 +1046,168 @@ memberships:
     }
 
     #[test]
+    fn resolve_passwords_missing_env_var() {
+        let roles = vec![crate::manifest::RoleDefinition {
+            name: "app-svc".to_string(),
+            login: Some(true),
+            password: Some(crate::manifest::PasswordSource {
+                from_env: "PGROLES_TEST_MISSING_VAR_9a8b7c6d".to_string(),
+            }),
+            password_valid_until: None,
+            superuser: None,
+            createdb: None,
+            createrole: None,
+            inherit: None,
+            replication: None,
+            bypassrls: None,
+            connection_limit: None,
+            comment: None,
+        }];
+
+        // Ensure the env var does not exist.
+        // SAFETY: test-only, unique var name avoids conflicts with parallel tests.
+        unsafe { std::env::remove_var("PGROLES_TEST_MISSING_VAR_9a8b7c6d") };
+
+        let result = resolve_passwords(&roles);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            matches!(err, PasswordResolutionError::MissingEnvVar { ref role, ref env_var }
+                if role == "app-svc" && env_var == "PGROLES_TEST_MISSING_VAR_9a8b7c6d"),
+            "expected MissingEnvVar, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn resolve_passwords_empty_env_var() {
+        let roles = vec![crate::manifest::RoleDefinition {
+            name: "app-svc".to_string(),
+            login: Some(true),
+            password: Some(crate::manifest::PasswordSource {
+                from_env: "PGROLES_TEST_EMPTY_VAR_1a2b3c4d".to_string(),
+            }),
+            password_valid_until: None,
+            superuser: None,
+            createdb: None,
+            createrole: None,
+            inherit: None,
+            replication: None,
+            bypassrls: None,
+            connection_limit: None,
+            comment: None,
+        }];
+
+        // Set the env var to an empty string.
+        // SAFETY: test-only, unique var name avoids conflicts with parallel tests.
+        unsafe { std::env::set_var("PGROLES_TEST_EMPTY_VAR_1a2b3c4d", "") };
+
+        let result = resolve_passwords(&roles);
+
+        // Clean up.
+        unsafe { std::env::remove_var("PGROLES_TEST_EMPTY_VAR_1a2b3c4d") };
+
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            matches!(err, PasswordResolutionError::EmptyPassword { ref role, ref env_var }
+                if role == "app-svc" && env_var == "PGROLES_TEST_EMPTY_VAR_1a2b3c4d"),
+            "expected EmptyPassword, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn resolve_passwords_happy_path() {
+        let roles = vec![crate::manifest::RoleDefinition {
+            name: "app-svc".to_string(),
+            login: Some(true),
+            password: Some(crate::manifest::PasswordSource {
+                from_env: "PGROLES_TEST_RESOLVE_VAR_5e6f7g8h".to_string(),
+            }),
+            password_valid_until: None,
+            superuser: None,
+            createdb: None,
+            createrole: None,
+            inherit: None,
+            replication: None,
+            bypassrls: None,
+            connection_limit: None,
+            comment: None,
+        }];
+
+        // SAFETY: test-only, unique var name avoids conflicts with parallel tests.
+        unsafe { std::env::set_var("PGROLES_TEST_RESOLVE_VAR_5e6f7g8h", "my_secret_pw") };
+
+        let result = resolve_passwords(&roles);
+
+        unsafe { std::env::remove_var("PGROLES_TEST_RESOLVE_VAR_5e6f7g8h") };
+
+        let resolved = result.expect("should succeed");
+        assert_eq!(resolved.len(), 1);
+        assert_eq!(resolved["app-svc"], "my_secret_pw");
+    }
+
+    #[test]
+    fn resolve_passwords_skips_roles_without_password() {
+        let roles = vec![crate::manifest::RoleDefinition {
+            name: "no-password".to_string(),
+            login: Some(true),
+            password: None,
+            password_valid_until: None,
+            superuser: None,
+            createdb: None,
+            createrole: None,
+            inherit: None,
+            replication: None,
+            bypassrls: None,
+            connection_limit: None,
+            comment: None,
+        }];
+
+        let result = resolve_passwords(&roles);
+        let resolved = result.expect("should succeed");
+        assert!(resolved.is_empty());
+    }
+
+    #[test]
+    fn inject_password_multiple_roles() {
+        let changes = vec![
+            Change::CreateRole {
+                name: "role-a".to_string(),
+                state: RoleState::default(),
+            },
+            Change::CreateRole {
+                name: "role-b".to_string(),
+                state: RoleState::default(),
+            },
+            Change::Grant {
+                role: "role-c".to_string(),
+                privileges: BTreeSet::from([crate::manifest::Privilege::Select]),
+                object_type: crate::manifest::ObjectType::Table,
+                schema: Some("public".to_string()),
+                name: Some("*".to_string()),
+            },
+        ];
+
+        let mut passwords = std::collections::BTreeMap::new();
+        passwords.insert("role-a".to_string(), "pw-a".to_string());
+        passwords.insert("role-b".to_string(), "pw-b".to_string());
+        passwords.insert("role-c".to_string(), "pw-c".to_string());
+
+        let result = inject_password_changes(changes, &passwords);
+
+        // role-a: CreateRole, SetPassword (inline)
+        // role-b: CreateRole, SetPassword (inline)
+        // role-c: Grant (existing role — SetPassword appended at end)
+        assert_eq!(result.len(), 6, "expected 6 changes, got: {result:?}");
+        assert!(matches!(&result[0], Change::CreateRole { name, .. } if name == "role-a"));
+        assert!(matches!(&result[1], Change::SetPassword { name, .. } if name == "role-a"));
+        assert!(matches!(&result[2], Change::CreateRole { name, .. } if name == "role-b"));
+        assert!(matches!(&result[3], Change::SetPassword { name, .. } if name == "role-b"));
+        assert!(matches!(&result[4], Change::Grant { .. }));
+        assert!(matches!(&result[5], Change::SetPassword { name, .. } if name == "role-c"));
+    }
+
+    #[test]
     fn diff_detects_valid_until_change() {
         let mut current = empty_graph();
         current.roles.insert(
