@@ -1298,7 +1298,10 @@ roles:
                 &database_url(),
             ])
             .env("TEST_PW_REDACT_VAR", password)
-            .env("RUST_LOG", "pgroles=debug,pgroles_core=debug,pgroles_inspect=debug,sqlx=warn")
+            .env(
+                "RUST_LOG",
+                "pgroles=debug,pgroles_core=debug,pgroles_inspect=debug,sqlx=warn",
+            )
             .assert()
             .success()
             .get_output()
