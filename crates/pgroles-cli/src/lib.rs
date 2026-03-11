@@ -188,6 +188,15 @@ impl PlanSummary {
     pub fn is_empty(&self) -> bool {
         self.total() == 0
     }
+
+    /// True if the plan has structural drift (excluding password-only changes).
+    ///
+    /// Password changes always appear in plans because passwords cannot be read
+    /// back from PostgreSQL for comparison. This method allows CI gates
+    /// (`--exit-code`) to distinguish real drift from password-only changes.
+    pub fn has_structural_changes(&self) -> bool {
+        self.total() - self.passwords_set > 0
+    }
 }
 
 impl std::fmt::Display for PlanSummary {

@@ -121,6 +121,13 @@ pub enum ReconcileError {
 
     #[error("lock contention on database \"{0}\": {1}")]
     LockContention(String, String),
+
+    #[error("Secret \"{secret}\" key \"{key}\" for role \"{role}\" password is empty")]
+    EmptyPasswordSecret {
+        role: String,
+        secret: String,
+        key: String,
+    },
 }
 
 /// Parse a duration string like "5m", "1h", "30s", "2h30m".
@@ -317,6 +324,7 @@ fn retry_class_for_reconcile_error(error: &ReconcileError) -> RetryClass {
         | ReconcileError::InvalidInterval(_, _)
         | ReconcileError::ConflictingPolicy(_)
         | ReconcileError::UnsafeRoleDrops(_)
+        | ReconcileError::EmptyPasswordSecret { .. }
         | ReconcileError::NoNamespace => RetryClass::Slow,
         ReconcileError::Context(context) => match context.as_ref() {
             ContextError::SecretMissing { .. } => RetryClass::Slow,
@@ -642,11 +650,16 @@ async fn apply_under_lock(
             );
     let current = pgroles_inspect::inspect(pool, &inspect_config).await?;
 
-    // 7. Compute diff.
-    let changes = pgroles_core::diff::apply_role_retirements(
+    // 7. Compute diff + inject password changes from K8s Secrets.
+    let mut changes = pgroles_core::diff::apply_role_retirements(
         pgroles_core::diff::diff(&current, desired),
         &manifest.retirements,
     );
+
+    let resolved_passwords = resolve_passwords_from_secrets(ctx, resource, namespace).await?;
+    if !resolved_passwords.is_empty() {
+        changes = pgroles_core::diff::inject_password_changes(changes, &resolved_passwords);
+    }
     let dropped_roles: Vec<String> = changes
         .iter()
         .filter_map(|change| match change {
@@ -738,8 +751,13 @@ async fn apply_under_lock(
         let mut transaction = pool.begin().await?;
         let mut statements_executed = 0usize;
         for change in &changes {
+            let is_sensitive = matches!(change, pgroles_core::diff::Change::SetPassword { .. });
             for sql in pgroles_core::sql::render_statements_with_context(change, &sql_ctx) {
-                tracing::debug!(%sql, "executing");
+                if is_sensitive {
+                    tracing::debug!("executing: ALTER ROLE ... PASSWORD [REDACTED]");
+                } else {
+                    tracing::debug!(%sql, "executing");
+                }
                 sqlx::query(&sql).execute(transaction.as_mut()).await?;
                 statements_executed += 1;
             }
@@ -785,6 +803,46 @@ async fn apply_under_lock(
         Action::requeue(requeue_interval),
         ReconcileOutcome::Reconciled,
     ))
+}
+
+/// Resolve role passwords from Kubernetes Secrets referenced in the CRD spec.
+///
+/// For each role that declares a `password` with a `PasswordSecretRef`, fetches
+/// the password value from the referenced Secret. Returns a map of
+/// role name → password string suitable for [`pgroles_core::diff::inject_password_changes`].
+async fn resolve_passwords_from_secrets(
+    ctx: &OperatorContext,
+    resource: &PostgresPolicy,
+    namespace: &str,
+) -> Result<std::collections::BTreeMap<String, String>, ReconcileError> {
+    let mut resolved = std::collections::BTreeMap::new();
+
+    for role_spec in &resource.spec.roles {
+        if let Some(password_ref) = &role_spec.password {
+            let secret_name = &password_ref.secret_ref.name;
+            let secret_key = password_ref
+                .secret_key
+                .as_deref()
+                .unwrap_or(&role_spec.name);
+
+            let password = ctx
+                .fetch_secret_value(namespace, secret_name, secret_key)
+                .await
+                .map_err(Box::new)?;
+
+            if password.is_empty() {
+                return Err(ReconcileError::EmptyPasswordSecret {
+                    role: role_spec.name.clone(),
+                    secret: secret_name.clone(),
+                    key: secret_key.to_string(),
+                });
+            }
+
+            resolved.insert(role_spec.name.clone(), password);
+        }
+    }
+
+    Ok(resolved)
 }
 
 /// Cleanup on deletion — evict cached pool.
@@ -869,7 +927,22 @@ fn render_plan_sql_for_status(
         return (None, false);
     }
 
-    let rendered = pgroles_core::sql::render_all_with_context(changes, sql_ctx);
+    // Render each change individually so we can redact passwords.
+    let rendered: String = changes
+        .iter()
+        .flat_map(|change| {
+            if let pgroles_core::diff::Change::SetPassword { name, .. } = change {
+                vec![format!(
+                    "ALTER ROLE {} PASSWORD '[REDACTED]';",
+                    pgroles_core::sql::quote_ident(name)
+                )]
+            } else {
+                pgroles_core::sql::render_statements_with_context(change, sql_ctx)
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+
     let (truncated, did_truncate) = truncate_status_text(&rendered, MAX_PLANNED_SQL_STATUS_BYTES);
     (Some(truncated), did_truncate)
 }
@@ -1033,6 +1106,7 @@ impl ReconcileError {
                 }
             }
             ReconcileError::UnsafeRoleDrops(_) => "UnsafeRoleDrops",
+            ReconcileError::EmptyPasswordSecret { .. } => "InvalidSpec",
             ReconcileError::Kube(_) => "KubernetesApiError",
             ReconcileError::NoNamespace => "InvalidResource",
         }

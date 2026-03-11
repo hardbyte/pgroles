@@ -237,7 +237,9 @@ async fn cmd_diff(
         }
     }
 
-    if use_exit_code && !summary.is_empty() {
+    // Use structural changes for exit code — password-only changes don't
+    // constitute drift because passwords can't be read back for comparison.
+    if use_exit_code && summary.has_structural_changes() {
         Ok(ExitCode::from(EXIT_DRIFT))
     } else {
         Ok(ExitCode::SUCCESS)
@@ -311,12 +313,23 @@ async fn cmd_apply(file: &Path, database_url: &str, dry_run: bool) -> Result<()>
     info!(changes = summary.total(), "applying changes");
     let mut transaction = pool.begin().await.context("failed to start transaction")?;
     for change in &changes {
+        let is_sensitive = matches!(change, pgroles_core::diff::Change::SetPassword { .. });
         for statement in pgroles_core::sql::render_statements_with_context(change, &sql_ctx) {
-            info!(sql = %statement, "executing");
+            if is_sensitive {
+                info!("executing: ALTER ROLE ... PASSWORD [REDACTED]");
+            } else {
+                info!(sql = %statement, "executing");
+            }
             sqlx::query(&statement)
                 .execute(transaction.as_mut())
                 .await
-                .with_context(|| format!("failed to execute: {statement}"))?;
+                .with_context(|| {
+                    if is_sensitive {
+                        "failed to execute: ALTER ROLE ... PASSWORD [REDACTED]".to_string()
+                    } else {
+                        format!("failed to execute: {statement}")
+                    }
+                })?;
         }
     }
     transaction

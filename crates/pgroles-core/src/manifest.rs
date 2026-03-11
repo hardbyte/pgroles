@@ -37,6 +37,11 @@ pub enum ManifestError {
         "role \"{role}\" has a password but login is not enabled — password will have no effect"
     )]
     PasswordWithoutLogin { role: String },
+
+    #[error(
+        "role \"{role}\" has an invalid password_valid_until value \"{value}\": expected ISO 8601 timestamp (e.g. \"2025-12-31T00:00:00Z\")"
+    )]
+    InvalidValidUntil { role: String, value: String },
 }
 
 // ---------------------------------------------------------------------------
@@ -564,10 +569,24 @@ pub fn expand_manifest(manifest: &PolicyManifest) -> Result<ExpandedManifest, Ma
     }
 
     // Validate: password on a non-login role is an error.
+    // We require login to be explicitly true — if login is None (defaults to false)
+    // a password would be useless.
     for role in &roles {
-        if role.password.is_some() && role.login == Some(false) {
+        if role.password.is_some() && role.login != Some(true) {
             return Err(ManifestError::PasswordWithoutLogin {
                 role: role.name.clone(),
+            });
+        }
+    }
+
+    // Validate: password_valid_until must be a valid ISO 8601 timestamp.
+    for role in &roles {
+        if let Some(value) = &role.password_valid_until
+            && !is_valid_iso8601_timestamp(value)
+        {
+            return Err(ManifestError::InvalidValidUntil {
+                role: role.name.clone(),
+                value: value.clone(),
             });
         }
     }
@@ -578,6 +597,111 @@ pub fn expand_manifest(manifest: &PolicyManifest) -> Result<ExpandedManifest, Ma
         default_privileges,
         memberships,
     })
+}
+
+// ---------------------------------------------------------------------------
+// Validation helpers
+// ---------------------------------------------------------------------------
+
+/// Validate that a string is a plausible ISO 8601 timestamp.
+///
+/// Accepts formats like:
+/// - `2025-12-31T00:00:00Z`
+/// - `2025-12-31T00:00:00+00:00`
+/// - `2025-12-31T00:00:00-05:00`
+/// - `2025-12-31T00:00:00.123Z`
+///
+/// This validates structure and numeric ranges (month 01-12, day 01-31,
+/// hour 00-23, minute/second 00-59). It does not check calendar validity
+/// (e.g. Feb 30 passes). PostgreSQL itself will reject truly invalid dates.
+fn is_valid_iso8601_timestamp(value: &str) -> bool {
+    // Minimum valid: "YYYY-MM-DDTHH:MM:SSZ" = 20 chars
+    if value.len() < 20 {
+        return false;
+    }
+
+    let bytes = value.as_bytes();
+
+    // Check date part: YYYY-MM-DD
+    if bytes[4] != b'-' || bytes[7] != b'-' || bytes[10] != b'T' {
+        return false;
+    }
+
+    let year = &value[0..4];
+    let month = &value[5..7];
+    let day = &value[8..10];
+
+    let Ok(y) = year.parse::<u16>() else {
+        return false;
+    };
+    let Ok(m) = month.parse::<u8>() else {
+        return false;
+    };
+    let Ok(d) = day.parse::<u8>() else {
+        return false;
+    };
+
+    if y < 1970 || !(1..=12).contains(&m) || !(1..=31).contains(&d) {
+        return false;
+    }
+
+    // Check time part: HH:MM:SS
+    if bytes[13] != b':' || bytes[16] != b':' {
+        return false;
+    }
+
+    let hour = &value[11..13];
+    let minute = &value[14..16];
+    let second = &value[17..19];
+
+    let Ok(h) = hour.parse::<u8>() else {
+        return false;
+    };
+    let Ok(min) = minute.parse::<u8>() else {
+        return false;
+    };
+    let Ok(sec) = second.parse::<u8>() else {
+        return false;
+    };
+
+    if h > 23 || min > 59 || sec > 59 {
+        return false;
+    }
+
+    // Remaining suffix must be a valid timezone indicator.
+    let suffix = &value[19..];
+
+    // Handle optional fractional seconds: .NNN
+    let tz_part = if let Some(rest) = suffix.strip_prefix('.') {
+        // Skip digits after the decimal point
+        let frac_end = rest
+            .find(|c: char| !c.is_ascii_digit())
+            .unwrap_or(rest.len());
+        if frac_end == 0 {
+            return false; // "." with no digits
+        }
+        &rest[frac_end..]
+    } else {
+        suffix
+    };
+
+    // Valid timezone indicators: "Z", "+HH:MM", "-HH:MM"
+    match tz_part {
+        "Z" => true,
+        s if (s.starts_with('+') || s.starts_with('-'))
+            && s.len() == 6
+            && s.as_bytes()[3] == b':' =>
+        {
+            let Ok(tz_h) = s[1..3].parse::<u8>() else {
+                return false;
+            };
+            let Ok(tz_m) = s[4..6].parse::<u8>() else {
+                return false;
+            };
+            tz_h <= 14 && tz_m <= 59
+        }
+        _ => false,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1094,5 +1218,78 @@ roles:
                 .to_string()
                 .contains("login is not enabled")
         );
+    }
+
+    #[test]
+    fn reject_password_on_default_login_role() {
+        // login is None (defaults to NOLOGIN) — password should still be rejected
+        let yaml = r#"
+roles:
+  - name: implicit-nologin-role
+    password:
+      from_env: SOME_PASSWORD
+"#;
+        let manifest = parse_manifest(yaml).unwrap();
+        let result = expand_manifest(&manifest);
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("login is not enabled")
+        );
+    }
+
+    #[test]
+    fn reject_invalid_password_valid_until() {
+        let yaml = r#"
+roles:
+  - name: bad-date
+    login: true
+    password_valid_until: "not-a-date"
+"#;
+        let manifest = parse_manifest(yaml).unwrap();
+        let result = expand_manifest(&manifest);
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("invalid password_valid_until")
+        );
+    }
+
+    #[test]
+    fn reject_date_only_valid_until() {
+        let yaml = r#"
+roles:
+  - name: bad-date
+    login: true
+    password_valid_until: "2025-12-31"
+"#;
+        let manifest = parse_manifest(yaml).unwrap();
+        let result = expand_manifest(&manifest);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn accept_valid_iso8601_timestamps() {
+        // UTC with Z
+        assert!(is_valid_iso8601_timestamp("2025-12-31T00:00:00Z"));
+        // With timezone offset
+        assert!(is_valid_iso8601_timestamp("2025-06-15T14:30:00+05:30"));
+        assert!(is_valid_iso8601_timestamp("2025-06-15T14:30:00-05:00"));
+        // With fractional seconds
+        assert!(is_valid_iso8601_timestamp("2025-12-31T23:59:59.999Z"));
+    }
+
+    #[test]
+    fn reject_invalid_iso8601_timestamps() {
+        assert!(!is_valid_iso8601_timestamp("not-a-date"));
+        assert!(!is_valid_iso8601_timestamp("2025-12-31")); // date only
+        assert!(!is_valid_iso8601_timestamp("2025-13-31T00:00:00Z")); // month 13
+        assert!(!is_valid_iso8601_timestamp("2025-12-31T25:00:00Z")); // hour 25
+        assert!(!is_valid_iso8601_timestamp("2025-12-31T00:00:00")); // no timezone
+        assert!(!is_valid_iso8601_timestamp("")); // empty
     }
 }

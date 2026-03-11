@@ -215,6 +215,46 @@ impl OperatorContext {
         Ok(pool)
     }
 
+    /// Fetch a single string value from a Kubernetes Secret.
+    ///
+    /// Used to resolve role passwords from Secret references at reconcile time.
+    pub async fn fetch_secret_value(
+        &self,
+        namespace: &str,
+        secret_name: &str,
+        secret_key: &str,
+    ) -> Result<String, ContextError> {
+        let secrets_api: kube::Api<k8s_openapi::api::core::v1::Secret> =
+            kube::Api::namespaced(self.kube_client.clone(), namespace);
+
+        let secret =
+            secrets_api
+                .get(secret_name)
+                .await
+                .map_err(|err| ContextError::SecretFetch {
+                    name: secret_name.to_string(),
+                    namespace: namespace.to_string(),
+                    source: err,
+                })?;
+
+        let data = secret.data.ok_or_else(|| ContextError::SecretMissing {
+            name: secret_name.to_string(),
+            key: secret_key.to_string(),
+        })?;
+
+        let value_bytes = data
+            .get(secret_key)
+            .ok_or_else(|| ContextError::SecretMissing {
+                name: secret_name.to_string(),
+                key: secret_key.to_string(),
+            })?;
+
+        String::from_utf8(value_bytes.0.clone()).map_err(|_| ContextError::SecretMissing {
+            name: secret_name.to_string(),
+            key: secret_key.to_string(),
+        })
+    }
+
     /// Remove a cached pool (e.g. when secret changes or CR is deleted).
     pub async fn evict_pool(&self, namespace: &str, secret_name: &str, secret_key: &str) {
         let cache_key = format!("{namespace}/{secret_name}/{secret_key}");
