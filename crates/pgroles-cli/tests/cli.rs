@@ -1285,7 +1285,10 @@ roles:
 "#
         ));
 
-        // Apply with the password env var set and debug logging enabled.
+        // Apply with the password env var set and pgroles debug logging enabled.
+        // Use a targeted log filter so sqlx query logs (which echo raw SQL
+        // including passwords) are suppressed — we are testing *pgroles'* own
+        // redaction, not sqlx's internal logging.
         let output = pgroles_cmd()
             .args([
                 "apply",
@@ -1295,7 +1298,7 @@ roles:
                 &database_url(),
             ])
             .env("TEST_PW_REDACT_VAR", password)
-            .env("RUST_LOG", "debug")
+            .env("RUST_LOG", "pgroles=debug,pgroles_core=debug,pgroles_inspect=debug,sqlx=warn")
             .assert()
             .success()
             .get_output()
