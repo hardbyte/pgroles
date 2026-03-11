@@ -585,6 +585,63 @@ schemas:
     }
 
     // -----------------------------------------------------------------------
+    // has_structural_changes — password-only drift detection
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn has_structural_changes_true_for_non_password_changes() {
+        let summary = PlanSummary {
+            roles_created: 1,
+            grants: 2,
+            ..Default::default()
+        };
+        assert!(summary.has_structural_changes());
+    }
+
+    #[test]
+    fn has_structural_changes_false_for_password_only() {
+        let summary = PlanSummary {
+            passwords_set: 3,
+            ..Default::default()
+        };
+        assert!(
+            !summary.has_structural_changes(),
+            "password-only plan should NOT be considered structural drift"
+        );
+    }
+
+    #[test]
+    fn has_structural_changes_true_for_mixed() {
+        let summary = PlanSummary {
+            roles_created: 1,
+            passwords_set: 2,
+            ..Default::default()
+        };
+        assert!(
+            summary.has_structural_changes(),
+            "mixed plan with structural + password changes IS structural drift"
+        );
+    }
+
+    #[test]
+    fn has_structural_changes_false_for_empty() {
+        let summary = PlanSummary::default();
+        assert!(!summary.has_structural_changes());
+    }
+
+    #[test]
+    fn plan_summary_displays_password_count() {
+        let summary = PlanSummary {
+            passwords_set: 2,
+            roles_created: 1,
+            ..Default::default()
+        };
+        let display = summary.to_string();
+        assert!(display.contains("2 password(s) to set"), "got: {display}");
+        assert!(display.contains("3 change(s)"), "got: {display}");
+    }
+
+    // -----------------------------------------------------------------------
     // format_plan_json
     // -----------------------------------------------------------------------
 

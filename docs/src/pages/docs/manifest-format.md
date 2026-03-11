@@ -81,6 +81,9 @@ roles:
     login: true
     createdb: false
     connection_limit: 10
+    password:
+      from_env: APP_SERVICE_PASSWORD
+    password_valid_until: "2026-12-31T00:00:00Z"
 ```
 
 ### Supported attributes
@@ -97,8 +100,36 @@ roles:
 | `bypassrls` | bool | `false` | Bypasses row-level security |
 | `connection_limit` | int | `-1` (unlimited) | Max concurrent connections |
 | `comment` | string | *none* | Comment on the role |
+| `password` | object | *none* | Password source (see below) |
+| `password_valid_until` | string | *none* | Password expiration (ISO 8601) |
 
 Unspecified attributes use PostgreSQL defaults.
+
+### Passwords
+
+Roles with `login: true` can declare a password source. The password value is never stored in the manifest — it is resolved at apply time from an environment variable (CLI) or a Kubernetes Secret (operator).
+
+```yaml
+roles:
+  - name: app-service
+    login: true
+    password:
+      from_env: APP_SERVICE_PASSWORD   # CLI: read from this env var
+    password_valid_until: "2026-12-31T00:00:00Z"
+```
+
+- `password.from_env` — the environment variable name containing the password (CLI mode).
+- `password_valid_until` — an ISO 8601 timestamp (e.g. `"2025-12-31T00:00:00Z"`) that sets the PostgreSQL `VALID UNTIL` attribute on the role. The timestamp must include a date, time, and timezone indicator.
+
+Only `login: true` roles may have a password. Declaring a password on a non-login role is a validation error.
+
+{% callout type="note" title="Passwords and drift detection" %}
+Because PostgreSQL does not expose password hashes for comparison, password changes always appear in the plan. The `diff --exit-code` flag treats password-only changes as non-structural — they will **not** trigger exit code 2.
+{% /callout %}
+
+{% callout type="warning" title="Password values are never logged" %}
+pgroles redacts password values in all log output, dry-run SQL, and operator status fields. The actual password is only used in the `ALTER ROLE ... PASSWORD` statement sent to PostgreSQL inside the apply transaction.
+{% /callout %}
 
 ## grants
 

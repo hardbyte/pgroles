@@ -1811,6 +1811,105 @@ mod tests {
     }
 
     #[test]
+    fn render_plan_sql_for_status_redacts_passwords() {
+        let changes = vec![
+            pgroles_core::diff::Change::CreateRole {
+                name: "app-svc".to_string(),
+                state: pgroles_core::model::RoleState {
+                    login: true,
+                    ..pgroles_core::model::RoleState::default()
+                },
+            },
+            pgroles_core::diff::Change::SetPassword {
+                name: "app-svc".to_string(),
+                password: "super_secret_p@ssw0rd!".to_string(),
+            },
+        ];
+
+        let sql_ctx = pgroles_core::sql::SqlContext::default();
+        let (sql, truncated) = render_plan_sql_for_status(&changes, &sql_ctx);
+
+        let sql = sql.expect("expected non-empty planned SQL");
+        assert!(!truncated);
+        assert!(
+            sql.contains("[REDACTED]"),
+            "status SQL should contain [REDACTED], got: {sql}"
+        );
+        assert!(
+            !sql.contains("super_secret_p@ssw0rd!"),
+            "status SQL must NOT contain the actual password, got: {sql}"
+        );
+        assert!(
+            sql.contains("CREATE ROLE"),
+            "status SQL should still contain non-password changes, got: {sql}"
+        );
+    }
+
+    #[test]
+    fn render_plan_sql_for_status_empty_changes_returns_none() {
+        let sql_ctx = pgroles_core::sql::SqlContext::default();
+        let (sql, truncated) = render_plan_sql_for_status(&[], &sql_ctx);
+        assert!(sql.is_none());
+        assert!(!truncated);
+    }
+
+    #[test]
+    fn render_plan_sql_for_status_password_only_plan() {
+        let changes = vec![pgroles_core::diff::Change::SetPassword {
+            name: "db-user".to_string(),
+            password: "my_secret_pw".to_string(),
+        }];
+
+        let sql_ctx = pgroles_core::sql::SqlContext::default();
+        let (sql, _) = render_plan_sql_for_status(&changes, &sql_ctx);
+
+        let sql = sql.expect("expected non-empty planned SQL");
+        assert!(
+            sql.contains("[REDACTED]"),
+            "password-only plan should still show redacted SQL"
+        );
+        assert!(
+            !sql.contains("my_secret_pw"),
+            "password-only plan must NOT leak the password"
+        );
+    }
+
+    #[test]
+    fn error_reason_empty_password_secret() {
+        let err = ReconcileError::EmptyPasswordSecret {
+            role: "app-svc".to_string(),
+            secret: "pg-passwords".to_string(),
+            key: "app-svc".to_string(),
+        };
+        assert_eq!(err.reason(), "InvalidSpec");
+    }
+
+    #[test]
+    fn retry_classifies_empty_password_secret_as_slow() {
+        let error = finalizer::Error::ApplyFailed(ReconcileError::EmptyPasswordSecret {
+            role: "app-svc".to_string(),
+            secret: "pg-passwords".to_string(),
+            key: "app-svc".to_string(),
+        });
+        assert_eq!(retry_class(&error), RetryClass::Slow);
+    }
+
+    #[test]
+    fn accumulate_summary_counts_passwords() {
+        use pgroles_core::diff::Change;
+
+        let mut summary = ChangeSummary::default();
+        accumulate_summary(
+            &mut summary,
+            &Change::SetPassword {
+                name: "app-svc".to_string(),
+                password: "secret".to_string(),
+            },
+        );
+        assert_eq!(summary.passwords_set, 1);
+    }
+
+    #[test]
     fn conflict_detection_ignores_invalid_peer_policies() {
         let resource = valid_role_policy("valid-policy", "analytics", "shared-db-secret");
         let identity = DatabaseIdentity::new("default", "shared-db-secret", "DATABASE_URL");

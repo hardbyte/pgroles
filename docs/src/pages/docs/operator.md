@@ -215,6 +215,28 @@ kubectl create secret generic mydb-credentials \
 
 The operator reads the Secret from the same namespace as the `PostgresPolicy` resource. When the Secret's `resourceVersion` changes (e.g. credential rotation), the operator automatically reconnects with updated credentials.
 
+### Role passwords
+
+Roles can reference Kubernetes Secrets for their passwords. The operator resolves password values at reconcile time and injects them into the apply transaction:
+
+```yaml
+spec:
+  roles:
+    - name: app-service
+      login: true
+      password:
+        secretRef:
+          name: app-passwords
+        secretKey: app-service      # optional, defaults to the role name
+      passwordValidUntil: "2026-12-31T00:00:00Z"
+```
+
+- `password.secretRef.name` — the Secret containing the password value.
+- `password.secretKey` — the key within the Secret. Defaults to the role name if omitted.
+- `passwordValidUntil` — ISO 8601 timestamp for PostgreSQL `VALID UNTIL`.
+
+Password values are redacted in operator logs and the `status.planned_sql` field. If the referenced Secret or key is missing, the operator sets a `SecretMissing` or `SecretFetchFailed` status condition and retries on the normal interval.
+
 The controller also emits Kubernetes Events for notable state transitions. These are intended for `kubectl describe` and quick operational debugging, not as a durable audit trail or alerting mechanism.
 
 ## Reconciliation
