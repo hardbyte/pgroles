@@ -469,6 +469,102 @@ jobs:
           wait_for_ready_true rotated-secret-policy
           wait_for_event_reason rotated-secret-policy Recovered
 
+          # ----------------------------------------------------------------
+          # Password lifecycle (#46): create role with password from Secret,
+          # verify authentication, rotate password, verify re-auth
+          # ----------------------------------------------------------------
+          echo "--- Password lifecycle: create password Secret and apply policy ---"
+          kubectl create secret generic role-passwords \
+            --from-literal=password-user='e2e_initial_pw!' \
+            --dry-run=client -o yaml | kubectl apply -f -
+          kubectl apply -f k8s/samples/password-policy.yaml
+          wait_for_ready_true password-policy
+
+          echo "--- Password lifecycle: verify role exists ---"
+          kubectl exec postgres-0 -- psql -U postgres -tAc \
+            "SELECT rolname FROM pg_roles WHERE rolname = 'password-user'" | grep -qx "password-user"
+
+          echo "--- Password lifecycle: verify role can authenticate with password ---"
+          kubectl exec postgres-0 -- psql \
+            "postgresql://password-user:e2e_initial_pw!@localhost:5432/postgres" \
+            -tAc "SELECT 1" | grep -qx "1"
+
+          echo "--- Password lifecycle: verify VALID UNTIL is set ---"
+          kubectl exec postgres-0 -- psql -U postgres -tAc \
+            "SELECT rolvaliduntil FROM pg_authid WHERE rolname = 'password-user'" | grep -q "2099-12-31"
+
+          echo "--- Password lifecycle: verify operator logs do not leak password ---"
+          operator_logs="$(kubectl -n pgroles-system logs deployment/pgroles-operator --tail=500 2>/dev/null || true)"
+          if printf '%s' "$operator_logs" | grep -qF 'e2e_initial_pw!'; then
+            echo "::error::Password leaked in operator logs"
+            exit 1
+          fi
+          echo "Password not found in operator logs (redaction verified)"
+
+          echo "--- Password lifecycle: rotate password in Secret ---"
+          kubectl create secret generic role-passwords \
+            --from-literal=password-user='e2e_rotated_pw!' \
+            --dry-run=client -o yaml | kubectl apply -f -
+
+          echo "--- Password lifecycle: wait for reconciliation to pick up new password ---"
+          for i in $(seq 1 30); do
+            if kubectl exec postgres-0 -- psql \
+              "postgresql://password-user:e2e_rotated_pw!@localhost:5432/postgres" \
+              -tAc "SELECT 1" 2>/dev/null | grep -qx "1"; then
+              echo "Password rotation verified"
+              break
+            fi
+            echo "Waiting for password rotation... (attempt $i/30)"
+            sleep 5
+          done
+          kubectl exec postgres-0 -- psql \
+            "postgresql://password-user:e2e_rotated_pw!@localhost:5432/postgres" \
+            -tAc "SELECT 1" | grep -qx "1"
+
+          echo "--- Password lifecycle: old password should no longer work ---"
+          if kubectl exec postgres-0 -- psql \
+            "postgresql://password-user:e2e_initial_pw!@localhost:5432/postgres" \
+            -tAc "SELECT 1" 2>/dev/null; then
+            echo "::error::Old password still works after rotation"
+            exit 1
+          fi
+          echo "Old password correctly rejected"
+
+          # ----------------------------------------------------------------
+          # Password secret resolution errors (#43)
+          # ----------------------------------------------------------------
+
+          echo "--- Missing password Secret: policy referencing non-existent Secret ---"
+          kubectl apply -f k8s/samples/missing-password-secret-policy.yaml
+          wait_for_ready_reason missing-password-secret-policy SecretFetchFailed
+
+          echo "--- Missing password Secret: fix by creating the Secret ---"
+          kubectl create secret generic nonexistent-password-secret \
+            --from-literal=missing-pw-user='fixed_pw!' \
+            --dry-run=client -o yaml | kubectl apply -f -
+          wait_for_ready_true missing-password-secret-policy
+          kubectl exec postgres-0 -- psql -U postgres -tAc \
+            "SELECT rolname FROM pg_roles WHERE rolname = 'missing-pw-user'" | grep -qx "missing-pw-user"
+          wait_for_event_reason missing-password-secret-policy Recovered
+
+          echo "--- Empty password Secret: Secret exists but value is empty ---"
+          kubectl create secret generic empty-password-secret \
+            --from-literal=empty-pw-user='' \
+            --dry-run=client -o yaml | kubectl apply -f -
+          kubectl apply -f k8s/samples/empty-password-secret-policy.yaml
+          wait_for_ready_reason empty-password-secret-policy InvalidSpec
+          wait_for_last_error_contains empty-password-secret-policy "password is empty"
+
+          echo "--- Empty password Secret: fix by providing a non-empty value ---"
+          kubectl create secret generic empty-password-secret \
+            --from-literal=empty-pw-user='now_has_password!' \
+            --dry-run=client -o yaml | kubectl apply -f -
+          wait_for_ready_true empty-password-secret-policy
+          kubectl exec postgres-0 -- psql \
+            "postgresql://empty-pw-user:now_has_password!@localhost:5432/postgres" \
+            -tAc "SELECT 1" | grep -qx "1"
+          wait_for_event_reason empty-password-secret-policy Recovered
+
           bash scripts/generate-load-policy.sh 20 /tmp/load-policy.yaml load-policy postgres-credentials loada
           bash scripts/generate-load-policy.sh 10 /tmp/load-policy-secondary.yaml load-policy-secondary loadtest-postgres-credentials loadb
           {

@@ -228,12 +228,12 @@ spec:
         secretRef:
           name: app-passwords
         secretKey: app-service      # optional, defaults to the role name
-      passwordValidUntil: "2026-12-31T00:00:00Z"
+      password_valid_until: "2026-12-31T00:00:00Z"
 ```
 
 - `password.secretRef.name` — the Secret containing the password value.
 - `password.secretKey` — the key within the Secret. Defaults to the role name if omitted.
-- `passwordValidUntil` — ISO 8601 timestamp for PostgreSQL `VALID UNTIL`.
+- `password_valid_until` — ISO 8601 timestamp for PostgreSQL `VALID UNTIL`.
 
 Password values are redacted in operator logs and the `status.planned_sql` field. If the referenced Secret or key is missing, the operator sets a `SecretMissing` or `SecretFetchFailed` status condition and retries on the normal interval.
 
