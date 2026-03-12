@@ -404,6 +404,16 @@
                     "description": "Reusable privilege profiles.",
                     "type": "object"
                   },
+                  "reconciliation_mode": {
+                    "default": "authoritative",
+                    "description": "Convergence strategy: how aggressively to converge the database.\n\n- `authoritative` (default): full convergence — anything not in the\n  manifest is revoked/dropped.\n- `additive`: only grant, never revoke — safe for incremental adoption.\n- `adopt`: manage declared roles fully, but never drop undeclared roles.",
+                    "enum": [
+                      "authoritative",
+                      "additive",
+                      "adopt"
+                    ],
+                    "type": "string"
+                  },
                   "retirements": {
                     "default": [],
                     "description": "Explicit role-retirement workflows for roles that should be removed.",
