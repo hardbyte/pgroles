@@ -303,29 +303,27 @@ pub fn inject_password_changes(
         .collect();
 
     let mut result = Vec::with_capacity(changes.len() + resolved_passwords.len());
-    let mut handled = std::collections::BTreeSet::new();
 
     // Insert SetPassword immediately after CreateRole for new roles.
     for change in changes {
-        let create_name = if let Change::CreateRole { name, .. } = &change {
-            resolved_passwords
-                .get(name.as_str())
-                .map(|pw| (name.clone(), pw.clone()))
-        } else {
-            None
-        };
-
-        result.push(change);
-
-        if let Some((name, password)) = create_name {
-            handled.insert(name.clone());
-            result.push(Change::SetPassword { name, password });
+        if let Change::CreateRole { ref name, .. } = change
+            && let Some(password) = resolved_passwords.get(name.as_str())
+        {
+            let role_name = name.clone();
+            let password = password.clone();
+            result.push(change);
+            result.push(Change::SetPassword {
+                name: role_name,
+                password,
+            });
+            continue;
         }
+        result.push(change);
     }
 
     // For existing roles (not newly created), append SetPassword after all creates/alters.
     for (role_name, password) in resolved_passwords {
-        if !created_roles.contains(role_name) && !handled.contains(role_name) {
+        if !created_roles.contains(role_name) {
             result.push(Change::SetPassword {
                 name: role_name.clone(),
                 password: password.clone(),

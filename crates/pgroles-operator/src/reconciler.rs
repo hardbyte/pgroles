@@ -815,7 +815,16 @@ async fn resolve_passwords_from_secrets(
     resource: &PostgresPolicy,
     namespace: &str,
 ) -> Result<std::collections::BTreeMap<String, String>, ReconcileError> {
+    use k8s_openapi::api::core::v1::Secret;
+
     let mut resolved = std::collections::BTreeMap::new();
+
+    // Cache fetched Secrets by name to avoid duplicate API calls when
+    // multiple roles reference different keys in the same Secret.
+    let mut secret_cache: std::collections::BTreeMap<String, Secret> =
+        std::collections::BTreeMap::new();
+
+    let secrets_api: kube::Api<Secret> = kube::Api::namespaced(ctx.kube_client.clone(), namespace);
 
     for role_spec in &resource.spec.roles {
         if let Some(password_ref) = &role_spec.password {
@@ -825,10 +834,39 @@ async fn resolve_passwords_from_secrets(
                 .as_deref()
                 .unwrap_or(&role_spec.name);
 
-            let password = ctx
-                .fetch_secret_value(namespace, secret_name, secret_key)
-                .await
-                .map_err(Box::new)?;
+            let secret = if let Some(cached) = secret_cache.get(secret_name.as_str()) {
+                cached
+            } else {
+                let fetched = secrets_api.get(secret_name).await.map_err(|err| {
+                    Box::new(crate::context::ContextError::SecretFetch {
+                        name: secret_name.clone(),
+                        namespace: namespace.to_string(),
+                        source: err,
+                    })
+                })?;
+                secret_cache.entry(secret_name.clone()).or_insert(fetched)
+            };
+
+            let data = secret.data.as_ref().ok_or_else(|| {
+                Box::new(crate::context::ContextError::SecretMissing {
+                    name: secret_name.clone(),
+                    key: secret_key.to_string(),
+                })
+            })?;
+
+            let value_bytes = data.get(secret_key).ok_or_else(|| {
+                Box::new(crate::context::ContextError::SecretMissing {
+                    name: secret_name.clone(),
+                    key: secret_key.to_string(),
+                })
+            })?;
+
+            let password = String::from_utf8(value_bytes.0.clone()).map_err(|_| {
+                Box::new(crate::context::ContextError::SecretMissing {
+                    name: secret_name.clone(),
+                    key: secret_key.to_string(),
+                })
+            })?;
 
             if password.is_empty() {
                 return Err(ReconcileError::EmptyPasswordSecret {
