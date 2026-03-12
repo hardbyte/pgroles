@@ -210,15 +210,22 @@ impl PlanSummary {
     pub fn has_structural_changes(&self) -> bool {
         self.total() - self.passwords_set > 0
     }
-}
 
-impl std::fmt::Display for PlanSummary {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    pub fn format_plan(&self) -> String {
+        self.format_with_header("Plan")
+    }
+
+    pub fn format_applied(&self) -> String {
+        self.format_with_header("Applied")
+    }
+
+    fn format_with_header(&self, header: &str) -> String {
         if self.is_empty() {
-            return write!(f, "No changes needed. Database is in sync with manifest.");
+            return "No changes needed. Database is in sync with manifest.".to_string();
         }
 
-        writeln!(f, "Plan: {} change(s)", self.total())?;
+        let mut output = String::new();
+        output.push_str(&format!("{header}: {} change(s)\n", self.total()));
 
         let items: Vec<(&str, usize)> = vec![
             ("role(s) to create", self.roles_created),
@@ -242,10 +249,17 @@ impl std::fmt::Display for PlanSummary {
 
         for (label, count) in items {
             if count > 0 {
-                writeln!(f, "  {count} {label}")?;
+                output.push_str(&format!("  {count} {label}\n"));
             }
         }
-        Ok(())
+
+        output
+    }
+}
+
+impl std::fmt::Display for PlanSummary {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.format_plan())
     }
 }
 
@@ -768,5 +782,23 @@ schemas:
         let sql = format_plan_sql_with_context(&changes, &sql::SqlContext::default());
         assert!(sql.contains("[REDACTED]"), "got: {sql}");
         assert!(!sql.contains("super-secret"), "got: {sql}");
+    }
+
+    #[test]
+    fn format_applied_uses_applied_header() {
+        let summary = PlanSummary {
+            roles_created: 1,
+            grants: 2,
+            ..Default::default()
+        };
+
+        let display = summary.format_applied();
+        assert!(
+            display.starts_with("Applied: 3 change(s)\n"),
+            "got: {display}"
+        );
+        assert!(display.contains("1 role(s) to create"), "got: {display}");
+        assert!(display.contains("2 grant(s) to add"), "got: {display}");
+        assert!(!display.contains("Plan:"), "got: {display}");
     }
 }

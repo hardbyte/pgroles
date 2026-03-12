@@ -352,7 +352,7 @@ async fn cmd_apply(
     if dry_run {
         println!("-- DRY RUN: the following SQL would be executed:\n");
         print!("{sql_output}");
-        eprintln!("\n{summary}");
+        eprintln!("\n{}", summary.format_plan());
         if !drop_safety.is_empty() {
             eprintln!("\n{drop_safety}");
         }
@@ -399,7 +399,7 @@ async fn cmd_apply(
         "Applied {total} change(s) successfully.",
         total = summary.total()
     );
-    print!("{summary}");
+    print!("{}", summary.format_applied());
 
     Ok(())
 }
