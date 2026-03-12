@@ -114,12 +114,25 @@ pub fn format_plan_sql(changes: &[Change]) -> String {
 
 /// Format a plan as SQL statements using an explicit SQL context.
 pub fn format_plan_sql_with_context(changes: &[Change], ctx: &sql::SqlContext) -> String {
-    sql::render_all_with_context(changes, ctx)
+    sql::render_all_with_context(&redacted_changes(changes), ctx)
 }
 
 /// Format a plan as JSON for machine consumption.
 pub fn format_plan_json(changes: &[Change]) -> Result<String> {
-    serde_json::to_string_pretty(changes).map_err(|err| anyhow::anyhow!("{err}"))
+    serde_json::to_string_pretty(&redacted_changes(changes)).map_err(|err| anyhow::anyhow!("{err}"))
+}
+
+fn redacted_changes(changes: &[Change]) -> Vec<Change> {
+    changes
+        .iter()
+        .map(|change| match change {
+            Change::SetPassword { name, .. } => Change::SetPassword {
+                name: name.clone(),
+                password: "[REDACTED]".to_string(),
+            },
+            other => other.clone(),
+        })
+        .collect()
 }
 
 /// Summary statistics for a plan.
@@ -731,5 +744,29 @@ schemas:
         let text = json_output.to_string();
         assert!(text.contains("CreateRole"), "got: {text}");
         assert!(text.contains("analytics"), "got: {text}");
+    }
+
+    #[test]
+    fn format_plan_json_redacts_passwords() {
+        let changes = vec![Change::SetPassword {
+            name: "app-svc".to_string(),
+            password: "super-secret".to_string(),
+        }];
+
+        let json = format_plan_json(&changes).expect("json formatting should succeed");
+        assert!(json.contains("[REDACTED]"), "got: {json}");
+        assert!(!json.contains("super-secret"), "got: {json}");
+    }
+
+    #[test]
+    fn format_plan_sql_redacts_passwords() {
+        let changes = vec![Change::SetPassword {
+            name: "app-svc".to_string(),
+            password: "super-secret".to_string(),
+        }];
+
+        let sql = format_plan_sql_with_context(&changes, &sql::SqlContext::default());
+        assert!(sql.contains("[REDACTED]"), "got: {sql}");
+        assert!(!sql.contains("super-secret"), "got: {sql}");
     }
 }

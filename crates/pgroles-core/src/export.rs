@@ -265,4 +265,45 @@ roles:
             "got:\n{serialized}"
         );
     }
+
+    #[test]
+    fn export_omits_password_and_preserves_password_valid_until() {
+        let yaml = r#"
+roles:
+  - name: app-role
+    login: true
+    password_valid_until: "2026-12-31T00:00:00Z"
+"#;
+        let manifest = parse_manifest(yaml).unwrap();
+        let expanded = expand_manifest(&manifest).unwrap();
+        let graph = RoleGraph::from_expanded(&expanded, None).unwrap();
+
+        let exported = role_graph_to_manifest(&graph);
+        let role = exported
+            .roles
+            .iter()
+            .find(|r| r.name == "app-role")
+            .unwrap();
+
+        assert!(
+            role.password.is_none(),
+            "passwords should never be exported"
+        );
+        assert_eq!(
+            role.password_valid_until.as_deref(),
+            Some("2026-12-31T00:00:00Z")
+        );
+
+        let serialized = serde_yaml::to_string(&exported).unwrap();
+        assert!(
+            !serialized.contains("password:"),
+            "exported YAML must not contain password fields, got:\n{serialized}"
+        );
+        assert!(
+            serialized.contains("password_valid_until: \"2026-12-31T00:00:00Z\"")
+                || serialized.contains("password_valid_until: '2026-12-31T00:00:00Z'")
+                || serialized.contains("password_valid_until: 2026-12-31T00:00:00Z"),
+            "exported YAML should preserve password_valid_until, got:\n{serialized}"
+        );
+    }
 }
