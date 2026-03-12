@@ -75,13 +75,16 @@ CREATE ROLE "inventory-editor"
 GRANT USAGE ON SCHEMA "inventory"
   TO "inventory-editor";
 GRANT SELECT, INSERT, UPDATE, DELETE, REFERENCES, TRIGGER
-  ON ALL TABLES IN SCHEMA "inventory"
+  ON TABLE "inventory"."orders"
+  TO "inventory-editor";
+GRANT SELECT, INSERT, UPDATE, DELETE, REFERENCES, TRIGGER
+  ON TABLE "inventory"."customers"
   TO "inventory-editor";
 GRANT USAGE, SELECT, UPDATE
-  ON ALL SEQUENCES IN SCHEMA "inventory"
+  ON SEQUENCE "inventory"."orders_id_seq"
   TO "inventory-editor";
 GRANT EXECUTE
-  ON ALL FUNCTIONS IN SCHEMA "inventory"
+  ON FUNCTION "inventory"."refresh_inventory_cache"()
   TO "inventory-editor";
 
 -- Roles removed from the manifest get cleaned up:
@@ -89,6 +92,10 @@ REVOKE ALL ON SCHEMA "legacy"
   FROM "old-reader";
 DROP ROLE "old-reader";
 ```
+
+For wildcard relation grants, pgroles expands the current objects of the requested
+type safely, so table grants do not accidentally touch views or materialized
+views.
 
 Then `pgroles apply` to execute it.
 
@@ -103,6 +110,9 @@ pgroles diff -f pgroles.yaml --database-url postgres://...
 
 # Apply the changes:
 pgroles apply -f pgroles.yaml --database-url postgres://...
+
+# Write the generated manifest directly to a file:
+pgroles generate --database-url postgres://... --output pgroles.yaml
 ```
 
 `--database-url` can also be set via the `DATABASE_URL` environment variable.
@@ -133,7 +143,9 @@ docker run --rm ghcr.io/hardbyte/pgroles --help
 - **Profiles** — define privilege templates once, apply them across schemas. Each `schema x profile` pair becomes a role.
 - **Safer privilege bundles** — common application profiles can pair table, sequence, and function privileges so identity columns and trigger-driven routines are covered together.
 - **Brownfield adoption** — `pgroles generate` introspects an existing database and produces a manifest you can refine.
+- **Reproducible export** — `pgroles generate --output` writes the current database state directly to a manifest file.
 - **Drift detection** — `pgroles diff --exit-code` returns exit code 2 on drift, designed for CI gates.
+- **Password management** — login roles can set passwords from environment variables (CLI) or Kubernetes Secrets (operator), with `VALID UNTIL` expiration and redacted output.
 - **Safe role removal** — preflight checks for owned objects, active sessions, and dependencies before dropping roles. Explicit `retirements` declare cleanup steps.
 - **Managed PostgreSQL** — works with RDS, Aurora, Cloud SQL, AlloyDB, and Azure Database for PostgreSQL. Detects provider-specific reserved roles and warns about privilege limitations.
 - **Kubernetes operator** — reconcile `PostgresPolicy` custom resources continuously. Install via Helm:

@@ -62,7 +62,7 @@ grants:
 
 Generates: `GRANT CONNECT ON DATABASE "mydb" TO "analytics";`
 
-### Wildcard (all objects in schema)
+### Wildcard (all objects of a type in schema)
 
 Use `name: "*"` to grant on all existing objects of a type:
 
@@ -73,7 +73,10 @@ grants:
     on: { type: table, schema: public, name: "*" }
 ```
 
-Generates: `GRANT SELECT ON ALL TABLES IN SCHEMA "public" TO "analytics";`
+pgroles expands wildcard relation grants against the current objects of the
+requested type in that schema. That keeps `table`, `view`, and
+`materialized_view` grants scoped correctly instead of letting one subtype
+touch the others.
 
 ### Specific object
 

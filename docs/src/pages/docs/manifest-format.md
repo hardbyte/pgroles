@@ -164,7 +164,9 @@ Supported values for `type`: `table`, `view`, `materialized_view`, `sequence`, `
 
 ### Wildcard grants
 
-Use `name: "*"` to grant on all objects of a type in a schema. This generates `GRANT ... ON ALL TABLES IN SCHEMA` style SQL.
+Use `name: "*"` to grant on all current objects of a type in a schema. pgroles
+expands relation wildcards safely by object type, so `table`, `view`, and
+`materialized_view` privileges do not bleed across each other.
 
 ## default_privileges
 

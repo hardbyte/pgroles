@@ -157,9 +157,17 @@ Generate a YAML manifest from the current database state. This is the primary to
 ```shell
 pgroles generate --database-url postgres://localhost/mydb
 pgroles generate --database-url postgres://localhost/mydb > policy.yaml
+pgroles generate --database-url postgres://localhost/mydb --output policy.yaml
 ```
 
 The generated manifest uses no profiles — all roles, grants, default privileges, and memberships are emitted as top-level entries. When applied back to the same database, it should produce zero diff.
+
+### Options
+
+| Flag | Description |
+|---|---|
+| `--database-url` | PostgreSQL connection string (or `DATABASE_URL` env) |
+| `-o`, `--output` | Write the generated manifest to a file instead of stdout |
 
 {% callout type="note" title="Starting point for refinement" %}
 The generated manifest is a flat snapshot of the current state. After generating it, you can reorganize roles into profiles and schemas to take advantage of pgroles' template system.

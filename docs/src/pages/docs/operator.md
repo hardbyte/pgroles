@@ -32,11 +32,10 @@ helm install pgroles-operator oci://ghcr.io/hardbyte/charts/pgroles-operator
 
 ### Rust crate
 
-Install from crates.io:
+Add the operator crate from crates.io:
 
-```toml
-[dependencies]
-pgroles-operator = "<current-release>"
+```shell
+cargo add pgroles-operator
 ```
 
 If you are embedding the reconciler or CRD types directly from source, depend on the repository in your `Cargo.toml`:

@@ -5,8 +5,8 @@ description: >-
   Define roles, memberships, grants, and default privileges in YAML
   and let the operator converge your database to the desired state.
 type: application
-version: 0.1.5
-appVersion: "0.1.5"
+version: 0.2.0
+appVersion: "0.2.0"
 icon: https://raw.githubusercontent.com/hardbyte/pgroles/main/docs/public/logo.svg
 sources:
   - https://github.com/hardbyte/pgroles
@@ -17,7 +17,7 @@ maintainers:
 annotations:
   artifacthub.io/changes: |
     - kind: added
-      description: Initial release of the pgroles Kubernetes operator.
+      description: Adds operator plan mode, password-backed roles, and the current production-readiness validation profile.
   artifacthub.io/category: database
   artifacthub.io/operator: "true"
   artifacthub.io/prerelease: "true"

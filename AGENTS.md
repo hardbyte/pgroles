@@ -59,8 +59,9 @@ diff(current, desired) → Vec<Change> → sql::render_all_with_context() → SQ
 - **pgroles-core** — Pure library, no IO. Manifest parsing, profile expansion, diff engine, SQL rendering, manifest export. All collections use `BTreeMap`/`BTreeSet` for deterministic output.
 - **pgroles-inspect** — Async database introspection via `sqlx`/`pg_catalog`. Version detection, cloud provider detection (RDS, Cloud SQL, AlloyDB, Azure), drop-role safety preflight.
 - **pgroles-cli** — Binary crate. Thin orchestration over core + inspect. Subcommands: `validate`, `diff`/`plan`, `apply`, `inspect`, `generate`.
-- **pgroles-operator** — Kubernetes operator (WIP). Reconciles `PostgresPolicy` CRDs (`pgroles.io/v1alpha1`). Has a `crdgen` binary for generating `k8s/crd.yaml`.
+- **pgroles-operator** — Kubernetes operator. Reconciles `PostgresPolicy` CRDs (`pgroles.io/v1alpha1`). Has a `crdgen` binary for generating `k8s/crd.yaml`.
   - Health endpoints: `/livez`, `/readyz`
+  - Reconciliation modes: `apply`, `plan`
   - Metrics/telemetry: prefer OTLP export via OpenTelemetry Collector; do not add a built-in Prometheus scrape endpoint by default unless the change explicitly requires it.
 
 ### Diff Change Ordering
@@ -69,11 +70,14 @@ diff(current, desired) → Vec<Change> → sql::render_all_with_context() → SQ
 
 ## CI
 
-Four jobs in `.github/workflows/ci.yml`:
+Five jobs in `.github/workflows/ci.yml`:
 1. **Lint** — `cargo fmt --check`, `clippy -D warnings`, CRD drift check
 2. **Unit Tests** — `cargo test --workspace`
 3. **Integration Tests** — PG 16/17/18 matrix, `cargo test --workspace -- --include-ignored`
-4. **E2E** — kind cluster, deploys operator plus an OpenTelemetry Collector, runs happy-path plus conflict/invalid/missing-secret/insufficient-privilege/secret-rotation operator scenarios, verifies larger generated policy convergence at higher object counts, verifies roles in database, and verifies OTLP metrics export
+4. **Docker Smoke Tests** — verifies the documented container flows work end-to-end
+5. **E2E** — kind cluster, deploys operator plus an OpenTelemetry Collector, runs happy-path plus conflict/invalid/missing-secret/insufficient-privilege/secret-rotation operator scenarios, verifies larger generated policy convergence at higher object counts, verifies roles in database, and verifies OTLP metrics export
+
+The heavier fairness/load coverage lives in `.github/workflows/operator-fairness-load.yml` and runs on a nightly schedule when `main` has changed.
 
 ## Release and Containers
 

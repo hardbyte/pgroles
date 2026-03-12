@@ -18,9 +18,8 @@ resources.
 
 From crates.io:
 
-```toml
-[dependencies]
-pgroles-operator = "<current-release>"
+```shell
+cargo add pgroles-operator
 ```
 
 Library from source:

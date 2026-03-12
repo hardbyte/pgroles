@@ -1,12 +1,35 @@
 # pgroles Roadmap
 
-## Goals
+## Product direction
 
-- Make the current CLI/operator behavior safe and actually convergent.
-- Tighten the declarative contract so the manifest expresses intent, not just SQL-shaped inputs.
-- Harden the operator only after the core reconciliation model is reliable.
+pgroles is a declarative PostgreSQL access-control tool with two delivery paths:
 
-## Prior Art Comparison
+- a CLI for explicit, reviewed change workflows
+- a Kubernetes operator for continuous reconciliation
+
+The current focus is no longer basic controller viability. The core diff/apply model, safety checks, and operator production foundations are on `main`. The roadmap is now about tightening the declarative contract, evolving the API carefully, and broadening compatibility and validation.
+
+## Current state
+
+pgroles already provides:
+
+- convergent `diff` / `apply` workflow with transactional execution
+- profile-based manifest expansion across schemas
+- default privileges with explicit owner context
+- brownfield `generate` for existing databases
+- managed-provider detection for RDS, Aurora, Cloud SQL, AlloyDB, and Azure Database for PostgreSQL
+- password management for login roles with redacted output and `VALID UNTIL`
+- safety preflight for destructive role retirement workflows
+- PostgreSQL-version-aware SQL generation (PG 14+)
+- a production-focused Kubernetes operator with:
+  - plan mode
+  - per-database serialization
+  - advisory locking
+  - failure-aware retry behavior
+  - OTLP metrics, health probes, and Kubernetes Events
+  - CI coverage for conflict detection, secret rotation, insufficient privileges, and scheduled fairness/load runs
+
+## Prior art comparison
 
 | Capability | pgbedrock | TF cyrilgdn | pgroles |
 |---|---|---|---|
@@ -18,140 +41,110 @@
 | Profile/template system | No | No | **Yes** (profiles × schemas) |
 | Role retirement lifecycle | No | No | **Yes** (reassign/drop/terminate) |
 | Brownfield `generate` | Yes | N/A | **Yes** |
-| PG version adaptation | No | Broken | **Yes** (PG 14+ via SqlContext) |
-| K8s operator | No | No | **Yes** (alpha CRD) |
+| PG version adaptation | No | Broken | **Yes** (PG 14+ via `SqlContext`) |
+| K8s operator | No | No | **Yes** (`v1alpha1` CRD) |
 | Transactional apply | No | No | **Yes** |
-| Safety preflight checks | No | No | **Yes** (owned objects, sessions) |
-| Idempotent diff | Broken (spurious changes) | Broken (dirty state) | **Yes** (BTreeMap determinism) |
-| Cloud-managed PG detection | No | No | **Yes** (RDS, Cloud SQL, Azure) |
+| Safety preflight checks | No | No | **Yes** (owned objects, sessions, blockers) |
+| Idempotent diff | Broken (spurious changes) | Broken (dirty state) | **Yes** (deterministic graph + live inventory) |
+| Cloud-managed PG detection | No | No | **Yes** (RDS, Cloud SQL, AlloyDB, Azure) |
+| Password management | No | Partial | **Yes** (CLI env + operator Secret sources) |
 
-## Recently Completed
+## Recently completed
 
-The following features have been implemented:
+The following landed recently and shape the next release line:
 
-- **`generate` command** — Introspects all non-system roles and emits a flat manifest for brownfield adoption. Round-trip invariant: generated manifest applied back produces zero diff.
-- **`--format json`** — Machine-readable JSON output for `diff`/`plan`, suitable for CI/CD pipelines.
-- **Drift exit code** — `diff` exits with code 2 when changes are detected (`--exit-code`, default on).
-- **PG version detection** — `SqlContext` adapts SQL generation based on server version. PG 16+ uses `WITH INHERIT`/`WITH ADMIN`; PG 14–15 falls back to legacy `WITH ADMIN OPTION`.
-- **Cloud provider detection** — Detects `rds_superuser`, `cloudsqlsuperuser`, `azure_pg_admin` memberships and validates planned changes against privilege level.
-- **Cloud auth provider schema** — `auth_providers` manifest field for declaring Cloud SQL IAM, RDS IAM, and Azure AD providers (informational metadata).
+- **Operator plan mode** — `spec.mode: plan` computes drift and publishes planned SQL without mutating PostgreSQL.
+- **Password support** — login roles can declare a password source and optional `password_valid_until` timestamp.
+- **`generate --output`** — brownfield export can write manifests directly to a file.
+- **Subtype-safe wildcard relation grants** — wildcard `table`, `view`, and `materialized_view` privileges no longer bleed across relation subtypes.
+- **Docs and branding refresh** — the docs site, README, and operator guidance now reflect the current product model more accurately.
 
-## Phase 1: Safety and Semantic Validation
+## Near-term roadmap
 
-- Extend the current live destructive-operation preflight:
-  - ownership, privilege-dependency, and active-session checks are implemented now
-  - current reports also distinguish current-db/shared cleanup from other-database cleanup
-  - next add broader unmanaged dependency detection before destructive changes
-  - next surface likely blockers more precisely as warnings vs hard blockers in dry-run output
-- Harden the new role-retirement path:
-  - explicit `retirements` with `REASSIGN OWNED` / `DROP OWNED` are implemented now
-  - next decide whether session termination should ever be an explicit opt-in workflow
-  - next document the current single-database boundary for retirement cleanup more clearly
-- Expand manifest semantic validation:
-  - top-level default privileges must declare `grant.role`
-  - object target combinations should be checked for required/forbidden fields
-  - unsupported default privilege object types should be rejected
-  - privilege/object combinations should be validated early
-  - validate that declared default privilege owners have CREATE privileges on the schema
-- Keep transactional apply as the default execution model.
-- Keep membership flag changes covered by regression tests; the current remove-then-add behavior is acceptable because apply is transactional.
-- Broaden function grant coverage, especially for overloaded signatures and inspect/render parity.
+### 1. Tighten semantic validation
 
-## Phase 2: Test Coverage
+- Broaden manifest validation for privilege/object combinations before connecting to PostgreSQL.
+- Validate default privilege declarations more aggressively, especially owner/schema relationships.
+- Keep destructive retirement planning precise about warnings vs hard blockers.
+- Broaden function grant coverage, especially overloaded signatures and inspect/render parity.
 
-- Add live PostgreSQL tests for:
-  - wildcard table/sequence/function grants
-  - function grants with arguments
-  - membership option changes
-  - default privilege validation and reconciliation
-  - destructive preflight checks for owned objects and unsafe drops
-- Add operator tests for:
-  - Secret rotation
-  - degraded status on failure
-  - reconcile recovery after failure
-  - safe failure reporting for blocked destructive changes
+### 2. Make the declarative boundary more explicit
 
-## Phase 3: Declarative Boundary & Reconciliation Modes
-
-- Introduce an explicit managed scope:
+- Introduce a clearer managed scope model:
   - managed roles
   - managed schemas
   - managed ownership transitions
   - whether revokes/drops are authoritative inside that scope
-- Add reconcile modes:
-  - `authoritative` (current behavior, default): full convergence
-  - `additive`: only create/grant, never revoke/drop — filter out `Revoke`, `RevokeDefaultPrivilege`, `RemoveMember`, `DropRole` from the diff output
-  - `adopt`: like authoritative, but only manage roles that already exist in the DB or are declared in the manifest
-- Implementation: `ReconcileMode` enum and a post-filter on `diff()` output. The diff engine stays pure; filtering happens in the CLI/operator layer.
-- Treat selectors like "all tables in schema X" as first-class intent, not a string convention.
-- Make owner context for default privileges explicit instead of relying on fallbacks.
+- Add reconciliation modes beyond the current authoritative default:
+  - `authoritative`
+  - `additive`
+  - `adopt`
+- Keep the diff engine pure and implement those modes as post-filters in the CLI/operator layer.
 
-## Phase 4: Scope and UX
+### 3. Operator API evolution
 
-- Keep the current contract explicit: one manifest reconciles one database connection.
-- Decide whether multi-database manifests are a non-goal or a later orchestration feature.
-- If multi-database support is added, model it above the current single-database diff engine rather than overloading one manifest with ambiguous scope.
-- Make `inspect` emit a detailed normalized graph, not just counts.
+- Carry the current controller semantics into the next CRD revision instead of leaving them as implementation-only conventions.
+- Promote beyond `v1alpha1` only once compatibility, upgrade, and rollback expectations are explicit.
+- Keep status, Events, and OTLP metrics aligned as the CRD evolves.
 
-## Phase 5: Row-Level Security
+### 4. Compatibility and validation
 
-Unique differentiator vs all prior art — no other tool manages RLS policies declaratively.
+- Keep expanding compatibility coverage across supported PostgreSQL versions and managed providers.
+- Maintain the scheduled fairness/load workflow as the operator surface changes.
+- Add longer-running and higher-scale validation without making normal PR CI heavy or flaky.
 
-- **RLS data model**: `rls_policies` manifest section with table, schema, policy name, command, permissive/restrictive, roles, USING/WITH CHECK expressions. Extends `RoleGraph` with `rls_policies: BTreeMap<RlsPolicyKey, RlsPolicyState>` and `rls_enabled_tables`.
-- **RLS diff engine**: New `Change` variants — `EnableRls`, `DisableRls`, `CreatePolicy`, `AlterPolicy`, `DropPolicy`. Ordering: `EnableRls` before `CreatePolicy`, `DropPolicy` before `DisableRls`.
-- **RLS introspection**: Query `pg_tables` (rowsecurity) and `pg_policies` for current state.
-- **RLS SQL generation**: `CREATE POLICY`, `ALTER POLICY`, `DROP POLICY`, `ALTER TABLE ... ENABLE/DISABLE ROW LEVEL SECURITY`.
+### 5. CLI/operator UX
 
-## Phase 6: Operator Hardening
+- Improve plan-review ergonomics without weakening the transactional apply model.
+- Make `inspect` and generated exports easier to use as normalized graph/debugging surfaces.
+- Continue documenting privilege bundles and common application patterns so table/sequence/function access is less error-prone.
 
-- Cache pools by Secret resource version and watch for Secret updates.
-- Surface `Ready`, `Reconciling`, and `Degraded` conditions consistently.
-- Add rate-limited retries and clearer failure summaries.
-- Add policy around deletion behavior instead of relying on implicit defaults.
+## Longer-term differentiators
 
-## Future: Cloud Auth & Integrations
+### Row-level security
 
-- **Cloud auth provider runtime**: Auto-detect IAM-mapped role names, validate role naming conventions, set `rds_iam` attribute on RDS IAM roles. (Manifest schema is already in place.)
-- **Vault integration**: Generate Vault-compatible creation statement templates from the manifest (export format, not runtime integration).
-- **LDAP/SCIM adapter**: Enterprise feature, out of scope for v0.x.
+Unique differentiator vs most existing tools — declarative management for PostgreSQL RLS policies.
 
-## Architecture Principles
+Potential shape:
 
-The current architecture is clean and should be preserved:
+- `rls_policies` manifest section with table, schema, policy name, command, permissive/restrictive mode, roles, `USING`, and `WITH CHECK`
+- new `Change` variants such as `EnableRls`, `CreatePolicy`, `AlterPolicy`, `DropPolicy`
+- introspection from `pg_policies` and table row-security flags
+- SQL generation for `CREATE POLICY`, `ALTER POLICY`, `DROP POLICY`, and `ALTER TABLE ... ENABLE/DISABLE ROW LEVEL SECURITY`
 
+### Cloud auth and integrations
+
+- richer runtime support for IAM-mapped roles where the provider metadata is already modeled
+- export-oriented integrations for external secret/password systems rather than trying to subsume them
+
+## Architecture principles
+
+The current architecture should stay intact:
+
+```text
+YAML -> PolicyManifest -> ExpandedManifest -> RoleGraph (desired)
+                                               ↓ diff()
+DB   -> pg_catalog queries -> RoleGraph (current) -> Vec<Change> -> SQL
 ```
-YAML → PolicyManifest → ExpandedManifest → RoleGraph (desired)
-                                                ↓ diff()
-DB   → pg_catalog queries → RoleGraph (current) → Vec<Change> → SQL
-```
 
-All new features should plug into this pipeline without restructuring it:
-- **RLS** extends `RoleGraph`, `Change`, introspection, and SQL generation
-- **Reconciliation modes** are a post-filter on `Vec<Change>`
-- **Version detection** is a context parameter to SQL generation
-- **Export** is `RoleGraph → PolicyManifest` (the reverse of `from_expanded`)
+New features should plug into that pipeline without restructuring it:
 
-The 4-crate split is correct:
-- `pgroles-core`: Pure, no IO, testable without a database
-- `pgroles-inspect`: Database-dependent, async
-- `pgroles-cli`: Binary, thin orchestration layer
+- RLS extends `RoleGraph`, `Change`, introspection, and SQL generation
+- reconciliation modes are a post-filter on `Vec<Change>`
+- version detection is a context parameter to SQL generation
+- export is `RoleGraph -> PolicyManifest` (the reverse of `from_expanded`)
+
+The 4-crate split remains correct:
+
+- `pgroles-core`: pure, no I/O, testable without a database
+- `pgroles-inspect`: database-dependent, async
+- `pgroles-cli`: binary, thin orchestration layer
 - `pgroles-operator`: Kubernetes-specific
 
-### Non-goals
+## Non-goals
 
 - GUI / web dashboard — pgroles is a CLI/operator tool
 - Schema DDL management — pgroles manages authorization, not schema
 - Multi-database orchestration in a single manifest — one manifest = one database connection
-- Password lifecycle management (rotation, distribution) — Vault handles this better. Note: pgroles does support setting initial passwords from environment variables and enforcing `VALID UNTIL` expiration
+- Full password lifecycle management (rotation, distribution, external secret orchestration)
 - LDAP/SCIM sync — enterprise feature, out of scope for v0.x
-
-## Declarative Direction
-
-Today, pgroles is declarative at the manifest surface but still partly operational internally. The next step is to make the core model intent-based:
-
-- desired selectors and edges in
-- normalized current state over the same managed boundary
-- diff between those two graphs
-- SQL only as an execution backend
-
-That makes the tool more predictable for both the CLI and the operator.
