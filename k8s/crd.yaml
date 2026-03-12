@@ -475,6 +475,39 @@
                         "name": {
                           "type": "string"
                         },
+                        "password": {
+                          "description": "Password source for this role. References a Kubernetes Secret key.",
+                          "nullable": true,
+                          "properties": {
+                            "secretKey": {
+                              "description": "Key within the Secret. Defaults to the role name.",
+                              "nullable": true,
+                              "type": "string"
+                            },
+                            "secretRef": {
+                              "description": "Reference to the Kubernetes Secret containing the password.",
+                              "properties": {
+                                "name": {
+                                  "description": "Name of the Secret.",
+                                  "type": "string"
+                                }
+                              },
+                              "required": [
+                                "name"
+                              ],
+                              "type": "object"
+                            }
+                          },
+                          "required": [
+                            "secretRef"
+                          ],
+                          "type": "object"
+                        },
+                        "password_valid_until": {
+                          "description": "Password expiration timestamp (ISO 8601, e.g. \"2025-12-31T00:00:00Z\").",
+                          "nullable": true,
+                          "type": "string"
+                        },
                         "replication": {
                           "nullable": true,
                           "type": "boolean"
@@ -568,6 +601,10 @@
                         "format": "int32",
                         "type": "integer"
                       },
+                      "passwords_set": {
+                        "format": "int32",
+                        "type": "integer"
+                      },
                       "roles_altered": {
                         "format": "int32",
                         "type": "integer"
@@ -596,6 +633,7 @@
                       "grants_revoked",
                       "members_added",
                       "members_removed",
+                      "passwords_set",
                       "roles_altered",
                       "roles_created",
                       "roles_dropped",

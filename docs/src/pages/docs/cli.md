@@ -46,7 +46,7 @@ The `sql` format prints the full SQL script. The `summary` format shows counts o
 
 ### CI drift detection
 
-By default, `diff` exits with code **2** when changes are detected and **0** when the database is in sync. Command failures still use a normal error exit code. This makes it suitable for CI gates and SRE runbooks:
+By default, `diff` exits with code **2** when structural changes are detected and **0** when the database is in sync. Password-only changes are excluded from drift detection because PostgreSQL does not expose password hashes for comparison — they always appear in the plan but will not trigger a non-zero exit. Command failures still use a normal error exit code. This makes it suitable for CI gates and SRE runbooks:
 
 ```shell
 if pgroles diff --database-url postgres://localhost/mydb; then
@@ -174,16 +174,17 @@ The generated manifest is a flat snapshot of the current state. After generating
 pgroles applies changes in dependency order:
 
 1. Create roles
-2. Alter role attributes
-3. Grant privileges
-4. Set default privileges
-5. Remove memberships
-6. Add memberships
-7. Revoke default privileges
-8. Revoke privileges
-9. Terminate sessions for retired roles
-10. Reassign owned objects for retired roles
-11. Drop owned objects / revoke remaining privileges for retired roles
-12. Drop roles
+2. Set passwords (immediately after each role creation, or appended for existing roles)
+3. Alter role attributes
+4. Grant privileges
+5. Set default privileges
+6. Remove memberships
+7. Add memberships
+8. Revoke default privileges
+9. Revoke privileges
+10. Terminate sessions for retired roles
+11. Reassign owned objects for retired roles
+12. Drop owned objects / revoke remaining privileges for retired roles
+13. Drop roles
 
 This ensures roles exist before they're granted privileges, membership flag changes can be re-applied safely, and retired roles can be drained and cleaned up before the final drop.

@@ -33,7 +33,7 @@ Atlas covers roles, grants, and permissions via its HCL schema format, and has g
 
 - **Row-level security** — Atlas manages `CREATE POLICY` with `USING` and `CHECK` expressions as first-class HCL blocks. pgroles does not touch RLS at all.
 - **Column-level grants** — Atlas can grant privileges on individual columns; pgroles operates at the object level.
-- **Password and secret management** — Atlas integrates with AWS Secrets Manager, GCP Secret Manager, and HashiCorp Vault for injecting role passwords at deploy time. pgroles does not manage passwords.
+- **Password and secret management** — Atlas integrates with AWS Secrets Manager, GCP Secret Manager, and HashiCorp Vault for injecting role passwords at deploy time. pgroles supports setting passwords from environment variables (CLI) or Kubernetes Secrets (operator), with `VALID UNTIL` expiration, but does not integrate with external secret managers directly.
 - **Unified schema + security** — If you already use Atlas for DDL migrations, keeping role definitions in the same HCL file and the same workflow is a natural fit.
 - **Multi-database** — Atlas supports MySQL, SQL Server, ClickHouse, and others with the same model. pgroles is PostgreSQL-only.
 - **Ecosystem depth** — Native GitHub Actions, GitLab components, CircleCI orbs, Bitbucket, and Azure DevOps integrations, plus the Atlas Schema Registry for plan storage and pre-approval workflows.
@@ -45,7 +45,7 @@ Atlas covers roles, grants, and permissions via its HCL schema format, and has g
 - **Pricing** — Atlas's role and permission management is a Pro feature (paid subscription). pgroles is open source.
 - **Composability** — pgroles is deliberately narrow in scope. It manages what lives in `pg_roles` and `pg_catalog` — nothing else. This makes it easy to drop in alongside an existing DDL migration workflow without conflict.
 
-**Choose Atlas if:** you want a single tool for your entire schema lifecycle including RLS, column-level grants, and secret-managed passwords — and you don't need default privilege management.
+**Choose Atlas if:** you want a single tool for your entire schema lifecycle including RLS, column-level grants, and deep secret manager integrations — and you don't need default privilege management.
 
 **Choose pgroles if:** default privileges are important to you, you want open-source tooling, or you want to manage roles independently from your DDL migrations.
 

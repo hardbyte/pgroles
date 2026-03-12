@@ -180,6 +180,23 @@ pub struct RoleSpec {
     pub connection_limit: Option<i32>,
     #[serde(default)]
     pub comment: Option<String>,
+    /// Password source for this role. References a Kubernetes Secret key.
+    #[serde(default)]
+    pub password: Option<PasswordSecretRef>,
+    /// Password expiration timestamp (ISO 8601, e.g. "2025-12-31T00:00:00Z").
+    #[serde(default)]
+    pub password_valid_until: Option<String>,
+}
+
+/// Reference to a Kubernetes Secret key containing a role password.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct PasswordSecretRef {
+    /// Reference to the Kubernetes Secret containing the password.
+    pub secret_ref: SecretReference,
+    /// Key within the Secret. Defaults to the role name.
+    #[serde(default)]
+    pub secret_key: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -282,6 +299,7 @@ pub struct ChangeSummary {
     pub default_privileges_revoked: i32,
     pub members_added: i32,
     pub members_removed: i32,
+    pub passwords_set: i32,
     pub total: i32,
 }
 
@@ -385,6 +403,8 @@ impl PostgresPolicySpec {
                 bypassrls: r.bypassrls,
                 connection_limit: r.connection_limit,
                 comment: r.comment.clone(),
+                password: None, // K8s passwords are resolved separately via Secret refs
+                password_valid_until: r.password_valid_until.clone(),
             })
             .collect();
 
@@ -640,6 +660,8 @@ mod tests {
                 bypassrls: None,
                 connection_limit: None,
                 comment: Some("test role".to_string()),
+                password: None,
+                password_valid_until: None,
             }],
             grants: vec![],
             default_privileges: vec![],
@@ -741,6 +763,8 @@ mod tests {
                 bypassrls: None,
                 connection_limit: None,
                 comment: None,
+                password: None,
+                password_valid_until: None,
             }],
             grants: vec![],
             default_privileges: vec![],

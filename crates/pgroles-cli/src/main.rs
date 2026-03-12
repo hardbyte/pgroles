@@ -11,7 +11,8 @@ use tracing::info;
 use pgroles_cli::{
     PlanSummary, apply_role_retirements, compute_plan, format_plan_json,
     format_plan_sql_with_context, format_role_graph_summary, format_validation_result,
-    planned_role_drops, read_manifest_file, validate_manifest,
+    inject_password_changes, planned_role_drops, read_manifest_file, resolve_passwords,
+    validate_manifest,
 };
 use pgroles_inspect::{InspectConfig, inspect_drop_role_safety};
 
@@ -199,9 +200,15 @@ async fn cmd_diff(
     let pool = connect_db(database_url).await?;
     let current = inspect_current(&pool, &validated).await?;
 
-    let changes = apply_role_retirements(
-        compute_plan(&current, &validated.desired),
-        &validated.manifest.retirements,
+    let resolved_passwords =
+        resolve_passwords(&validated.expanded).context("failed to resolve role passwords")?;
+
+    let changes = inject_password_changes(
+        apply_role_retirements(
+            compute_plan(&current, &validated.desired),
+            &validated.manifest.retirements,
+        ),
+        &resolved_passwords,
     );
     let drop_safety = inspect_drop_safety(&pool, &changes, &validated.manifest.retirements).await?;
     let summary = PlanSummary::from_changes(&changes);
@@ -230,7 +237,9 @@ async fn cmd_diff(
         }
     }
 
-    if use_exit_code && !summary.is_empty() {
+    // Use structural changes for exit code — password-only changes don't
+    // constitute drift because passwords can't be read back for comparison.
+    if use_exit_code && summary.has_structural_changes() {
         Ok(ExitCode::from(EXIT_DRIFT))
     } else {
         Ok(ExitCode::SUCCESS)
@@ -252,9 +261,15 @@ async fn cmd_apply(file: &Path, database_url: &str, dry_run: bool) -> Result<()>
 
     let current = inspect_current(&pool, &validated).await?;
 
-    let changes = apply_role_retirements(
-        compute_plan(&current, &validated.desired),
-        &validated.manifest.retirements,
+    let resolved_passwords =
+        resolve_passwords(&validated.expanded).context("failed to resolve role passwords")?;
+
+    let changes = inject_password_changes(
+        apply_role_retirements(
+            compute_plan(&current, &validated.desired),
+            &validated.manifest.retirements,
+        ),
+        &resolved_passwords,
     );
 
     // Validate changes against privilege level.
@@ -298,12 +313,23 @@ async fn cmd_apply(file: &Path, database_url: &str, dry_run: bool) -> Result<()>
     info!(changes = summary.total(), "applying changes");
     let mut transaction = pool.begin().await.context("failed to start transaction")?;
     for change in &changes {
+        let is_sensitive = matches!(change, pgroles_core::diff::Change::SetPassword { .. });
         for statement in pgroles_core::sql::render_statements_with_context(change, &sql_ctx) {
-            info!(sql = %statement, "executing");
+            if is_sensitive {
+                info!("executing: ALTER ROLE ... PASSWORD [REDACTED]");
+            } else {
+                info!(sql = %statement, "executing");
+            }
             sqlx::query(&statement)
                 .execute(transaction.as_mut())
                 .await
-                .with_context(|| format!("failed to execute: {statement}"))?;
+                .with_context(|| {
+                    if is_sensitive {
+                        "failed to execute: ALTER ROLE ... PASSWORD [REDACTED]".to_string()
+                    } else {
+                        format!("failed to execute: {statement}")
+                    }
+                })?;
         }
     }
     transaction

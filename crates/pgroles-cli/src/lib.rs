@@ -88,6 +88,21 @@ pub fn apply_role_retirements(changes: Vec<Change>, retirements: &[RoleRetiremen
     diff::apply_role_retirements(changes, retirements)
 }
 
+/// Resolve password sources from environment variables for roles that declare them.
+pub fn resolve_passwords(
+    expanded: &ExpandedManifest,
+) -> Result<std::collections::BTreeMap<String, String>> {
+    diff::resolve_passwords(&expanded.roles).map_err(|err| anyhow::anyhow!("{err}"))
+}
+
+/// Inject `SetPassword` changes into a plan for roles with resolved passwords.
+pub fn inject_password_changes(
+    changes: Vec<Change>,
+    resolved_passwords: &std::collections::BTreeMap<String, String>,
+) -> Vec<Change> {
+    diff::inject_password_changes(changes, resolved_passwords)
+}
+
 // ---------------------------------------------------------------------------
 // Output formatting
 // ---------------------------------------------------------------------------
@@ -123,6 +138,7 @@ pub struct PlanSummary {
     pub default_privileges_revoked: usize,
     pub members_added: usize,
     pub members_removed: usize,
+    pub passwords_set: usize,
 }
 
 impl PlanSummary {
@@ -144,6 +160,7 @@ impl PlanSummary {
                 Change::RevokeDefaultPrivilege { .. } => summary.default_privileges_revoked += 1,
                 Change::AddMember { .. } => summary.members_added += 1,
                 Change::RemoveMember { .. } => summary.members_removed += 1,
+                Change::SetPassword { .. } => summary.passwords_set += 1,
             }
         }
         summary
@@ -164,11 +181,21 @@ impl PlanSummary {
             + self.default_privileges_revoked
             + self.members_added
             + self.members_removed
+            + self.passwords_set
     }
 
     /// True if the plan has no changes.
     pub fn is_empty(&self) -> bool {
         self.total() == 0
+    }
+
+    /// True if the plan has structural drift (excluding password-only changes).
+    ///
+    /// Password changes always appear in plans because passwords cannot be read
+    /// back from PostgreSQL for comparison. This method allows CI gates
+    /// (`--exit-code`) to distinguish real drift from password-only changes.
+    pub fn has_structural_changes(&self) -> bool {
+        self.total() - self.passwords_set > 0
     }
 }
 
@@ -197,6 +224,7 @@ impl std::fmt::Display for PlanSummary {
             ),
             ("membership(s) to add", self.members_added),
             ("membership(s) to remove", self.members_removed),
+            ("password(s) to set", self.passwords_set),
         ];
 
         for (label, count) in items {
@@ -554,6 +582,63 @@ schemas:
         let validated = validate_manifest(MINIMAL_MANIFEST).unwrap();
         let summary = format_role_graph_summary(&validated.desired);
         assert!(summary.contains("Roles: 1"), "got: {summary}");
+    }
+
+    // -----------------------------------------------------------------------
+    // has_structural_changes — password-only drift detection
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn has_structural_changes_true_for_non_password_changes() {
+        let summary = PlanSummary {
+            roles_created: 1,
+            grants: 2,
+            ..Default::default()
+        };
+        assert!(summary.has_structural_changes());
+    }
+
+    #[test]
+    fn has_structural_changes_false_for_password_only() {
+        let summary = PlanSummary {
+            passwords_set: 3,
+            ..Default::default()
+        };
+        assert!(
+            !summary.has_structural_changes(),
+            "password-only plan should NOT be considered structural drift"
+        );
+    }
+
+    #[test]
+    fn has_structural_changes_true_for_mixed() {
+        let summary = PlanSummary {
+            roles_created: 1,
+            passwords_set: 2,
+            ..Default::default()
+        };
+        assert!(
+            summary.has_structural_changes(),
+            "mixed plan with structural + password changes IS structural drift"
+        );
+    }
+
+    #[test]
+    fn has_structural_changes_false_for_empty() {
+        let summary = PlanSummary::default();
+        assert!(!summary.has_structural_changes());
+    }
+
+    #[test]
+    fn plan_summary_displays_password_count() {
+        let summary = PlanSummary {
+            passwords_set: 2,
+            roles_created: 1,
+            ..Default::default()
+        };
+        let display = summary.to_string();
+        assert!(display.contains("2 password(s) to set"), "got: {display}");
+        assert!(display.contains("3 change(s)"), "got: {display}");
     }
 
     // -----------------------------------------------------------------------

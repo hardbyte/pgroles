@@ -142,7 +142,7 @@ The 4-crate split is correct:
 - GUI / web dashboard — pgroles is a CLI/operator tool
 - Schema DDL management — pgroles manages authorization, not schema
 - Multi-database orchestration in a single manifest — one manifest = one database connection
-- Password management — Vault handles this better
+- Password lifecycle management (rotation, distribution) — Vault handles this better. Note: pgroles does support setting initial passwords from environment variables and enforcing `VALID UNTIL` expiration
 - LDAP/SCIM sync — enterprise feature, out of scope for v0.x
 
 ## Declarative Direction

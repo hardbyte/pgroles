@@ -350,6 +350,73 @@ fn inspect_missing_database_url() {
 }
 
 // =========================================================================
+// validate subcommand — password validation errors
+// =========================================================================
+
+#[test]
+fn validate_rejects_password_on_nologin_role() {
+    let manifest_file = write_temp_manifest(
+        r#"
+roles:
+  - name: no_login_role
+    password:
+      from_env: SOME_VAR
+"#,
+    );
+
+    pgroles_cmd()
+        .args(["validate", "--file", manifest_file.path().to_str().unwrap()])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("no_login_role"))
+        .stderr(predicate::str::contains("password").or(predicate::str::contains("login")));
+}
+
+#[test]
+fn validate_rejects_invalid_password_valid_until() {
+    let manifest_file = write_temp_manifest(
+        r#"
+roles:
+  - name: expiring_role
+    login: true
+    password:
+      from_env: SOME_VAR
+    password_valid_until: "2025-13-01"
+"#,
+    );
+
+    pgroles_cmd()
+        .args(["validate", "--file", manifest_file.path().to_str().unwrap()])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("expiring_role"))
+        .stderr(
+            predicate::str::contains("password_valid_until")
+                .or(predicate::str::contains("ISO 8601")),
+        );
+}
+
+#[test]
+fn validate_accepts_role_with_password() {
+    let manifest_file = write_temp_manifest(
+        r#"
+roles:
+  - name: good_role
+    login: true
+    password:
+      from_env: SOME_VAR
+    password_valid_until: "2026-12-31T00:00:00Z"
+"#,
+    );
+
+    pgroles_cmd()
+        .args(["validate", "--file", manifest_file.path().to_str().unwrap()])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Manifest is valid"));
+}
+
+// =========================================================================
 // diff/apply/inspect with invalid manifest (should fail before DB connect)
 // =========================================================================
 
@@ -1194,6 +1261,124 @@ retirements:
             DROP ROLE IF EXISTS "{successor_role}";
             "#
         ));
+    }
+
+    #[test]
+    #[ignore]
+    fn apply_with_password_does_not_leak_password_in_stderr() {
+        let role = unique_name("pw_redact_role");
+        let password = "s3cret_p@ssw0rd_DO_NOT_LEAK";
+
+        execute_sql(&format!(
+            r#"
+            DROP ROLE IF EXISTS "{role}";
+            "#
+        ));
+
+        let manifest_file = write_temp_manifest(&format!(
+            r#"
+roles:
+  - name: {role}
+    login: true
+    password:
+      from_env: TEST_PW_REDACT_VAR
+"#
+        ));
+
+        // Apply with the password env var set and pgroles debug logging enabled.
+        // Use a targeted log filter so sqlx query logs (which echo raw SQL
+        // including passwords) are suppressed — we are testing *pgroles'* own
+        // redaction, not sqlx's internal logging.
+        let output = pgroles_cmd()
+            .args([
+                "apply",
+                "--file",
+                manifest_file.path().to_str().unwrap(),
+                "--database-url",
+                &database_url(),
+            ])
+            .env("TEST_PW_REDACT_VAR", password)
+            .env(
+                "RUST_LOG",
+                "pgroles=debug,pgroles_core=debug,pgroles_inspect=debug,sqlx=warn",
+            )
+            .assert()
+            .success()
+            .get_output()
+            .clone();
+
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            !stderr.contains(password),
+            "stderr must NOT contain the actual password. Got:\n{stderr}"
+        );
+        assert!(
+            stderr.contains("REDACTED"),
+            "stderr should mention REDACTED when applying password changes. Got:\n{stderr}"
+        );
+
+        assert!(query_role_exists(&role), "role should exist after apply");
+
+        execute_sql(&format!(r#"DROP ROLE IF EXISTS "{role}";"#));
+    }
+
+    #[test]
+    #[ignore]
+    fn diff_exit_code_ignores_password_only_drift() {
+        let role = unique_name("pw_drift_role");
+
+        execute_sql(&format!(
+            r#"
+            DROP ROLE IF EXISTS "{role}";
+            "#
+        ));
+
+        // First apply to create the role without a password.
+        let initial_manifest = write_temp_manifest(&format!(
+            r#"
+roles:
+  - name: {role}
+    login: true
+"#
+        ));
+
+        pgroles_cmd()
+            .args([
+                "apply",
+                "--file",
+                initial_manifest.path().to_str().unwrap(),
+                "--database-url",
+                &database_url(),
+            ])
+            .assert()
+            .success();
+
+        // Now diff with a password — should NOT trigger exit code 2
+        // because password changes are not structural drift.
+        let password_manifest = write_temp_manifest(&format!(
+            r#"
+roles:
+  - name: {role}
+    login: true
+    password:
+      from_env: TEST_PW_DRIFT_VAR
+"#
+        ));
+
+        pgroles_cmd()
+            .args([
+                "diff",
+                "--file",
+                password_manifest.path().to_str().unwrap(),
+                "--database-url",
+                &database_url(),
+                "--exit-code",
+            ])
+            .env("TEST_PW_DRIFT_VAR", "test_password_123")
+            .assert()
+            .success(); // exit code 0, not 2
+
+        execute_sql(&format!(r#"DROP ROLE IF EXISTS "{role}";"#));
     }
 
     #[test]
