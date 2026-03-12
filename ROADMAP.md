@@ -54,6 +54,7 @@ pgroles already provides:
 The following landed recently and shape the next release line:
 
 - **Operator plan mode** — `spec.mode: plan` computes drift and publishes planned SQL without mutating PostgreSQL.
+- **Reconciliation modes** — `authoritative`, `additive`, and `adopt` are now available in the CLI and operator.
 - **Password support** — login roles can declare a password source and optional `password_valid_until` timestamp.
 - **`generate --output`** — brownfield export can write manifests directly to a file.
 - **Subtype-safe wildcard relation grants** — wildcard `table`, `view`, and `materialized_view` privileges no longer bleed across relation subtypes.
@@ -75,11 +76,7 @@ The following landed recently and shape the next release line:
   - managed schemas
   - managed ownership transitions
   - whether revokes/drops are authoritative inside that scope
-- Add reconciliation modes beyond the current authoritative default:
-  - `authoritative`
-  - `additive`
-  - `adopt`
-- Keep the diff engine pure and implement those modes as post-filters in the CLI/operator layer.
+- Keep the current reconciliation modes aligned across the CLI, operator, and future CRD/API revisions.
 
 ### 3. Operator API evolution
 

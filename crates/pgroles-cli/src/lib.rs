@@ -665,10 +665,9 @@ schemas:
 
         let filtered = filter_changes(changes, ReconciliationMode::Additive);
         assert!(
-            !filtered.iter().any(|c| matches!(
-                c,
-                pgroles_core::diff::Change::DropRole { .. }
-            )),
+            !filtered
+                .iter()
+                .any(|c| matches!(c, pgroles_core::diff::Change::DropRole { .. })),
             "additive mode should filter out DropRole"
         );
     }
@@ -702,17 +701,15 @@ schemas:
 
         let filtered = filter_changes(changes, ReconciliationMode::Adopt);
         assert!(
-            !filtered.iter().any(|c| matches!(
-                c,
-                pgroles_core::diff::Change::DropRole { .. }
-            )),
+            !filtered
+                .iter()
+                .any(|c| matches!(c, pgroles_core::diff::Change::DropRole { .. })),
             "adopt mode should filter out DropRole"
         );
         assert!(
-            filtered.iter().any(|c| matches!(
-                c,
-                pgroles_core::diff::Change::Revoke { .. }
-            )),
+            filtered
+                .iter()
+                .any(|c| matches!(c, pgroles_core::diff::Change::Revoke { .. })),
             "adopt mode should keep Revoke changes"
         );
     }

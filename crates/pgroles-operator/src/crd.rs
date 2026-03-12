@@ -119,7 +119,9 @@ pub enum CrdReconciliationMode {
 impl From<CrdReconciliationMode> for pgroles_core::diff::ReconciliationMode {
     fn from(crd: CrdReconciliationMode) -> Self {
         match crd {
-            CrdReconciliationMode::Authoritative => pgroles_core::diff::ReconciliationMode::Authoritative,
+            CrdReconciliationMode::Authoritative => {
+                pgroles_core::diff::ReconciliationMode::Authoritative
+            }
             CrdReconciliationMode::Additive => pgroles_core::diff::ReconciliationMode::Additive,
             CrdReconciliationMode::Adopt => pgroles_core::diff::ReconciliationMode::Adopt,
         }

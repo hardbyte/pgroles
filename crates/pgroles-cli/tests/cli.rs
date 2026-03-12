@@ -1748,11 +1748,7 @@ grants:
 
         // INSERT should still be granted
         assert!(
-            query_has_relation_privilege(
-                &role,
-                &format!(r#""{schema}"."widgets""#),
-                "INSERT"
-            ),
+            query_has_relation_privilege(&role, &format!(r#""{schema}"."widgets""#), "INSERT"),
             "INSERT should NOT be revoked in additive mode"
         );
 

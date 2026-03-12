@@ -190,7 +190,16 @@ async fn run(cli: Cli) -> Result<ExitCode> {
             mode,
             exit_code,
             no_exit_code,
-        } => cmd_diff(&file, &database_url, &format, mode.into(), exit_code && !no_exit_code).await,
+        } => {
+            cmd_diff(
+                &file,
+                &database_url,
+                &format,
+                mode.into(),
+                exit_code && !no_exit_code,
+            )
+            .await
+        }
         Commands::Apply {
             file,
             database_url,
@@ -287,7 +296,12 @@ async fn cmd_diff(
     }
 }
 
-async fn cmd_apply(file: &Path, database_url: &str, dry_run: bool, mode: ReconciliationMode) -> Result<()> {
+async fn cmd_apply(
+    file: &Path,
+    database_url: &str,
+    dry_run: bool,
+    mode: ReconciliationMode,
+) -> Result<()> {
     let yaml = read_manifest_file(file)?;
     let validated = validate_manifest(&yaml)?;
 

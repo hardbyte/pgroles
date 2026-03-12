@@ -1150,14 +1150,32 @@ memberships:
         }
 
         // Verify constructive changes are present
-        assert!(filtered.iter().any(|c| matches!(c, Change::CreateRole { .. })));
-        assert!(filtered.iter().any(|c| matches!(c, Change::AlterRole { .. })));
-        assert!(filtered.iter().any(|c| matches!(c, Change::SetComment { .. })));
+        assert!(
+            filtered
+                .iter()
+                .any(|c| matches!(c, Change::CreateRole { .. }))
+        );
+        assert!(
+            filtered
+                .iter()
+                .any(|c| matches!(c, Change::AlterRole { .. }))
+        );
+        assert!(
+            filtered
+                .iter()
+                .any(|c| matches!(c, Change::SetComment { .. }))
+        );
         assert!(filtered.iter().any(|c| matches!(c, Change::Grant { .. })));
-        assert!(filtered
-            .iter()
-            .any(|c| matches!(c, Change::SetDefaultPrivilege { .. })));
-        assert!(filtered.iter().any(|c| matches!(c, Change::AddMember { .. })));
+        assert!(
+            filtered
+                .iter()
+                .any(|c| matches!(c, Change::SetDefaultPrivilege { .. }))
+        );
+        assert!(
+            filtered
+                .iter()
+                .any(|c| matches!(c, Change::AddMember { .. }))
+        );
     }
 
     #[test]
@@ -1183,12 +1201,16 @@ memberships:
 
         // Verify revokes ARE still present (unlike additive)
         assert!(filtered.iter().any(|c| matches!(c, Change::Revoke { .. })));
-        assert!(filtered
-            .iter()
-            .any(|c| matches!(c, Change::RevokeDefaultPrivilege { .. })));
-        assert!(filtered
-            .iter()
-            .any(|c| matches!(c, Change::RemoveMember { .. })));
+        assert!(
+            filtered
+                .iter()
+                .any(|c| matches!(c, Change::RevokeDefaultPrivilege { .. }))
+        );
+        assert!(
+            filtered
+                .iter()
+                .any(|c| matches!(c, Change::RemoveMember { .. }))
+        );
     }
 
     #[test]
@@ -1250,14 +1272,20 @@ memberships:
 
     #[test]
     fn reconciliation_mode_display() {
-        assert_eq!(ReconciliationMode::Authoritative.to_string(), "authoritative");
+        assert_eq!(
+            ReconciliationMode::Authoritative.to_string(),
+            "authoritative"
+        );
         assert_eq!(ReconciliationMode::Additive.to_string(), "additive");
         assert_eq!(ReconciliationMode::Adopt.to_string(), "adopt");
     }
 
     #[test]
     fn reconciliation_mode_default_is_authoritative() {
-        assert_eq!(ReconciliationMode::default(), ReconciliationMode::Authoritative);
+        assert_eq!(
+            ReconciliationMode::default(),
+            ReconciliationMode::Authoritative
+        );
     }
 
     // -----------------------------------------------------------------------
