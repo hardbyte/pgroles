@@ -1534,6 +1534,160 @@ roles:
 
     #[test]
     #[ignore]
+    fn diff_format_json_redacts_password_changes() {
+        let role = unique_name("pw_json_role");
+
+        execute_sql(&format!(r#"DROP ROLE IF EXISTS "{role}";"#));
+
+        let manifest = write_temp_manifest(&format!(
+            r#"
+roles:
+  - name: {role}
+    login: true
+    password:
+      from_env: TEST_PW_JSON_VAR
+"#
+        ));
+
+        let output = pgroles_cmd()
+            .args([
+                "diff",
+                "--file",
+                manifest.path().to_str().unwrap(),
+                "--database-url",
+                &database_url(),
+                "--format",
+                "json",
+                "--no-exit-code",
+            ])
+            .env("TEST_PW_JSON_VAR", "json_secret_value")
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone();
+
+        let stdout = String::from_utf8(output).expect("stdout is not valid UTF-8");
+        assert!(stdout.contains("[REDACTED]"), "got:\n{stdout}");
+        assert!(!stdout.contains("json_secret_value"), "got:\n{stdout}");
+    }
+
+    #[test]
+    #[ignore]
+    fn diff_format_sql_redacts_password_changes() {
+        let role = unique_name("pw_sql_role");
+
+        execute_sql(&format!(r#"DROP ROLE IF EXISTS "{role}";"#));
+
+        let manifest = write_temp_manifest(&format!(
+            r#"
+roles:
+  - name: {role}
+    login: true
+    password:
+      from_env: TEST_PW_SQL_VAR
+"#
+        ));
+
+        let output = pgroles_cmd()
+            .args([
+                "diff",
+                "--file",
+                manifest.path().to_str().unwrap(),
+                "--database-url",
+                &database_url(),
+                "--format",
+                "sql",
+                "--no-exit-code",
+            ])
+            .env("TEST_PW_SQL_VAR", "sql_secret_value")
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone();
+
+        let stdout = String::from_utf8(output).expect("stdout is not valid UTF-8");
+        assert!(stdout.contains("[REDACTED]"), "got:\n{stdout}");
+        assert!(!stdout.contains("sql_secret_value"), "got:\n{stdout}");
+        assert!(stdout.contains("ALTER ROLE"), "got:\n{stdout}");
+    }
+
+    #[test]
+    #[ignore]
+    fn apply_missing_password_env_var_fails() {
+        let role = unique_name("pw_missing_env_role");
+
+        execute_sql(&format!(r#"DROP ROLE IF EXISTS "{role}";"#));
+
+        let manifest = write_temp_manifest(&format!(
+            r#"
+roles:
+  - name: {role}
+    login: true
+    password:
+      from_env: TEST_PW_MISSING_ENV_VAR
+"#
+        ));
+
+        pgroles_cmd()
+            .args([
+                "apply",
+                "--file",
+                manifest.path().to_str().unwrap(),
+                "--database-url",
+                &database_url(),
+            ])
+            .assert()
+            .failure()
+            .stderr(predicate::str::contains("failed to resolve role passwords"))
+            .stderr(predicate::str::contains("TEST_PW_MISSING_ENV_VAR"));
+
+        assert!(
+            !query_role_exists(&role),
+            "role should not be created when password env var is missing"
+        );
+    }
+
+    #[test]
+    #[ignore]
+    fn generate_omits_password_fields_and_preserves_password_valid_until() {
+        let role = unique_name("pw_generate_role");
+        let password = "gen_secret_123!";
+        let valid_until = "2027-01-01 00:00:00+00";
+
+        execute_sql(&format!(
+            r#"
+            DROP ROLE IF EXISTS "{role}";
+            CREATE ROLE "{role}" LOGIN PASSWORD '{password}' VALID UNTIL '{valid_until}';
+            "#
+        ));
+
+        let output = pgroles_cmd()
+            .args(["generate", "--database-url", &database_url()])
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone();
+
+        let yaml = String::from_utf8(output).expect("output is not valid UTF-8");
+        assert!(!yaml.contains("password:"), "got:\n{yaml}");
+        assert!(!yaml.contains("from_env:"), "got:\n{yaml}");
+        assert!(
+            yaml.contains(&format!("name: {role}")),
+            "generated YAML should include role, got:\n{yaml}"
+        );
+        assert!(
+            yaml.contains("password_valid_until:"),
+            "generated YAML should preserve password_valid_until, got:\n{yaml}"
+        );
+
+        execute_sql(&format!(r#"DROP ROLE IF EXISTS "{role}";"#));
+    }
+
+    #[test]
+    #[ignore]
     fn retirement_manifest_can_terminate_active_sessions() {
         let role = unique_name("session_role");
         let password = "retireme123!";

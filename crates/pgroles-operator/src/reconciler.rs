@@ -824,8 +824,6 @@ async fn resolve_passwords_from_secrets(
 ) -> Result<std::collections::BTreeMap<String, String>, ReconcileError> {
     use k8s_openapi::api::core::v1::Secret;
 
-    let mut resolved = std::collections::BTreeMap::new();
-
     // Cache fetched Secrets by name to avoid duplicate API calls when
     // multiple roles reference different keys in the same Secret.
     let mut secret_cache: std::collections::BTreeMap<String, Secret> =
@@ -836,14 +834,7 @@ async fn resolve_passwords_from_secrets(
     for role_spec in &resource.spec.roles {
         if let Some(password_ref) = &role_spec.password {
             let secret_name = &password_ref.secret_ref.name;
-            let secret_key = password_ref
-                .secret_key
-                .as_deref()
-                .unwrap_or(&role_spec.name);
-
-            let secret = if let Some(cached) = secret_cache.get(secret_name.as_str()) {
-                cached
-            } else {
+            if !secret_cache.contains_key(secret_name.as_str()) {
                 let fetched = secrets_api.get(secret_name).await.map_err(|err| {
                     Box::new(crate::context::ContextError::SecretFetch {
                         name: secret_name.clone(),
@@ -851,8 +842,34 @@ async fn resolve_passwords_from_secrets(
                         source: err,
                     })
                 })?;
-                secret_cache.entry(secret_name.clone()).or_insert(fetched)
-            };
+                secret_cache.insert(secret_name.clone(), fetched);
+            }
+        }
+    }
+
+    resolve_passwords_from_cached_secrets(resource, &secret_cache)
+}
+
+fn resolve_passwords_from_cached_secrets(
+    resource: &PostgresPolicy,
+    secret_cache: &std::collections::BTreeMap<String, k8s_openapi::api::core::v1::Secret>,
+) -> Result<std::collections::BTreeMap<String, String>, ReconcileError> {
+    let mut resolved = std::collections::BTreeMap::new();
+
+    for role_spec in &resource.spec.roles {
+        if let Some(password_ref) = &role_spec.password {
+            let secret_name = &password_ref.secret_ref.name;
+            let secret_key = password_ref
+                .secret_key
+                .as_deref()
+                .unwrap_or(&role_spec.name);
+
+            let secret = secret_cache.get(secret_name.as_str()).ok_or_else(|| {
+                Box::new(crate::context::ContextError::SecretMissing {
+                    name: secret_name.clone(),
+                    key: secret_key.to_string(),
+                })
+            })?;
 
             let data = secret.data.as_ref().ok_or_else(|| {
                 Box::new(crate::context::ContextError::SecretMissing {
@@ -1166,11 +1183,15 @@ impl ReconcileError {
 mod tests {
     use super::*;
     use crate::crd::{
-        ConnectionSpec, CrdReconciliationMode, PolicyMode, PostgresPolicySpec, RoleSpec,
-        SecretReference,
+        ConnectionSpec, CrdReconciliationMode, PasswordSecretRef, PolicyMode, PostgresPolicySpec,
+        RoleSpec, SecretReference,
+    };
+    use k8s_openapi::{
+        ByteString, api::core::v1::Secret, apimachinery::pkg::apis::meta::v1::ObjectMeta,
     };
     use sqlx::error::{DatabaseError, ErrorKind};
     use std::borrow::Cow;
+    use std::collections::BTreeMap;
     use std::error::Error as StdError;
     use std::fmt;
 
@@ -1325,6 +1346,87 @@ mod tests {
                 retirements: Vec::new(),
             },
         )
+    }
+
+    fn password_role_policy() -> PostgresPolicy {
+        test_policy_with_spec(
+            "password-policy",
+            PostgresPolicySpec {
+                connection: ConnectionSpec {
+                    secret_ref: SecretReference {
+                        name: "db-credentials".to_string(),
+                    },
+                    secret_key: "DATABASE_URL".to_string(),
+                },
+                interval: "5m".to_string(),
+                suspend: false,
+                mode: PolicyMode::Apply,
+                reconciliation_mode: CrdReconciliationMode::default(),
+                default_owner: None,
+                profiles: Default::default(),
+                schemas: Vec::new(),
+                roles: vec![
+                    RoleSpec {
+                        name: "app".to_string(),
+                        login: Some(true),
+                        superuser: None,
+                        createdb: None,
+                        createrole: None,
+                        inherit: None,
+                        replication: None,
+                        bypassrls: None,
+                        connection_limit: None,
+                        comment: None,
+                        password: Some(PasswordSecretRef {
+                            secret_ref: SecretReference {
+                                name: "role-passwords".to_string(),
+                            },
+                            secret_key: None,
+                        }),
+                        password_valid_until: None,
+                    },
+                    RoleSpec {
+                        name: "reporter".to_string(),
+                        login: Some(true),
+                        superuser: None,
+                        createdb: None,
+                        createrole: None,
+                        inherit: None,
+                        replication: None,
+                        bypassrls: None,
+                        connection_limit: None,
+                        comment: None,
+                        password: Some(PasswordSecretRef {
+                            secret_ref: SecretReference {
+                                name: "role-passwords".to_string(),
+                            },
+                            secret_key: Some("reporter-password".to_string()),
+                        }),
+                        password_valid_until: None,
+                    },
+                ],
+                grants: Vec::new(),
+                default_privileges: Vec::new(),
+                memberships: Vec::new(),
+                retirements: Vec::new(),
+            },
+        )
+    }
+
+    fn secret_with_keys(name: &str, entries: &[(&str, &str)]) -> Secret {
+        Secret {
+            metadata: ObjectMeta {
+                name: Some(name.to_string()),
+                ..Default::default()
+            },
+            data: Some(
+                entries
+                    .iter()
+                    .map(|(key, value)| ((*key).to_string(), ByteString(value.as_bytes().to_vec())))
+                    .collect(),
+            ),
+            ..Default::default()
+        }
     }
 
     #[test]
@@ -1971,6 +2073,90 @@ mod tests {
             detect_policy_conflict_in_list(&resource, &identity, &ownership, vec![invalid_peer]);
 
         assert_eq!(conflict, None);
+    }
+
+    #[test]
+    fn resolve_passwords_from_cached_secrets_supports_default_and_explicit_keys() {
+        let resource = password_role_policy();
+        let cache = BTreeMap::from([(
+            "role-passwords".to_string(),
+            secret_with_keys(
+                "role-passwords",
+                &[
+                    ("app", "app-secret"),
+                    ("reporter-password", "reporter-secret"),
+                ],
+            ),
+        )]);
+
+        let resolved =
+            resolve_passwords_from_cached_secrets(&resource, &cache).expect("should resolve");
+
+        assert_eq!(resolved.get("app").map(String::as_str), Some("app-secret"));
+        assert_eq!(
+            resolved.get("reporter").map(String::as_str),
+            Some("reporter-secret")
+        );
+    }
+
+    #[test]
+    fn resolve_passwords_from_cached_secrets_reports_missing_key() {
+        let resource = password_role_policy();
+        let cache = BTreeMap::from([(
+            "role-passwords".to_string(),
+            secret_with_keys("role-passwords", &[("app", "app-secret")]),
+        )]);
+
+        let err = resolve_passwords_from_cached_secrets(&resource, &cache).unwrap_err();
+        let context = match err {
+            ReconcileError::Context(context) => context,
+            other => panic!("expected context error, got {other:?}"),
+        };
+        assert!(matches!(
+            *context,
+            crate::context::ContextError::SecretMissing { ref name, ref key }
+            if name == "role-passwords" && key == "reporter-password"
+        ));
+    }
+
+    #[test]
+    fn resolve_passwords_from_cached_secrets_reports_empty_password() {
+        let resource = password_role_policy();
+        let cache = BTreeMap::from([(
+            "role-passwords".to_string(),
+            secret_with_keys(
+                "role-passwords",
+                &[("app", ""), ("reporter-password", "ok")],
+            ),
+        )]);
+
+        let err = resolve_passwords_from_cached_secrets(&resource, &cache).unwrap_err();
+        assert!(matches!(
+            err,
+            ReconcileError::EmptyPasswordSecret { ref role, ref secret, ref key }
+            if role == "app" && secret == "role-passwords" && key == "app"
+        ));
+    }
+
+    #[test]
+    fn resolve_passwords_from_cached_secrets_allows_whitespace_passwords() {
+        let resource = password_role_policy();
+        let cache = BTreeMap::from([(
+            "role-passwords".to_string(),
+            secret_with_keys(
+                "role-passwords",
+                &[("app", "   "), ("reporter-password", "\tsecret")],
+            ),
+        )]);
+
+        let resolved =
+            resolve_passwords_from_cached_secrets(&resource, &cache).expect("should resolve");
+
+        assert_eq!(resolved.get("app").map(String::as_str), Some("   "));
+        assert_eq!(
+            resolved.get("reporter").map(String::as_str),
+            Some("\tsecret")
+        );
     }
 
     #[test]
