@@ -18,8 +18,8 @@ The operator brings the same convergent model as the CLI into Kubernetes. Instea
 - Status conditions and change summaries on the custom resource
 - Finalizer-based cleanup on resource deletion
 
-{% callout title="Production-focused controller" %}
-The operator is intended for production use. The current API is still `v1alpha1`, so the remaining work is primarily around API hardening and lifecycle polish rather than basic controller viability.
+{% callout title="Early production use" %}
+The operator handles serialized reconciliation with conflict detection, failure-aware retry, and observable status reporting. The API is `v1alpha1` — controller semantics are stable but the CRD contract and upgrade path are not yet hardened. Evaluate against your own risk tolerance before unsupervised production use.
 {% /callout %}
 
 ## Installation
@@ -80,62 +80,80 @@ The operator runs as `nobody` (UID 65534) with a read-only root filesystem, no c
 - Validate and review the manifest with the CLI before handing it to the operator.
 - Treat deletion as "stop managing", not "revert the database".
 
-## Production roadmap
+## Production status
 
-The operator now has the production-readiness foundations on `main`. The remaining work is mostly about API evolution and maintaining the stronger validation profile already in CI.
+The operator's safety model — serialized reconciliation, conflict detection, failure-aware retry, and transactional apply — is stable and well-tested. The API surface, scale ceiling, and operational guidance are not.
 
-### Implemented foundations
+### What's solid
 
-- Canonical database identity and ownership claims let the controller detect overlapping `PostgresPolicy` resources targeting the same database.
-- Conflicting policies are rejected instead of allowing last-writer-wins behavior.
-- Status records managed database identity, owned role/schema summaries, `lastAttemptedGeneration`, `lastSuccessfulReconcileTime`, and the last error message.
-- Reconciliation is serialized per database target:
-  - in-process locking prevents concurrent reconciles within one operator replica
-  - PostgreSQL advisory locking prevents concurrent reconciles across multiple replicas
-- Retry behavior is failure-aware:
-  - transient operational failures use exponential backoff with jitter
-  - invalid specs, conflicts, and unsafe role-drop workflows fall back to the normal reconcile interval
-  - lock contention keeps its own short retry path
-- The operator exposes:
-  - `/livez`
-  - `/readyz`
-- Metrics are exported via OpenTelemetry OTLP with the OpenTelemetry Collector as the intended Kubernetes sink.
-- Transition-based Kubernetes Events are emitted for notable policy state changes.
+**Reconciliation safety:**
 
-### Current validation profile
+- All changes execute in a single PostgreSQL transaction (all-or-nothing).
+- Reconciliation is serialized per database target: in-process locking within a replica, PostgreSQL advisory locking across replicas.
+- Conflicting policies (overlapping ownership claims) are rejected, not silently merged.
 
-CI covers:
+**Failure handling:**
 
-- multiple policies targeting the same database with conflicting ownership
-- multiple non-overlapping policies targeting the same database
-- shared-secret churn across multiple policies targeting the same database
-- invalid specs
-- missing secrets
-- insufficient database privileges
-- rotated secrets and connection recovery after secret repair
-- transition-based Kubernetes Event delivery for warning and recovery states
+- Transient operational failures use exponential backoff with jitter.
+- Invalid specs, conflicts, and unsafe role-drop workflows fall back to the normal reconcile interval without hot-looping.
+- Lock contention has its own short retry path.
 
-Default PR CI validates:
+**Observability:**
 
-- generated policies spanning 2 databases
-- 30 managed schemas total
-- 60 generated roles total
-- schema, table, and sequence privilege checks on both database targets
+- Status conditions (`Ready`, `Drifted`, `Degraded`, `Conflict`, `Paused`) with change summaries and error detail.
+- OTLP metrics export via OpenTelemetry Collector.
+- Transition-based Kubernetes Events for `kubectl describe` debugging.
+- `/livez` and `/readyz` health probes.
 
-Scheduled fairness/load coverage on `main` additionally exercises:
+### What's not there yet
 
-- 5 generated policies across 3 databases
-- 100 managed schemas total
-- 200 generated roles total
-- repeated shared-secret churn across 3 same-database policies
-- targeted secret churn on a separate database to verify isolation
-- latency reporting in the workflow summary for initial convergence and full churn completion
+**API stability:**
 
-### Remaining work
+- The CRD is `v1alpha1`. There is no conversion webhook, no migration tooling, and no documented upgrade path between versions.
+- Controller semantics that should be part of the API contract are currently implementation-only conventions.
 
-- Carry the current controller semantics into the next CRD revision rather than leaving them as implementation-only conventions.
-- Promote the API beyond `v1alpha1` only after the compatibility and upgrade story is explicit.
-- Keep the validation profile current as the manifest surface and operator behavior evolve.
+**Scale and HA:**
+
+- The largest tested workload is 200 roles / 100 schemas / 5 policies (scheduled CI only, not PR CI).
+- Advisory locks enable multi-replica deployment, but there is no documented HA pattern, replica guidance, or failure-mode analysis.
+
+**Password management test coverage:**
+
+- Password support shipped in v0.2.0, but several code paths lack test coverage: Secret resolution happy paths, end-to-end password lifecycle, and generate/export round-trip behavior with passwords.
+
+**Managed provider validation:**
+
+- RDS, Cloud SQL, AlloyDB, and Azure detection is implemented but not validated against live managed instances.
+
+**Deployment security:**
+
+- The operator requires a ClusterRole with Secret read access. There is no namespace-scoped deployment option or RBAC hardening guidance.
+
+**Deletion semantics:**
+
+- Deleting a `PostgresPolicy` stops reconciliation but does not revert the database. This is intentional ("stop managing" not "undo"), but diverges from GitOps conventions where deleting a resource reverts its effects.
+
+### CI validation coverage
+
+PR CI validates:
+
+- conflicting and non-overlapping same-database policies
+- shared-secret churn and recovery
+- invalid specs, missing secrets, insufficient privileges
+- Kubernetes Event delivery for warning and recovery transitions
+- generated policies spanning 2 databases, 30 schemas, 60 roles
+
+Scheduled coverage on `main` additionally exercises:
+
+- 5 policies across 3 databases, 100 schemas, 200 roles
+- repeated secret churn with latency reporting
+
+### Roadmap to API stability
+
+- Carry controller semantics into the CRD contract rather than leaving them as implementation conventions.
+- Promote beyond `v1alpha1` only after the upgrade and rollback story is explicit.
+- Fill password management test gaps before treating that feature as production-grade.
+- Establish a scale validation baseline that reflects real-world deployment sizes.
 
 ## Custom resource
 

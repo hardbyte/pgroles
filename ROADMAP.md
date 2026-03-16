@@ -7,7 +7,7 @@ pgroles is a declarative PostgreSQL access-control tool with two delivery paths:
 - a CLI for explicit, reviewed change workflows
 - a Kubernetes operator for continuous reconciliation
 
-The current focus is no longer basic controller viability. The core diff/apply model, safety checks, and operator production foundations are on `main`. The roadmap is now about tightening the declarative contract, evolving the API carefully, and broadening compatibility and validation.
+The core diff/apply model, safety checks, and operator reconciliation safety (serialized locking, conflict detection, failure-aware retry, transactional apply) are stable on `main`. The roadmap is now about API stability, scale validation, test coverage gaps (especially password management), and broadening compatibility — the work that separates "safe controller" from "production-grade platform".
 
 ## Current state
 
