@@ -15,6 +15,7 @@ use pgroles_cli::{
     validate_manifest,
 };
 use pgroles_core::diff::{ReconciliationMode, filter_changes};
+use pgroles_core::visual::{self, VisualSource};
 use pgroles_inspect::{InspectConfig, inspect_drop_role_safety};
 
 // ---------------------------------------------------------------------------
@@ -121,6 +122,70 @@ enum Commands {
         #[arg(short, long)]
         output: Option<PathBuf>,
     },
+
+    /// Visualize the role graph structure.
+    ///
+    /// Renders roles, memberships, grants, and default privileges as a graph
+    /// in various output formats.
+    Graph {
+        #[command(subcommand)]
+        source: GraphSource,
+    },
+}
+
+#[derive(Subcommand)]
+enum GraphSource {
+    /// Build the graph from a manifest file (desired state).
+    Desired {
+        /// Path to the policy manifest YAML file.
+        #[arg(short, long, default_value = "pgroles.yaml")]
+        file: PathBuf,
+
+        /// Output format.
+        #[arg(long, default_value = "tree")]
+        format: GraphFormat,
+
+        /// Write output to this file instead of stdout.
+        #[arg(short, long)]
+        output: Option<PathBuf>,
+    },
+
+    /// Build the graph from a live database (current state).
+    Current {
+        /// Path to the policy manifest YAML file (required when --scope=managed).
+        #[arg(short, long)]
+        file: Option<PathBuf>,
+
+        /// PostgreSQL connection string (or set DATABASE_URL).
+        #[arg(long, env = "DATABASE_URL")]
+        database_url: String,
+
+        /// Which roles to include: "managed" (requires -f) or "all".
+        #[arg(long, default_value = "managed")]
+        scope: GraphScope,
+
+        /// Output format.
+        #[arg(long, default_value = "tree")]
+        format: GraphFormat,
+
+        /// Write output to this file instead of stdout.
+        #[arg(short, long)]
+        output: Option<PathBuf>,
+    },
+}
+
+#[derive(Clone, Debug, clap::ValueEnum)]
+enum GraphFormat {
+    Tree,
+    Json,
+    Dot,
+    Mermaid,
+}
+
+#[derive(Clone, Debug, clap::ValueEnum)]
+enum GraphScope {
+    Managed,
+    All,
 }
 
 #[derive(Clone, Debug, clap::ValueEnum)]
@@ -220,6 +285,33 @@ async fn run(cli: Cli) -> Result<ExitCode> {
             cmd_generate(&database_url, output.as_deref()).await?;
             Ok(ExitCode::SUCCESS)
         }
+        Commands::Graph { source } => match source {
+            GraphSource::Desired {
+                file,
+                format,
+                output,
+            } => {
+                cmd_graph_desired(&file, &format, output.as_deref())?;
+                Ok(ExitCode::SUCCESS)
+            }
+            GraphSource::Current {
+                file,
+                database_url,
+                scope,
+                format,
+                output,
+            } => {
+                cmd_graph_current(
+                    file.as_deref(),
+                    &database_url,
+                    &scope,
+                    &format,
+                    output.as_deref(),
+                )
+                .await?;
+                Ok(ExitCode::SUCCESS)
+            }
+        },
     }
 }
 
@@ -442,6 +534,77 @@ async fn cmd_generate(database_url: &str, output: Option<&Path>) -> Result<()> {
         None => print!("{yaml}"),
     }
 
+    Ok(())
+}
+
+fn cmd_graph_desired(file: &Path, format: &GraphFormat, output: Option<&Path>) -> Result<()> {
+    let yaml = read_manifest_file(file)?;
+    let validated = validate_manifest(&yaml)?;
+
+    let visual = visual::build_visual_graph(&validated.desired, VisualSource::Desired);
+    let rendered = render_graph(&visual, format);
+    write_output(&rendered, output)
+}
+
+async fn cmd_graph_current(
+    file: Option<&Path>,
+    database_url: &str,
+    scope: &GraphScope,
+    format: &GraphFormat,
+    output: Option<&Path>,
+) -> Result<()> {
+    // Validate file requirement before connecting to the database.
+    if matches!(scope, GraphScope::Managed) && file.is_none() {
+        anyhow::bail!(
+            "--file is required when --scope=managed (to determine which roles are managed)"
+        );
+    }
+
+    let pool = connect_db(database_url).await?;
+
+    let graph = match scope {
+        GraphScope::Managed => {
+            let file = file.expect("validated above");
+            let yaml = read_manifest_file(file)?;
+            let validated = validate_manifest(&yaml)?;
+            inspect_current(&pool, &validated).await?
+        }
+        GraphScope::All => {
+            info!("introspecting all non-system roles");
+            pgroles_inspect::inspect_all(
+                &pool,
+                &pgroles_inspect::InspectAllConfig {
+                    exclude_system_roles: true,
+                },
+            )
+            .await
+            .context("failed to introspect database")?
+        }
+    };
+
+    let visual = visual::build_visual_graph(&graph, VisualSource::Current);
+    let rendered = render_graph(&visual, format);
+    write_output(&rendered, output)
+}
+
+fn render_graph(visual: &visual::VisualGraph, format: &GraphFormat) -> String {
+    match format {
+        GraphFormat::Tree => visual::render_tree(visual),
+        GraphFormat::Json => visual::render_json(visual),
+        GraphFormat::Dot => visual::render_dot(visual),
+        GraphFormat::Mermaid => visual::render_mermaid(visual),
+    }
+}
+
+fn write_output(content: &str, output: Option<&Path>) -> Result<()> {
+    match output {
+        Some(path) => {
+            std::fs::write(path, content)
+                .with_context(|| format!("failed to write output to {}", path.display()))?;
+            info!(path = %path.display(), "output written");
+        }
+        None => print!("{content}"),
+    }
     Ok(())
 }
 
