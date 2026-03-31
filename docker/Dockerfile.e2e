@@ -1,6 +1,0 @@
-FROM ubuntu:24.04
-
-COPY pgroles-operator-e2e /usr/local/bin/pgroles-operator
-
-USER 65534
-ENTRYPOINT ["pgroles-operator"]

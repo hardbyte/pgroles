@@ -20,10 +20,11 @@ rules:
   - apiGroups: ["pgroles.io"]
     resources: ["postgrespolicies/finalizers"]
     verbs: ["update"]
-  # Read Secrets for database connection strings
+  # Read Secrets for database connection strings and password references;
+  # create/update Secrets for operator-generated passwords.
   - apiGroups: [""]
     resources: ["secrets"]
-    verbs: ["get", "list", "watch"]
+    verbs: ["get", "list", "watch", "create", "update", "patch"]
   # Emit events for kubectl describe / operational debugging
   - apiGroups: ["events.k8s.io"]
     resources: ["events"]

@@ -116,6 +116,9 @@ pub enum ReconcileError {
     #[error("invalid interval \"{0}\": {1}")]
     InvalidInterval(String, String),
 
+    #[error("invalid spec: {0}")]
+    InvalidSpec(String),
+
     #[error("{0}")]
     ConflictingPolicy(String),
 
@@ -128,6 +131,15 @@ pub enum ReconcileError {
         secret: String,
         key: String,
     },
+
+    #[error("password generation error: {0}")]
+    PasswordGeneration(#[from] Box<crate::password::PasswordError>),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ResolvedPassword {
+    cleartext: String,
+    source_version: String,
 }
 
 /// Parse a duration string like "5m", "1h", "30s", "2h30m".
@@ -322,9 +334,11 @@ fn retry_class_for_reconcile_error(error: &ReconcileError) -> RetryClass {
         ReconcileError::LockContention(_, _) => RetryClass::LockContention,
         ReconcileError::ManifestExpansion(_)
         | ReconcileError::InvalidInterval(_, _)
+        | ReconcileError::InvalidSpec(_)
         | ReconcileError::ConflictingPolicy(_)
         | ReconcileError::UnsafeRoleDrops(_)
         | ReconcileError::EmptyPasswordSecret { .. }
+        | ReconcileError::PasswordGeneration(_)
         | ReconcileError::NoNamespace => RetryClass::Slow,
         ReconcileError::Context(context) => match context.as_ref() {
             ContextError::SecretMissing { .. } => RetryClass::Slow,
@@ -526,6 +540,9 @@ async fn reconcile_apply_inner(
     })
     .await?;
 
+    spec.validate_password_specs(&name)
+        .map_err(|err| ReconcileError::InvalidSpec(err.to_string()))?;
+
     let ownership = spec.ownership_claims()?;
     update_status(ctx, resource, |status| {
         status.managed_database_identity = Some(identity.as_str().to_string());
@@ -664,8 +681,10 @@ async fn apply_under_lock(
     );
 
     let resolved_passwords = resolve_passwords_from_secrets(ctx, resource, namespace).await?;
-    if !resolved_passwords.is_empty() {
-        changes = pgroles_core::diff::inject_password_changes(changes, &resolved_passwords);
+    let (password_changes, applied_password_source_versions) =
+        select_password_changes(&changes, &resolved_passwords, resource.status.as_ref());
+    if !password_changes.is_empty() {
+        changes = pgroles_core::diff::inject_password_changes(changes, &password_changes);
     }
     let dropped_roles: Vec<String> = changes
         .iter()
@@ -802,6 +821,7 @@ async fn apply_under_lock(
         status.planned_sql = None;
         status.planned_sql_truncated = false;
         status.last_error = None;
+        status.applied_password_source_versions = applied_password_source_versions;
         status.transient_failure_count = 0;
     })
     .await?;
@@ -812,17 +832,24 @@ async fn apply_under_lock(
     ))
 }
 
-/// Resolve role passwords from Kubernetes Secrets referenced in the CRD spec.
+/// Resolve role passwords from Kubernetes Secrets or generate them.
 ///
-/// For each role that declares a `password` with a `PasswordSecretRef`, fetches
-/// the password value from the referenced Secret. Returns a map of
-/// role name → password string suitable for [`pgroles_core::diff::inject_password_changes`].
+/// For each role that declares a `password`:
+/// - `PasswordSpec::SecretRef`: fetches the password from the referenced Secret.
+/// - `PasswordSpec::Generate`: ensures a generated Secret exists (creating one
+///   if needed) and reads the password from it.
+///
+/// Returns a map of role name → cleartext password string suitable for
+/// [`pgroles_core::diff::inject_password_changes`] (which computes the
+/// SCRAM-SHA-256 verifier before creating `SetPassword` changes).
 async fn resolve_passwords_from_secrets(
     ctx: &OperatorContext,
     resource: &PostgresPolicy,
     namespace: &str,
-) -> Result<std::collections::BTreeMap<String, String>, ReconcileError> {
+) -> Result<std::collections::BTreeMap<String, ResolvedPassword>, ReconcileError> {
     use k8s_openapi::api::core::v1::Secret;
+
+    let mut resolved = std::collections::BTreeMap::new();
 
     // Cache fetched Secrets by name to avoid duplicate API calls when
     // multiple roles reference different keys in the same Secret.
@@ -831,9 +858,12 @@ async fn resolve_passwords_from_secrets(
 
     let secrets_api: kube::Api<Secret> = kube::Api::namespaced(ctx.kube_client.clone(), namespace);
 
+    // First pass: fetch all referenced Secrets for secretRef roles.
     for role_spec in &resource.spec.roles {
-        if let Some(password_ref) = &role_spec.password {
-            let secret_name = &password_ref.secret_ref.name;
+        if let Some(pw) = &role_spec.password
+            && let Some(secret_ref) = &pw.secret_ref
+        {
+            let secret_name = &secret_ref.name;
             if !secret_cache.contains_key(secret_name.as_str()) {
                 let fetched = secrets_api.get(secret_name).await.map_err(|err| {
                     Box::new(crate::context::ContextError::SecretFetch {
@@ -847,64 +877,151 @@ async fn resolve_passwords_from_secrets(
         }
     }
 
-    resolve_passwords_from_cached_secrets(resource, &secret_cache)
-}
-
-fn resolve_passwords_from_cached_secrets(
-    resource: &PostgresPolicy,
-    secret_cache: &std::collections::BTreeMap<String, k8s_openapi::api::core::v1::Secret>,
-) -> Result<std::collections::BTreeMap<String, String>, ReconcileError> {
-    let mut resolved = std::collections::BTreeMap::new();
-
+    // Second pass: resolve passwords from cache (secretRef) or generate.
     for role_spec in &resource.spec.roles {
-        if let Some(password_ref) = &role_spec.password {
-            let secret_name = &password_ref.secret_ref.name;
-            let secret_key = password_ref
-                .secret_key
-                .as_deref()
-                .unwrap_or(&role_spec.name);
-
-            let secret = secret_cache.get(secret_name.as_str()).ok_or_else(|| {
-                Box::new(crate::context::ContextError::SecretMissing {
-                    name: secret_name.clone(),
-                    key: secret_key.to_string(),
-                })
-            })?;
-
-            let data = secret.data.as_ref().ok_or_else(|| {
-                Box::new(crate::context::ContextError::SecretMissing {
-                    name: secret_name.clone(),
-                    key: secret_key.to_string(),
-                })
-            })?;
-
-            let value_bytes = data.get(secret_key).ok_or_else(|| {
-                Box::new(crate::context::ContextError::SecretMissing {
-                    name: secret_name.clone(),
-                    key: secret_key.to_string(),
-                })
-            })?;
-
-            let password = String::from_utf8(value_bytes.0.clone()).map_err(|_| {
-                Box::new(crate::context::ContextError::SecretMissing {
-                    name: secret_name.clone(),
-                    key: secret_key.to_string(),
-                })
-            })?;
-
-            if password.is_empty() {
-                return Err(ReconcileError::EmptyPasswordSecret {
-                    role: role_spec.name.clone(),
-                    secret: secret_name.clone(),
-                    key: secret_key.to_string(),
-                });
+        if let Some(pw) = &role_spec.password {
+            if let Some(gen_spec) = &pw.generate {
+                // Generate mode — ensure a Secret exists with a generated password.
+                let password = crate::password::ensure_generated_secret(
+                    ctx.kube_client.clone(),
+                    namespace,
+                    resource,
+                    &role_spec.name,
+                    gen_spec,
+                )
+                .await
+                .map_err(Box::new)?;
+                resolved.insert(
+                    role_spec.name.clone(),
+                    ResolvedPassword {
+                        cleartext: password.password,
+                        source_version: password.source_version,
+                    },
+                );
+            } else if pw.secret_ref.is_some() {
+                // SecretRef mode — read from an existing Secret.
+                let password = resolve_password_from_cache(&role_spec.name, pw, &secret_cache)?;
+                resolved.insert(role_spec.name.clone(), password);
             }
-
-            resolved.insert(role_spec.name.clone(), password);
         }
     }
 
     Ok(resolved)
+}
+
+/// Extract a password from a pre-fetched Secret cache for a `secretRef` role.
+fn resolve_password_from_cache(
+    role_name: &str,
+    password_spec: &crate::crd::PasswordSpec,
+    secret_cache: &std::collections::BTreeMap<String, k8s_openapi::api::core::v1::Secret>,
+) -> Result<ResolvedPassword, ReconcileError> {
+    let secret_ref = password_spec.secret_ref.as_ref().ok_or_else(|| {
+        Box::new(crate::context::ContextError::SecretMissing {
+            name: "(no secretRef)".to_string(),
+            key: role_name.to_string(),
+        })
+    })?;
+    let secret_name = &secret_ref.name;
+    let secret_key = password_spec.secret_key.as_deref().unwrap_or(role_name);
+
+    let secret = secret_cache.get(secret_name.as_str()).ok_or_else(|| {
+        Box::new(crate::context::ContextError::SecretMissing {
+            name: secret_name.clone(),
+            key: secret_key.to_string(),
+        })
+    })?;
+
+    let data = secret.data.as_ref().ok_or_else(|| {
+        Box::new(crate::context::ContextError::SecretMissing {
+            name: secret_name.clone(),
+            key: secret_key.to_string(),
+        })
+    })?;
+
+    let value_bytes = data.get(secret_key).ok_or_else(|| {
+        Box::new(crate::context::ContextError::SecretMissing {
+            name: secret_name.clone(),
+            key: secret_key.to_string(),
+        })
+    })?;
+
+    let password = String::from_utf8(value_bytes.0.clone()).map_err(|_| {
+        Box::new(crate::context::ContextError::SecretMissing {
+            name: secret_name.clone(),
+            key: secret_key.to_string(),
+        })
+    })?;
+
+    if password.is_empty() {
+        return Err(ReconcileError::EmptyPasswordSecret {
+            role: role_name.to_string(),
+            secret: secret_name.clone(),
+            key: secret_key.to_string(),
+        });
+    }
+
+    let resource_version = secret
+        .metadata
+        .resource_version
+        .as_deref()
+        .unwrap_or("unknown");
+    Ok(ResolvedPassword {
+        cleartext: password,
+        source_version: format!("{secret_name}:{secret_key}:{resource_version}"),
+    })
+}
+
+/// Resolve passwords from a pre-populated cache (for unit testing without K8s).
+#[cfg(test)]
+fn resolve_passwords_from_cached_secrets(
+    resource: &PostgresPolicy,
+    secret_cache: &std::collections::BTreeMap<String, k8s_openapi::api::core::v1::Secret>,
+) -> Result<std::collections::BTreeMap<String, ResolvedPassword>, ReconcileError> {
+    let mut resolved = std::collections::BTreeMap::new();
+    for role_spec in &resource.spec.roles {
+        if let Some(pw) = &role_spec.password
+            && pw.secret_ref.is_some()
+        {
+            let password = resolve_password_from_cache(&role_spec.name, pw, secret_cache)?;
+            resolved.insert(role_spec.name.clone(), password);
+        }
+    }
+    Ok(resolved)
+}
+
+fn select_password_changes(
+    changes: &[pgroles_core::diff::Change],
+    resolved_passwords: &std::collections::BTreeMap<String, ResolvedPassword>,
+    status: Option<&PostgresPolicyStatus>,
+) -> (
+    std::collections::BTreeMap<String, String>,
+    std::collections::BTreeMap<String, String>,
+) {
+    let created_roles: std::collections::BTreeSet<&str> = changes
+        .iter()
+        .filter_map(|change| match change {
+            pgroles_core::diff::Change::CreateRole { name, .. } => Some(name.as_str()),
+            _ => None,
+        })
+        .collect();
+    let previous_versions = status
+        .map(|status| &status.applied_password_source_versions)
+        .cloned()
+        .unwrap_or_default();
+
+    let mut password_changes = std::collections::BTreeMap::new();
+    let mut current_versions = std::collections::BTreeMap::new();
+
+    for (role, resolved) in resolved_passwords {
+        current_versions.insert(role.clone(), resolved.source_version.clone());
+        if created_roles.contains(role.as_str())
+            || previous_versions.get(role) != Some(&resolved.source_version)
+        {
+            password_changes.insert(role.clone(), resolved.cleartext.clone());
+        }
+    }
+
+    (password_changes, current_versions)
 }
 
 /// Cleanup on deletion — evict cached pool.
@@ -1111,6 +1228,16 @@ fn detect_policy_conflict_in_list(
             continue;
         }
 
+        if let Err(error) = other.spec.validate_password_specs(&other_name) {
+            tracing::warn!(
+                policy = %format!("{other_ns}/{other_name}"),
+                database = %identity.as_str(),
+                %error,
+                "skipping conflict detection for invalid peer policy"
+            );
+            continue;
+        }
+
         let other_ownership = match other.spec.ownership_claims() {
             Ok(claims) => claims,
             Err(error) => {
@@ -1143,9 +1270,9 @@ fn detect_policy_conflict_in_list(
 impl ReconcileError {
     fn reason(&self) -> &'static str {
         match self {
-            ReconcileError::ManifestExpansion(_) | ReconcileError::InvalidInterval(_, _) => {
-                "InvalidSpec"
-            }
+            ReconcileError::ManifestExpansion(_)
+            | ReconcileError::InvalidInterval(_, _)
+            | ReconcileError::InvalidSpec(_) => "InvalidSpec",
             ReconcileError::ConflictingPolicy(_) => "ConflictingPolicy",
             ReconcileError::LockContention(_, _) => "LockContention",
             ReconcileError::Context(context) => match context.as_ref() {
@@ -1169,6 +1296,7 @@ impl ReconcileError {
             }
             ReconcileError::UnsafeRoleDrops(_) => "UnsafeRoleDrops",
             ReconcileError::EmptyPasswordSecret { .. } => "InvalidSpec",
+            ReconcileError::PasswordGeneration(_) => "SecretFetchFailed",
             ReconcileError::Kube(_) => "KubernetesApiError",
             ReconcileError::NoNamespace => "InvalidResource",
         }
@@ -1183,7 +1311,7 @@ impl ReconcileError {
 mod tests {
     use super::*;
     use crate::crd::{
-        ConnectionSpec, CrdReconciliationMode, PasswordSecretRef, PolicyMode, PostgresPolicySpec,
+        ConnectionSpec, CrdReconciliationMode, PasswordSpec, PolicyMode, PostgresPolicySpec,
         RoleSpec, SecretReference,
     };
     use k8s_openapi::{
@@ -1377,11 +1505,12 @@ mod tests {
                         bypassrls: None,
                         connection_limit: None,
                         comment: None,
-                        password: Some(PasswordSecretRef {
-                            secret_ref: SecretReference {
+                        password: Some(PasswordSpec {
+                            secret_ref: Some(SecretReference {
                                 name: "role-passwords".to_string(),
-                            },
+                            }),
                             secret_key: None,
+                            generate: None,
                         }),
                         password_valid_until: None,
                     },
@@ -1396,11 +1525,12 @@ mod tests {
                         bypassrls: None,
                         connection_limit: None,
                         comment: None,
-                        password: Some(PasswordSecretRef {
-                            secret_ref: SecretReference {
+                        password: Some(PasswordSpec {
+                            secret_ref: Some(SecretReference {
                                 name: "role-passwords".to_string(),
-                            },
+                            }),
                             secret_key: Some("reporter-password".to_string()),
+                            generate: None,
                         }),
                         password_valid_until: None,
                     },
@@ -1414,9 +1544,18 @@ mod tests {
     }
 
     fn secret_with_keys(name: &str, entries: &[(&str, &str)]) -> Secret {
+        secret_with_keys_and_version(name, "1", entries)
+    }
+
+    fn secret_with_keys_and_version(
+        name: &str,
+        resource_version: &str,
+        entries: &[(&str, &str)],
+    ) -> Secret {
         Secret {
             metadata: ObjectMeta {
                 name: Some(name.to_string()),
+                resource_version: Some(resource_version.to_string()),
                 ..Default::default()
             },
             data: Some(
@@ -1690,6 +1829,12 @@ mod tests {
     #[test]
     fn error_reason_invalid_spec_for_invalid_interval() {
         let err = ReconcileError::InvalidInterval("5x".into(), "unknown unit 'x'".into());
+        assert_eq!(err.reason(), "InvalidSpec");
+    }
+
+    #[test]
+    fn error_reason_invalid_spec_for_password_validation() {
+        let err = ReconcileError::InvalidSpec("role password must set exactly one mode".into());
         assert_eq!(err.reason(), "InvalidSpec");
     }
 
@@ -2092,9 +2237,16 @@ mod tests {
         let resolved =
             resolve_passwords_from_cached_secrets(&resource, &cache).expect("should resolve");
 
-        assert_eq!(resolved.get("app").map(String::as_str), Some("app-secret"));
         assert_eq!(
-            resolved.get("reporter").map(String::as_str),
+            resolved
+                .get("app")
+                .map(|password| password.cleartext.as_str()),
+            Some("app-secret")
+        );
+        assert_eq!(
+            resolved
+                .get("reporter")
+                .map(|password| password.cleartext.as_str()),
             Some("reporter-secret")
         );
     }
@@ -2152,10 +2304,104 @@ mod tests {
         let resolved =
             resolve_passwords_from_cached_secrets(&resource, &cache).expect("should resolve");
 
-        assert_eq!(resolved.get("app").map(String::as_str), Some("   "));
         assert_eq!(
-            resolved.get("reporter").map(String::as_str),
+            resolved
+                .get("app")
+                .map(|password| password.cleartext.as_str()),
+            Some("   ")
+        );
+        assert_eq!(
+            resolved
+                .get("reporter")
+                .map(|password| password.cleartext.as_str()),
             Some("\tsecret")
+        );
+    }
+
+    #[test]
+    fn select_password_changes_skips_unchanged_password_sources() {
+        let resolved = BTreeMap::from([(
+            "app".to_string(),
+            ResolvedPassword {
+                cleartext: "app-secret".to_string(),
+                source_version: "role-passwords:app:7".to_string(),
+            },
+        )]);
+        let status = PostgresPolicyStatus {
+            applied_password_source_versions: BTreeMap::from([(
+                "app".to_string(),
+                "role-passwords:app:7".to_string(),
+            )]),
+            ..Default::default()
+        };
+
+        let (password_changes, current_versions) =
+            select_password_changes(&[], &resolved, Some(&status));
+
+        assert!(password_changes.is_empty());
+        assert_eq!(
+            current_versions.get("app").map(String::as_str),
+            Some("role-passwords:app:7")
+        );
+    }
+
+    #[test]
+    fn select_password_changes_applies_on_source_version_change() {
+        let resolved = BTreeMap::from([(
+            "app".to_string(),
+            ResolvedPassword {
+                cleartext: "new-secret".to_string(),
+                source_version: "role-passwords:app:8".to_string(),
+            },
+        )]);
+        let status = PostgresPolicyStatus {
+            applied_password_source_versions: BTreeMap::from([(
+                "app".to_string(),
+                "role-passwords:app:7".to_string(),
+            )]),
+            ..Default::default()
+        };
+
+        let (password_changes, _) = select_password_changes(&[], &resolved, Some(&status));
+
+        assert_eq!(
+            password_changes.get("app").map(String::as_str),
+            Some("new-secret")
+        );
+    }
+
+    #[test]
+    fn select_password_changes_applies_for_newly_created_role() {
+        use pgroles_core::diff::Change;
+        use pgroles_core::model::RoleState;
+
+        let resolved = BTreeMap::from([(
+            "app".to_string(),
+            ResolvedPassword {
+                cleartext: "new-secret".to_string(),
+                source_version: "role-passwords:app:7".to_string(),
+            },
+        )]);
+        let status = PostgresPolicyStatus {
+            applied_password_source_versions: BTreeMap::from([(
+                "app".to_string(),
+                "role-passwords:app:7".to_string(),
+            )]),
+            ..Default::default()
+        };
+        let changes = vec![Change::CreateRole {
+            name: "app".to_string(),
+            state: RoleState {
+                login: true,
+                ..RoleState::default()
+            },
+        }];
+
+        let (password_changes, _) = select_password_changes(&changes, &resolved, Some(&status));
+
+        assert_eq!(
+            password_changes.get("app").map(String::as_str),
+            Some("new-secret")
         );
     }
 

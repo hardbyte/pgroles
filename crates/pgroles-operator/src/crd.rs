@@ -7,7 +7,7 @@
 use kube::CustomResource;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use pgroles_core::manifest::{
     DefaultPrivilege, Grant, Membership, ObjectType, Privilege, RoleRetirement, SchemaBinding,
@@ -214,23 +214,123 @@ pub struct RoleSpec {
     pub connection_limit: Option<i32>,
     #[serde(default)]
     pub comment: Option<String>,
-    /// Password source for this role. References a Kubernetes Secret key.
+    /// Password source for this role. Either a reference to an existing Secret
+    /// or a request for the operator to generate one.
     #[serde(default)]
-    pub password: Option<PasswordSecretRef>,
+    pub password: Option<PasswordSpec>,
     /// Password expiration timestamp (ISO 8601, e.g. "2025-12-31T00:00:00Z").
     #[serde(default)]
     pub password_valid_until: Option<String>,
 }
 
-/// Reference to a Kubernetes Secret key containing a role password.
+/// Password configuration: either reference an existing Secret or have the
+/// operator generate a password and create a Secret.
+///
+/// Exactly one of `secretRef` or `generate` must be set.
+///
+/// ```yaml
+/// # Read from existing Secret:
+/// password:
+///   secretRef: { name: role-passwords }
+///   secretKey: password-user
+///
+/// # Operator generates and manages a Secret:
+/// password:
+///   generate:
+///     length: 48
+/// ```
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
-pub struct PasswordSecretRef {
-    /// Reference to the Kubernetes Secret containing the password.
-    pub secret_ref: SecretReference,
-    /// Key within the Secret. Defaults to the role name.
+pub struct PasswordSpec {
+    /// Reference to an existing Kubernetes Secret containing the password.
+    /// Mutually exclusive with `generate`.
+    #[serde(default)]
+    pub secret_ref: Option<SecretReference>,
+    /// Key within the referenced Secret. Defaults to the role name.
+    /// Only used with `secretRef`.
     #[serde(default)]
     pub secret_key: Option<String>,
+    /// Generate a random password and store it in a new Kubernetes Secret.
+    /// Mutually exclusive with `secretRef`.
+    #[serde(default)]
+    pub generate: Option<GeneratePasswordSpec>,
+}
+
+/// Backward-compatible alias used internally in tests and reconciler.
+pub type PasswordSecretRef = PasswordSpec;
+
+impl PasswordSpec {
+    /// Returns true if this is a reference to an existing Secret.
+    pub fn is_secret_ref(&self) -> bool {
+        self.secret_ref.is_some()
+    }
+
+    /// Returns true if this is a request to generate a password.
+    pub fn is_generate(&self) -> bool {
+        self.generate.is_some()
+    }
+}
+
+/// Configuration for operator-generated passwords.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct GeneratePasswordSpec {
+    /// Password length. Defaults to 32. Minimum 16, maximum 128.
+    #[serde(default)]
+    pub length: Option<u32>,
+    /// Override the generated Secret name. Defaults to `{policy}-pgr-{role}`.
+    #[serde(default)]
+    pub secret_name: Option<String>,
+    /// Key within the generated Secret. Defaults to `password`.
+    #[serde(default)]
+    pub secret_key: Option<String>,
+}
+
+#[derive(Debug, Clone, thiserror::Error)]
+pub enum PasswordValidationError {
+    #[error("role \"{role}\" has a password but login is not enabled")]
+    PasswordWithoutLogin { role: String },
+
+    #[error("role \"{role}\" password must set exactly one of secretRef or generate")]
+    InvalidPasswordMode { role: String },
+
+    #[error("role \"{role}\" password.generate.length must be between {min} and {max}")]
+    InvalidGeneratedLength { role: String, min: u32, max: u32 },
+
+    #[error(
+        "role \"{role}\" password.generate.secretName \"{name}\" is not a valid Kubernetes Secret name"
+    )]
+    InvalidGeneratedSecretName { role: String, name: String },
+
+    #[error("role \"{role}\" password {field} \"{key}\" is not a valid Kubernetes Secret data key")]
+    InvalidSecretKey {
+        role: String,
+        field: &'static str,
+        key: String,
+    },
+}
+
+fn is_valid_secret_name(name: &str) -> bool {
+    if name.is_empty() || name.len() > crate::password::MAX_SECRET_NAME_LENGTH {
+        return false;
+    }
+    let bytes = name.as_bytes();
+    if !bytes[0].is_ascii_lowercase() && !bytes[0].is_ascii_digit() {
+        return false;
+    }
+    if !bytes[bytes.len() - 1].is_ascii_lowercase() && !bytes[bytes.len() - 1].is_ascii_digit() {
+        return false;
+    }
+    bytes
+        .iter()
+        .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || *b == b'-' || *b == b'.')
+}
+
+fn is_valid_secret_key(key: &str) -> bool {
+    !key.is_empty()
+        && key
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
 }
 
 // ---------------------------------------------------------------------------
@@ -291,6 +391,10 @@ pub struct PostgresPolicyStatus {
     /// Last reconcile error message, if any.
     #[serde(default)]
     pub last_error: Option<String>,
+
+    /// Last applied password source version for each password-managed role.
+    #[serde(default)]
+    pub applied_password_source_versions: BTreeMap<String, String>,
 
     /// Consecutive transient operational failures used for exponential backoff.
     #[serde(default)]
@@ -377,6 +481,103 @@ impl OwnershipClaims {
         }
 
         parts.join("; ")
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Secret name helpers
+// ---------------------------------------------------------------------------
+
+impl PostgresPolicySpec {
+    pub fn validate_password_specs(
+        &self,
+        policy_name: &str,
+    ) -> Result<(), PasswordValidationError> {
+        for role in &self.roles {
+            let Some(password) = &role.password else {
+                continue;
+            };
+
+            if role.login != Some(true) {
+                return Err(PasswordValidationError::PasswordWithoutLogin {
+                    role: role.name.clone(),
+                });
+            }
+
+            match (&password.secret_ref, &password.generate) {
+                (Some(_), None) => {
+                    let secret_key = password.secret_key.as_deref().unwrap_or(&role.name);
+                    if !is_valid_secret_key(secret_key) {
+                        return Err(PasswordValidationError::InvalidSecretKey {
+                            role: role.name.clone(),
+                            field: "secretKey",
+                            key: secret_key.to_string(),
+                        });
+                    }
+                }
+                (None, Some(generate)) => {
+                    if let Some(length) = generate.length
+                        && !(crate::password::MIN_PASSWORD_LENGTH
+                            ..=crate::password::MAX_PASSWORD_LENGTH)
+                            .contains(&length)
+                    {
+                        return Err(PasswordValidationError::InvalidGeneratedLength {
+                            role: role.name.clone(),
+                            min: crate::password::MIN_PASSWORD_LENGTH,
+                            max: crate::password::MAX_PASSWORD_LENGTH,
+                        });
+                    }
+
+                    let secret_name =
+                        crate::password::generated_secret_name(policy_name, &role.name, generate);
+                    if !is_valid_secret_name(&secret_name) {
+                        return Err(PasswordValidationError::InvalidGeneratedSecretName {
+                            role: role.name.clone(),
+                            name: secret_name,
+                        });
+                    }
+
+                    let secret_key = crate::password::generated_secret_key(generate);
+                    if !is_valid_secret_key(&secret_key) {
+                        return Err(PasswordValidationError::InvalidSecretKey {
+                            role: role.name.clone(),
+                            field: "generate.secretKey",
+                            key: secret_key,
+                        });
+                    }
+                }
+                _ => {
+                    return Err(PasswordValidationError::InvalidPasswordMode {
+                        role: role.name.clone(),
+                    });
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// All Kubernetes Secret names referenced by this spec.
+    ///
+    /// Includes the connection Secret, password `secretRef` Secrets, and
+    /// generated password Secrets. Used by the controller to trigger
+    /// reconciliation when any of these Secrets change (or are deleted).
+    pub fn referenced_secret_names(&self, policy_name: &str) -> BTreeSet<String> {
+        let mut names = BTreeSet::new();
+        names.insert(self.connection.secret_ref.name.clone());
+        for role in &self.roles {
+            if let Some(pw) = &role.password {
+                if let Some(secret_ref) = &pw.secret_ref {
+                    names.insert(secret_ref.name.clone());
+                }
+                if let Some(gen_spec) = &pw.generate {
+                    let secret_name =
+                        crate::password::generated_secret_name(policy_name, &role.name, gen_spec);
+                    names.insert(secret_name);
+                }
+            }
+        }
+        names
     }
 }
 
@@ -968,6 +1169,7 @@ mod tests {
         assert!(status.owned_roles.is_empty());
         assert!(status.owned_schemas.is_empty());
         assert!(status.last_error.is_none());
+        assert!(status.applied_password_source_versions.is_empty());
     }
 
     #[test]
@@ -1282,5 +1484,378 @@ retirements:
         assert_eq!(spec.retirements.len(), 1);
         assert_eq!(spec.retirements[0].role, "legacy-app");
         assert!(spec.retirements[0].terminate_sessions);
+    }
+
+    #[test]
+    fn referenced_secret_names_includes_connection_secret() {
+        let spec = PostgresPolicySpec {
+            connection: ConnectionSpec {
+                secret_ref: SecretReference {
+                    name: "pg-conn".to_string(),
+                },
+                secret_key: "DATABASE_URL".to_string(),
+            },
+            interval: "5m".to_string(),
+            suspend: false,
+            mode: PolicyMode::Apply,
+            reconciliation_mode: CrdReconciliationMode::default(),
+            default_owner: None,
+            profiles: std::collections::HashMap::new(),
+            schemas: vec![],
+            roles: vec![],
+            grants: vec![],
+            default_privileges: vec![],
+            memberships: vec![],
+            retirements: vec![],
+        };
+
+        let names = spec.referenced_secret_names("test-policy");
+        assert!(names.contains("pg-conn"));
+        assert_eq!(names.len(), 1);
+    }
+
+    #[test]
+    fn referenced_secret_names_includes_password_secrets() {
+        let spec = PostgresPolicySpec {
+            connection: ConnectionSpec {
+                secret_ref: SecretReference {
+                    name: "pg-conn".to_string(),
+                },
+                secret_key: "DATABASE_URL".to_string(),
+            },
+            interval: "5m".to_string(),
+            suspend: false,
+            mode: PolicyMode::Apply,
+            reconciliation_mode: CrdReconciliationMode::default(),
+            default_owner: None,
+            profiles: std::collections::HashMap::new(),
+            schemas: vec![],
+            roles: vec![
+                RoleSpec {
+                    name: "role-a".to_string(),
+                    login: Some(true),
+                    password: Some(PasswordSpec {
+                        secret_ref: Some(SecretReference {
+                            name: "role-passwords".to_string(),
+                        }),
+                        secret_key: Some("role-a".to_string()),
+                        generate: None,
+                    }),
+                    password_valid_until: None,
+                    superuser: None,
+                    createdb: None,
+                    createrole: None,
+                    inherit: None,
+                    replication: None,
+                    bypassrls: None,
+                    connection_limit: None,
+                    comment: None,
+                },
+                RoleSpec {
+                    name: "role-b".to_string(),
+                    login: Some(true),
+                    password: Some(PasswordSpec {
+                        secret_ref: Some(SecretReference {
+                            name: "other-secret".to_string(),
+                        }),
+                        secret_key: None,
+                        generate: None,
+                    }),
+                    password_valid_until: None,
+                    superuser: None,
+                    createdb: None,
+                    createrole: None,
+                    inherit: None,
+                    replication: None,
+                    bypassrls: None,
+                    connection_limit: None,
+                    comment: None,
+                },
+                RoleSpec {
+                    name: "role-c".to_string(),
+                    login: None,
+                    password: None,
+                    password_valid_until: None,
+                    superuser: None,
+                    createdb: None,
+                    createrole: None,
+                    inherit: None,
+                    replication: None,
+                    bypassrls: None,
+                    connection_limit: None,
+                    comment: None,
+                },
+            ],
+            grants: vec![],
+            default_privileges: vec![],
+            memberships: vec![],
+            retirements: vec![],
+        };
+
+        let names = spec.referenced_secret_names("test-policy");
+        assert!(
+            names.contains("pg-conn"),
+            "should include connection secret"
+        );
+        assert!(
+            names.contains("role-passwords"),
+            "should include role-a password secret"
+        );
+        assert!(
+            names.contains("other-secret"),
+            "should include role-b password secret"
+        );
+        assert_eq!(names.len(), 3);
+    }
+
+    #[test]
+    fn validate_password_specs_rejects_password_without_login() {
+        let spec = PostgresPolicySpec {
+            connection: ConnectionSpec {
+                secret_ref: SecretReference {
+                    name: "pg-conn".to_string(),
+                },
+                secret_key: "DATABASE_URL".to_string(),
+            },
+            interval: "5m".to_string(),
+            suspend: false,
+            mode: PolicyMode::Apply,
+            reconciliation_mode: CrdReconciliationMode::default(),
+            default_owner: None,
+            profiles: std::collections::HashMap::new(),
+            schemas: vec![],
+            roles: vec![RoleSpec {
+                name: "app-user".to_string(),
+                login: Some(false),
+                superuser: None,
+                createdb: None,
+                createrole: None,
+                inherit: None,
+                replication: None,
+                bypassrls: None,
+                connection_limit: None,
+                comment: None,
+                password: Some(PasswordSpec {
+                    secret_ref: Some(SecretReference {
+                        name: "role-passwords".to_string(),
+                    }),
+                    secret_key: None,
+                    generate: None,
+                }),
+                password_valid_until: None,
+            }],
+            grants: vec![],
+            default_privileges: vec![],
+            memberships: vec![],
+            retirements: vec![],
+        };
+
+        assert!(matches!(
+            spec.validate_password_specs("test-policy"),
+            Err(PasswordValidationError::PasswordWithoutLogin { ref role }) if role == "app-user"
+        ));
+    }
+
+    #[test]
+    fn validate_password_specs_rejects_invalid_password_mode() {
+        let spec = PostgresPolicySpec {
+            connection: ConnectionSpec {
+                secret_ref: SecretReference {
+                    name: "pg-conn".to_string(),
+                },
+                secret_key: "DATABASE_URL".to_string(),
+            },
+            interval: "5m".to_string(),
+            suspend: false,
+            mode: PolicyMode::Apply,
+            reconciliation_mode: CrdReconciliationMode::default(),
+            default_owner: None,
+            profiles: std::collections::HashMap::new(),
+            schemas: vec![],
+            roles: vec![RoleSpec {
+                name: "app-user".to_string(),
+                login: Some(true),
+                superuser: None,
+                createdb: None,
+                createrole: None,
+                inherit: None,
+                replication: None,
+                bypassrls: None,
+                connection_limit: None,
+                comment: None,
+                password: Some(PasswordSpec {
+                    secret_ref: Some(SecretReference {
+                        name: "role-passwords".to_string(),
+                    }),
+                    secret_key: None,
+                    generate: Some(GeneratePasswordSpec {
+                        length: Some(32),
+                        secret_name: None,
+                        secret_key: None,
+                    }),
+                }),
+                password_valid_until: None,
+            }],
+            grants: vec![],
+            default_privileges: vec![],
+            memberships: vec![],
+            retirements: vec![],
+        };
+
+        assert!(matches!(
+            spec.validate_password_specs("test-policy"),
+            Err(PasswordValidationError::InvalidPasswordMode { ref role }) if role == "app-user"
+        ));
+    }
+
+    #[test]
+    fn validate_password_specs_rejects_invalid_generated_length() {
+        let spec = PostgresPolicySpec {
+            connection: ConnectionSpec {
+                secret_ref: SecretReference {
+                    name: "pg-conn".to_string(),
+                },
+                secret_key: "DATABASE_URL".to_string(),
+            },
+            interval: "5m".to_string(),
+            suspend: false,
+            mode: PolicyMode::Apply,
+            reconciliation_mode: CrdReconciliationMode::default(),
+            default_owner: None,
+            profiles: std::collections::HashMap::new(),
+            schemas: vec![],
+            roles: vec![RoleSpec {
+                name: "app-user".to_string(),
+                login: Some(true),
+                superuser: None,
+                createdb: None,
+                createrole: None,
+                inherit: None,
+                replication: None,
+                bypassrls: None,
+                connection_limit: None,
+                comment: None,
+                password: Some(PasswordSpec {
+                    secret_ref: None,
+                    secret_key: None,
+                    generate: Some(GeneratePasswordSpec {
+                        length: Some(8),
+                        secret_name: None,
+                        secret_key: None,
+                    }),
+                }),
+                password_valid_until: None,
+            }],
+            grants: vec![],
+            default_privileges: vec![],
+            memberships: vec![],
+            retirements: vec![],
+        };
+
+        assert!(matches!(
+            spec.validate_password_specs("test-policy"),
+            Err(PasswordValidationError::InvalidGeneratedLength { ref role, .. }) if role == "app-user"
+        ));
+    }
+
+    #[test]
+    fn validate_password_specs_rejects_invalid_generated_secret_key() {
+        let spec = PostgresPolicySpec {
+            connection: ConnectionSpec {
+                secret_ref: SecretReference {
+                    name: "pg-conn".to_string(),
+                },
+                secret_key: "DATABASE_URL".to_string(),
+            },
+            interval: "5m".to_string(),
+            suspend: false,
+            mode: PolicyMode::Apply,
+            reconciliation_mode: CrdReconciliationMode::default(),
+            default_owner: None,
+            profiles: std::collections::HashMap::new(),
+            schemas: vec![],
+            roles: vec![RoleSpec {
+                name: "app-user".to_string(),
+                login: Some(true),
+                superuser: None,
+                createdb: None,
+                createrole: None,
+                inherit: None,
+                replication: None,
+                bypassrls: None,
+                connection_limit: None,
+                comment: None,
+                password: Some(PasswordSpec {
+                    secret_ref: None,
+                    secret_key: None,
+                    generate: Some(GeneratePasswordSpec {
+                        length: Some(32),
+                        secret_name: None,
+                        secret_key: Some("bad/key".to_string()),
+                    }),
+                }),
+                password_valid_until: None,
+            }],
+            grants: vec![],
+            default_privileges: vec![],
+            memberships: vec![],
+            retirements: vec![],
+        };
+
+        assert!(matches!(
+            spec.validate_password_specs("test-policy"),
+            Err(PasswordValidationError::InvalidSecretKey { ref role, field, .. })
+                if role == "app-user" && field == "generate.secretKey"
+        ));
+    }
+
+    #[test]
+    fn validate_password_specs_rejects_invalid_generated_secret_name() {
+        let spec = PostgresPolicySpec {
+            connection: ConnectionSpec {
+                secret_ref: SecretReference {
+                    name: "pg-conn".to_string(),
+                },
+                secret_key: "DATABASE_URL".to_string(),
+            },
+            interval: "5m".to_string(),
+            suspend: false,
+            mode: PolicyMode::Apply,
+            reconciliation_mode: CrdReconciliationMode::default(),
+            default_owner: None,
+            profiles: std::collections::HashMap::new(),
+            schemas: vec![],
+            roles: vec![RoleSpec {
+                name: "app-user".to_string(),
+                login: Some(true),
+                superuser: None,
+                createdb: None,
+                createrole: None,
+                inherit: None,
+                replication: None,
+                bypassrls: None,
+                connection_limit: None,
+                comment: None,
+                password: Some(PasswordSpec {
+                    secret_ref: None,
+                    secret_key: None,
+                    generate: Some(GeneratePasswordSpec {
+                        length: Some(32),
+                        secret_name: Some("Bad_Name".to_string()),
+                        secret_key: None,
+                    }),
+                }),
+                password_valid_until: None,
+            }],
+            grants: vec![],
+            default_privileges: vec![],
+            memberships: vec![],
+            retirements: vec![],
+        };
+
+        assert!(matches!(
+            spec.validate_password_specs("test-policy"),
+            Err(PasswordValidationError::InvalidGeneratedSecretName { ref role, .. }) if role == "app-user"
+        ));
     }
 }
