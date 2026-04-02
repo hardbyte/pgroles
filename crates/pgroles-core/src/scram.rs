@@ -15,6 +15,7 @@ use base64::engine::general_purpose::STANDARD as BASE64;
 use hmac::{Hmac, Mac};
 use rand::Rng;
 use sha2::{Digest, Sha256};
+use zeroize::Zeroize;
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -38,21 +39,28 @@ fn compute_verifier_with_salt(password: &str, iterations: u32, salt: &[u8]) -> S
     pbkdf2::pbkdf2_hmac::<Sha256>(password.as_bytes(), salt, iterations, &mut salted_password);
 
     // 2. ClientKey = HMAC-SHA256(SaltedPassword, "Client Key")
-    let client_key = hmac_sha256(&salted_password, b"Client Key");
+    let mut client_key = hmac_sha256(&salted_password, b"Client Key");
 
     // 3. StoredKey = SHA256(ClientKey)
-    let stored_key = Sha256::digest(client_key);
+    let stored_key = Sha256::digest(&client_key);
 
     // 4. ServerKey = HMAC-SHA256(SaltedPassword, "Server Key")
-    let server_key = hmac_sha256(&salted_password, b"Server Key");
+    let mut server_key = hmac_sha256(&salted_password, b"Server Key");
 
     // 5. Format as PostgreSQL SCRAM-SHA-256 verifier string.
-    format!(
+    let verifier = format!(
         "SCRAM-SHA-256${iterations}:{salt}${stored_key}:{server_key}",
         salt = BASE64.encode(salt),
         stored_key = BASE64.encode(stored_key),
-        server_key = BASE64.encode(server_key),
-    )
+        server_key = BASE64.encode(&server_key),
+    );
+
+    // 6. Zeroize sensitive intermediate key material.
+    salted_password.zeroize();
+    client_key.zeroize();
+    server_key.zeroize();
+
+    verifier
 }
 
 fn hmac_sha256(key: &[u8], message: &[u8]) -> Vec<u8> {
@@ -131,5 +139,24 @@ mod tests {
         let v1 = compute_verifier_with_salt("deterministic", 4096, &[42u8; 16]);
         let v2 = compute_verifier_with_salt("deterministic", 4096, &[42u8; 16]);
         assert_eq!(v1, v2);
+    }
+
+    #[test]
+    fn known_vector_matches_rfc7677() {
+        // Test vector from RFC 7677 Appendix B (SCRAM-SHA-256):
+        // username = "user", password = "pencil", iterations = 4096,
+        // salt = W22ZaJ0SNY7soEsUEjb6gQ== (base64)
+        //
+        // Expected StoredKey and ServerKey from the RFC:
+        //   StoredKey = WG5d8oPm3OtcPnkdi4Uo7BkeZkBFzpcXkuLmtbsT4qY=
+        //   ServerKey = wfPLwcE6nTWhTAmQ7tl2KeoiWGPlZqQxSrmfPwDl2dU=
+        let salt = BASE64.decode("W22ZaJ0SNY7soEsUEjb6gQ==").unwrap();
+        let verifier = compute_verifier_with_salt("pencil", 4096, &salt);
+        assert_eq!(
+            verifier,
+            "SCRAM-SHA-256$4096:W22ZaJ0SNY7soEsUEjb6gQ==\
+             $WG5d8oPm3OtcPnkdi4Uo7BkeZkBFzpcXkuLmtbsT4qY=\
+             :wfPLwcE6nTWhTAmQ7tl2KeoiWGPlZqQxSrmfPwDl2dU="
+        );
     }
 }

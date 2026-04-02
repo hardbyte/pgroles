@@ -476,7 +476,7 @@ The operator requires a ClusterRole with these permissions:
 | `postgrespolicies` | get, list, watch, patch, update |
 | `postgrespolicies/status` | get, patch, update |
 | `postgrespolicies/finalizers` | update |
-| `secrets` | get, list, watch |
+| `secrets` | get, list, watch, create, update, patch |
 | `events` | create, patch |
 
 The Helm chart creates the ClusterRole, ClusterRoleBinding, and ServiceAccount automatically.

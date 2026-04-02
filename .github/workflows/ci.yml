@@ -588,6 +588,12 @@ jobs:
           assert_secret_has_keys generated-password-policy-pgr-genuser password verifier
           wait_for_password_hash_change genuser "$generated_initial_hash"
 
+          # Verify ownerReference GC: deleting the CR should garbage-collect the generated Secret
+          kubectl delete pgr generated-password-policy --wait=true
+          kubectl wait --for=delete secret/generated-password-policy-pgr-genuser --timeout=30s \
+            && echo "Generated Secret was garbage-collected on CR deletion" \
+            || { echo "::error::Generated Secret was NOT garbage-collected"; exit 1; }
+
           # ----------------------------------------------------------------
           # Password secret resolution errors (#43)
           # ----------------------------------------------------------------

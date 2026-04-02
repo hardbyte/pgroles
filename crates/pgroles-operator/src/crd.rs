@@ -256,9 +256,6 @@ pub struct PasswordSpec {
     pub generate: Option<GeneratePasswordSpec>,
 }
 
-/// Backward-compatible alias used internally in tests and reconciler.
-pub type PasswordSecretRef = PasswordSpec;
-
 impl PasswordSpec {
     /// Returns true if this is a reference to an existing Secret.
     pub fn is_secret_ref(&self) -> bool {
@@ -310,12 +307,16 @@ pub enum PasswordValidationError {
     },
 }
 
+/// Validate a Kubernetes Secret name per RFC 1123 DNS subdomain rules:
+/// lowercase alpha start, alphanumeric end, body allows lowercase alpha,
+/// digits, `-`, and `.`.
 fn is_valid_secret_name(name: &str) -> bool {
     if name.is_empty() || name.len() > crate::password::MAX_SECRET_NAME_LENGTH {
         return false;
     }
     let bytes = name.as_bytes();
-    if !bytes[0].is_ascii_lowercase() && !bytes[0].is_ascii_digit() {
+    // RFC 1123: must start with a lowercase letter.
+    if !bytes[0].is_ascii_lowercase() {
         return false;
     }
     if !bytes[bytes.len() - 1].is_ascii_lowercase() && !bytes[bytes.len() - 1].is_ascii_digit() {
@@ -1627,6 +1628,54 @@ retirements:
             roles: vec![RoleSpec {
                 name: "app-user".to_string(),
                 login: Some(false),
+                superuser: None,
+                createdb: None,
+                createrole: None,
+                inherit: None,
+                replication: None,
+                bypassrls: None,
+                connection_limit: None,
+                comment: None,
+                password: Some(PasswordSpec {
+                    secret_ref: Some(SecretReference {
+                        name: "role-passwords".to_string(),
+                    }),
+                    secret_key: None,
+                    generate: None,
+                }),
+                password_valid_until: None,
+            }],
+            grants: vec![],
+            default_privileges: vec![],
+            memberships: vec![],
+            retirements: vec![],
+        };
+
+        assert!(matches!(
+            spec.validate_password_specs("test-policy"),
+            Err(PasswordValidationError::PasswordWithoutLogin { ref role }) if role == "app-user"
+        ));
+    }
+
+    #[test]
+    fn validate_password_specs_rejects_password_with_login_omitted() {
+        let spec = PostgresPolicySpec {
+            connection: ConnectionSpec {
+                secret_ref: SecretReference {
+                    name: "pg-conn".to_string(),
+                },
+                secret_key: "DATABASE_URL".to_string(),
+            },
+            interval: "5m".to_string(),
+            suspend: false,
+            mode: PolicyMode::Apply,
+            reconciliation_mode: CrdReconciliationMode::default(),
+            default_owner: None,
+            profiles: std::collections::HashMap::new(),
+            schemas: vec![],
+            roles: vec![RoleSpec {
+                name: "app-user".to_string(),
+                login: None, // omitted, not explicitly false
                 superuser: None,
                 createdb: None,
                 createrole: None,

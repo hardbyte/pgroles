@@ -188,8 +188,8 @@ pub async fn ensure_generated_secret(
             );
 
             let owner_ref = OwnerReference {
-                api_version: "pgroles.io/v1alpha1".to_string(),
-                kind: "PostgresPolicy".to_string(),
+                api_version: <PostgresPolicy as kube::Resource>::api_version(&()).to_string(),
+                kind: <PostgresPolicy as kube::Resource>::kind(&()).to_string(),
                 name: policy.name_any(),
                 uid: policy.uid().unwrap_or_default(),
                 controller: Some(true),
@@ -313,6 +313,30 @@ pub enum PasswordError {
 
     #[error("Kubernetes API error for Secret \"{secret}\": {source}")]
     KubeApi { secret: String, source: kube::Error },
+}
+
+impl PasswordError {
+    /// Returns `true` if this error is likely transient (network issues, API
+    /// server unavailability) and should be retried with exponential backoff
+    /// rather than waiting for the full policy interval.
+    pub fn is_transient(&self) -> bool {
+        match self {
+            // Missing key or empty password are spec/data issues — not transient.
+            PasswordError::MissingKey { .. } | PasswordError::EmptyPassword { .. } => false,
+            // Kube API errors: transient unless it's a clear client error (4xx).
+            PasswordError::KubeApi { source, .. } => {
+                if let kube::Error::Api(status) = source {
+                    // 4xx errors (except 409 Conflict and 429 Too Many Requests)
+                    // are non-transient — they indicate a spec or RBAC problem.
+                    let code = status.code;
+                    !(400..500).contains(&code) || code == 409 || code == 429
+                } else {
+                    // Transport errors, timeouts, etc. are transient.
+                    true
+                }
+            }
+        }
+    }
 }
 
 #[cfg(test)]

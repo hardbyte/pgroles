@@ -338,8 +338,14 @@ fn retry_class_for_reconcile_error(error: &ReconcileError) -> RetryClass {
         | ReconcileError::ConflictingPolicy(_)
         | ReconcileError::UnsafeRoleDrops(_)
         | ReconcileError::EmptyPasswordSecret { .. }
-        | ReconcileError::PasswordGeneration(_)
         | ReconcileError::NoNamespace => RetryClass::Slow,
+        ReconcileError::PasswordGeneration(err) => {
+            if err.is_transient() {
+                RetryClass::Transient
+            } else {
+                RetryClass::Slow
+            }
+        }
         ReconcileError::Context(context) => match context.as_ref() {
             ContextError::SecretMissing { .. } => RetryClass::Slow,
             ContextError::SecretFetch { .. } => {
@@ -2193,6 +2199,58 @@ mod tests {
     }
 
     #[test]
+    fn error_reason_password_generation() {
+        let err = ReconcileError::PasswordGeneration(Box::new(
+            crate::password::PasswordError::MissingKey {
+                secret: "my-secret".to_string(),
+                key: "password".to_string(),
+            },
+        ));
+        assert_eq!(err.reason(), "SecretFetchFailed");
+    }
+
+    #[test]
+    fn retry_classifies_password_generation_missing_key_as_slow() {
+        let error = finalizer::Error::ApplyFailed(ReconcileError::PasswordGeneration(Box::new(
+            crate::password::PasswordError::MissingKey {
+                secret: "my-secret".to_string(),
+                key: "password".to_string(),
+            },
+        )));
+        assert_eq!(retry_class(&error), RetryClass::Slow);
+    }
+
+    #[test]
+    fn retry_classifies_password_generation_kube_server_error_as_transient() {
+        let error = finalizer::Error::ApplyFailed(ReconcileError::PasswordGeneration(Box::new(
+            crate::password::PasswordError::KubeApi {
+                secret: "my-secret".to_string(),
+                source: kube::Error::Api(
+                    kube::core::Status::failure("internal error", "InternalError")
+                        .with_code(500)
+                        .boxed(),
+                ),
+            },
+        )));
+        assert_eq!(retry_class(&error), RetryClass::Transient);
+    }
+
+    #[test]
+    fn retry_classifies_password_generation_kube_forbidden_as_slow() {
+        let error = finalizer::Error::ApplyFailed(ReconcileError::PasswordGeneration(Box::new(
+            crate::password::PasswordError::KubeApi {
+                secret: "my-secret".to_string(),
+                source: kube::Error::Api(
+                    kube::core::Status::failure("forbidden", "Forbidden")
+                        .with_code(403)
+                        .boxed(),
+                ),
+            },
+        )));
+        assert_eq!(retry_class(&error), RetryClass::Slow);
+    }
+
+    #[test]
     fn accumulate_summary_counts_passwords() {
         use pgroles_core::diff::Change;
 
@@ -2403,6 +2461,46 @@ mod tests {
             password_changes.get("app").map(String::as_str),
             Some("new-secret")
         );
+    }
+
+    #[test]
+    fn select_password_changes_applies_all_on_first_reconcile() {
+        // When status is None (first reconcile), all passwords should be applied
+        // since there are no previous source versions to compare against.
+        let resolved = BTreeMap::from([
+            (
+                "app".to_string(),
+                ResolvedPassword {
+                    cleartext: "secret-a".to_string(),
+                    source_version: "role-passwords:app:1".to_string(),
+                },
+            ),
+            (
+                "reporter".to_string(),
+                ResolvedPassword {
+                    cleartext: "secret-b".to_string(),
+                    source_version: "role-passwords:reporter:1".to_string(),
+                },
+            ),
+        ]);
+        let changes: Vec<pgroles_core::diff::Change> = vec![];
+
+        let (password_changes, versions) = select_password_changes(&changes, &resolved, None);
+
+        assert_eq!(
+            password_changes.len(),
+            2,
+            "all passwords should be applied on first reconcile"
+        );
+        assert_eq!(
+            password_changes.get("app").map(String::as_str),
+            Some("secret-a")
+        );
+        assert_eq!(
+            password_changes.get("reporter").map(String::as_str),
+            Some("secret-b")
+        );
+        assert_eq!(versions.len(), 2, "all source versions should be tracked");
     }
 
     #[test]
