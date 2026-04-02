@@ -42,12 +42,7 @@ jobs:
         run: cargo deny check
 
       - name: CRD drift check
-        run: |
-          cargo run --bin crdgen > /tmp/crd-generated.yaml
-          diff k8s/crd.yaml /tmp/crd-generated.yaml || {
-            echo "::error::CRD YAML is out of date. Run 'cargo run --bin crdgen > k8s/crd.yaml' and commit."
-            exit 1
-          }
+        run: scripts/check-crd-drift.sh
 
   # ---------------------------------------------------------------------------
   # Job 2: Unit tests

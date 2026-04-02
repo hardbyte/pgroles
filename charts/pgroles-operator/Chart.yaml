@@ -5,8 +5,8 @@ description: >-
   Define roles, memberships, grants, and default privileges in YAML
   and let the operator converge your database to the desired state.
 type: application
-version: 0.2.0
-appVersion: "0.2.0"
+version: 0.2.1
+appVersion: "0.3.0"
 icon: https://raw.githubusercontent.com/hardbyte/pgroles/main/docs/public/logo.svg
 sources:
   - https://github.com/hardbyte/pgroles
@@ -16,8 +16,10 @@ maintainers:
     url: https://hardbyte.nz
 annotations:
   artifacthub.io/changes: |
-    - kind: added
-      description: Adds operator plan mode, password-backed roles, and the current production-readiness validation profile.
+    - kind: changed
+      description: Renames grant targets from `on` to `object` in the chart CRD and examples while keeping legacy input compatibility in the parser.
+    - kind: fixed
+      description: Publishes the current `mode` field in the chart CRD and strengthens CRD drift detection against generated output.
   artifacthub.io/category: database
   artifacthub.io/operator: "true"
   artifacthub.io/prerelease: "true"
