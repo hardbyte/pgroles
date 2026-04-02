@@ -306,6 +306,11 @@ pub enum PasswordValidationError {
         field: &'static str,
         key: String,
     },
+
+    #[error(
+        "role \"{role}\" password.generate.secretKey \"{key}\" is reserved for the SCRAM verifier"
+    )]
+    ReservedGeneratedSecretKey { role: String, key: String },
 }
 
 /// Validate a Kubernetes Secret name per RFC 1123 DNS subdomain rules:
@@ -544,6 +549,12 @@ impl PostgresPolicySpec {
                         return Err(PasswordValidationError::InvalidSecretKey {
                             role: role.name.clone(),
                             field: "generate.secretKey",
+                            key: secret_key,
+                        });
+                    }
+                    if secret_key == crate::password::GENERATED_VERIFIER_KEY {
+                        return Err(PasswordValidationError::ReservedGeneratedSecretKey {
+                            role: role.name.clone(),
                             key: secret_key,
                         });
                     }
@@ -1914,6 +1925,57 @@ retirements:
         assert!(matches!(
             spec.validate_password_specs("test-policy"),
             Err(PasswordValidationError::InvalidGeneratedSecretName { ref role, .. }) if role == "app-user"
+        ));
+    }
+
+    #[test]
+    fn validate_password_specs_rejects_reserved_generated_secret_key() {
+        let spec = PostgresPolicySpec {
+            connection: ConnectionSpec {
+                secret_ref: SecretReference {
+                    name: "pg-conn".to_string(),
+                },
+                secret_key: "DATABASE_URL".to_string(),
+            },
+            interval: "5m".to_string(),
+            suspend: false,
+            mode: PolicyMode::Apply,
+            reconciliation_mode: CrdReconciliationMode::default(),
+            default_owner: None,
+            profiles: std::collections::HashMap::new(),
+            schemas: vec![],
+            roles: vec![RoleSpec {
+                name: "app-user".to_string(),
+                login: Some(true),
+                superuser: None,
+                createdb: None,
+                createrole: None,
+                inherit: None,
+                replication: None,
+                bypassrls: None,
+                connection_limit: None,
+                comment: None,
+                password: Some(PasswordSpec {
+                    secret_ref: None,
+                    secret_key: None,
+                    generate: Some(GeneratePasswordSpec {
+                        length: Some(32),
+                        secret_name: None,
+                        secret_key: Some("verifier".to_string()),
+                    }),
+                }),
+                password_valid_until: None,
+            }],
+            grants: vec![],
+            default_privileges: vec![],
+            memberships: vec![],
+            retirements: vec![],
+        };
+
+        assert!(matches!(
+            spec.validate_password_specs("test-policy"),
+            Err(PasswordValidationError::ReservedGeneratedSecretKey { ref role, ref key })
+                if role == "app-user" && key == "verifier"
         ));
     }
 }

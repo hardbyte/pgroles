@@ -22,6 +22,9 @@ pub const MAX_PASSWORD_LENGTH: u32 = 128;
 /// Maximum length for a Kubernetes Secret name.
 pub const MAX_SECRET_NAME_LENGTH: usize = 253;
 
+/// Fixed key used to store the SCRAM verifier in generated Secrets.
+pub const GENERATED_VERIFIER_KEY: &str = "verifier";
+
 /// Character set for generated passwords: alphanumeric + common symbols.
 const CHARSET: &[u8] =
     b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789!@#$%^&*-_=+";
@@ -113,10 +116,80 @@ fn secret_source_version(secret: &Secret, secret_name: &str, secret_key: &str) -
     format!("{secret_name}:{secret_key}:{resource_version}")
 }
 
+pub fn missing_generated_secret_source_version(secret_name: &str, secret_key: &str) -> String {
+    format!("{secret_name}:{secret_key}:missing")
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GeneratedPasswordSecret {
     pub password: String,
     pub source_version: String,
+}
+
+fn generated_password_from_existing_secret(
+    secret: &Secret,
+    secret_name: &str,
+    secret_key: &str,
+) -> Result<GeneratedPasswordSecret, PasswordError> {
+    let data = secret
+        .data
+        .as_ref()
+        .ok_or_else(|| PasswordError::MissingKey {
+            secret: secret_name.to_string(),
+            key: secret_key.to_string(),
+        })?;
+    let value_bytes = data
+        .get(secret_key)
+        .ok_or_else(|| PasswordError::MissingKey {
+            secret: secret_name.to_string(),
+            key: secret_key.to_string(),
+        })?;
+    let password =
+        String::from_utf8(value_bytes.0.clone()).map_err(|_| PasswordError::MissingKey {
+            secret: secret_name.to_string(),
+            key: secret_key.to_string(),
+        })?;
+    if password.is_empty() {
+        return Err(PasswordError::EmptyPassword {
+            secret: secret_name.to_string(),
+            key: secret_key.to_string(),
+        });
+    }
+
+    Ok(GeneratedPasswordSecret {
+        password,
+        source_version: secret_source_version(secret, secret_name, secret_key),
+    })
+}
+
+async fn get_generated_secret_opt(
+    secrets_api: &Api<Secret>,
+    secret_name: &str,
+    secret_key: &str,
+) -> Result<Option<GeneratedPasswordSecret>, PasswordError> {
+    match secrets_api.get_opt(secret_name).await {
+        Ok(Some(existing)) => {
+            generated_password_from_existing_secret(&existing, secret_name, secret_key).map(Some)
+        }
+        Ok(None) => Ok(None),
+        Err(err) => Err(PasswordError::KubeApi {
+            secret: secret_name.to_string(),
+            source: err,
+        }),
+    }
+}
+
+pub async fn get_generated_secret(
+    client: kube::Client,
+    namespace: &str,
+    policy_name: &str,
+    role_name: &str,
+    spec: &GeneratePasswordSpec,
+) -> Result<Option<GeneratedPasswordSecret>, PasswordError> {
+    let secrets_api: Api<Secret> = Api::namespaced(client, namespace);
+    let secret_name = generated_secret_name(policy_name, role_name, spec);
+    let secret_key = generated_secret_key(spec);
+    get_generated_secret_opt(&secrets_api, &secret_name, &secret_key).await
 }
 
 /// Ensure a Kubernetes Secret exists for a generated password.
@@ -140,43 +213,14 @@ pub async fn ensure_generated_secret(
     let secret_key = generated_secret_key(spec);
 
     // Try to read the existing Secret first.
-    match secrets_api.get_opt(&secret_name).await {
+    match get_generated_secret_opt(&secrets_api, &secret_name, &secret_key).await {
         Ok(Some(existing)) => {
-            // Secret exists — extract the password.
-            let data = existing
-                .data
-                .as_ref()
-                .ok_or_else(|| PasswordError::MissingKey {
-                    secret: secret_name.clone(),
-                    key: secret_key.clone(),
-                })?;
-            let value_bytes = data
-                .get(&secret_key)
-                .ok_or_else(|| PasswordError::MissingKey {
-                    secret: secret_name.clone(),
-                    key: secret_key.clone(),
-                })?;
-            let password = String::from_utf8(value_bytes.0.clone()).map_err(|_| {
-                PasswordError::MissingKey {
-                    secret: secret_name.clone(),
-                    key: secret_key.clone(),
-                }
-            })?;
-            if password.is_empty() {
-                return Err(PasswordError::EmptyPassword {
-                    secret: secret_name,
-                    key: secret_key,
-                });
-            }
             tracing::debug!(
                 secret = %secret_name,
                 role = %role_name,
                 "using existing generated password Secret"
             );
-            Ok(GeneratedPasswordSecret {
-                password,
-                source_version: secret_source_version(&existing, &secret_name, &secret_key),
-            })
+            Ok(existing)
         }
         Ok(None) => {
             // Secret doesn't exist — generate and create.
@@ -210,7 +254,7 @@ pub async fn ensure_generated_secret(
             let mut data = BTreeMap::new();
             data.insert(secret_key.clone(), ByteString(password.as_bytes().to_vec()));
             data.insert(
-                "verifier".to_string(),
+                GENERATED_VERIFIER_KEY.to_string(),
                 ByteString(verifier.as_bytes().to_vec()),
             );
 
@@ -251,35 +295,7 @@ pub async fn ensure_generated_secret(
                             source: err,
                         }
                     })?;
-                    let data = existing
-                        .data
-                        .as_ref()
-                        .ok_or_else(|| PasswordError::MissingKey {
-                            secret: secret_name.clone(),
-                            key: secret_key.clone(),
-                        })?;
-                    let value_bytes =
-                        data.get(&secret_key)
-                            .ok_or_else(|| PasswordError::MissingKey {
-                                secret: secret_name.clone(),
-                                key: secret_key.clone(),
-                            })?;
-                    let password = String::from_utf8(value_bytes.0.clone()).map_err(|_| {
-                        PasswordError::MissingKey {
-                            secret: secret_name.clone(),
-                            key: secret_key.clone(),
-                        }
-                    })?;
-                    if password.is_empty() {
-                        return Err(PasswordError::EmptyPassword {
-                            secret: secret_name,
-                            key: secret_key,
-                        });
-                    }
-                    Ok(GeneratedPasswordSecret {
-                        password,
-                        source_version: secret_source_version(&existing, &secret_name, &secret_key),
-                    })
+                    generated_password_from_existing_secret(&existing, &secret_name, &secret_key)
                 }
                 Err(err) => Err(PasswordError::KubeApi {
                     secret: secret_name,
@@ -287,10 +303,7 @@ pub async fn ensure_generated_secret(
                 }),
             }
         }
-        Err(err) => Err(PasswordError::KubeApi {
-            secret: secret_name,
-            source: err,
-        }),
+        Err(err) => Err(err),
     }
 }
 

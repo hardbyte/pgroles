@@ -273,7 +273,7 @@ spec:
 - `password.generate.secretName` — override the generated Secret name. If omitted, the operator derives a Kubernetes-safe name from `{policy}-pgr-{role}`.
 - `password.generate.secretKey` — key written into the generated Secret. Defaults to `password`.
 
-Generated Secrets are created in the same namespace as the `PostgresPolicy`, owned by that policy, and include both the cleartext password and a SCRAM verifier. The cleartext password is written at `password.generate.secretKey` (default `password`) and the SCRAM verifier is written at the fixed key `verifier`. Do not set `password.generate.secretKey` to `verifier`. Deleting the generated Secret causes the operator to recreate it and rotate the PostgreSQL password on the next reconcile.
+Generated Secrets are created in the same namespace as the `PostgresPolicy`, owned by that policy, and include both the cleartext password and a SCRAM verifier. The cleartext password is written at `password.generate.secretKey` (default `password`) and the SCRAM verifier is written at the fixed key `verifier`. `password.generate.secretKey` must not be `verifier`; the CRD rejects that value. Deleting the generated Secret causes the operator to recreate it and rotate the PostgreSQL password on the next reconcile.
 
 #### Validation and reconcile semantics
 
@@ -282,7 +282,6 @@ Generated Secrets are created in the same namespace as the `PostgresPolicy`, own
 - Password values are redacted in operator logs and the `status.planned_sql` field.
 - If the referenced Secret or key is missing, the operator sets a `SecretMissing` or `SecretFetchFailed` status condition and retries on the normal interval.
 - Password updates are driven by password-source Secret changes. After a successful `apply`, unchanged password sources do not create permanent drift in later `plan` reconciles.
-- For `password.generate`, generated Secrets are resolved before the controller branches into `apply` vs `plan`, so a `plan` reconcile can still create or recreate the Kubernetes Secret even though it does not execute PostgreSQL password SQL.
 - pgroles cannot detect direct password changes made in PostgreSQL outside the operator, because PostgreSQL does not expose comparable password state safely.
 
 The controller also emits Kubernetes Events for notable state transitions. These are intended for `kubectl describe` and quick operational debugging, not as a durable audit trail or alerting mechanism.
@@ -295,7 +294,7 @@ The operator reconciles on three paths:
 - referenced Secret changes
 - the normal periodic `interval`
 
-Each reconcile inspects the current database state, computes a diff from the policy, and then either applies it or publishes a plan depending on `spec.mode`. For password-generated roles, plan mode can still create or recreate the generated Kubernetes Secret while preparing the plan; it does not execute PostgreSQL DDL. Same-database policies are serialized, and status-only updates do not retrigger the controller.
+Each reconcile inspects the current database state, computes a diff from the policy, and then either applies it or publishes a plan depending on `spec.mode`. Plan mode is non-mutating: it does not execute PostgreSQL DDL and it does not create generated password Secrets. Same-database policies are serialized, and status-only updates do not retrigger the controller.
 
 Use this page for the external behavior and operating model. For the internal controller pipeline and locking model, see the [operator architecture](/docs/operator-architecture) page.
 

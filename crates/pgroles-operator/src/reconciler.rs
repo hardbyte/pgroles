@@ -842,8 +842,9 @@ async fn apply_under_lock(
 ///
 /// For each role that declares a `password`:
 /// - `PasswordSpec::SecretRef`: fetches the password from the referenced Secret.
-/// - `PasswordSpec::Generate`: ensures a generated Secret exists (creating one
-///   if needed) and reads the password from it.
+/// - `PasswordSpec::Generate`: reads the generated Secret if it exists; in
+///   apply mode it creates the Secret if needed, while in plan mode it keeps
+///   reconciliation non-mutating and synthesizes an in-memory password.
 ///
 /// Returns a map of role name → cleartext password string suitable for
 /// [`pgroles_core::diff::inject_password_changes`] (which computes the
@@ -887,16 +888,53 @@ async fn resolve_passwords_from_secrets(
     for role_spec in &resource.spec.roles {
         if let Some(pw) = &role_spec.password {
             if let Some(gen_spec) = &pw.generate {
-                // Generate mode — ensure a Secret exists with a generated password.
-                let password = crate::password::ensure_generated_secret(
-                    ctx.kube_client.clone(),
-                    namespace,
-                    resource,
-                    &role_spec.name,
-                    gen_spec,
-                )
-                .await
-                .map_err(Box::new)?;
+                let password = if resource.spec.mode == PolicyMode::Plan {
+                    match crate::password::get_generated_secret(
+                        ctx.kube_client.clone(),
+                        namespace,
+                        &resource.name_any(),
+                        &role_spec.name,
+                        gen_spec,
+                    )
+                    .await
+                    .map_err(Box::new)?
+                    {
+                        Some(existing) => existing,
+                        None => {
+                            let secret_name = crate::password::generated_secret_name(
+                                &resource.name_any(),
+                                &role_spec.name,
+                                gen_spec,
+                            );
+                            let secret_key = crate::password::generated_secret_key(gen_spec);
+                            let cleartext = crate::password::generate_password(
+                                gen_spec
+                                    .length
+                                    .unwrap_or(crate::password::DEFAULT_PASSWORD_LENGTH),
+                            );
+
+                            crate::password::GeneratedPasswordSecret {
+                                password: cleartext,
+                                source_version:
+                                    crate::password::missing_generated_secret_source_version(
+                                        &secret_name,
+                                        &secret_key,
+                                    ),
+                            }
+                        }
+                    }
+                } else {
+                    // Apply mode — ensure a Secret exists with a generated password.
+                    crate::password::ensure_generated_secret(
+                        ctx.kube_client.clone(),
+                        namespace,
+                        resource,
+                        &role_spec.name,
+                        gen_spec,
+                    )
+                    .await
+                    .map_err(Box::new)?
+                };
                 resolved.insert(
                     role_spec.name.clone(),
                     ResolvedPassword {
