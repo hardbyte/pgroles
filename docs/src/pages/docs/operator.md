@@ -182,13 +182,13 @@ spec:
     editor:
       grants:
         - privileges: [USAGE]
-          'on': { type: schema }
+          object: { type: schema }
         - privileges: [SELECT, INSERT, UPDATE, DELETE, REFERENCES, TRIGGER]
-          'on': { type: table, name: "*" }
+          object: { type: table, name: "*" }
         - privileges: [USAGE, SELECT, UPDATE]
-          'on': { type: sequence, name: "*" }
+          object: { type: sequence, name: "*" }
         - privileges: [EXECUTE]
-          'on': { type: function, name: "*" }
+          object: { type: function, name: "*" }
       default_privileges:
         - privileges: [SELECT, INSERT, UPDATE, DELETE, REFERENCES, TRIGGER]
           on_type: table
@@ -209,7 +209,7 @@ spec:
   grants:
     - role: app-service
       privileges: [CONNECT]
-      'on': { type: database, name: mydb }
+      object: { type: database, name: mydb }
 
   memberships:
     - role: inventory-editor

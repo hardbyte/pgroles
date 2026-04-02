@@ -4,11 +4,11 @@ const manifestSnippet = `profiles:
   writer:
     grants:
       - privileges: [USAGE]
-        on: { type: schema }
+        object: { type: schema }
       - privileges: [SELECT, INSERT, UPDATE, DELETE, TRIGGER]
-        on: { type: table, name: "*" }
+        object: { type: table, name: "*" }
       - privileges: [USAGE, SELECT, UPDATE]
-        on: { type: sequence, name: "*" }`
+        object: { type: sequence, name: "*" }`
 
 const planSnippet = `Plan: 4 change(s)
   1 role(s) to create

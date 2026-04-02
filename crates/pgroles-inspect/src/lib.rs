@@ -92,26 +92,26 @@ impl InspectConfig {
 
         // Collect schema names from grants
         for grant in &expanded.grants {
-            if let Some(ref schema) = grant.on.schema {
+            if let Some(ref schema) = grant.object.schema {
                 managed_schemas.insert(schema.clone());
             }
             // Schema-level grants use the name field as the schema name
-            if grant.on.object_type == pgroles_core::manifest::ObjectType::Schema
-                && let Some(ref name) = grant.on.name
+            if grant.object.object_type == pgroles_core::manifest::ObjectType::Schema
+                && let Some(ref name) = grant.object.name
             {
                 managed_schemas.insert(name.clone());
             }
-            if grant.on.name.as_deref() == Some("*")
+            if grant.object.name.as_deref() == Some("*")
                 && !matches!(
-                    grant.on.object_type,
+                    grant.object.object_type,
                     pgroles_core::manifest::ObjectType::Schema
                         | pgroles_core::manifest::ObjectType::Database
                 )
-                && let Some(schema) = &grant.on.schema
+                && let Some(schema) = &grant.object.schema
             {
                 wildcard_grants.insert(WildcardGrantPattern {
                     role: grant.role.clone(),
-                    object_type: grant.on.object_type,
+                    object_type: grant.object.object_type,
                     schema: schema.clone(),
                 });
             }
@@ -332,9 +332,9 @@ profiles:
   editor:
     grants:
       - privileges: [USAGE]
-        on: { type: schema }
+        object: { type: schema }
       - privileges: [SELECT, INSERT]
-        on: { type: table, name: "*" }
+        object: { type: table, name: "*" }
     default_privileges:
       - privileges: [SELECT, INSERT]
         on_type: table
@@ -352,7 +352,7 @@ roles:
 grants:
   - role: analytics
     privileges: [CONNECT]
-    on: { type: database, name: mydb }
+    object: { type: database, name: mydb }
 "#;
         let manifest = parse_manifest(yaml).unwrap();
         let expanded = expand_manifest(&manifest).unwrap();

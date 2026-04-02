@@ -26,10 +26,10 @@ Then apply a PostgresPolicy resource:
         login: false
     grants:
       - role: app-reader
-        on: { type: schema, name: public }
+        object: { type: schema, name: public }
         privileges: [USAGE]
       - role: app-reader
-        on: { type: table, schema: public, name: "*" }
+        object: { type: table, schema: public, name: "*" }
         privileges: [SELECT]
   EOF
 

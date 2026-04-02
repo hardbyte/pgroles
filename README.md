@@ -26,13 +26,13 @@ profiles:
   editor:
     grants:
       - privileges: [USAGE]
-        on: { type: schema }
+        object: { type: schema }
       - privileges: [SELECT, INSERT, UPDATE, DELETE, REFERENCES, TRIGGER]
-        on: { type: table, name: "*" }
+        object: { type: table, name: "*" }
       - privileges: [USAGE, SELECT, UPDATE]
-        on: { type: sequence, name: "*" }
+        object: { type: sequence, name: "*" }
       - privileges: [EXECUTE]
-        on: { type: function, name: "*" }
+        object: { type: function, name: "*" }
     default_privileges:
       - privileges: [SELECT, INSERT, UPDATE, DELETE, REFERENCES, TRIGGER]
         on_type: table
@@ -44,9 +44,9 @@ profiles:
   viewer:
     grants:
       - privileges: [USAGE]
-        on: { type: schema }
+        object: { type: schema }
       - privileges: [SELECT]
-        on: { type: table, name: "*" }
+        object: { type: table, name: "*" }
 
 schemas:
   - name: inventory

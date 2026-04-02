@@ -654,7 +654,7 @@ async fn inspect_current(
         .expanded
         .grants
         .iter()
-        .any(|g| g.on.object_type == pgroles_core::manifest::ObjectType::Database);
+        .any(|g| g.object.object_type == pgroles_core::manifest::ObjectType::Database);
 
     let config = InspectConfig::from_expanded(&validated.expanded, has_database_grants)
         .with_additional_roles(

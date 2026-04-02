@@ -662,7 +662,7 @@ async fn apply_under_lock(
     let has_database_grants = expanded
         .grants
         .iter()
-        .any(|g| g.on.object_type == pgroles_core::manifest::ObjectType::Database);
+        .any(|g| g.object.object_type == pgroles_core::manifest::ObjectType::Database);
     let inspect_config =
         pgroles_inspect::InspectConfig::from_expanded(expanded, has_database_grants)
             .with_additional_roles(

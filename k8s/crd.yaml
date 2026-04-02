@@ -152,7 +152,7 @@
                     "items": {
                       "description": "A concrete grant on a specific object or wildcard.",
                       "properties": {
-                        "on": {
+                        "object": {
                           "description": "Target object for a grant.",
                           "properties": {
                             "name": {
@@ -211,7 +211,7 @@
                         }
                       },
                       "required": [
-                        "on",
+                        "object",
                         "privileges",
                         "role"
                       ],
@@ -336,7 +336,7 @@
                           "items": {
                             "description": "Grant template within a profile.",
                             "properties": {
-                              "on": {
+                              "object": {
                                 "description": "Object target within a profile.",
                                 "properties": {
                                   "name": {
@@ -386,7 +386,7 @@
                               }
                             },
                             "required": [
-                              "on",
+                              "object",
                               "privileges"
                             ],
                             "type": "object"

@@ -171,7 +171,8 @@ pub struct ProfileSpec {
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct ProfileGrantSpec {
     pub privileges: Vec<Privilege>,
-    pub on: ProfileObjectTargetSpec,
+    #[serde(alias = "on")]
+    pub object: ProfileObjectTargetSpec,
 }
 
 /// Object target within a profile.
@@ -605,9 +606,9 @@ impl PostgresPolicySpec {
                         .iter()
                         .map(|g| ProfileGrant {
                             privileges: g.privileges.clone(),
-                            on: ProfileObjectTarget {
-                                object_type: g.on.object_type,
-                                name: g.on.name.clone(),
+                            object: ProfileObjectTarget {
+                                object_type: g.object.object_type,
+                                name: g.object.name.clone(),
                             },
                         })
                         .collect(),
@@ -710,10 +711,10 @@ impl PostgresPolicySpec {
             manifest
                 .grants
                 .iter()
-                .filter_map(|g| match g.on.object_type {
+                .filter_map(|g| match g.object.object_type {
                     ObjectType::Database => None,
-                    ObjectType::Schema => g.on.name.clone(),
-                    _ => g.on.schema.clone(),
+                    ObjectType::Schema => g.object.name.clone(),
+                    _ => g.object.schema.clone(),
                 }),
         );
         schemas.extend(
@@ -867,6 +868,14 @@ mod tests {
         assert!(
             yaml.contains("PostgresPolicy"),
             "kind should be PostgresPolicy"
+        );
+        assert!(
+            yaml.contains("\"mode\"") || yaml.contains(" mode:"),
+            "schema should declare spec.mode"
+        );
+        assert!(
+            yaml.contains("\"object\"") || yaml.contains(" object:"),
+            "schema should declare grant object targets using object"
         );
     }
 
@@ -1447,9 +1456,9 @@ profiles:
   editor:
     grants:
       - privileges: [USAGE]
-        on: { type: schema }
+        object: { type: schema }
       - privileges: [SELECT, INSERT, UPDATE, DELETE]
-        on: { type: table, name: "*" }
+        object: { type: table, name: "*" }
     default_privileges:
       - privileges: [SELECT, INSERT, UPDATE, DELETE]
         on_type: table
@@ -1462,7 +1471,7 @@ roles:
 grants:
   - role: analytics
     privileges: [CONNECT]
-    on: { type: database, name: mydb }
+    object: { type: database, name: mydb }
 memberships:
   - role: inventory-editor
     members:

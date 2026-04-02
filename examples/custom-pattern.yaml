@@ -9,11 +9,11 @@ default_owner: deploy_user
 profiles:
   writer:
     grants:
-      - on: { type: schema }
+      - object: { type: schema }
         privileges: [USAGE, CREATE]
-      - on: { type: table, name: "*" }
+      - object: { type: table, name: "*" }
         privileges: [SELECT, INSERT, UPDATE, DELETE]
-      - on: { type: sequence, name: "*" }
+      - object: { type: sequence, name: "*" }
         privileges: [USAGE, SELECT]
     default_privileges:
       - on_type: table
@@ -23,9 +23,9 @@ profiles:
 
   reader:
     grants:
-      - on: { type: schema }
+      - object: { type: schema }
         privileges: [USAGE]
-      - on: { type: table, name: "*" }
+      - object: { type: table, name: "*" }
         privileges: [SELECT]
     default_privileges:
       - on_type: table
