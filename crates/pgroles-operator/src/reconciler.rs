@@ -2263,11 +2263,11 @@ mod tests {
         let error = finalizer::Error::ApplyFailed(ReconcileError::PasswordGeneration(Box::new(
             crate::password::PasswordError::KubeApi {
                 secret: "my-secret".to_string(),
-                source: kube::Error::Api(
+                source: Box::new(kube::Error::Api(
                     kube::core::Status::failure("internal error", "InternalError")
                         .with_code(500)
                         .boxed(),
-                ),
+                )),
             },
         )));
         assert_eq!(retry_class(&error), RetryClass::Transient);
@@ -2278,11 +2278,11 @@ mod tests {
         let error = finalizer::Error::ApplyFailed(ReconcileError::PasswordGeneration(Box::new(
             crate::password::PasswordError::KubeApi {
                 secret: "my-secret".to_string(),
-                source: kube::Error::Api(
+                source: Box::new(kube::Error::Api(
                     kube::core::Status::failure("forbidden", "Forbidden")
                         .with_code(403)
                         .boxed(),
-                ),
+                )),
             },
         )));
         assert_eq!(retry_class(&error), RetryClass::Slow);

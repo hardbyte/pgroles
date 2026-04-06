@@ -174,7 +174,7 @@ async fn get_generated_secret_opt(
         Ok(None) => Ok(None),
         Err(err) => Err(PasswordError::KubeApi {
             secret: secret_name.to_string(),
-            source: err,
+            source: Box::new(err),
         }),
     }
 }
@@ -292,14 +292,14 @@ pub async fn ensure_generated_secret(
                     let existing = secrets_api.get(&secret_name).await.map_err(|err| {
                         PasswordError::KubeApi {
                             secret: secret_name.clone(),
-                            source: err,
+                            source: Box::new(err),
                         }
                     })?;
                     generated_password_from_existing_secret(&existing, &secret_name, &secret_key)
                 }
                 Err(err) => Err(PasswordError::KubeApi {
                     secret: secret_name,
-                    source: err,
+                    source: Box::new(err),
                 }),
             }
         }
@@ -325,7 +325,10 @@ pub enum PasswordError {
     EmptyPassword { secret: String, key: String },
 
     #[error("Kubernetes API error for Secret \"{secret}\": {source}")]
-    KubeApi { secret: String, source: kube::Error },
+    KubeApi {
+        secret: String,
+        source: Box<kube::Error>,
+    },
 }
 
 impl PasswordError {
@@ -338,7 +341,7 @@ impl PasswordError {
             PasswordError::MissingKey { .. } | PasswordError::EmptyPassword { .. } => false,
             // Kube API errors: transient unless it's a clear client error (4xx).
             PasswordError::KubeApi { source, .. } => {
-                if let kube::Error::Api(status) = source {
+                if let kube::Error::Api(status) = &**source {
                     // 4xx errors (except 409 Conflict and 429 Too Many Requests)
                     // are non-transient — they indicate a spec or RBAC problem.
                     let code = status.code;
