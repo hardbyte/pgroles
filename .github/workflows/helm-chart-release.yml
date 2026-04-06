@@ -7,6 +7,7 @@ on:
   workflow_dispatch:
 
 permissions:
+  contents: read
   packages: write
 
 jobs:
@@ -15,8 +16,28 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - uses: dtolnay/rust-toolchain@stable
+
       - name: Install Helm
         uses: azure/setup-helm@v4
+
+      - name: Verify chart version matches release tag
+        run: |
+          tag_version="${GITHUB_REF_NAME#v}"
+          chart_version="$(awk -F': ' '/^version:/ { print $2 }' charts/pgroles-operator/Chart.yaml)"
+
+          if [ -z "$chart_version" ]; then
+            echo "::error::Could not read chart version from charts/pgroles-operator/Chart.yaml"
+            exit 1
+          fi
+
+          if [ "$chart_version" != "$tag_version" ]; then
+            echo "::error::Chart version ${chart_version} does not match release tag ${tag_version}"
+            exit 1
+          fi
+
+      - name: Check chart CRD drift
+        run: scripts/check-crd-drift.sh
 
       - name: Login to GHCR
         run: echo "${{ secrets.GITHUB_TOKEN }}" | helm registry login ghcr.io -u ${{ github.repository_owner }} --password-stdin
@@ -25,4 +46,4 @@ jobs:
         run: helm package charts/pgroles-operator
 
       - name: Push chart to GHCR
-        run: helm push pgroles-operator-*.tgz oci://ghcr.io/hardbyte/charts
+        run: helm push "pgroles-operator-${GITHUB_REF_NAME#v}.tgz" oci://ghcr.io/hardbyte/charts
