@@ -139,24 +139,26 @@ Grants define object privileges:
 grants:
   - role: analytics
     privileges: [SELECT]
-    on: { type: table, schema: public, name: "*" }
+    object: { type: table, schema: public, name: "*" }
   - role: analytics
     privileges: [USAGE]
-    on: { type: schema, name: public }
+    object: { type: schema, name: public }
   - role: analytics
     privileges: [CONNECT]
-    on: { type: database, name: mydb }
+    object: { type: database, name: mydb }
 ```
 
 ### Object target
 
-The `on` field specifies the grant target:
+The `object` field specifies the grant target:
 
 | Field | Description |
 |---|---|
 | `type` | Object type (see below) |
 | `schema` | Schema name (required for most types except `schema` and `database`) |
 | `name` | Object name, `"*"` for all objects, or omit for schema-level grants |
+
+pgroles also accepts a quoted legacy `"on"` key when parsing older manifests, but `object` is the supported spelling for new manifests and generated output.
 
 ### Object types
 

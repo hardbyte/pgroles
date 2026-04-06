@@ -25,11 +25,11 @@ spec:
   profiles:
     editor:
       grants:
-        - 'on': { type: schema }
+        - object: { type: schema }
           privileges: [USAGE]
-        - 'on': { type: table, name: "*" }
+        - object: { type: table, name: "*" }
           privileges: [SELECT, INSERT, UPDATE, DELETE]
-        - 'on': { type: sequence, name: "*" }
+        - object: { type: sequence, name: "*" }
           privileges: [USAGE]
       default_privileges:
         - on_type: table
@@ -38,9 +38,9 @@ spec:
           privileges: [USAGE]
     viewer:
       grants:
-        - 'on': { type: schema }
+        - object: { type: schema }
           privileges: [USAGE]
-        - 'on': { type: table, name: "*" }
+        - object: { type: table, name: "*" }
           privileges: [SELECT]
       default_privileges:
         - on_type: table

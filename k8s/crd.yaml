@@ -152,7 +152,7 @@
                     "items": {
                       "description": "A concrete grant on a specific object or wildcard.",
                       "properties": {
-                        "on": {
+                        "object": {
                           "description": "Target object for a grant.",
                           "properties": {
                             "name": {
@@ -211,7 +211,7 @@
                         }
                       },
                       "required": [
-                        "on",
+                        "object",
                         "privileges",
                         "role"
                       ],
@@ -336,7 +336,7 @@
                           "items": {
                             "description": "Grant template within a profile.",
                             "properties": {
-                              "on": {
+                              "object": {
                                 "description": "Object target within a profile.",
                                 "properties": {
                                   "name": {
@@ -386,7 +386,7 @@
                               }
                             },
                             "required": [
-                              "on",
+                              "object",
                               "privileges"
                             ],
                             "type": "object"
@@ -486,16 +486,41 @@
                           "type": "string"
                         },
                         "password": {
-                          "description": "Password source for this role. References a Kubernetes Secret key.",
+                          "description": "Password source for this role. Either a reference to an existing Secret\nor a request for the operator to generate one.",
                           "nullable": true,
                           "properties": {
+                            "generate": {
+                              "description": "Generate a random password and store it in a new Kubernetes Secret.\nMutually exclusive with `secretRef`.",
+                              "nullable": true,
+                              "properties": {
+                                "length": {
+                                  "description": "Password length. Defaults to 32. Minimum 16, maximum 128.",
+                                  "format": "uint32",
+                                  "minimum": 0.0,
+                                  "nullable": true,
+                                  "type": "integer"
+                                },
+                                "secretKey": {
+                                  "description": "Key within the generated Secret. Defaults to `password`.",
+                                  "nullable": true,
+                                  "type": "string"
+                                },
+                                "secretName": {
+                                  "description": "Override the generated Secret name. Defaults to `{policy}-pgr-{role}`.",
+                                  "nullable": true,
+                                  "type": "string"
+                                }
+                              },
+                              "type": "object"
+                            },
                             "secretKey": {
-                              "description": "Key within the Secret. Defaults to the role name.",
+                              "description": "Key within the referenced Secret. Defaults to the role name.\nOnly used with `secretRef`.",
                               "nullable": true,
                               "type": "string"
                             },
                             "secretRef": {
-                              "description": "Reference to the Kubernetes Secret containing the password.",
+                              "description": "Reference to an existing Kubernetes Secret containing the password.\nMutually exclusive with `generate`.",
+                              "nullable": true,
                               "properties": {
                                 "name": {
                                   "description": "Name of the Secret.",
@@ -508,9 +533,6 @@
                               "type": "object"
                             }
                           },
-                          "required": [
-                            "secretRef"
-                          ],
                           "type": "object"
                         },
                         "password_valid_until": {
@@ -583,6 +605,14 @@
                 "description": "Status of a `PostgresPolicy` resource.",
                 "nullable": true,
                 "properties": {
+                  "applied_password_source_versions": {
+                    "additionalProperties": {
+                      "type": "string"
+                    },
+                    "default": {},
+                    "description": "Last applied password source version for each password-managed role.",
+                    "type": "object"
+                  },
                   "change_summary": {
                     "description": "Summary of changes applied in the last reconciliation.",
                     "nullable": true,

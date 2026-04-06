@@ -42,12 +42,7 @@ jobs:
         run: cargo deny check
 
       - name: CRD drift check
-        run: |
-          cargo run --bin crdgen > /tmp/crd-generated.yaml
-          diff k8s/crd.yaml /tmp/crd-generated.yaml || {
-            echo "::error::CRD YAML is out of date. Run 'cargo run --bin crdgen > k8s/crd.yaml' and commit."
-            exit 1
-          }
+        run: scripts/check-crd-drift.sh
 
   # ---------------------------------------------------------------------------
   # Job 2: Unit tests
@@ -177,13 +172,7 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
-      - name: Build binaries
-        run: cargo build -p pgroles-operator
-
-      - name: Stage operator binary for E2E image
-        run: |
-          mkdir -p dist
-          install -Dm755 -s target/debug/pgroles-operator dist/pgroles-operator-e2e
+      - uses: docker/setup-buildx-action@v4
 
       - name: Install kind
         run: |
@@ -250,7 +239,7 @@ jobs:
             --dry-run=client -o yaml | kubectl apply -f -
 
       - name: Build operator image and load into kind
-        run: docker build -f docker/Dockerfile.e2e -t pgroles-operator:e2e dist
+        run: docker build -f docker/Dockerfile --target operator -t pgroles-operator:e2e .
 
       - name: Load image into kind
         run: kind load docker-image pgroles-operator:e2e --name pgroles-e2e
@@ -453,6 +442,35 @@ jobs:
             return 1
           }
 
+          wait_for_password_hash_stable() {
+            local role="$1" expected_hash="$2"
+            for i in $(seq 1 6); do
+              sleep 5
+              local current
+              current="$(get_password_hash "$role")"
+              if [ -z "$current" ] || [ "$current" != "$expected_hash" ]; then
+                echo "::error::Password hash for $role changed unexpectedly"
+                echo "Expected: $expected_hash"
+                echo "Current:  $current"
+                return 1
+              fi
+              echo "Password hash still stable for $role (attempt $i/6)"
+            done
+          }
+
+          assert_secret_has_keys() {
+            local name="$1"; shift
+            for key in "$@"; do
+              local value
+              value="$(kubectl get secret "$name" -o "jsonpath={.data.$key}" 2>/dev/null || true)"
+              if [ -z "$value" ]; then
+                echo "::error::Secret $name is missing key $key"
+                return 1
+              fi
+            done
+            echo "Secret $name contains expected keys: $*"
+          }
+
           upsert_secret() {
             local name="$1"; shift
             local args=()
@@ -547,6 +565,29 @@ jobs:
 
           upsert_secret role-passwords password-user='e2e_rotated_pw!'
           wait_for_password_hash_change password-user "$initial_hash"
+
+          # ----------------------------------------------------------------
+          # Generated password lifecycle: create, remain stable, recreate
+          # ----------------------------------------------------------------
+          kubectl apply -f k8s/samples/generated-password-policy.yaml
+          wait_for_ready_true generated-password-policy
+
+          assert_role_exists genuser
+          assert_password_set genuser
+          assert_secret_has_keys generated-password-policy-pgr-genuser password verifier
+          generated_initial_hash="$(get_password_hash genuser)"
+          wait_for_password_hash_stable genuser "$generated_initial_hash"
+
+          kubectl delete secret generated-password-policy-pgr-genuser --wait=true
+          wait_for_ready_true generated-password-policy
+          assert_secret_has_keys generated-password-policy-pgr-genuser password verifier
+          wait_for_password_hash_change genuser "$generated_initial_hash"
+
+          # Verify ownerReference GC: deleting the CR should garbage-collect the generated Secret
+          kubectl delete pgr generated-password-policy --wait=true
+          kubectl wait --for=delete secret/generated-password-policy-pgr-genuser --timeout=30s \
+            && echo "Generated Secret was garbage-collected on CR deletion" \
+            || { echo "::error::Generated Secret was NOT garbage-collected"; exit 1; }
 
           # ----------------------------------------------------------------
           # Password secret resolution errors (#43)

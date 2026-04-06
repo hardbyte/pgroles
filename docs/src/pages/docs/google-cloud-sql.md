@@ -89,10 +89,10 @@ roles:
 grants:
   - role: "backend-team@example.com"
     privileges: [USAGE]
-    on: { type: schema, name: app }
+    object: { type: schema, name: app }
   - role: "backend-team@example.com"
     privileges: [SELECT, INSERT, UPDATE]
-    on: { type: table, schema: app, name: "*" }
+    object: { type: table, schema: app, name: "*" }
 ```
 
 When a group member logs in for the first time, Cloud SQL creates their individual PostgreSQL role automatically and grants them the group's privileges.

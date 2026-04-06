@@ -35,6 +35,8 @@ axum = { workspace = true }
 opentelemetry = { workspace = true }
 opentelemetry_sdk = { workspace = true }
 opentelemetry-otlp = { workspace = true }
+rand = "0.9"
+base64 = "0.22"
 
 [[bin]]
 name = "pgroles-operator"

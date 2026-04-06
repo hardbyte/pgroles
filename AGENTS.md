@@ -22,11 +22,12 @@ cargo test --workspace -- --include-ignored
 # Run a single test
 cargo test -p pgroles-core --lib diff::tests::diff_creates_new_roles -- --exact
 
-# CRD drift check (CI enforces k8s/crd.yaml matches crdgen output)
-cargo run --bin crdgen > /tmp/crd-generated.yaml && diff k8s/crd.yaml /tmp/crd-generated.yaml
+# CRD drift check (CI enforces both committed CRD copies match crdgen output)
+scripts/check-crd-drift.sh
 
 # Regenerate CRD after modifying crd.rs
 cargo run --bin crdgen > k8s/crd.yaml
+cp k8s/crd.yaml charts/pgroles-operator/crds/postgrespolicies.pgroles.io.yaml
 ```
 
 ### Local PostgreSQL for integration tests

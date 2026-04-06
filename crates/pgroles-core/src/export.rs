@@ -80,7 +80,7 @@ pub fn role_graph_to_manifest(graph: &RoleGraph) -> PolicyManifest {
         .map(|(key, state)| Grant {
             role: key.role.clone(),
             privileges: state.privileges.iter().copied().collect(),
-            on: ObjectTarget {
+            object: ObjectTarget {
                 object_type: key.object_type,
                 schema: key.schema.clone(),
                 name: key.name.clone(),
@@ -162,9 +162,9 @@ profiles:
   editor:
     grants:
       - privileges: [USAGE]
-        on: { type: schema }
+        object: { type: schema }
       - privileges: [SELECT, INSERT, UPDATE, DELETE]
-        on: { type: table, name: "*" }
+        object: { type: table, name: "*" }
     default_privileges:
       - privileges: [SELECT, INSERT, UPDATE, DELETE]
         on_type: table
@@ -263,6 +263,28 @@ roles:
         assert!(
             serialized.contains("connection_limit: 5"),
             "got:\n{serialized}"
+        );
+    }
+
+    #[test]
+    fn exported_yaml_uses_object_for_grant_targets() {
+        let yaml = r#"
+grants:
+  - role: analytics
+    privileges: [SELECT]
+    object: { type: table, schema: public, name: "*" }
+"#;
+        let manifest = parse_manifest(yaml).unwrap();
+        let expanded = expand_manifest(&manifest).unwrap();
+        let graph = RoleGraph::from_expanded(&expanded, None).unwrap();
+
+        let exported = role_graph_to_manifest(&graph);
+        let serialized = serde_yaml::to_string(&exported).unwrap();
+
+        assert!(serialized.contains("object:"), "got:\n{serialized}");
+        assert!(
+            !serialized.contains("\non:"),
+            "exported YAML should not emit legacy on key, got:\n{serialized}"
         );
     }
 

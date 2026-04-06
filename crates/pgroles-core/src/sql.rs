@@ -626,6 +626,11 @@ fn render_terminate_sessions(role: &str) -> Vec<String> {
     )]
 }
 
+/// Render `ALTER ROLE ... PASSWORD` using a pre-computed SCRAM-SHA-256 verifier.
+///
+/// The `password` parameter is expected to be a SCRAM-SHA-256 verifier string
+/// (starting with `SCRAM-SHA-256$`). PostgreSQL detects this prefix and stores
+/// the verifier directly, so the cleartext password never appears in the SQL.
 fn render_set_password(name: &str, password: &str) -> Vec<String> {
     vec![format!(
         "ALTER ROLE {} PASSWORD {};",
@@ -1080,9 +1085,9 @@ profiles:
   editor:
     grants:
       - privileges: [USAGE]
-        on: { type: schema }
+        object: { type: schema }
       - privileges: [SELECT, INSERT, UPDATE, DELETE]
-        on: { type: table, name: "*" }
+        object: { type: table, name: "*" }
     default_privileges:
       - privileges: [SELECT, INSERT, UPDATE, DELETE]
         on_type: table

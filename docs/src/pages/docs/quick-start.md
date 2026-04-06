@@ -43,13 +43,13 @@ roles:
 grants:
   - role: analytics
     privileges: [CONNECT]
-    on: { type: database, name: mydb }
+    object: { type: database, name: mydb }
   - role: analytics
     privileges: [USAGE]
-    on: { type: schema, name: public }
+    object: { type: schema, name: public }
   - role: analytics
     privileges: [SELECT]
-    on: { type: table, schema: public, name: "*" }
+    object: { type: table, schema: public, name: "*" }
 ```
 
 ## Validate the manifest

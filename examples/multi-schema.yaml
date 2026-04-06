@@ -12,13 +12,13 @@ default_owner: migration_runner
 profiles:
   editor:
     grants:
-      - on: { type: schema }
+      - object: { type: schema }
         privileges: [USAGE]
-      - on: { type: table, name: "*" }
+      - object: { type: table, name: "*" }
         privileges: [SELECT, INSERT, UPDATE, DELETE]
-      - on: { type: sequence, name: "*" }
+      - object: { type: sequence, name: "*" }
         privileges: [USAGE, SELECT]
-      - on: { type: function, name: "*" }
+      - object: { type: function, name: "*" }
         privileges: [EXECUTE]
     default_privileges:
       - on_type: table
@@ -30,11 +30,11 @@ profiles:
 
   viewer:
     grants:
-      - on: { type: schema }
+      - object: { type: schema }
         privileges: [USAGE]
-      - on: { type: table, name: "*" }
+      - object: { type: table, name: "*" }
         privileges: [SELECT]
-      - on: { type: sequence, name: "*" }
+      - object: { type: sequence, name: "*" }
         privileges: [SELECT]
     default_privileges:
       - on_type: table
@@ -61,22 +61,22 @@ roles:
 # Grants for one-off roles — manually specified per-schema.
 grants:
   - role: readonly-all
-    on: { type: schema, name: orders }
+    object: { type: schema, name: orders }
     privileges: [USAGE]
   - role: readonly-all
-    on: { type: table, schema: orders, name: "*" }
+    object: { type: table, schema: orders, name: "*" }
     privileges: [SELECT]
   - role: readonly-all
-    on: { type: schema, name: products }
+    object: { type: schema, name: products }
     privileges: [USAGE]
   - role: readonly-all
-    on: { type: table, schema: products, name: "*" }
+    object: { type: table, schema: products, name: "*" }
     privileges: [SELECT]
   - role: readonly-all
-    on: { type: schema, name: customers }
+    object: { type: schema, name: customers }
     privileges: [USAGE]
   - role: readonly-all
-    on: { type: table, schema: customers, name: "*" }
+    object: { type: table, schema: customers, name: "*" }
     privileges: [SELECT]
 
 # Memberships — external group roles are NOT created by pgroles.

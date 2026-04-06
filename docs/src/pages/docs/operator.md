@@ -117,9 +117,9 @@ The operator's safety model — serialized reconciliation, conflict detection, f
 - The largest tested workload is 200 roles / 100 schemas / 5 policies (scheduled CI, not PR CI).
 - Advisory locks enable multi-replica deployment, but there is no documented HA pattern, replica guidance, or failure-mode analysis.
 
-**Password management test coverage:**
+**Password drift visibility:**
 
-- Password support exists but several code paths lack test coverage: Secret resolution happy paths, end-to-end password lifecycle, and generate/export round-trip with passwords.
+- PostgreSQL does not expose password material in a way pgroles can compare safely. The operator can detect password source Secret changes and re-apply them, but it cannot detect out-of-band manual password changes made directly in the database.
 
 **Managed provider validation:**
 
@@ -139,6 +139,7 @@ PR CI validates:
 
 - conflicting and non-overlapping same-database policies
 - shared-secret churn and recovery
+- synced and generated password lifecycle flows
 - invalid specs, missing secrets, insufficient privileges
 - Kubernetes Event delivery for warning and recovery transitions
 - generated policies spanning 2 databases, 30 schemas, 60 roles
@@ -152,7 +153,6 @@ Scheduled coverage on `main` additionally exercises:
 
 - Carry controller semantics into the CRD contract rather than leaving them as implementation conventions.
 - Promote beyond `v1alpha1` only after the upgrade and rollback story is explicit.
-- Close password management test gaps.
 - Establish a scale validation baseline that reflects real-world deployment sizes.
 
 ## Custom resource
@@ -182,13 +182,13 @@ spec:
     editor:
       grants:
         - privileges: [USAGE]
-          'on': { type: schema }
+          object: { type: schema }
         - privileges: [SELECT, INSERT, UPDATE, DELETE, REFERENCES, TRIGGER]
-          'on': { type: table, name: "*" }
+          object: { type: table, name: "*" }
         - privileges: [USAGE, SELECT, UPDATE]
-          'on': { type: sequence, name: "*" }
+          object: { type: sequence, name: "*" }
         - privileges: [EXECUTE]
-          'on': { type: function, name: "*" }
+          object: { type: function, name: "*" }
       default_privileges:
         - privileges: [SELECT, INSERT, UPDATE, DELETE, REFERENCES, TRIGGER]
           on_type: table
@@ -209,7 +209,7 @@ spec:
   grants:
     - role: app-service
       privileges: [CONNECT]
-      'on': { type: database, name: mydb }
+      object: { type: database, name: mydb }
 
   memberships:
     - role: inventory-editor
@@ -235,7 +235,9 @@ The operator reads the Secret from the same namespace as the `PostgresPolicy` re
 
 ### Role passwords
 
-Roles can reference Kubernetes Secrets for their passwords. The operator resolves password values at reconcile time and injects them into the apply transaction:
+Roles can either sync a password from an existing Kubernetes Secret or ask the operator to generate and manage a per-role Secret. In both cases the password value is resolved at reconcile time and only sent to PostgreSQL inside the apply transaction.
+
+#### Sync from an existing Secret
 
 ```yaml
 spec:
@@ -253,7 +255,34 @@ spec:
 - `password.secretKey` — the key within the Secret. Defaults to the role name if omitted.
 - `password_valid_until` — ISO 8601 timestamp for PostgreSQL `VALID UNTIL`.
 
-Password values are redacted in operator logs and the `status.planned_sql` field. If the referenced Secret or key is missing, the operator sets a `SecretMissing` or `SecretFetchFailed` status condition and retries on the normal interval.
+#### Generate and manage a Secret
+
+```yaml
+spec:
+  roles:
+    - name: app-service
+      login: true
+      password:
+        generate:
+          length: 48                # optional, must be 16-128
+          secretName: app-service-password   # optional
+          secretKey: password       # optional, defaults to password
+```
+
+- `password.generate.length` — generated password length. Defaults to `32`. Must be between `16` and `128`.
+- `password.generate.secretName` — override the generated Secret name. If omitted, the operator derives a Kubernetes-safe name from `{policy}-pgr-{role}`.
+- `password.generate.secretKey` — key written into the generated Secret. Defaults to `password`.
+
+Generated Secrets are created in the same namespace as the `PostgresPolicy`, owned by that policy, and include both the cleartext password and a SCRAM verifier. The cleartext password is written at `password.generate.secretKey` (default `password`) and the SCRAM verifier is written at the fixed key `verifier`. `password.generate.secretKey` must not be `verifier`; the CRD rejects that value. Deleting the generated Secret causes the operator to recreate it and rotate the PostgreSQL password on the next reconcile.
+
+#### Validation and reconcile semantics
+
+- Passwords are only allowed on roles with `login: true`.
+- Exactly one of `password.secretRef` or `password.generate` must be set.
+- Password values are redacted in operator logs and the `status.planned_sql` field.
+- If the referenced Secret or key is missing, the operator sets a `SecretMissing` or `SecretFetchFailed` status condition and retries on the normal interval.
+- Password updates are driven by password-source Secret changes. After a successful `apply`, unchanged password sources do not create permanent drift in later `plan` reconciles.
+- pgroles cannot detect direct password changes made in PostgreSQL outside the operator, because PostgreSQL does not expose comparable password state safely.
 
 The controller also emits Kubernetes Events for notable state transitions. These are intended for `kubectl describe` and quick operational debugging, not as a durable audit trail or alerting mechanism.
 
@@ -265,7 +294,7 @@ The operator reconciles on three paths:
 - referenced Secret changes
 - the normal periodic `interval`
 
-Each reconcile inspects the current database state, computes a diff from the policy, and then either applies it or publishes a non-mutating plan depending on `spec.mode`. Same-database policies are serialized, and status-only updates do not retrigger the controller.
+Each reconcile inspects the current database state, computes a diff from the policy, and then either applies it or publishes a plan depending on `spec.mode`. Plan mode is non-mutating: it does not execute PostgreSQL DDL and it does not create generated password Secrets. Same-database policies are serialized, and status-only updates do not retrigger the controller.
 
 Use this page for the external behavior and operating model. For the internal controller pipeline and locking model, see the [operator architecture](/docs/operator-architecture) page.
 
@@ -307,16 +336,18 @@ spec:
       login: true
 ```
 
-Plan mode is useful when you want the operator to stay in-cluster but you are not ready to trust it with mutations yet.
+Plan mode is useful when you want the operator to stay in-cluster but you are not ready to trust it with PostgreSQL mutations yet.
 
 Current behavior in `plan` mode:
 
 - the operator connects to the database and computes the full diff normally
-- no SQL is executed
+- no PostgreSQL SQL is executed
 - `status.change_summary` records the pending changes
 - `status.planned_sql` stores the rendered SQL, truncated if needed for status size safety
 - `Ready=True` with reason `Planned`
 - `Drifted=True` when changes are pending, `Drifted=False` when the database is already in sync
+- for `password.generate`, the controller may still create or recreate the generated Kubernetes Secret while resolving password inputs for the plan
+- for password-managed roles, `Drifted=False` is only possible after a prior successful `apply` recorded the password source version; a plan-only policy cannot prove an existing database password already matches its Secret
 
 Use `suspend` when you want the controller to stop reconciling entirely. Use `plan` when you want it to keep inspecting and showing you what it would do.
 
@@ -446,7 +477,7 @@ The operator requires a ClusterRole with these permissions:
 | `postgrespolicies` | get, list, watch, patch, update |
 | `postgrespolicies/status` | get, patch, update |
 | `postgrespolicies/finalizers` | update |
-| `secrets` | get, list, watch |
+| `secrets` | get, list, watch, create, update, patch |
 | `events` | create, patch |
 
 The Helm chart creates the ClusterRole, ClusterRoleBinding, and ServiceAccount automatically.

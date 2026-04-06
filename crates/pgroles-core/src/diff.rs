@@ -102,7 +102,11 @@ pub enum Change {
     /// Terminate other active sessions before dropping a role.
     TerminateSessions { role: String },
 
-    /// Set a role's password (from an environment variable at apply time).
+    /// Set a role's password using a SCRAM-SHA-256 verifier.
+    ///
+    /// The `password` field contains a pre-computed SCRAM-SHA-256 verifier
+    /// string (not cleartext). PostgreSQL detects the `SCRAM-SHA-256$` prefix
+    /// and stores it directly without re-hashing.
     ///
     /// This change is injected by [`inject_password_changes`] after the core
     /// diff engine runs. The diff engine itself does not handle passwords
@@ -384,6 +388,11 @@ pub enum PasswordResolutionError {
 /// `CreateRole`. For existing roles with a password source, a `SetPassword` is
 /// appended after all creates/alters (ensuring the role exists).
 ///
+/// Cleartext passwords are converted to SCRAM-SHA-256 verifiers before being
+/// placed in `SetPassword` changes, so the cleartext never appears in generated
+/// SQL. PostgreSQL detects the `SCRAM-SHA-256$` prefix and stores the verifier
+/// directly.
+///
 /// This function should be called after `diff()` and `apply_role_retirements()`.
 pub fn inject_password_changes(
     changes: Vec<Change>,
@@ -410,11 +419,12 @@ pub fn inject_password_changes(
             && let Some(password) = resolved_passwords.get(name.as_str())
         {
             let role_name = name.clone();
-            let password = password.clone();
+            let verifier =
+                crate::scram::compute_verifier(password, crate::scram::DEFAULT_ITERATIONS);
             result.push(change);
             result.push(Change::SetPassword {
                 name: role_name,
-                password,
+                password: verifier,
             });
             continue;
         }
@@ -424,9 +434,11 @@ pub fn inject_password_changes(
     // For existing roles (not newly created), append SetPassword after all creates/alters.
     for (role_name, password) in resolved_passwords {
         if !created_roles.contains(role_name) {
+            let verifier =
+                crate::scram::compute_verifier(password, crate::scram::DEFAULT_ITERATIONS);
             result.push(Change::SetPassword {
                 name: role_name.clone(),
-                password: password.clone(),
+                password: verifier,
             });
         }
     }
@@ -991,9 +1003,9 @@ profiles:
   editor:
     grants:
       - privileges: [USAGE]
-        on: { type: schema }
+        object: { type: schema }
       - privileges: [SELECT, INSERT, UPDATE, DELETE]
-        on: { type: table, name: "*" }
+        object: { type: table, name: "*" }
     default_privileges:
       - privileges: [SELECT, INSERT, UPDATE, DELETE]
         on_type: table
@@ -1353,7 +1365,7 @@ memberships:
         assert_eq!(result.len(), 2);
         assert!(matches!(&result[0], Change::CreateRole { name, .. } if name == "app-svc"));
         assert!(
-            matches!(&result[1], Change::SetPassword { name, password } if name == "app-svc" && password == "secret123")
+            matches!(&result[1], Change::SetPassword { name, password } if name == "app-svc" && password.starts_with("SCRAM-SHA-256$"))
         );
     }
 
@@ -1375,7 +1387,7 @@ memberships:
         assert_eq!(result.len(), 2);
         assert!(matches!(&result[0], Change::Grant { .. }));
         assert!(
-            matches!(&result[1], Change::SetPassword { name, password } if name == "app-svc" && password == "secret123")
+            matches!(&result[1], Change::SetPassword { name, password } if name == "app-svc" && password.starts_with("SCRAM-SHA-256$"))
         );
     }
 

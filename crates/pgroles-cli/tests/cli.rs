@@ -44,7 +44,7 @@ roles:
 grants:
   - role: analytics
     privileges: [CONNECT]
-    on: { type: database, name: mydb }
+    object: { type: database, name: mydb }
 "#;
 
 const VALID_PROFILES: &str = r#"
@@ -54,18 +54,18 @@ profiles:
   editor:
     grants:
       - privileges: [USAGE]
-        on: { type: schema }
+        object: { type: schema }
       - privileges: [SELECT, INSERT, UPDATE, DELETE]
-        on: { type: table, name: "*" }
+        object: { type: table, name: "*" }
     default_privileges:
       - privileges: [SELECT, INSERT, UPDATE, DELETE]
         on_type: table
   viewer:
     grants:
       - privileges: [USAGE]
-        on: { type: schema }
+        object: { type: schema }
       - privileges: [SELECT]
-        on: { type: table, name: "*" }
+        object: { type: table, name: "*" }
     default_privileges:
       - privileges: [SELECT]
         on_type: table
@@ -83,7 +83,7 @@ roles:
 grants:
   - role: app-service
     privileges: [CONNECT]
-    on: { type: database, name: mydb }
+    object: { type: database, name: mydb }
 
 memberships:
   - role: inventory-editor
@@ -939,7 +939,7 @@ roles:
 grants:
   - role: {role}
     privileges: [SELECT]
-    on: {{ type: table, schema: {schema}, name: "*" }}
+    object: {{ type: table, schema: {schema}, name: "*" }}
 "#
         ));
 
@@ -1004,7 +1004,7 @@ roles:
 grants:
   - role: {role}
     privileges: [SELECT]
-    on: {{ type: table, schema: {schema}, name: "*" }}
+    object: {{ type: table, schema: {schema}, name: "*" }}
 "#
         ));
 
@@ -1078,7 +1078,7 @@ roles:
 grants:
   - role: {role}
     privileges: [EXECUTE]
-    on: {{ type: function, schema: {schema}, name: "{function_name}(integer, text)" }}
+    object: {{ type: function, schema: {schema}, name: "{function_name}(integer, text)" }}
 "#
         ));
 
@@ -1796,7 +1796,7 @@ roles:
 grants:
   - role: {managed_role}
     privileges: [SELECT]
-    on: {{ type: table, schema: {schema}, name: "*" }}
+    object: {{ type: table, schema: {schema}, name: "*" }}
 "#
         ));
 
@@ -1882,7 +1882,7 @@ roles:
 grants:
   - role: {role}
     privileges: [SELECT]
-    on: {{ type: table, schema: {schema}, name: "*" }}
+    object: {{ type: table, schema: {schema}, name: "*" }}
 "#
         ));
 
@@ -1947,7 +1947,7 @@ roles:
 grants:
   - role: {managed_role}
     privileges: [SELECT]
-    on: {{ type: table, schema: {schema}, name: "*" }}
+    object: {{ type: table, schema: {schema}, name: "*" }}
 "#
         ));
 

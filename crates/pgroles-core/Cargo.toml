@@ -17,3 +17,11 @@ serde_json = { workspace = true }
 serde_yaml = { workspace = true }
 schemars = { workspace = true }
 thiserror = { workspace = true }
+
+# SCRAM-SHA-256 verifier computation
+sha2 = "0.10"
+hmac = "0.12"
+pbkdf2 = "0.12"
+base64 = "0.22"
+rand = "0.9"
+zeroize = "1"

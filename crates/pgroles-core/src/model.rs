@@ -292,9 +292,9 @@ impl RoleGraph {
 fn grant_key_from_manifest(grant: &Grant) -> GrantKey {
     GrantKey {
         role: grant.role.clone(),
-        object_type: grant.on.object_type,
-        schema: grant.on.schema.clone(),
-        name: grant.on.name.clone(),
+        object_type: grant.object.object_type,
+        schema: grant.object.schema.clone(),
+        name: grant.object.name.clone(),
     }
 }
 
@@ -407,9 +407,9 @@ profiles:
   editor:
     grants:
       - privileges: [USAGE]
-        on: { type: schema }
+        object: { type: schema }
       - privileges: [SELECT, INSERT]
-        on: { type: table, name: "*" }
+        object: { type: table, name: "*" }
     default_privileges:
       - privileges: [SELECT, INSERT]
         on_type: table
@@ -473,10 +473,10 @@ roles:
 grants:
   - role: testrole
     privileges: [SELECT]
-    on: { type: table, schema: public, name: "*" }
+    object: { type: table, schema: public, name: "*" }
   - role: testrole
     privileges: [INSERT, UPDATE]
-    on: { type: table, schema: public, name: "*" }
+    object: { type: table, schema: public, name: "*" }
 "#;
         let manifest = parse_manifest(yaml).unwrap();
         let expanded = expand_manifest(&manifest).unwrap();

@@ -228,7 +228,8 @@ pub struct Profile {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProfileGrant {
     pub privileges: Vec<Privilege>,
-    pub on: ProfileObjectTarget,
+    #[serde(alias = "on")]
+    pub object: ProfileObjectTarget,
 }
 
 /// Object target within a profile — schema is omitted (filled during expansion).
@@ -320,7 +321,8 @@ pub struct PasswordSource {
 pub struct Grant {
     pub role: String,
     pub privileges: Vec<Privilege>,
-    pub on: ObjectTarget,
+    #[serde(alias = "on")]
+    pub object: ObjectTarget,
 }
 
 /// Target object for a grant.
@@ -477,23 +479,23 @@ pub fn expand_manifest(manifest: &PolicyManifest) -> Result<ExpandedManifest, Ma
 
             // Expand profile grants — fill in schema
             for profile_grant in &profile.grants {
-                let object_target = match profile_grant.on.object_type {
+                let object_target = match profile_grant.object.object_type {
                     ObjectType::Schema => ObjectTarget {
                         object_type: ObjectType::Schema,
                         schema: None,
                         name: Some(schema_binding.name.clone()),
                     },
                     _ => ObjectTarget {
-                        object_type: profile_grant.on.object_type,
+                        object_type: profile_grant.object.object_type,
                         schema: Some(schema_binding.name.clone()),
-                        name: profile_grant.on.name.clone(),
+                        name: profile_grant.object.name.clone(),
                     },
                 };
 
                 grants.push(Grant {
                     role: role_name.clone(),
                     privileges: profile_grant.privileges.clone(),
-                    on: object_target,
+                    object: object_target,
                 });
             }
 
@@ -734,13 +736,13 @@ profiles:
     login: false
     grants:
       - privileges: [USAGE]
-        on: { type: schema }
+        object: { type: schema }
       - privileges: [SELECT, INSERT, UPDATE, DELETE, REFERENCES, TRIGGER]
-        on: { type: table, name: "*" }
+        object: { type: table, name: "*" }
       - privileges: [USAGE, SELECT, UPDATE]
-        on: { type: sequence, name: "*" }
+        object: { type: sequence, name: "*" }
       - privileges: [EXECUTE]
-        on: { type: function, name: "*" }
+        object: { type: function, name: "*" }
     default_privileges:
       - privileges: [SELECT, INSERT, UPDATE, DELETE, REFERENCES, TRIGGER]
         on_type: table
@@ -787,9 +789,9 @@ profiles:
     login: false
     grants:
       - privileges: [USAGE]
-        on: { type: schema }
+        object: { type: schema }
       - privileges: [SELECT, INSERT]
-        on: { type: table, name: "*" }
+        object: { type: table, name: "*" }
 
 schemas:
   - name: myschema
@@ -805,12 +807,15 @@ schemas:
         // Schema usage grant + table grant
         assert_eq!(expanded.grants.len(), 2);
         assert_eq!(expanded.grants[0].role, "myschema-editor");
-        assert_eq!(expanded.grants[0].on.object_type, ObjectType::Schema);
-        assert_eq!(expanded.grants[0].on.name, Some("myschema".to_string()));
+        assert_eq!(expanded.grants[0].object.object_type, ObjectType::Schema);
+        assert_eq!(expanded.grants[0].object.name, Some("myschema".to_string()));
 
-        assert_eq!(expanded.grants[1].on.object_type, ObjectType::Table);
-        assert_eq!(expanded.grants[1].on.schema, Some("myschema".to_string()));
-        assert_eq!(expanded.grants[1].on.name, Some("*".to_string()));
+        assert_eq!(expanded.grants[1].object.object_type, ObjectType::Table);
+        assert_eq!(
+            expanded.grants[1].object.schema,
+            Some("myschema".to_string())
+        );
+        assert_eq!(expanded.grants[1].object.name, Some("*".to_string()));
     }
 
     #[test]
@@ -820,11 +825,11 @@ profiles:
   editor:
     grants:
       - privileges: [SELECT]
-        on: { type: table, name: "*" }
+        object: { type: table, name: "*" }
   viewer:
     grants:
       - privileges: [SELECT]
-        on: { type: table, name: "*" }
+        object: { type: table, name: "*" }
 
 schemas:
   - name: alpha
@@ -854,7 +859,7 @@ profiles:
   viewer:
     grants:
       - privileges: [SELECT]
-        on: { type: table, name: "*" }
+        object: { type: table, name: "*" }
 
 schemas:
   - name: legacy_data
@@ -997,7 +1002,7 @@ profiles:
   editor:
     grants:
       - privileges: [SELECT]
-        on: { type: table, name: "*" }
+        object: { type: table, name: "*" }
 
 schemas:
   - name: inventory
@@ -1020,6 +1025,24 @@ grants:
 
         assert_eq!(expanded.roles.len(), 2);
         assert_eq!(expanded.grants.len(), 2); // 1 from profile + 1 one-off
+    }
+
+    #[test]
+    fn parse_manifest_accepts_legacy_on_alias() {
+        let yaml = r#"
+grants:
+  - role: analytics
+    privileges: [SELECT]
+    on:
+      type: table
+      schema: public
+      name: "*"
+"#;
+        let manifest = parse_manifest(yaml).unwrap();
+        assert_eq!(manifest.grants.len(), 1);
+        assert_eq!(manifest.grants[0].object.object_type, ObjectType::Table);
+        assert_eq!(manifest.grants[0].object.schema.as_deref(), Some("public"));
+        assert_eq!(manifest.grants[0].object.name.as_deref(), Some("*"));
     }
 
     #[test]

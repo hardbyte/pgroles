@@ -10,4 +10,4 @@ roles:
 grants:
   - role: smoke_viewer
     privileges: [CONNECT]
-    on: { type: database, name: pgroles_test }
+    object: { type: database, name: pgroles_test }

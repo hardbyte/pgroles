@@ -13,11 +13,13 @@ Grants define what privileges a role has on database objects. pgroles supports g
 grants:
   - role: analytics
     privileges: [SELECT]
-    on:
+    object:
       type: table
       schema: public
       name: "*"
 ```
+
+The preferred key is `object`. pgroles still accepts a quoted legacy `"on"` key when parsing older manifests, but new manifests should use `object` to avoid YAML 1.1 boolean coercion.
 
 ## Privilege types
 
@@ -46,7 +48,7 @@ Grant privileges on the schema itself (e.g. `USAGE` to allow accessing objects w
 grants:
   - role: analytics
     privileges: [USAGE]
-    on: { type: schema, name: public }
+    object: { type: schema, name: public }
 ```
 
 Generates: `GRANT USAGE ON SCHEMA "public" TO "analytics";`
@@ -57,7 +59,7 @@ Generates: `GRANT USAGE ON SCHEMA "public" TO "analytics";`
 grants:
   - role: analytics
     privileges: [CONNECT]
-    on: { type: database, name: mydb }
+    object: { type: database, name: mydb }
 ```
 
 Generates: `GRANT CONNECT ON DATABASE "mydb" TO "analytics";`
@@ -70,7 +72,7 @@ Use `name: "*"` to grant on all existing objects of a type:
 grants:
   - role: analytics
     privileges: [SELECT]
-    on: { type: table, schema: public, name: "*" }
+    object: { type: table, schema: public, name: "*" }
 ```
 
 pgroles expands wildcard relation grants against the current objects of the
@@ -84,7 +86,7 @@ touch the others.
 grants:
   - role: analytics
     privileges: [SELECT]
-    on: { type: table, schema: public, name: users }
+    object: { type: table, schema: public, name: users }
 ```
 
 Generates: `GRANT SELECT ON TABLE "public"."users" TO "analytics";`
@@ -97,10 +99,10 @@ If multiple grant entries target the same role and object, their privileges are 
 grants:
   - role: app
     privileges: [SELECT]
-    on: { type: table, schema: public, name: "*" }
+    object: { type: table, schema: public, name: "*" }
   - role: app
     privileges: [INSERT, UPDATE]
-    on: { type: table, schema: public, name: "*" }
+    object: { type: table, schema: public, name: "*" }
 ```
 
 This is equivalent to granting `SELECT, INSERT, UPDATE` on all tables.

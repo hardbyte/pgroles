@@ -703,9 +703,9 @@ profiles:
   editor:
     grants:
       - privileges: [USAGE]
-        on: { type: schema }
+        object: { type: schema }
       - privileges: [SELECT, INSERT, UPDATE, DELETE]
-        on: { type: table, name: "*" }
+        object: { type: table, name: "*" }
     default_privileges:
       - privileges: [SELECT, INSERT, UPDATE, DELETE]
         on_type: table
@@ -722,7 +722,7 @@ roles:
 grants:
   - role: analytics
     privileges: [CONNECT]
-    on: { type: database, name: mydb }
+    object: { type: database, name: mydb }
 
 memberships:
   - role: orders-editor
@@ -927,10 +927,10 @@ roles:
 grants:
   - role: role-a
     privileges: [SELECT]
-    on: { type: table, schema: app, name: "*" }
+    object: { type: table, schema: app, name: "*" }
   - role: role-b
     privileges: [SELECT, INSERT, UPDATE]
-    on: { type: table, schema: app, name: "*" }
+    object: { type: table, schema: app, name: "*" }
 "#;
         let manifest = parse_manifest(yaml).unwrap();
         let expanded = expand_manifest(&manifest).unwrap();

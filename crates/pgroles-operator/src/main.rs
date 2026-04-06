@@ -103,7 +103,10 @@ async fn main() -> anyhow::Result<()> {
                 .into_iter()
                 .filter(|policy| {
                     policy.namespace().as_deref() == Some(secret_ns.as_str())
-                        && policy.spec.connection.secret_ref.name == secret_name
+                        && policy
+                            .spec
+                            .referenced_secret_names(&policy.name_any())
+                            .contains(&secret_name)
                 })
                 .map(|policy| ObjectRef::from_obj(policy.as_ref()))
                 .collect::<Vec<_>>();

@@ -57,7 +57,7 @@ profiles:
   viewer:
     grants:
       - privileges: [SELECT]
-        on: { type: table, name: "*" }
+        object: { type: table, name: "*" }
     default_privileges:
       - privileges: [SELECT]
         on_type: table
