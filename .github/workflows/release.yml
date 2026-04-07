@@ -28,11 +28,11 @@ jobs:
       IMAGE_REGISTRY: ghcr.io
       IMAGE_REPOSITORY: hardbyte
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Docker meta
         id: meta
-        uses: docker/metadata-action@v5
+        uses: docker/metadata-action@v6
         with:
           images: ${{ env.IMAGE_REGISTRY }}/${{ env.IMAGE_REPOSITORY }}/${{ env.IMAGE_NAME }}
           tags: |
@@ -50,7 +50,7 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Download Linux binary artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v7
         with:
           pattern: docker-binary-*
           path: dist
@@ -61,7 +61,7 @@ jobs:
 
       - name: Build and push
         id: build-and-push
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v7
         with:
           context: .
           file: docker/Dockerfile.runtime
@@ -101,11 +101,11 @@ jobs:
       IMAGE_REGISTRY: ghcr.io
       IMAGE_REPOSITORY: hardbyte
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Docker meta
         id: meta
-        uses: docker/metadata-action@v5
+        uses: docker/metadata-action@v6
         with:
           images: ${{ env.IMAGE_REGISTRY }}/${{ env.IMAGE_REPOSITORY }}/${{ env.IMAGE_NAME }}
           tags: |
@@ -123,7 +123,7 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Download Linux binary artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v7
         with:
           pattern: docker-binary-*
           path: dist
@@ -134,7 +134,7 @@ jobs:
 
       - name: Build and push
         id: build-and-push
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v7
         with:
           context: .
           file: docker/Dockerfile.runtime
@@ -212,7 +212,7 @@ jobs:
             release_asset: false
             docker_asset: true
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -255,7 +255,7 @@ jobs:
 
       - name: Upload release artifact
         if: matrix.release_asset
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: binary-${{ matrix.target }}
           path: ${{ env.ARCHIVE }}
@@ -271,7 +271,7 @@ jobs:
 
       - name: Upload Docker binary artifact
         if: matrix.docker_asset
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: docker-binary-${{ matrix.binary }}-${{ matrix.target }}
           path: docker-dist/${{ matrix.binary }}-${{ matrix.target }}
@@ -284,16 +284,16 @@ jobs:
     needs: [build-binaries]
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Download all artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v7
         with:
           pattern: binary-*
           merge-multiple: true
 
       - name: Create release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v2.6.1
         with:
           generate_release_notes: true
           prerelease: ${{ contains(github.ref_name, '-') }}
@@ -306,7 +306,7 @@ jobs:
     name: Publish to crates.io
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - uses: dtolnay/rust-toolchain@stable
 
