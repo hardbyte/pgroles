@@ -5,8 +5,8 @@ description: >-
   Define roles, memberships, grants, and default privileges in YAML
   and let the operator converge your database to the desired state.
 type: application
-version: 0.4.0-alpha.1
-appVersion: "0.4.0-alpha.1"
+version: 0.4.0
+appVersion: "0.4.0"
 icon: https://raw.githubusercontent.com/hardbyte/pgroles/main/docs/public/logo.svg
 sources:
   - https://github.com/hardbyte/pgroles
@@ -24,7 +24,7 @@ annotations:
       description: Adds release-time checks so chart publication fails if the chart version or bundled CRDs are stale.
   artifacthub.io/category: database
   artifacthub.io/operator: "true"
-  artifacthub.io/prerelease: "true"
+  artifacthub.io/prerelease: "false"
   artifacthub.io/operatorCapabilities: Basic Install
   artifacthub.io/license: MIT
   artifacthub.io/links: |
