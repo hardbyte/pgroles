@@ -13,6 +13,7 @@ allow = [
     "Unicode-DFS-2016",
     "OpenSSL",
     "Zlib",
+    "CDLA-Permissive-2.0",
 ]
 
 [licenses.private]
