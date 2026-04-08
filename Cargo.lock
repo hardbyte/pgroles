@@ -1815,7 +1815,7 @@ dependencies = [
 
 [[package]]
 name = "pgroles-cli"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "anyhow",
  "assert_cmd",
@@ -1834,7 +1834,7 @@ dependencies = [
 
 [[package]]
 name = "pgroles-core"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "base64",
  "hmac",
@@ -1851,7 +1851,7 @@ dependencies = [
 
 [[package]]
 name = "pgroles-inspect"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "pgroles-core",
  "sqlx",
@@ -1861,7 +1861,7 @@ dependencies = [
 
 [[package]]
 name = "pgroles-operator"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "anyhow",
  "axum",
@@ -2667,6 +2667,7 @@ dependencies = [
  "memchr",
  "once_cell",
  "percent-encoding",
+ "rustls",
  "serde",
  "serde_json",
  "sha2",
@@ -2676,6 +2677,7 @@ dependencies = [
  "tokio-stream",
  "tracing",
  "url",
+ "webpki-roots 0.26.11",
 ]
 
 [[package]]
@@ -3453,6 +3455,24 @@ checksum = "854ba17bb104abfb26ba36da9729addc7ce7f06f5c0f90f3c391f8461cca21f9"
 dependencies = [
  "js-sys",
  "wasm-bindgen",
+]
+
+[[package]]
+name = "webpki-roots"
+version = "0.26.11"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "521bc38abb08001b01866da9f51eb7c5d647a19260e00054a8c7fd5f9e57f7a9"
+dependencies = [
+ "webpki-roots 1.0.6",
+]
+
+[[package]]
+name = "webpki-roots"
+version = "1.0.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "22cfaf3c063993ff62e73cb4311efde4db1efb31ab78a3e5c457939ad5cc0bed"
+dependencies = [
+ "rustls-pki-types",
 ]
 
 [[package]]
