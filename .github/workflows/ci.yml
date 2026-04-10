@@ -494,6 +494,73 @@ jobs:
             echo "Operator logs clean (no '$forbidden')"
           }
 
+          # -- Plan helpers --------------------------------------------------------
+
+          wait_for_plan_phase() {
+            local plan="$1" expected_phase="$2"
+            for i in $(seq 1 30); do
+              phase="$(kubectl get pgplan "$plan" -o jsonpath='{.status.phase}' 2>/dev/null || true)"
+              if [ "$phase" = "$expected_phase" ]; then
+                echo "✓ $plan reached phase=$expected_phase"
+                return 0
+              fi
+              echo "  Waiting for $plan phase=$expected_phase (current=$phase)... ($i/30)"
+              sleep 3
+            done
+            echo "::error::$plan did not reach phase=$expected_phase within timeout"
+            kubectl get pgplan "$plan" -o yaml || true
+            return 1
+          }
+
+          approve_plan() {
+            local plan="$1"
+            kubectl annotate pgplan "$plan" pgroles.io/approved=true --overwrite
+          }
+
+          reject_plan() {
+            local plan="$1"
+            kubectl annotate pgplan "$plan" pgroles.io/rejected=true --overwrite
+          }
+
+          get_plan_sql() {
+            local plan="$1"
+            local inline
+            inline="$(kubectl get pgplan "$plan" -o jsonpath='{.status.sqlInline}' 2>/dev/null || true)"
+            if [ -n "$inline" ]; then
+              echo "$inline"
+              return 0
+            fi
+            local cm_name cm_key
+            cm_name="$(kubectl get pgplan "$plan" -o jsonpath='{.status.sqlRef.name}' 2>/dev/null || true)"
+            cm_key="$(kubectl get pgplan "$plan" -o jsonpath='{.status.sqlRef.key}' 2>/dev/null || true)"
+            if [ -n "$cm_name" ] && [ -n "$cm_key" ]; then
+              kubectl get configmap "$cm_name" -o jsonpath="{.data.${cm_key}}" 2>/dev/null || true
+              return 0
+            fi
+            echo ""
+          }
+
+          wait_for_current_plan_ref() {
+            local policy="$1"
+            for i in $(seq 1 30); do
+              local plan_name
+              plan_name="$(kubectl get pgr "$policy" -o jsonpath='{.status.current_plan_ref.name}' 2>/dev/null || true)"
+              if [ -n "$plan_name" ]; then
+                echo "$plan_name"
+                return 0
+              fi
+              echo "  Waiting for $policy currentPlanRef... ($i/30)"
+              sleep 3
+            done
+            echo "::error::$policy did not get currentPlanRef within timeout"
+            return 1
+          }
+
+          get_plan_count() {
+            local policy="$1"
+            kubectl get pgplan -l "pgroles.io/policy=$policy" --no-headers 2>/dev/null | wc -l | tr -d ' '
+          }
+
           kubectl delete pgr basic-policy --wait=true
 
           kubectl apply -f k8s/samples/disjoint-policy.yaml
