@@ -25,6 +25,32 @@
             "type": "string"
           },
           {
+            "jsonPath": ".spec.mode",
+            "name": "Mode",
+            "type": "string"
+          },
+          {
+            "jsonPath": ".spec.reconciliation_mode",
+            "name": "Recon",
+            "priority": 1,
+            "type": "string"
+          },
+          {
+            "jsonPath": ".status.conditions[?(@.type==\"Drifted\")].status",
+            "name": "Drift",
+            "type": "string"
+          },
+          {
+            "jsonPath": ".status.change_summary.total",
+            "name": "Changes",
+            "type": "integer"
+          },
+          {
+            "jsonPath": ".status.last_successful_reconcile_time",
+            "name": "Last Reconcile",
+            "type": "date"
+          },
+          {
             "jsonPath": ".metadata.creationTimestamp",
             "name": "Age",
             "type": "date"
