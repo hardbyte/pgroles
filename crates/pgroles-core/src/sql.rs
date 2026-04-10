@@ -151,7 +151,7 @@ pub fn render_statements_with_context(change: &Change, ctx: &SqlContext) -> Vec<
         Change::DropOwned { role } => render_drop_owned(role),
         Change::TerminateSessions { role } => render_terminate_sessions(role),
         Change::SetPassword { name, password } => render_set_password(name, password),
-        Change::DropRole { name } => vec![format!("DROP ROLE {};", quote_ident(name))],
+        Change::DropRole { name } => vec![format!("DROP ROLE IF EXISTS {};", quote_ident(name))],
     }
 }
 
@@ -173,6 +173,14 @@ pub fn render_all_with_context(changes: &[Change], ctx: &SqlContext) -> String {
 // CREATE ROLE
 // ---------------------------------------------------------------------------
 
+// NOTE: PostgreSQL does not support `CREATE ROLE IF NOT EXISTS` natively.
+// The PL/pgSQL idiom `DO $$ BEGIN CREATE ROLE ...; EXCEPTION WHEN
+// duplicate_object THEN NULL; END $$;` would work but changes the SQL
+// profile significantly. Instead, we rely on the plan-phase lifecycle
+// (Pending -> Approved -> Applying -> Applied) and transaction atomicity
+// to guarantee that a CREATE ROLE is not re-executed after a successful
+// commit. The only edge case is a committed transaction whose K8s status
+// update failed, which is handled by the plan's sql_hash deduplication.
 fn render_create_role(name: &str, state: &RoleState) -> Vec<String> {
     let mut sql = format!("CREATE ROLE {}", quote_ident(name));
     let mut options = vec![
@@ -730,7 +738,7 @@ mod tests {
         let change = Change::DropRole {
             name: "old-role".to_string(),
         };
-        assert_eq!(render(&change), "DROP ROLE \"old-role\";");
+        assert_eq!(render(&change), "DROP ROLE IF EXISTS \"old-role\";");
     }
 
     #[test]

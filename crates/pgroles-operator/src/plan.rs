@@ -475,7 +475,7 @@ pub async fn cleanup_old_plans(
 // ---------------------------------------------------------------------------
 
 /// Render the full executable SQL from changes (including real passwords).
-fn render_full_sql(
+pub(crate) fn render_full_sql(
     changes: &[pgroles_core::diff::Change],
     sql_context: &pgroles_core::sql::SqlContext,
 ) -> String {
@@ -508,7 +508,7 @@ fn render_redacted_sql(
 }
 
 /// Compute SHA-256 hash of the SQL string as a hex digest.
-fn compute_sql_hash(sql: &str) -> String {
+pub(crate) fn compute_sql_hash(sql: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(sql.as_bytes());
     format!("{:x}", hasher.finalize())
@@ -743,6 +743,37 @@ pub async fn mark_plan_rejected(
         "False",
         "Rejected",
         "Plan rejected via annotation",
+    );
+
+    let patch = serde_json::json!({ "status": status });
+    plans_api
+        .patch_status(
+            &plan_name,
+            &PatchParams::apply("pgroles-operator"),
+            &Patch::Merge(&patch),
+        )
+        .await?;
+
+    Ok(())
+}
+
+/// Mark a plan as Superseded (database state changed since approval).
+pub async fn mark_plan_superseded(
+    client: &Client,
+    plan: &PostgresPolicyPlan,
+) -> Result<(), ReconcileError> {
+    let namespace = plan.namespace().ok_or(ReconcileError::NoNamespace)?;
+    let plan_name = plan.name_any();
+    let plans_api: Api<PostgresPolicyPlan> = Api::namespaced(client.clone(), &namespace);
+
+    let mut status = plan.status.clone().unwrap_or_default();
+    status.phase = PlanPhase::Superseded;
+    set_plan_condition(
+        &mut status.conditions,
+        "Approved",
+        "False",
+        "Superseded",
+        "Database state changed since plan was approved",
     );
 
     let patch = serde_json::json!({ "status": status });
