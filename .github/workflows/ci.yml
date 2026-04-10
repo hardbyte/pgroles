@@ -185,8 +185,10 @@ jobs:
       - name: Create kind cluster
         run: kind create cluster --name pgroles-e2e --wait 60s
 
-      - name: Install CRD
-        run: kubectl apply -f k8s/crd.yaml
+      - name: Install CRDs
+        run: |
+          kubectl apply -f k8s/crd.yaml
+          kubectl apply -f k8s/postgrespolicyplan-crd.yaml
 
       - name: Deploy dev PostgreSQL
         run: |
