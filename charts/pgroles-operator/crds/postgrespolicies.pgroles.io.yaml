@@ -40,7 +40,7 @@
             "type": "integer"
           },
           {
-            "jsonPath": ".status.last_reconcile_time",
+            "jsonPath": ".status.last_successful_reconcile_time",
             "name": "Last Reconcile",
             "type": "date"
           },

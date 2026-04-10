@@ -33,7 +33,7 @@ use pgroles_core::manifest::{
     printcolumn = r#"{"name":"Mode","type":"string","jsonPath":".spec.mode"}"#,
     printcolumn = r#"{"name":"Drift","type":"string","jsonPath":".status.conditions[?(@.type==\"Drifted\")].status"}"#,
     printcolumn = r#"{"name":"Changes","type":"integer","jsonPath":".status.change_summary.total"}"#,
-    printcolumn = r#"{"name":"Last Reconcile","type":"date","jsonPath":".status.last_reconcile_time"}"#,
+    printcolumn = r#"{"name":"Last Reconcile","type":"date","jsonPath":".status.last_successful_reconcile_time"}"#,
     printcolumn = r#"{"name":"Age","type":"date","jsonPath":".metadata.creationTimestamp"}"#
 )]
 pub struct PostgresPolicySpec {
