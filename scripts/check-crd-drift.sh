@@ -7,38 +7,29 @@ cd "$repo_root"
 tmpdir="$(mktemp -d)"
 trap 'rm -rf "$tmpdir"' EXIT
 
-# crdgen outputs multiple CRDs separated by "---"
-cargo run --bin crdgen > "$tmpdir/all.json"
-
-# Split on the --- separator
-python3 -c "
-import sys
-content = open('$tmpdir/all.json').read()
-parts = content.split('\n---\n')
-for i, part in enumerate(parts):
-    open(f'$tmpdir/crd-{i}.json', 'w').write(part.strip() + '\n')
-"
+cargo run --bin crdgen -- --output-dir "$tmpdir"
 
 failed=0
 
 check_drift() {
-  local committed_path="$1"
-  local generated_path="$2"
+  local committed="$1"
+  local generated="$2"
 
-  if ! diff -u "$committed_path" "$generated_path" >/dev/null 2>&1; then
-    echo "::error::${committed_path} is out of date. Regenerate with 'cargo run --bin crdgen' and split the output."
-    diff -u "$committed_path" "$generated_path" || true
+  if ! diff -u "$committed" "$generated" >/dev/null 2>&1; then
+    echo "::error::${committed} is out of date. Regenerate with: cargo run --bin crdgen -- --output-dir charts/pgroles-operator/crds/"
+    diff -u "$committed" "$generated" || true
     failed=1
   fi
 }
 
-# PostgresPolicy CRD (first document)
-check_drift "k8s/crd.yaml" "$tmpdir/crd-0.json"
-check_drift "charts/pgroles-operator/crds/postgrespolicies.pgroles.io.yaml" "$tmpdir/crd-0.json"
+for crd in "$tmpdir"/*.yaml; do
+  name="$(basename "$crd")"
+  check_drift "charts/pgroles-operator/crds/$name" "$crd"
+done
 
-# PostgresPolicyPlan CRD (second document)
-check_drift "k8s/postgrespolicyplan-crd.yaml" "$tmpdir/crd-1.json"
-check_drift "charts/pgroles-operator/crds/postgrespolicyplans.pgroles.io.yaml" "$tmpdir/crd-1.json"
+# k8s/ copies
+check_drift "k8s/crd.yaml" "$tmpdir/postgrespolicies.pgroles.io.yaml"
+check_drift "k8s/postgrespolicyplan-crd.yaml" "$tmpdir/postgrespolicyplans.pgroles.io.yaml"
 
 if [ "$failed" -ne 0 ]; then
   exit 1
