@@ -2248,10 +2248,17 @@ retirements:
 
     #[test]
     fn approval_mode_serde_roundtrip() {
+        // Deserialize
         let manual: ApprovalMode = serde_json::from_str("\"manual\"").unwrap();
         assert_eq!(manual, ApprovalMode::Manual);
         let auto: ApprovalMode = serde_json::from_str("\"auto\"").unwrap();
         assert_eq!(auto, ApprovalMode::Auto);
+
+        // Serialize back
+        let manual_json = serde_json::to_value(&ApprovalMode::Manual).unwrap();
+        assert_eq!(manual_json, serde_json::Value::String("manual".to_string()));
+        let auto_json = serde_json::to_value(&ApprovalMode::Auto).unwrap();
+        assert_eq!(auto_json, serde_json::Value::String("auto".to_string()));
     }
 
     #[test]
@@ -2265,5 +2272,159 @@ retirements:
         assert!(status.computed_at.is_none());
         assert!(status.applied_at.is_none());
         assert!(status.last_error.is_none());
+    }
+
+    #[test]
+    fn spec_without_approval_field_deserializes_as_none() {
+        let json = serde_json::json!({
+            "connection": {
+                "secretRef": { "name": "pg-secret" },
+                "secretKey": "DATABASE_URL"
+            },
+            "interval": "5m",
+            "suspend": false,
+            "mode": "apply",
+            "reconciliation_mode": "authoritative"
+        });
+
+        let spec: PostgresPolicySpec =
+            serde_json::from_value(json).expect("should deserialize without approval field");
+        assert!(
+            spec.approval.is_none(),
+            "approval should be None when omitted"
+        );
+        assert_eq!(
+            spec.effective_approval(),
+            ApprovalMode::Auto,
+            "effective_approval should infer Auto from apply mode"
+        );
+    }
+
+    #[test]
+    fn status_without_current_plan_ref_deserializes_as_none() {
+        let json = serde_json::json!({
+            "conditions": [],
+            "owned_roles": [],
+            "owned_schemas": []
+        });
+
+        let status: PostgresPolicyStatus =
+            serde_json::from_value(json).expect("should deserialize without current_plan_ref");
+        assert!(
+            status.current_plan_ref.is_none(),
+            "current_plan_ref should be None when omitted"
+        );
+    }
+
+    #[test]
+    fn effective_approval_explicit_auto_overrides_plan_mode() {
+        let spec = PostgresPolicySpec {
+            connection: ConnectionSpec {
+                secret_ref: SecretReference {
+                    name: "test".into(),
+                },
+                secret_key: "DATABASE_URL".into(),
+            },
+            interval: "5m".into(),
+            suspend: false,
+            mode: PolicyMode::Plan,
+            reconciliation_mode: CrdReconciliationMode::Authoritative,
+            default_owner: None,
+            profiles: Default::default(),
+            schemas: vec![],
+            roles: vec![],
+            grants: vec![],
+            default_privileges: vec![],
+            memberships: vec![],
+            retirements: vec![],
+            approval: Some(ApprovalMode::Auto),
+        };
+
+        assert_eq!(
+            spec.effective_approval(),
+            ApprovalMode::Auto,
+            "explicit Auto should override Plan mode's default of Manual"
+        );
+    }
+
+    #[test]
+    fn plan_phase_rejected_display() {
+        assert_eq!(PlanPhase::Rejected.to_string(), "Rejected");
+    }
+
+    #[test]
+    fn plan_phase_all_variants_display() {
+        let variants = [
+            PlanPhase::Pending,
+            PlanPhase::Approved,
+            PlanPhase::Applying,
+            PlanPhase::Applied,
+            PlanPhase::Failed,
+            PlanPhase::Superseded,
+            PlanPhase::Rejected,
+        ];
+        for variant in &variants {
+            let display = variant.to_string();
+            assert!(
+                !display.is_empty(),
+                "PlanPhase::{variant:?} should have non-empty Display output"
+            );
+        }
+    }
+
+    #[test]
+    fn plan_status_defaults() {
+        let status = PostgresPolicyPlanStatus::default();
+        assert_eq!(status.phase, PlanPhase::Pending);
+        assert!(status.conditions.is_empty());
+        assert!(status.sql_ref.is_none());
+        assert!(status.sql_hash.is_none());
+        assert!(status.sql_inline.is_none());
+        assert!(status.change_summary.is_none());
+        assert!(status.computed_at.is_none());
+        assert!(status.applied_at.is_none());
+        assert!(status.last_error.is_none());
+    }
+
+    #[test]
+    fn plan_spec_camel_case_serialization() {
+        let spec = PostgresPolicyPlanSpec {
+            policy_ref: PolicyPlanRef {
+                name: "my-policy".into(),
+            },
+            policy_generation: 3,
+            reconciliation_mode: CrdReconciliationMode::Authoritative,
+            owned_roles: vec!["role-a".into()],
+            owned_schemas: vec!["public".into()],
+            managed_database_identity: "ns/secret/key".into(),
+        };
+
+        let json = serde_json::to_value(&spec).expect("should serialize to JSON");
+        let obj = json.as_object().expect("should be a JSON object");
+
+        assert!(
+            obj.contains_key("policyRef"),
+            "should use camelCase: policyRef"
+        );
+        assert!(
+            obj.contains_key("policyGeneration"),
+            "should use camelCase: policyGeneration"
+        );
+        assert!(
+            obj.contains_key("reconciliationMode"),
+            "should use camelCase: reconciliationMode"
+        );
+        assert!(
+            obj.contains_key("ownedRoles"),
+            "should use camelCase: ownedRoles"
+        );
+        assert!(
+            obj.contains_key("ownedSchemas"),
+            "should use camelCase: ownedSchemas"
+        );
+        assert!(
+            obj.contains_key("managedDatabaseIdentity"),
+            "should use camelCase: managedDatabaseIdentity"
+        );
     }
 }
