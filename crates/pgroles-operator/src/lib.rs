@@ -9,4 +9,5 @@ pub mod crd;
 pub mod events;
 pub mod observability;
 pub mod password;
+pub mod plan;
 pub mod reconciler;

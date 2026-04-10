@@ -966,7 +966,7 @@ pub fn now_rfc3339() -> String {
 }
 
 /// Convert days since Unix epoch to (year, month, day).
-fn days_to_date(days_since_epoch: u64) -> (u64, u64, u64) {
+pub fn days_to_date(days_since_epoch: u64) -> (u64, u64, u64) {
     // Civil calendar algorithm from Howard Hinnant
     let z = days_since_epoch + 719468;
     let era = z / 146097;
