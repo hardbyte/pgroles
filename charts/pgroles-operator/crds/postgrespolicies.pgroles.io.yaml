@@ -64,6 +64,15 @@
               "spec": {
                 "description": "Spec for a `PostgresPolicy` custom resource.\n\nDefines the desired state of PostgreSQL roles, grants, default privileges,\nand memberships for a single database connection.",
                 "properties": {
+                  "approval": {
+                    "default": "manual",
+                    "description": "Approval mode for plans: `auto` or `manual`.\nWhen `manual` (default for new deployments), plans require explicit\napproval before the operator executes them.\nWhen `auto`, plans are approved and applied immediately.",
+                    "enum": [
+                      "manual",
+                      "auto"
+                    ],
+                    "type": "string"
+                  },
                   "connection": {
                     "description": "Database connection configuration.",
                     "properties": {
@@ -745,6 +754,19 @@
                       "type": "object"
                     },
                     "type": "array"
+                  },
+                  "current_plan_ref": {
+                    "description": "Reference to the current/latest plan for this policy.",
+                    "nullable": true,
+                    "properties": {
+                      "name": {
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "name"
+                    ],
+                    "type": "object"
                   },
                   "last_attempted_generation": {
                     "description": "The `.metadata.generation` that was last attempted.",

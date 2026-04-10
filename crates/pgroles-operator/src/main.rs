@@ -144,8 +144,8 @@ async fn main() -> anyhow::Result<()> {
 mod tests {
     use super::policy_trigger_hash;
     use pgroles_operator::crd::{
-        ConnectionSpec, CrdReconciliationMode, PolicyMode, PostgresPolicy, PostgresPolicySpec,
-        SecretReference,
+        ApprovalMode, ConnectionSpec, CrdReconciliationMode, PolicyMode, PostgresPolicy,
+        PostgresPolicySpec, SecretReference,
     };
 
     fn test_policy() -> PostgresPolicy {
@@ -168,6 +168,7 @@ mod tests {
             default_privileges: Vec::new(),
             memberships: Vec::new(),
             retirements: Vec::new(),
+            approval: ApprovalMode::default(),
         };
         let mut policy = PostgresPolicy::new("example", spec);
         policy.metadata.namespace = Some("default".to_string());
