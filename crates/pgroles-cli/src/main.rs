@@ -526,7 +526,15 @@ async fn cmd_inspect(file: Option<&Path>, database_url: &str) -> Result<()> {
     };
 
     print!("{}", format_role_graph_summary(&current));
-    eprintln!("Note: grants to PUBLIC are not shown. Effective privileges may differ from what is displayed here (see https://github.com/hardbyte/pgroles/issues/57).");
+
+    // Query and display PUBLIC grants (informational only).
+    let public_grants = pgroles_inspect::fetch_public_grants(&pool)
+        .await
+        .context("failed to query PUBLIC grants")?;
+    let public_output = pgroles_inspect::format_public_grants(&public_grants);
+    if !public_output.is_empty() {
+        print!("{public_output}");
+    }
 
     Ok(())
 }
