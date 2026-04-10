@@ -521,6 +521,7 @@ async fn cmd_inspect(file: Option<&Path>, database_url: &str) -> Result<()> {
     };
 
     print!("{}", format_role_graph_summary(&current));
+    eprintln!("Note: grants to PUBLIC are not shown. Effective privileges may differ from what is displayed here (see https://github.com/hardbyte/pgroles/issues/57).");
 
     Ok(())
 }
