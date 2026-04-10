@@ -15,9 +15,29 @@ use kube::{Api, Client, Resource, ResourceExt};
 use tracing::info;
 
 use pgroles_operator::context::OperatorContext;
-use pgroles_operator::crd::PostgresPolicy;
+use pgroles_operator::crd::{LABEL_POLICY, PostgresPolicy, PostgresPolicyPlan};
 use pgroles_operator::observability::{OperatorObservability, serve_health};
 use pgroles_operator::reconciler::{error_policy, reconcile};
+
+/// Hash for plan annotation changes — triggers parent policy reconciliation
+/// when approval/rejection annotations are added or modified.
+fn plan_annotation_hash(plan: &PostgresPolicyPlan) -> Option<u64> {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    // Hash the approval-related annotations so we trigger on changes.
+    if let Some(annotations) = &plan.metadata.annotations {
+        annotations
+            .get(pgroles_operator::crd::PLAN_APPROVED_ANNOTATION)
+            .hash(&mut hasher);
+        annotations
+            .get(pgroles_operator::crd::PLAN_REJECTED_ANNOTATION)
+            .hash(&mut hasher);
+    }
+    // Also hash the plan's status phase to detect operator-driven transitions.
+    if let Some(status) = &plan.status {
+        format!("{}", status.phase).hash(&mut hasher);
+    }
+    Some(hasher.finish())
+}
 
 fn policy_trigger_hash(policy: &PostgresPolicy) -> Option<u64> {
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
@@ -87,37 +107,80 @@ async fn main() -> anyhow::Result<()> {
         .applied_objects()
         .predicate_filter(policy_trigger_hash, Default::default());
     let policy_store = reader.clone();
-    let secret_triggers = watcher(Api::<Secret>::all(client), watcher::Config::default())
-        .default_backoff()
-        .touched_objects()
-        .predicate_filter(predicates::resource_version, Default::default())
-        .filter_map(|secret| async move { secret.ok() })
-        .flat_map(move |secret| {
-            let policy_store = policy_store.clone();
-            let Some(secret_ns) = secret.namespace() else {
-                return stream::iter(Vec::<ObjectRef<PostgresPolicy>>::new());
+    let secret_triggers = watcher(
+        Api::<Secret>::all(client.clone()),
+        watcher::Config::default(),
+    )
+    .default_backoff()
+    .touched_objects()
+    .predicate_filter(predicates::resource_version, Default::default())
+    .filter_map(|secret| async move { secret.ok() })
+    .flat_map(move |secret| {
+        let policy_store = policy_store.clone();
+        let Some(secret_ns) = secret.namespace() else {
+            return stream::iter(Vec::<ObjectRef<PostgresPolicy>>::new());
+        };
+        let secret_name = secret.name_any();
+        let refs = policy_store
+            .state()
+            .into_iter()
+            .filter(|policy| {
+                policy.namespace().as_deref() == Some(secret_ns.as_str())
+                    && policy
+                        .spec
+                        .referenced_secret_names(&policy.name_any())
+                        .contains(&secret_name)
+            })
+            .map(|policy| ObjectRef::from_obj(policy.as_ref()))
+            .collect::<Vec<_>>();
+        stream::iter(refs)
+    });
+
+    // Watch PostgresPolicyPlan resources for annotation changes (approval/rejection).
+    // When a plan's annotations change, trigger reconciliation of the parent policy.
+    let plan_policy_store = reader.clone();
+    let plan_triggers = watcher(
+        Api::<PostgresPolicyPlan>::all(client),
+        watcher::Config::default(),
+    )
+    .default_backoff()
+    .touched_objects()
+    .predicate_filter(plan_annotation_hash, Default::default())
+    .filter_map(|plan| async move { plan.ok() })
+    .flat_map(move |plan| {
+        let policy_store = plan_policy_store.clone();
+        // Look up the parent policy name from the plan's label.
+        let plan_ns = plan.namespace();
+        let parent_policy_name = plan
+            .metadata
+            .labels
+            .as_ref()
+            .and_then(|labels| labels.get(LABEL_POLICY))
+            .cloned();
+
+        let refs: Vec<ObjectRef<PostgresPolicy>> =
+            if let (Some(ns), Some(policy_name)) = (plan_ns, parent_policy_name) {
+                policy_store
+                    .state()
+                    .into_iter()
+                    .filter(|policy| {
+                        policy.namespace().as_deref() == Some(ns.as_str())
+                            && policy.name_any() == policy_name
+                    })
+                    .map(|policy| ObjectRef::from_obj(policy.as_ref()))
+                    .collect()
+            } else {
+                Vec::new()
             };
-            let secret_name = secret.name_any();
-            let refs = policy_store
-                .state()
-                .into_iter()
-                .filter(|policy| {
-                    policy.namespace().as_deref() == Some(secret_ns.as_str())
-                        && policy
-                            .spec
-                            .referenced_secret_names(&policy.name_any())
-                            .contains(&secret_name)
-                })
-                .map(|policy| ObjectRef::from_obj(policy.as_ref()))
-                .collect::<Vec<_>>();
-            stream::iter(refs)
-        });
+        stream::iter(refs)
+    });
 
     info!("starting controller");
     observability.mark_ready();
 
     Controller::for_stream(policy_stream, reader)
         .reconcile_on(secret_triggers)
+        .reconcile_on(plan_triggers)
         .shutdown_on_signal()
         .run(reconcile, error_policy, ctx)
         .for_each(|result| async move {
