@@ -1355,8 +1355,8 @@ impl ReconcileError {
 mod tests {
     use super::*;
     use crate::crd::{
-        ApprovalMode, ConnectionSpec, CrdReconciliationMode, PasswordSpec, PolicyMode,
-        PostgresPolicySpec, RoleSpec, SecretReference,
+        ConnectionSpec, CrdReconciliationMode, PasswordSpec, PolicyMode, PostgresPolicySpec,
+        RoleSpec, SecretReference,
     };
     use k8s_openapi::{
         ByteString, api::core::v1::Secret, apimachinery::pkg::apis::meta::v1::ObjectMeta,
@@ -1434,7 +1434,7 @@ mod tests {
             default_privileges: Vec::new(),
             memberships: Vec::new(),
             retirements: Vec::new(),
-            approval: ApprovalMode::default(),
+            approval: None,
         };
         let mut resource = PostgresPolicy::new("example", spec);
         resource.metadata.namespace = Some("default".to_string());
@@ -1486,7 +1486,7 @@ mod tests {
                 default_privileges: Vec::new(),
                 memberships: Vec::new(),
                 retirements: Vec::new(),
-                approval: ApprovalMode::default(),
+                approval: None,
             },
         )
     }
@@ -1518,7 +1518,7 @@ mod tests {
                 default_privileges: Vec::new(),
                 memberships: Vec::new(),
                 retirements: Vec::new(),
-                approval: ApprovalMode::default(),
+                approval: None,
             },
         )
     }
@@ -1586,7 +1586,7 @@ mod tests {
                 default_privileges: Vec::new(),
                 memberships: Vec::new(),
                 retirements: Vec::new(),
-                approval: ApprovalMode::default(),
+                approval: None,
             },
         )
     }

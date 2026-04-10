@@ -7,7 +7,9 @@
   "spec": {
     "group": "pgroles.io",
     "names": {
-      "categories": [],
+      "categories": [
+        "pgroles"
+      ],
       "kind": "PostgresPolicyPlan",
       "plural": "postgrespolicyplans",
       "shortNames": [
@@ -248,8 +250,14 @@
                       "Applying",
                       "Applied",
                       "Failed",
-                      "Superseded"
+                      "Superseded",
+                      "Rejected"
                     ],
+                    "type": "string"
+                  },
+                  "sqlHash": {
+                    "description": "SHA-256 hash of the planned SQL, used to detect duplicate plans.\nIf a newly computed plan has the same hash as the current pending plan,\nthe operator can skip creating a redundant plan.",
+                    "nullable": true,
                     "type": "string"
                   },
                   "sqlInline": {
