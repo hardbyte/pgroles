@@ -30,6 +30,12 @@
             "type": "string"
           },
           {
+            "jsonPath": ".spec.reconciliation_mode",
+            "name": "Recon",
+            "priority": 1,
+            "type": "string"
+          },
+          {
             "jsonPath": ".status.conditions[?(@.type==\"Drifted\")].status",
             "name": "Drift",
             "type": "string"
