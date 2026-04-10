@@ -9,7 +9,7 @@ use k8s_openapi::api::core::v1::ObjectReference;
 use kube::Resource;
 use kube::runtime::events::{Event, EventType, Recorder};
 
-use crate::crd::{PolicyCondition, PostgresPolicy, PostgresPolicyStatus};
+use crate::crd::{PolicyCondition, PostgresPolicy, PostgresPolicyPlan, PostgresPolicyStatus};
 
 /// Publish Kubernetes Events for notable status transitions.
 pub async fn publish_status_events(
@@ -23,6 +23,72 @@ pub async fn publish_status_events(
         recorder.publish(&event, &reference).await?;
     }
     Ok(())
+}
+
+/// Publish a plan lifecycle event on the parent policy.
+pub async fn publish_plan_event(
+    recorder: &Recorder,
+    policy: &PostgresPolicy,
+    plan: &PostgresPolicyPlan,
+    event_type: PlanEventType,
+) -> Result<(), kube::Error> {
+    let reference: ObjectReference = policy.object_ref(&());
+    let plan_name = kube::ResourceExt::name_any(plan);
+    let event = match event_type {
+        PlanEventType::Created { change_count } => event(
+            EventType::Normal,
+            "PlanCreated",
+            "PlanLifecycle",
+            format!("Plan {plan_name} created with {change_count} change(s)"),
+        ),
+        PlanEventType::Approved => event(
+            EventType::Normal,
+            "PlanApproved",
+            "PlanLifecycle",
+            format!("Plan {plan_name} approved"),
+        ),
+        PlanEventType::Rejected => event(
+            EventType::Normal,
+            "PlanRejected",
+            "PlanLifecycle",
+            format!("Plan {plan_name} rejected"),
+        ),
+        PlanEventType::ApplyStarted => event(
+            EventType::Normal,
+            "ApplyStarted",
+            "PlanLifecycle",
+            format!("Executing plan {plan_name}"),
+        ),
+        PlanEventType::ApplySucceeded => event(
+            EventType::Normal,
+            "ApplySucceeded",
+            "PlanLifecycle",
+            format!("Plan {plan_name} applied successfully"),
+        ),
+        PlanEventType::ApplyFailed { error } => event(
+            EventType::Warning,
+            "ApplyFailed",
+            "PlanLifecycle",
+            format!("Plan {plan_name} failed: {error}"),
+        ),
+    };
+    recorder.publish(&event, &reference).await
+}
+
+/// Types of plan lifecycle events.
+pub enum PlanEventType {
+    /// A new plan was computed.
+    Created { change_count: i32 },
+    /// Approval annotation detected on a plan.
+    Approved,
+    /// Rejection annotation detected on a plan.
+    Rejected,
+    /// Plan execution has started.
+    ApplyStarted,
+    /// Plan execution completed successfully.
+    ApplySucceeded,
+    /// Plan execution failed.
+    ApplyFailed { error: String },
 }
 
 fn derive_status_events(

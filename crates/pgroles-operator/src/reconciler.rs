@@ -633,6 +633,7 @@ async fn reconcile_apply_inner(
         requeue_interval,
         &name,
         &namespace,
+        identity,
     )
     .await;
 
@@ -657,6 +658,7 @@ async fn apply_under_lock(
     requeue_interval: Duration,
     name: &str,
     namespace: &str,
+    identity: &DatabaseIdentity,
 ) -> Result<(Action, ReconcileOutcome), ReconcileError> {
     // 6. Inspect current state from the database.
     let has_database_grants = expanded
@@ -715,6 +717,8 @@ async fn apply_under_lock(
     let sql_ctx = detect_sql_context(pool).await?;
     let (planned_sql, planned_sql_truncated) = render_plan_sql_for_status(&changes, &sql_ctx);
 
+    let effective_approval = resource.spec.effective_approval();
+
     if resource.spec.mode == PolicyMode::Plan {
         let drift_detected = !changes.is_empty();
         let ready_message = if drift_detected {
@@ -738,6 +742,27 @@ async fn apply_under_lock(
         ctx.observability
             .record_planned_changes(summary.total.max(0) as usize);
 
+        // Create a PostgresPolicyPlan resource for changes (if any).
+        let mut plan_ref_name = None;
+        if drift_detected {
+            let plan_name = crate::plan::create_or_update_plan(
+                &ctx.kube_client,
+                resource,
+                &changes,
+                &sql_ctx,
+                &inspect_config,
+                resource.spec.reconciliation_mode,
+                identity.as_str(),
+                &summary,
+            )
+            .await?;
+
+            crate::plan::update_policy_plan_ref(&ctx.kube_client, resource, &plan_name).await?;
+
+            plan_ref_name = Some(plan_name);
+        }
+
+        // Still write deprecated planned_sql to status for backward compat.
         update_status(ctx, resource, |status| {
             status.set_condition(ready_condition(true, "Planned", &ready_message));
             status.set_condition(drifted_condition(
@@ -761,8 +786,18 @@ async fn apply_under_lock(
             status.planned_sql_truncated = planned_sql_truncated;
             status.last_error = None;
             status.transient_failure_count = 0;
+            if let Some(ref plan_name) = plan_ref_name {
+                status.current_plan_ref = Some(crate::crd::PlanReference {
+                    name: plan_name.clone(),
+                });
+            }
         })
         .await?;
+
+        // Clean up old plans.
+        if let Err(err) = crate::plan::cleanup_old_plans(&ctx.kube_client, resource, None).await {
+            tracing::warn!(%err, "failed to clean up old plans");
+        }
 
         info!(
             name,
@@ -774,68 +809,315 @@ async fn apply_under_lock(
         return Ok((Action::requeue(requeue_interval), ReconcileOutcome::Planned));
     }
 
-    // 8. Apply changes.
-    if changes.is_empty() {
-        info!(name, namespace, "no changes needed");
-    } else {
-        info!(name, namespace, count = changes.len(), "applying changes");
+    // Apply mode — behavior depends on effective approval mode.
+    match effective_approval {
+        crate::crd::ApprovalMode::Auto => {
+            // Auto-approval: create plan -> immediately execute -> update status.
+            // This wraps the existing apply behavior in the plan lifecycle.
+            if !changes.is_empty() {
+                let plan_name = crate::plan::create_or_update_plan(
+                    &ctx.kube_client,
+                    resource,
+                    &changes,
+                    &sql_ctx,
+                    &inspect_config,
+                    resource.spec.reconciliation_mode,
+                    identity.as_str(),
+                    &summary,
+                )
+                .await?;
 
-        let mut transaction = pool.begin().await?;
-        let mut statements_executed = 0usize;
-        for change in &changes {
-            let is_sensitive = matches!(change, pgroles_core::diff::Change::SetPassword { .. });
-            for sql in pgroles_core::sql::render_statements_with_context(change, &sql_ctx) {
-                if is_sensitive {
-                    tracing::debug!("executing: ALTER ROLE ... PASSWORD [REDACTED]");
-                } else {
-                    tracing::debug!(%sql, "executing");
-                }
-                sqlx::query(&sql).execute(transaction.as_mut()).await?;
-                statements_executed += 1;
+                // Fetch the plan, mark it approved, and execute it.
+                let plans_api: kube::Api<crate::crd::PostgresPolicyPlan> =
+                    kube::Api::namespaced(ctx.kube_client.clone(), namespace);
+                let plan = plans_api.get(&plan_name).await?;
+
+                crate::plan::mark_plan_approved(&ctx.kube_client, &plan).await?;
+
+                // Re-fetch after approval status update.
+                let plan = plans_api.get(&plan_name).await?;
+                crate::plan::execute_plan(&ctx.kube_client, &plan, pool, &sql_ctx, &changes)
+                    .await?;
+
+                ctx.observability.record_apply_result("success");
+
+                crate::plan::update_policy_plan_ref(&ctx.kube_client, resource, &plan_name).await?;
+
+                info!(
+                    name,
+                    namespace,
+                    total = summary.total,
+                    plan = %plan_name,
+                    "auto-approved plan applied"
+                );
+            } else {
+                info!(name, namespace, "no changes needed");
             }
+
+            // Update status to Ready.
+            update_status(ctx, resource, |status| {
+                status.set_condition(ready_condition(true, "Reconciled", "All changes applied"));
+                status.set_condition(drifted_condition(false, "InSync", "No pending changes"));
+                status.conditions.retain(|c| {
+                    c.condition_type != "Reconciling"
+                        && c.condition_type != "Degraded"
+                        && c.condition_type != "Conflict"
+                        && c.condition_type != "Paused"
+                });
+                status.observed_generation = generation;
+                status.last_attempted_generation = generation;
+                status.last_successful_reconcile_time = Some(crate::crd::now_rfc3339());
+                status.last_reconcile_time = Some(crate::crd::now_rfc3339());
+                status.change_summary = Some(summary);
+                status.last_reconcile_mode = Some(PolicyMode::Apply);
+                status.planned_sql = None;
+                status.planned_sql_truncated = false;
+                status.last_error = None;
+                status.applied_password_source_versions = applied_password_source_versions;
+                status.transient_failure_count = 0;
+            })
+            .await?;
+
+            // Clean up old plans.
+            if let Err(err) = crate::plan::cleanup_old_plans(&ctx.kube_client, resource, None).await
+            {
+                tracing::warn!(%err, "failed to clean up old plans");
+            }
+
+            Ok((
+                Action::requeue(requeue_interval),
+                ReconcileOutcome::Reconciled,
+            ))
         }
-        transaction.commit().await?;
-        ctx.observability.record_apply_result("success");
-        ctx.observability
-            .record_apply_statements(statements_executed);
+        crate::crd::ApprovalMode::Manual => {
+            // Manual approval: check for an existing approved plan, or create one.
 
-        info!(
-            name,
-            namespace,
-            total = summary.total,
-            "reconciliation complete"
-        );
+            // First, check if there is a current pending plan that has been approved.
+            if let Some(current_plan) =
+                crate::plan::get_current_pending_plan(&ctx.kube_client, resource).await?
+            {
+                let approval_state = crate::plan::check_plan_approval(&current_plan);
+
+                match approval_state {
+                    crate::plan::PlanApprovalState::Approved => {
+                        // Execute the approved plan.
+                        info!(
+                            name,
+                            namespace,
+                            plan = %current_plan.name_any(),
+                            "executing manually approved plan"
+                        );
+
+                        crate::plan::mark_plan_approved(&ctx.kube_client, &current_plan).await?;
+
+                        let plans_api: kube::Api<crate::crd::PostgresPolicyPlan> =
+                            kube::Api::namespaced(ctx.kube_client.clone(), namespace);
+                        let plan = plans_api.get(&current_plan.name_any()).await?;
+                        crate::plan::execute_plan(
+                            &ctx.kube_client,
+                            &plan,
+                            pool,
+                            &sql_ctx,
+                            &changes,
+                        )
+                        .await?;
+
+                        ctx.observability.record_apply_result("success");
+
+                        // Update status to Ready.
+                        update_status(ctx, resource, |status| {
+                            status.set_condition(ready_condition(
+                                true,
+                                "Reconciled",
+                                "Approved plan applied",
+                            ));
+                            status.set_condition(drifted_condition(
+                                false,
+                                "InSync",
+                                "No pending changes",
+                            ));
+                            status.conditions.retain(|c| {
+                                c.condition_type != "Reconciling"
+                                    && c.condition_type != "Degraded"
+                                    && c.condition_type != "Conflict"
+                                    && c.condition_type != "Paused"
+                            });
+                            status.observed_generation = generation;
+                            status.last_attempted_generation = generation;
+                            status.last_successful_reconcile_time = Some(crate::crd::now_rfc3339());
+                            status.last_reconcile_time = Some(crate::crd::now_rfc3339());
+                            status.change_summary = Some(summary);
+                            status.last_reconcile_mode = Some(PolicyMode::Apply);
+                            status.planned_sql = None;
+                            status.planned_sql_truncated = false;
+                            status.last_error = None;
+                            status.applied_password_source_versions =
+                                applied_password_source_versions;
+                            status.transient_failure_count = 0;
+                        })
+                        .await?;
+
+                        if let Err(err) =
+                            crate::plan::cleanup_old_plans(&ctx.kube_client, resource, None).await
+                        {
+                            tracing::warn!(%err, "failed to clean up old plans");
+                        }
+
+                        return Ok((
+                            Action::requeue(requeue_interval),
+                            ReconcileOutcome::Reconciled,
+                        ));
+                    }
+                    crate::plan::PlanApprovalState::Rejected => {
+                        // Mark the plan as rejected.
+                        crate::plan::mark_plan_rejected(&ctx.kube_client, &current_plan).await?;
+                        info!(
+                            name,
+                            namespace,
+                            plan = %current_plan.name_any(),
+                            "plan rejected via annotation"
+                        );
+                        // Fall through to create a new plan on next cycle.
+                    }
+                    crate::plan::PlanApprovalState::Pending => {
+                        // Plan exists and is pending — nothing to do, requeue.
+                        info!(
+                            name,
+                            namespace,
+                            plan = %current_plan.name_any(),
+                            "plan awaiting manual approval"
+                        );
+
+                        update_status(ctx, resource, |status| {
+                            let msg = format!(
+                                "Plan {} awaiting approval; {} change(s) pending",
+                                current_plan.name_any(),
+                                summary.total,
+                            );
+                            status.set_condition(ready_condition(true, "Planned", &msg));
+                            status.set_condition(drifted_condition(
+                                !changes.is_empty(),
+                                if changes.is_empty() {
+                                    "InSync"
+                                } else {
+                                    "DriftDetected"
+                                },
+                                &msg,
+                            ));
+                            status.conditions.retain(|c| {
+                                c.condition_type != "Reconciling"
+                                    && c.condition_type != "Degraded"
+                                    && c.condition_type != "Conflict"
+                                    && c.condition_type != "Paused"
+                            });
+                            status.last_attempted_generation = generation;
+                            status.change_summary = Some(summary.clone());
+                            status.planned_sql = planned_sql.clone();
+                            status.planned_sql_truncated = planned_sql_truncated;
+                            status.last_error = None;
+                            status.transient_failure_count = 0;
+                        })
+                        .await?;
+
+                        return Ok((Action::requeue(requeue_interval), ReconcileOutcome::Planned));
+                    }
+                }
+            }
+
+            // No pending plan (or previous one was rejected) — create a new plan.
+            if changes.is_empty() {
+                info!(name, namespace, "no changes needed (manual approval mode)");
+
+                update_status(ctx, resource, |status| {
+                    status.set_condition(ready_condition(true, "Reconciled", "No changes needed"));
+                    status.set_condition(drifted_condition(false, "InSync", "No pending changes"));
+                    status.conditions.retain(|c| {
+                        c.condition_type != "Reconciling"
+                            && c.condition_type != "Degraded"
+                            && c.condition_type != "Conflict"
+                            && c.condition_type != "Paused"
+                    });
+                    status.observed_generation = generation;
+                    status.last_attempted_generation = generation;
+                    status.last_successful_reconcile_time = Some(crate::crd::now_rfc3339());
+                    status.last_reconcile_time = Some(crate::crd::now_rfc3339());
+                    status.change_summary = Some(summary);
+                    status.last_reconcile_mode = Some(PolicyMode::Apply);
+                    status.planned_sql = None;
+                    status.planned_sql_truncated = false;
+                    status.last_error = None;
+                    status.applied_password_source_versions = applied_password_source_versions;
+                    status.transient_failure_count = 0;
+                })
+                .await?;
+
+                return Ok((
+                    Action::requeue(requeue_interval),
+                    ReconcileOutcome::Reconciled,
+                ));
+            }
+
+            // Create a new plan and wait for approval.
+            let plan_name = crate::plan::create_or_update_plan(
+                &ctx.kube_client,
+                resource,
+                &changes,
+                &sql_ctx,
+                &inspect_config,
+                resource.spec.reconciliation_mode,
+                identity.as_str(),
+                &summary,
+            )
+            .await?;
+
+            crate::plan::update_policy_plan_ref(&ctx.kube_client, resource, &plan_name).await?;
+
+            let msg = format!(
+                "Plan {plan_name} created; {} change(s) awaiting approval",
+                summary.total,
+            );
+            update_status(ctx, resource, |status| {
+                status.set_condition(ready_condition(true, "Planned", &msg));
+                status.set_condition(drifted_condition(
+                    true,
+                    "DriftDetected",
+                    &format!("{} planned change(s) pending review", summary.total),
+                ));
+                status.conditions.retain(|c| {
+                    c.condition_type != "Reconciling"
+                        && c.condition_type != "Degraded"
+                        && c.condition_type != "Conflict"
+                        && c.condition_type != "Paused"
+                });
+                status.last_attempted_generation = generation;
+                status.change_summary = Some(summary.clone());
+                status.last_reconcile_mode = Some(PolicyMode::Apply);
+                status.planned_sql = planned_sql.clone();
+                status.planned_sql_truncated = planned_sql_truncated;
+                status.last_error = None;
+                status.transient_failure_count = 0;
+                status.current_plan_ref = Some(crate::crd::PlanReference {
+                    name: plan_name.clone(),
+                });
+            })
+            .await?;
+
+            if let Err(err) = crate::plan::cleanup_old_plans(&ctx.kube_client, resource, None).await
+            {
+                tracing::warn!(%err, "failed to clean up old plans");
+            }
+
+            info!(
+                name,
+                namespace,
+                total = summary.total,
+                plan = %plan_name,
+                "plan created, awaiting manual approval"
+            );
+
+            Ok((Action::requeue(requeue_interval), ReconcileOutcome::Planned))
+        }
     }
-
-    // 9. Update status to Ready.
-    update_status(ctx, resource, |status| {
-        status.set_condition(ready_condition(true, "Reconciled", "All changes applied"));
-        status.set_condition(drifted_condition(false, "InSync", "No pending changes"));
-        // Clear any previous "Reconciling" or "Degraded" conditions.
-        status.conditions.retain(|c| {
-            c.condition_type != "Reconciling"
-                && c.condition_type != "Degraded"
-                && c.condition_type != "Conflict"
-                && c.condition_type != "Paused"
-        });
-        status.observed_generation = generation;
-        status.last_attempted_generation = generation;
-        status.last_successful_reconcile_time = Some(crate::crd::now_rfc3339());
-        status.last_reconcile_time = Some(crate::crd::now_rfc3339());
-        status.change_summary = Some(summary);
-        status.last_reconcile_mode = Some(PolicyMode::Apply);
-        status.planned_sql = None;
-        status.planned_sql_truncated = false;
-        status.last_error = None;
-        status.applied_password_source_versions = applied_password_source_versions;
-        status.transient_failure_count = 0;
-    })
-    .await?;
-
-    Ok((
-        Action::requeue(requeue_interval),
-        ReconcileOutcome::Reconciled,
-    ))
 }
 
 /// Resolve role passwords from Kubernetes Secrets or generate them.
