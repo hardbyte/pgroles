@@ -425,8 +425,25 @@ pub struct ExpandedManifest {
 // ---------------------------------------------------------------------------
 
 /// Parse a YAML string into a `PolicyManifest`.
+///
+/// Accepts both bare manifests and Kubernetes CustomResource wrappers.
+/// If the YAML contains an `apiVersion` and `spec` field, the `spec` is
+/// extracted and parsed as a `PolicyManifest`.
 pub fn parse_manifest(yaml: &str) -> Result<PolicyManifest, ManifestError> {
-    let manifest: PolicyManifest = serde_yaml::from_str(yaml)?;
+    // Check if this looks like a Kubernetes CR wrapper.
+    let value: serde_yaml::Value = serde_yaml::from_str(yaml)?;
+    if let serde_yaml::Value::Mapping(ref map) = value {
+        let api_version_key = serde_yaml::Value::String("apiVersion".into());
+        let spec_key = serde_yaml::Value::String("spec".into());
+        if map.contains_key(&api_version_key) && map.contains_key(&spec_key) {
+            let spec = map.get(&spec_key).ok_or_else(|| {
+                ManifestError::Yaml(serde::de::Error::custom("missing spec in CR"))
+            })?;
+            let manifest: PolicyManifest = serde_yaml::from_value(spec.clone())?;
+            return Ok(manifest);
+        }
+    }
+    let manifest: PolicyManifest = serde_yaml::from_value(value)?;
     Ok(manifest)
 }
 
@@ -1314,5 +1331,96 @@ roles:
         assert!(!is_valid_iso8601_timestamp("2025-12-31T25:00:00Z")); // hour 25
         assert!(!is_valid_iso8601_timestamp("2025-12-31T00:00:00")); // no timezone
         assert!(!is_valid_iso8601_timestamp("")); // empty
+    }
+
+    #[test]
+    fn parse_manifest_from_kubernetes_cr() {
+        let yaml = r#"
+apiVersion: pgroles.io/v1alpha1
+kind: PostgresPolicy
+metadata:
+  name: staging-policy
+  namespace: pgroles-system
+spec:
+  connection:
+    secretRef:
+      name: pgroles-db-credentials
+  interval: "5m"
+  mode: plan
+  roles:
+    - name: app_analytics
+      login: true
+    - name: app_billing
+      login: true
+  schemas:
+    - name: analytics
+      profiles: [editor, viewer]
+  profiles:
+    editor:
+      grants:
+        - object: { type: schema }
+          privileges: [USAGE]
+        - object: { type: table, name: "*" }
+          privileges: [SELECT, INSERT, UPDATE, DELETE]
+    viewer:
+      grants:
+        - object: { type: schema }
+          privileges: [USAGE]
+        - object: { type: table, name: "*" }
+          privileges: [SELECT]
+  memberships:
+    - role: analytics-editor
+      members:
+        - { name: app_analytics }
+    - role: analytics-viewer
+      members:
+        - { name: app_billing }
+"#;
+        let manifest = parse_manifest(yaml).unwrap();
+        assert_eq!(manifest.roles.len(), 2);
+        assert_eq!(manifest.roles[0].name, "app_analytics");
+        assert_eq!(manifest.schemas.len(), 1);
+        assert_eq!(manifest.memberships.len(), 2);
+        assert_eq!(manifest.profiles.len(), 2);
+    }
+
+    #[test]
+    fn parse_manifest_bare_and_cr_produce_same_result() {
+        let bare = r#"
+roles:
+  - name: test_role
+    login: true
+schemas:
+  - name: public
+    profiles: [viewer]
+profiles:
+  viewer:
+    grants:
+      - object: { type: schema }
+        privileges: [USAGE]
+"#;
+        let cr = r#"
+apiVersion: pgroles.io/v1alpha1
+kind: PostgresPolicy
+metadata:
+  name: test
+spec:
+  roles:
+    - name: test_role
+      login: true
+  schemas:
+    - name: public
+      profiles: [viewer]
+  profiles:
+    viewer:
+      grants:
+        - object: { type: schema }
+          privileges: [USAGE]
+"#;
+        let from_bare = parse_manifest(bare).unwrap();
+        let from_cr = parse_manifest(cr).unwrap();
+        assert_eq!(from_bare.roles.len(), from_cr.roles.len());
+        assert_eq!(from_bare.schemas.len(), from_cr.schemas.len());
+        assert_eq!(from_bare.profiles.len(), from_cr.profiles.len());
     }
 }
