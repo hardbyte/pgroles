@@ -37,6 +37,7 @@ const navigation = [
             {title: 'CI/CD integration', href: '/docs/ci-cd'},
             {title: 'Google Cloud SQL', href: '/docs/google-cloud-sql'},
             {title: 'AWS RDS & Aurora', href: '/docs/aws-rds'},
+            {title: 'Staged adoption', href: '/docs/adoption'},
             {title: 'Kubernetes operator', href: '/docs/operator'},
             {title: 'Operator architecture', href: '/docs/operator-architecture'},
         ],
