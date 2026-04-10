@@ -102,7 +102,7 @@ enum Commands {
     Inspect {
         /// Path to policy manifest YAML. When provided, scopes output to roles
         /// and schemas declared in the manifest. When omitted, shows all
-        /// database roles and privileges.
+        /// non-system database roles and privileges.
         #[arg(short, long)]
         file: Option<PathBuf>,
 
@@ -499,14 +499,19 @@ async fn cmd_apply(
 }
 
 async fn cmd_inspect(file: Option<&Path>, database_url: &str) -> Result<()> {
-    let pool = connect_db(database_url).await?;
-
-    let current = match file {
+    // Validate manifest before connecting so YAML errors fail fast.
+    let validated = match file {
         Some(path) => {
             let yaml = read_manifest_file(path)?;
-            let validated = validate_manifest(&yaml)?;
-            inspect_current(&pool, &validated).await?
+            Some(validate_manifest(&yaml)?)
         }
+        None => None,
+    };
+
+    let pool = connect_db(database_url).await?;
+
+    let current = match validated {
+        Some(ref v) => inspect_current(&pool, v).await?,
         None => {
             info!("no manifest provided, inspecting all non-system roles");
             pgroles_inspect::inspect_all(
