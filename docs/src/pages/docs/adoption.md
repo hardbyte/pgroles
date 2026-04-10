@@ -49,7 +49,7 @@ If the output is `-- No changes needed`, the manifest matches the database and a
 
 ### 4. Enable additive apply
 
-Switch to `mode: apply` with `reconciliation_mode: additive`. This only adds grants and memberships — it never revokes existing privileges or drops roles.
+Switch to `mode: apply` with `reconciliation_mode: additive`. This applies all non-destructive changes — creating roles, adding grants and memberships, setting default privileges — but never revokes existing privileges, removes memberships, or drops roles.
 
 ```yaml
 spec:
@@ -80,6 +80,7 @@ grants:
     privileges: [CONNECT]
     object:
       type: database
+      name: myapp
 ```
 
 ```yaml
