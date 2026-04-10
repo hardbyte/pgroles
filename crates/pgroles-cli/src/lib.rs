@@ -42,6 +42,17 @@ pub fn parse_and_expand(yaml: &str) -> Result<ExpandedManifest> {
 /// Returns the expanded manifest and the desired RoleGraph.
 pub fn validate_manifest(yaml: &str) -> Result<ValidatedManifest> {
     let policy_manifest = parse(yaml)?;
+
+    if policy_manifest.roles.is_empty()
+        && policy_manifest.schemas.is_empty()
+        && policy_manifest.grants.is_empty()
+        && policy_manifest.memberships.is_empty()
+    {
+        tracing::warn!(
+            "manifest defines no roles, schemas, grants, or memberships — is the file correct?"
+        );
+    }
+
     let expanded =
         manifest::expand_manifest(&policy_manifest).map_err(|err| anyhow::anyhow!("{err}"))?;
 
