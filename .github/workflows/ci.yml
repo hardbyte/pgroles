@@ -739,6 +739,454 @@ jobs:
           kubectl -n pgroles-system logs deployment/otel-collector --tail=200
           exit 1
 
+      - name: Run plan lifecycle E2E scenarios
+        run: |
+          # -- Helper functions (same as above) -----------------------------------
+          wait_for_ready_true() {
+            policy="$1"
+            attempts="${2:-30}"
+            sleep_secs="${3:-3}"
+            for i in $(seq 1 "$attempts"); do
+              status="$(kubectl get pgr "$policy" -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}' 2>/dev/null || true)"
+              if [ "$status" = "True" ]; then
+                echo "$policy reached Ready=True"
+                return 0
+              fi
+              echo "Waiting for $policy Ready=True... (attempt $i/$attempts)"
+              sleep "$sleep_secs"
+            done
+            echo "::error::$policy did not reach Ready=True"
+            kubectl get pgr "$policy" -o yaml || true
+            kubectl -n pgroles-system logs deployment/pgroles-operator --tail=200 || true
+            return 1
+          }
+
+          wait_for_ready_status_reason() {
+            policy="$1"
+            expected_status="$2"
+            expected_reason="$3"
+            for i in $(seq 1 30); do
+              status="$(kubectl get pgr "$policy" -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}' 2>/dev/null || true)"
+              reason="$(kubectl get pgr "$policy" -o jsonpath='{.status.conditions[?(@.type=="Ready")].reason}' 2>/dev/null || true)"
+              if [ "$status" = "$expected_status" ] && [ "$reason" = "$expected_reason" ]; then
+                echo "$policy reached Ready=$expected_status with reason=$expected_reason"
+                return 0
+              fi
+              echo "Waiting for $policy Ready=$expected_status/$expected_reason... (attempt $i/30)"
+              sleep 3
+            done
+            echo "::error::$policy did not reach Ready=$expected_status with reason=$expected_reason"
+            kubectl get pgr "$policy" -o yaml || true
+            kubectl -n pgroles-system logs deployment/pgroles-operator --tail=200 || true
+            return 1
+          }
+
+          wait_for_drift_status() {
+            policy="$1"
+            expected_status="$2"
+            for i in $(seq 1 30); do
+              status="$(kubectl get pgr "$policy" -o jsonpath='{.status.conditions[?(@.type=="Drifted")].status}' 2>/dev/null || true)"
+              if [ "$status" = "$expected_status" ]; then
+                echo "$policy reached Drifted=$expected_status"
+                return 0
+              fi
+              echo "Waiting for $policy Drifted=$expected_status... (attempt $i/30)"
+              sleep 3
+            done
+            echo "::error::$policy did not reach Drifted=$expected_status"
+            kubectl get pgr "$policy" -o yaml || true
+            kubectl -n pgroles-system logs deployment/pgroles-operator --tail=200 || true
+            return 1
+          }
+
+          wait_for_event_reason() {
+            policy="$1"
+            expected_reason="$2"
+            namespace="${3:-default}"
+            for i in $(seq 1 30); do
+              events="$(
+                kubectl get events.events.k8s.io -n "$namespace" \
+                  -o jsonpath='{range .items[*]}{.regarding.name}{"\t"}{.reason}{"\n"}{end}' \
+                  2>/dev/null || true
+              )"
+              if printf '%s\n' "$events" | grep -Fxq "$policy	$expected_reason"; then
+                echo "$policy emitted Event reason=$expected_reason"
+                return 0
+              fi
+              echo "Waiting for $policy Event/$expected_reason... (attempt $i/30)"
+              sleep 3
+            done
+            echo "::error::$policy did not emit Event reason=$expected_reason"
+            kubectl get events.events.k8s.io -n "$namespace" || true
+            kubectl describe pgr "$policy" || true
+            kubectl -n pgroles-system logs deployment/pgroles-operator --tail=200 || true
+            return 1
+          }
+
+          pg_query() {
+            local db="${2:-postgres}"
+            kubectl exec postgres-0 -- psql -U postgres -d "$db" -tAc "$1"
+          }
+
+          assert_role_exists() {
+            pg_query "SELECT rolname FROM pg_roles WHERE rolname = '$1'" | grep -qx "$1"
+          }
+
+          wait_for_plan_phase() {
+            local plan="$1" expected_phase="$2"
+            for i in $(seq 1 30); do
+              phase="$(kubectl get pgplan "$plan" -o jsonpath='{.status.phase}' 2>/dev/null || true)"
+              if [ "$phase" = "$expected_phase" ]; then
+                echo "Plan $plan reached phase=$expected_phase"
+                return 0
+              fi
+              echo "  Waiting for $plan phase=$expected_phase (current=$phase)... ($i/30)"
+              sleep 3
+            done
+            echo "::error::$plan did not reach phase=$expected_phase within timeout"
+            kubectl get pgplan "$plan" -o yaml || true
+            return 1
+          }
+
+          approve_plan() {
+            local plan="$1"
+            kubectl annotate pgplan "$plan" pgroles.io/approved=true --overwrite
+          }
+
+          reject_plan() {
+            local plan="$1"
+            kubectl annotate pgplan "$plan" pgroles.io/rejected=true --overwrite
+          }
+
+          wait_for_current_plan_ref() {
+            local policy="$1"
+            for i in $(seq 1 30); do
+              local plan_name
+              plan_name="$(kubectl get pgr "$policy" -o jsonpath='{.status.current_plan_ref.name}' 2>/dev/null || true)"
+              if [ -n "$plan_name" ]; then
+                echo "$plan_name"
+                return 0
+              fi
+              echo "  Waiting for $policy currentPlanRef... ($i/30)"
+              sleep 3
+            done
+            echo "::error::$policy did not get currentPlanRef within timeout"
+            return 1
+          }
+
+          get_plan_count() {
+            local policy="$1"
+            kubectl get pgplan -l "pgroles.io/policy=$policy" --no-headers 2>/dev/null | wc -l | tr -d ' '
+          }
+
+          # ================================================================
+          # Group A: Manual approval flow
+          # ================================================================
+
+          echo "--- Test: Plan creation on drift detection ---"
+          kubectl apply -f k8s/samples/plan-approval-policy.yaml
+          wait_for_ready_status_reason plan-approval-policy True Planned
+          wait_for_drift_status plan-approval-policy True
+
+          # Verify plan was created
+          plan_count=$(get_plan_count plan-approval-policy)
+          if [ "$plan_count" -lt 1 ]; then
+            echo "::error::Expected at least 1 plan for plan-approval-policy, got $plan_count"
+            exit 1
+          fi
+
+          # Get the plan name
+          plan_name=$(wait_for_current_plan_ref plan-approval-policy)
+
+          # Verify plan fields
+          phase=$(kubectl get pgplan "$plan_name" -o jsonpath='{.status.phase}')
+          test "$phase" = "Pending" || { echo "::error::Expected Pending phase, got $phase"; exit 1; }
+
+          total=$(kubectl get pgplan "$plan_name" -o jsonpath='{.status.changeSummary.total}')
+          test "$total" -gt 0 || { echo "::error::Expected changes > 0, got $total"; exit 1; }
+
+          hash=$(kubectl get pgplan "$plan_name" -o jsonpath='{.status.sqlHash}')
+          test -n "$hash" || { echo "::error::Expected sqlHash to be set"; exit 1; }
+
+          echo "--- Test: Printer columns display ---"
+          kubectl get pgplan
+          # Just verify command succeeds and shows our plan
+
+          echo "--- Test: Manual approval -> Applied ---"
+          approve_plan "$plan_name"
+          wait_for_plan_phase "$plan_name" Applied
+
+          assert_role_exists approval_test_user
+
+          applied_at=$(kubectl get pgplan "$plan_name" -o jsonpath='{.status.appliedAt}')
+          test -n "$applied_at" || { echo "::error::Expected appliedAt to be set"; exit 1; }
+
+          # Verify events
+          wait_for_event_reason plan-approval-policy PlanApproved
+          wait_for_event_reason plan-approval-policy ApplySucceeded
+
+          # Cleanup
+          kubectl delete pgr plan-approval-policy --wait=true
+          pg_query "DROP ROLE IF EXISTS approval_test_user;"
+
+          # ================================================================
+          # Group A continued: Rejection
+          # ================================================================
+
+          echo "--- Test: Plan rejection ---"
+          # Create a new policy that will generate drift
+          kubectl apply -f - <<EOF
+          apiVersion: pgroles.io/v1alpha1
+          kind: PostgresPolicy
+          metadata:
+            name: reject-test-policy
+            namespace: default
+          spec:
+            connection:
+              secretRef:
+                name: postgres-credentials
+            interval: "30s"
+            mode: plan
+            approval: manual
+            roles:
+              - name: reject_test_user
+                login: true
+            grants:
+              - role: reject_test_user
+                privileges: [CONNECT]
+                object:
+                  type: database
+                  name: postgres
+          EOF
+
+          wait_for_ready_status_reason reject-test-policy True Planned
+          plan_name=$(wait_for_current_plan_ref reject-test-policy)
+
+          reject_plan "$plan_name"
+          wait_for_plan_phase "$plan_name" Rejected
+
+          # Verify role was NOT created
+          if pg_query "SELECT 1 FROM pg_roles WHERE rolname='reject_test_user'" | grep -q 1; then
+            echo "::error::reject_test_user should NOT exist after rejection"
+            exit 1
+          fi
+
+          # Cleanup
+          kubectl delete pgr reject-test-policy --wait=true
+
+          # ================================================================
+          # Group B: Auto-approval
+          # ================================================================
+
+          echo "--- Test: Auto-approval mode ---"
+          kubectl apply -f k8s/samples/auto-approval-policy.yaml
+          wait_for_ready_true auto-approval-policy
+
+          # In auto mode, plan should be created AND applied automatically
+          assert_role_exists auto_approved_user
+
+          # Verify a plan exists and is Applied
+          plan_count=$(get_plan_count auto-approval-policy)
+          test "$plan_count" -ge 1 || { echo "::error::Expected at least 1 plan"; exit 1; }
+
+          # The latest plan should be Applied
+          latest_plan=$(kubectl get pgplan -l pgroles.io/policy=auto-approval-policy --sort-by=.metadata.creationTimestamp -o name | tail -1)
+          phase=$(kubectl get "$latest_plan" -o jsonpath='{.status.phase}')
+          test "$phase" = "Applied" || { echo "::error::Expected Applied phase for auto-approval, got $phase"; exit 1; }
+
+          # Cleanup
+          kubectl delete pgr auto-approval-policy --wait=true
+          pg_query "DROP ROLE IF EXISTS auto_approved_user;"
+
+          # ================================================================
+          # Group C: Plan supersede on policy change
+          # ================================================================
+
+          echo "--- Test: Plan supersede on policy change ---"
+          kubectl apply -f - <<EOF
+          apiVersion: pgroles.io/v1alpha1
+          kind: PostgresPolicy
+          metadata:
+            name: supersede-test
+            namespace: default
+          spec:
+            connection:
+              secretRef:
+                name: postgres-credentials
+            interval: "30s"
+            mode: plan
+            approval: manual
+            roles:
+              - name: supersede_user_v1
+                login: true
+          EOF
+
+          wait_for_ready_status_reason supersede-test True Planned
+          first_plan=$(wait_for_current_plan_ref supersede-test)
+          echo "First plan: $first_plan"
+
+          # Update policy - add another role
+          kubectl apply -f - <<EOF
+          apiVersion: pgroles.io/v1alpha1
+          kind: PostgresPolicy
+          metadata:
+            name: supersede-test
+            namespace: default
+          spec:
+            connection:
+              secretRef:
+                name: postgres-credentials
+            interval: "30s"
+            mode: plan
+            approval: manual
+            roles:
+              - name: supersede_user_v1
+                login: true
+              - name: supersede_user_v2
+                login: true
+          EOF
+
+          # Wait for the new plan to appear
+          sleep 10
+          second_plan=$(wait_for_current_plan_ref supersede-test)
+          echo "Second plan: $second_plan"
+
+          if [ "$first_plan" = "$second_plan" ]; then
+            echo "::error::Expected a new plan after policy change"
+            exit 1
+          fi
+
+          # Verify first plan is Superseded
+          first_phase=$(kubectl get pgplan "$first_plan" -o jsonpath='{.status.phase}')
+          test "$first_phase" = "Superseded" || { echo "::error::Expected first plan to be Superseded, got $first_phase"; exit 1; }
+
+          # Verify second plan is Pending
+          second_phase=$(kubectl get pgplan "$second_plan" -o jsonpath='{.status.phase}')
+          test "$second_phase" = "Pending" || { echo "::error::Expected second plan to be Pending, got $second_phase"; exit 1; }
+
+          # Cleanup
+          kubectl delete pgr supersede-test --wait=true
+
+          # ================================================================
+          # Group D: Finalizer cleanup on policy delete
+          # ================================================================
+
+          echo "--- Test: Finalizer cleanup on policy delete ---"
+          kubectl apply -f - <<EOF
+          apiVersion: pgroles.io/v1alpha1
+          kind: PostgresPolicy
+          metadata:
+            name: cleanup-test
+            namespace: default
+          spec:
+            connection:
+              secretRef:
+                name: postgres-credentials
+            interval: "30s"
+            mode: plan
+            approval: manual
+            roles:
+              - name: cleanup_test_user
+                login: true
+          EOF
+
+          wait_for_ready_status_reason cleanup-test True Planned
+          plan_name=$(wait_for_current_plan_ref cleanup-test)
+
+          # Delete the policy - plans should be GC'd via ownerReferences
+          kubectl delete pgr cleanup-test --wait=true
+          sleep 5
+
+          # Verify plan was cleaned up
+          if kubectl get pgplan "$plan_name" 2>/dev/null; then
+            echo "::error::Plan $plan_name should have been garbage collected"
+            exit 1
+          fi
+          echo "Plan garbage collected after policy deletion"
+
+          # ================================================================
+          # Group E: Error handling
+          # ================================================================
+
+          echo "--- Test: Invalid manifest does not create plan ---"
+          kubectl apply -f k8s/samples/invalid-policy.yaml 2>/dev/null || true
+          sleep 5
+          plan_count=$(get_plan_count invalid-policy)
+          test "$plan_count" -eq 0 || { echo "::error::Invalid policy should not create plans, got $plan_count"; exit 1; }
+          echo "No plan created for invalid policy"
+          kubectl delete pgr invalid-policy --wait=true 2>/dev/null || true
+
+          # ================================================================
+          # Group F: Multi-policy independent plans
+          # ================================================================
+
+          echo "--- Test: Multi-policy independent plans ---"
+          # Create schemas first
+          pg_query "CREATE SCHEMA IF NOT EXISTS schema_alpha;"
+          pg_query "CREATE SCHEMA IF NOT EXISTS schema_beta;"
+
+          kubectl apply -f k8s/samples/multi-schema-policy-a.yaml
+          kubectl apply -f k8s/samples/multi-schema-policy-b.yaml
+
+          wait_for_ready_status_reason multi-schema-a True Planned
+          wait_for_ready_status_reason multi-schema-b True Planned
+
+          plan_a=$(wait_for_current_plan_ref multi-schema-a)
+          plan_b=$(wait_for_current_plan_ref multi-schema-b)
+
+          test "$plan_a" != "$plan_b" || { echo "::error::Expected different plans for different policies"; exit 1; }
+          echo "Independent plans created for multi-policy setup"
+
+          # Cleanup
+          kubectl delete pgr multi-schema-a multi-schema-b --wait=true
+          pg_query "DROP SCHEMA IF EXISTS schema_alpha CASCADE; DROP SCHEMA IF EXISTS schema_beta CASCADE;"
+
+          # ================================================================
+          # Group G: Operator restart with pending plan
+          # ================================================================
+
+          echo "--- Test: Operator restart with pending plan ---"
+          kubectl apply -f - <<EOF
+          apiVersion: pgroles.io/v1alpha1
+          kind: PostgresPolicy
+          metadata:
+            name: restart-test
+            namespace: default
+          spec:
+            connection:
+              secretRef:
+                name: postgres-credentials
+            interval: "30s"
+            mode: plan
+            approval: manual
+            roles:
+              - name: restart_test_user
+                login: true
+          EOF
+
+          wait_for_ready_status_reason restart-test True Planned
+          plan_name=$(wait_for_current_plan_ref restart-test)
+
+          # Restart the operator
+          kubectl -n pgroles-system rollout restart deployment/pgroles-operator
+          kubectl -n pgroles-system rollout status deployment/pgroles-operator --timeout=60s
+
+          # Plan should still exist and be Pending
+          sleep 10
+          phase=$(kubectl get pgplan "$plan_name" -o jsonpath='{.status.phase}')
+          test "$phase" = "Pending" || { echo "::error::Expected plan to remain Pending after restart, got $phase"; exit 1; }
+
+          # Approve it - should still work after restart
+          approve_plan "$plan_name"
+          wait_for_plan_phase "$plan_name" Applied
+          assert_role_exists restart_test_user
+
+          echo "Operator restart handled correctly"
+
+          # Cleanup
+          kubectl delete pgr restart-test --wait=true
+          pg_query "DROP ROLE IF EXISTS restart_test_user;"
+
       - name: Cleanup
         if: always()
         run: kind delete cluster --name pgroles-e2e
