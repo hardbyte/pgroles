@@ -294,12 +294,19 @@ pub fn format_validation_result(validated: &ValidatedManifest) -> String {
 pub fn format_role_graph_summary(graph: &RoleGraph) -> String {
     let mut output = String::new();
     output.push_str(&format!("Roles: {}\n", graph.roles.len()));
+    for (name, state) in &graph.roles {
+        let login_marker = if state.login { "LOGIN" } else { "NOLOGIN" };
+        output.push_str(&format!("  {name} ({login_marker})\n"));
+    }
     output.push_str(&format!("Grants: {}\n", graph.grants.len()));
     output.push_str(&format!(
         "Default privileges: {}\n",
         graph.default_privileges.len()
     ));
     output.push_str(&format!("Memberships: {}\n", graph.memberships.len()));
+    for edge in &graph.memberships {
+        output.push_str(&format!("  {} -> {}\n", edge.member, edge.role));
+    }
     output
 }
 
@@ -609,6 +616,7 @@ schemas:
         let validated = validate_manifest(MINIMAL_MANIFEST).unwrap();
         let summary = format_role_graph_summary(&validated.desired);
         assert!(summary.contains("Roles: 1"), "got: {summary}");
+        assert!(summary.contains("analytics (LOGIN)"), "got: {summary}");
     }
 
     // -----------------------------------------------------------------------

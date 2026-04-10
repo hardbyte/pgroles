@@ -98,11 +98,13 @@ enum Commands {
         mode: CliReconciliationMode,
     },
 
-    /// Inspect the current database state for managed roles and privileges.
+    /// Inspect the current database state for roles and privileges.
     Inspect {
-        /// Path to the policy manifest YAML file (used to scope inspection).
-        #[arg(short, long, default_value = "pgroles.yaml")]
-        file: PathBuf,
+        /// Path to policy manifest YAML. When provided, scopes output to roles
+        /// and schemas declared in the manifest. When omitted, shows all
+        /// non-system database roles and privileges.
+        #[arg(short, long)]
+        file: Option<PathBuf>,
 
         /// PostgreSQL connection string (or set DATABASE_URL).
         #[arg(long, env = "DATABASE_URL")]
@@ -275,7 +277,7 @@ async fn run(cli: Cli) -> Result<ExitCode> {
             Ok(ExitCode::SUCCESS)
         }
         Commands::Inspect { file, database_url } => {
-            cmd_inspect(&file, &database_url).await?;
+            cmd_inspect(file.as_deref(), &database_url).await?;
             Ok(ExitCode::SUCCESS)
         }
         Commands::Generate {
@@ -496,14 +498,43 @@ async fn cmd_apply(
     Ok(())
 }
 
-async fn cmd_inspect(file: &Path, database_url: &str) -> Result<()> {
-    let yaml = read_manifest_file(file)?;
-    let validated = validate_manifest(&yaml)?;
+async fn cmd_inspect(file: Option<&Path>, database_url: &str) -> Result<()> {
+    // Validate manifest before connecting so YAML errors fail fast.
+    let validated = match file {
+        Some(path) => {
+            let yaml = read_manifest_file(path)?;
+            Some(validate_manifest(&yaml)?)
+        }
+        None => None,
+    };
 
     let pool = connect_db(database_url).await?;
-    let current = inspect_current(&pool, &validated).await?;
+
+    let current = match validated {
+        Some(ref v) => inspect_current(&pool, v).await?,
+        None => {
+            info!("no manifest provided, inspecting all non-system roles");
+            pgroles_inspect::inspect_all(
+                &pool,
+                &pgroles_inspect::InspectAllConfig {
+                    exclude_system_roles: true,
+                },
+            )
+            .await
+            .context("failed to introspect database")?
+        }
+    };
 
     print!("{}", format_role_graph_summary(&current));
+
+    // Query and display PUBLIC grants (informational only).
+    let public_grants = pgroles_inspect::fetch_public_grants(&pool)
+        .await
+        .context("failed to query PUBLIC grants")?;
+    let public_output = pgroles_inspect::format_public_grants(&public_grants);
+    if !public_output.is_empty() {
+        print!("{public_output}");
+    }
 
     Ok(())
 }

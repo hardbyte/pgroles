@@ -912,7 +912,8 @@ mod live_db {
             .assert()
             .success()
             .stdout(predicate::str::contains("Roles:"))
-            .stdout(predicate::str::contains("Grants:"));
+            .stdout(predicate::str::contains("Grants:"))
+            .stdout(predicate::str::contains("PUBLIC grants"));
     }
 
     #[test]
@@ -2016,6 +2017,43 @@ grants:
             DROP ROLE IF EXISTS "{extra_role}";
             "#
         ));
+    }
+
+    /// Inspect without a manifest shows PUBLIC grants for the current database.
+    /// A fresh database should have at least CONNECT and TEMPORARY granted to
+    /// PUBLIC, and USAGE on the "public" schema.
+    #[test]
+    #[ignore]
+    fn inspect_shows_public_grants() {
+        pgroles_cmd()
+            .args(["inspect", "--database-url", &database_url()])
+            .assert()
+            .success()
+            .stdout(predicate::str::contains("PUBLIC grants"))
+            .stdout(predicate::str::contains("Database:"))
+            .stdout(predicate::str::contains("CONNECT"))
+            .stdout(predicate::str::contains("TEMPORARY"))
+            .stdout(predicate::str::contains("Schema \"public\""));
+    }
+
+    /// Inspect with a manifest also shows PUBLIC grants.
+    #[test]
+    #[ignore]
+    fn inspect_with_manifest_shows_public_grants() {
+        let manifest_file = write_temp_manifest(VALID_MINIMAL);
+
+        pgroles_cmd()
+            .args([
+                "inspect",
+                "--file",
+                manifest_file.path().to_str().unwrap(),
+                "--database-url",
+                &database_url(),
+            ])
+            .assert()
+            .success()
+            .stdout(predicate::str::contains("PUBLIC grants"))
+            .stdout(predicate::str::contains("CONNECT"));
     }
 
     /// Authoritative mode (default): drops extra roles that aren't in the manifest.
