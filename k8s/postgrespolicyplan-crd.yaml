@@ -124,6 +124,11 @@
                     "nullable": true,
                     "type": "string"
                   },
+                  "applyingSince": {
+                    "description": "Timestamp when the plan entered Applying phase (for stuck detection).",
+                    "nullable": true,
+                    "type": "string"
+                  },
                   "changeSummary": {
                     "description": "Summary of changes in this plan.",
                     "nullable": true,

@@ -594,6 +594,9 @@ pub struct PostgresPolicyPlanStatus {
     /// the operator can skip creating a redundant plan.
     #[serde(default)]
     pub sql_hash: Option<String>,
+    /// Timestamp when the plan entered Applying phase (for stuck detection).
+    #[serde(default)]
+    pub applying_since: Option<String>,
 }
 
 /// Reference to a ConfigMap containing SQL for a plan.

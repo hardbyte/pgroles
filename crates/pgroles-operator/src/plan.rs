@@ -21,6 +21,30 @@ use crate::crd::{
 };
 use crate::reconciler::ReconcileError;
 
+/// Result of plan creation — distinguishes genuinely new plans from
+/// deduplication hits so callers can decide whether to emit events.
+#[derive(Debug, Clone)]
+pub enum PlanCreationResult {
+    /// A new plan was created with the given name.
+    Created(String),
+    /// An existing plan with the same hash was found (deduplication).
+    Deduplicated(String),
+}
+
+impl PlanCreationResult {
+    /// Return the plan name regardless of variant.
+    pub fn plan_name(&self) -> &str {
+        match self {
+            PlanCreationResult::Created(name) | PlanCreationResult::Deduplicated(name) => name,
+        }
+    }
+
+    /// True when a new plan was actually created.
+    pub fn is_created(&self) -> bool {
+        matches!(self, PlanCreationResult::Created(_))
+    }
+}
+
 /// Maximum inline SQL size in plan status before spilling to a ConfigMap.
 const MAX_INLINE_SQL_BYTES: usize = 16 * 1024;
 
@@ -96,7 +120,7 @@ pub async fn create_or_update_plan(
     reconciliation_mode: CrdReconciliationMode,
     database_identity: &str,
     change_summary: &ChangeSummary,
-) -> Result<String, ReconcileError> {
+) -> Result<PlanCreationResult, ReconcileError> {
     let namespace = policy.namespace().ok_or(ReconcileError::NoNamespace)?;
     let policy_name = policy.name_any();
     let generation = policy.metadata.generation.unwrap_or(0);
@@ -113,7 +137,7 @@ pub async fn create_or_update_plan(
     let plans_api: Api<PostgresPolicyPlan> = Api::namespaced(client.clone(), &namespace);
 
     // 4. List existing plans for this policy.
-    let label_selector = format!("{LABEL_POLICY}={policy_name}");
+    let label_selector = format!("{LABEL_POLICY}={}", sanitize_label_value(&policy_name));
     let existing_plans = plans_api
         .list(&ListParams::default().labels(&label_selector))
         .await?;
@@ -124,14 +148,14 @@ pub async fn create_or_update_plan(
             && status.phase == PlanPhase::Pending
             && status.sql_hash.as_deref() == Some(&sql_hash)
         {
-            // Identical plan already exists — return early.
+            // Identical plan already exists — return early (deduplicated).
             let plan_name = plan.name_any();
             info!(
                 plan = %plan_name,
                 policy = %policy_name,
                 "existing pending plan has identical SQL hash, skipping creation"
             );
-            return Ok(plan_name);
+            return Ok(PlanCreationResult::Deduplicated(plan_name));
         }
     }
 
@@ -185,7 +209,7 @@ pub async fn create_or_update_plan(
     plan.metadata.namespace = Some(namespace.clone());
     plan.metadata.owner_references = Some(vec![owner_ref.clone()]);
     plan.metadata.labels = Some(BTreeMap::from([
-        (LABEL_POLICY.to_string(), policy_name.clone()),
+        (LABEL_POLICY.to_string(), sanitize_label_value(&policy_name)),
         (
             LABEL_DATABASE_IDENTITY.to_string(),
             sanitize_label_value(database_identity),
@@ -208,7 +232,7 @@ pub async fn create_or_update_plan(
                 owner_references: Some(vec![build_plan_owner_reference(&created_plan)]),
                 labels: Some(BTreeMap::from([(
                     LABEL_POLICY.to_string(),
-                    policy_name.clone(),
+                    sanitize_label_value(&policy_name),
                 )])),
                 ..Default::default()
             },
@@ -262,6 +286,7 @@ pub async fn create_or_update_plan(
         applied_at: None,
         last_error: None,
         sql_hash: Some(sql_hash),
+        applying_since: None,
     };
 
     let status_patch = serde_json::json!({ "status": plan_status });
@@ -280,7 +305,7 @@ pub async fn create_or_update_plan(
         "created new plan"
     );
 
-    Ok(plan_name)
+    Ok(PlanCreationResult::Created(plan_name))
 }
 
 // ---------------------------------------------------------------------------
@@ -415,7 +440,7 @@ pub async fn cleanup_old_plans(
     let max_plans = max_plans.unwrap_or(DEFAULT_MAX_PLANS);
 
     let plans_api: Api<PostgresPolicyPlan> = Api::namespaced(client.clone(), &namespace);
-    let label_selector = format!("{LABEL_POLICY}={policy_name}");
+    let label_selector = format!("{LABEL_POLICY}={}", sanitize_label_value(&policy_name));
     let existing_plans = plans_api
         .list(&ListParams::default().labels(&label_selector))
         .await?;
@@ -529,8 +554,9 @@ fn generate_plan_name(policy_name: &str) -> String {
     let random_suffix: u32 = rand::random::<u32>() % 1000;
     let suffix = format!("{millis:03}{random_suffix:03}");
     // Kubernetes names must be <= 253 chars and DNS-compatible.
-    // Truncate policy name if needed to leave room for suffix.
-    let max_prefix_len = 253 - "-plan-".len() - timestamp.len() - "-".len() - suffix.len();
+    // Reserve 4 chars for the potential "-sql" ConfigMap suffix.
+    let max_name_len = 253 - 4; // 249
+    let max_prefix_len = max_name_len - "-plan-".len() - timestamp.len() - "-".len() - suffix.len();
     let prefix = if policy_name.len() > max_prefix_len {
         &policy_name[..max_prefix_len]
     } else {
@@ -597,21 +623,23 @@ fn build_plan_owner_reference(plan: &PostgresPolicyPlan) -> OwnerReference {
 }
 
 /// Update the phase field on a plan's status.
+///
+/// When transitioning to `Applying`, also sets `applying_since` for stuck
+/// plan detection.
 async fn update_plan_phase(
     plans_api: &Api<PostgresPolicyPlan>,
     plan_name: &str,
     phase: PlanPhase,
 ) -> Result<(), ReconcileError> {
-    let patch = serde_json::json!({
-        "status": {
-            "phase": phase
-        }
-    });
+    let mut patch_value = serde_json::json!({ "status": { "phase": phase } });
+    if phase == PlanPhase::Applying {
+        patch_value["status"]["applying_since"] = serde_json::json!(crate::crd::now_rfc3339());
+    }
     plans_api
         .patch_status(
             plan_name,
             &PatchParams::apply("pgroles-operator"),
-            &Patch::Merge(&patch),
+            &Patch::Merge(&patch_value),
         )
         .await?;
     Ok(())
@@ -670,8 +698,11 @@ pub async fn update_policy_plan_ref(
     Ok(())
 }
 
-/// Look up the current pending plan for a policy, if any.
-pub async fn get_current_pending_plan(
+/// Look up the current actionable plan for a policy, if any.
+///
+/// An actionable plan is one in `Pending` or `Approved` phase — i.e. a plan
+/// that the reconciler should evaluate for approval/execution.
+pub async fn get_current_actionable_plan(
     client: &Client,
     policy: &PostgresPolicy,
 ) -> Result<Option<PostgresPolicyPlan>, ReconcileError> {
@@ -679,18 +710,18 @@ pub async fn get_current_pending_plan(
     let policy_name = policy.name_any();
 
     let plans_api: Api<PostgresPolicyPlan> = Api::namespaced(client.clone(), &namespace);
-    let label_selector = format!("{LABEL_POLICY}={policy_name}");
+    let label_selector = format!("{LABEL_POLICY}={}", sanitize_label_value(&policy_name));
     let existing_plans = plans_api
         .list(&ListParams::default().labels(&label_selector))
         .await?;
 
-    // Find the most recent pending plan (by creation time).
+    // Find the most recent actionable plan (Pending or Approved, by creation time).
     let mut pending_plans: Vec<PostgresPolicyPlan> = existing_plans
         .into_iter()
         .filter(|plan| {
             plan.status
                 .as_ref()
-                .map(|s| s.phase == PlanPhase::Pending)
+                .map(|s| matches!(s.phase, PlanPhase::Pending | PlanPhase::Approved))
                 .unwrap_or(false)
         })
         .collect();
@@ -714,7 +745,7 @@ pub async fn get_plan_by_phase(
     let policy_name = policy.name_any();
 
     let plans_api: Api<PostgresPolicyPlan> = Api::namespaced(client.clone(), &namespace);
-    let label_selector = format!("{LABEL_POLICY}={policy_name}");
+    let label_selector = format!("{LABEL_POLICY}={}", sanitize_label_value(&policy_name));
     let existing_plans = plans_api
         .list(&ListParams::default().labels(&label_selector))
         .await?;
@@ -769,10 +800,15 @@ pub async fn mark_plan_failed(
     Ok(())
 }
 
-/// Mark a plan as Approved (by the operator, for auto-approval flows).
+/// Mark a plan as Approved.
+///
+/// Callers provide `reason` and `message` to distinguish auto-approval from
+/// manual approval in the plan's conditions.
 pub async fn mark_plan_approved(
     client: &Client,
     plan: &PostgresPolicyPlan,
+    reason: &str,
+    message: &str,
 ) -> Result<(), ReconcileError> {
     let namespace = plan.namespace().ok_or(ReconcileError::NoNamespace)?;
     let plan_name = plan.name_any();
@@ -780,13 +816,7 @@ pub async fn mark_plan_approved(
 
     let mut status = plan.status.clone().unwrap_or_default();
     status.phase = PlanPhase::Approved;
-    set_plan_condition(
-        &mut status.conditions,
-        "Approved",
-        "True",
-        "AutoApproved",
-        "Plan auto-approved by policy approval mode",
-    );
+    set_plan_condition(&mut status.conditions, "Approved", "True", reason, message);
 
     let patch = serde_json::json!({ "status": status });
     plans_api

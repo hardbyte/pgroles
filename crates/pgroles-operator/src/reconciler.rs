@@ -668,7 +668,7 @@ async fn apply_under_lock(
         let applying_since_secs = stuck_plan
             .status
             .as_ref()
-            .and_then(|s| s.computed_at.as_deref())
+            .and_then(|s| s.applying_since.as_deref())
             .and_then(parse_rfc3339_to_epoch_secs);
         if let Some(since_secs) = applying_since_secs {
             let now_secs = std::time::SystemTime::now()
@@ -778,7 +778,7 @@ async fn apply_under_lock(
         // Create a PostgresPolicyPlan resource for changes (if any).
         let mut plan_ref_name = None;
         if drift_detected {
-            let plan_name = crate::plan::create_or_update_plan(
+            let creation_result = crate::plan::create_or_update_plan(
                 &ctx.kube_client,
                 resource,
                 &changes,
@@ -789,20 +789,23 @@ async fn apply_under_lock(
                 &summary,
             )
             .await?;
+            let plan_name = creation_result.plan_name().to_string();
 
-            // Emit PlanCreated event.
-            let plans_api: Api<PostgresPolicyPlan> =
-                Api::namespaced(ctx.kube_client.clone(), namespace);
-            let created_plan = plans_api.get(&plan_name).await?;
-            emit_plan_event(
-                ctx,
-                resource,
-                &created_plan,
-                PlanEventType::Created {
-                    change_count: summary.total,
-                },
-            )
-            .await;
+            // Only emit PlanCreated event for genuinely new plans, not dedup hits.
+            if creation_result.is_created() {
+                let plans_api: Api<PostgresPolicyPlan> =
+                    Api::namespaced(ctx.kube_client.clone(), namespace);
+                let created_plan = plans_api.get(&plan_name).await?;
+                emit_plan_event(
+                    ctx,
+                    resource,
+                    &created_plan,
+                    PlanEventType::Created {
+                        change_count: summary.total,
+                    },
+                )
+                .await;
+            }
 
             crate::plan::update_policy_plan_ref(&ctx.kube_client, resource, &plan_name).await?;
 
@@ -862,7 +865,7 @@ async fn apply_under_lock(
             // Auto-approval: create plan -> immediately execute -> update status.
             // This wraps the existing apply behavior in the plan lifecycle.
             if !changes.is_empty() {
-                let plan_name = crate::plan::create_or_update_plan(
+                let creation_result = crate::plan::create_or_update_plan(
                     &ctx.kube_client,
                     resource,
                     &changes,
@@ -873,23 +876,32 @@ async fn apply_under_lock(
                     &summary,
                 )
                 .await?;
+                let plan_name = creation_result.plan_name().to_string();
 
                 // Fetch the plan, mark it approved, and execute it.
                 let plans_api: Api<PostgresPolicyPlan> =
                     Api::namespaced(ctx.kube_client.clone(), namespace);
                 let plan = plans_api.get(&plan_name).await?;
 
-                emit_plan_event(
-                    ctx,
-                    resource,
-                    &plan,
-                    PlanEventType::Created {
-                        change_count: summary.total,
-                    },
-                )
-                .await;
+                if creation_result.is_created() {
+                    emit_plan_event(
+                        ctx,
+                        resource,
+                        &plan,
+                        PlanEventType::Created {
+                            change_count: summary.total,
+                        },
+                    )
+                    .await;
+                }
 
-                crate::plan::mark_plan_approved(&ctx.kube_client, &plan).await?;
+                crate::plan::mark_plan_approved(
+                    &ctx.kube_client,
+                    &plan,
+                    "AutoApproved",
+                    "Plan auto-approved by policy approval mode",
+                )
+                .await?;
 
                 // Re-fetch after approval status update.
                 let plan = plans_api.get(&plan_name).await?;
@@ -971,15 +983,12 @@ async fn apply_under_lock(
 
             // First, check if there is a current pending plan that has been approved.
             if let Some(current_plan) =
-                crate::plan::get_current_pending_plan(&ctx.kube_client, resource).await?
+                crate::plan::get_current_actionable_plan(&ctx.kube_client, resource).await?
             {
                 let approval_state = crate::plan::check_plan_approval(&current_plan);
 
                 match approval_state {
                     crate::plan::PlanApprovalState::Approved => {
-                        emit_plan_event(ctx, resource, &current_plan, PlanEventType::Approved)
-                            .await;
-
                         // Validate that the database state has not drifted since
                         // the plan was approved by comparing SQL hashes.
                         let fresh_sql = crate::plan::render_full_sql(&changes, &sql_ctx);
@@ -1002,7 +1011,7 @@ async fn apply_under_lock(
                                 .await?;
 
                             // Create a new plan with the fresh changes.
-                            let new_plan_name = crate::plan::create_or_update_plan(
+                            let new_creation_result = crate::plan::create_or_update_plan(
                                 &ctx.kube_client,
                                 resource,
                                 &changes,
@@ -1013,19 +1022,22 @@ async fn apply_under_lock(
                                 &summary,
                             )
                             .await?;
+                            let new_plan_name = new_creation_result.plan_name().to_string();
 
-                            let plans_api: Api<PostgresPolicyPlan> =
-                                Api::namespaced(ctx.kube_client.clone(), namespace);
-                            let new_plan = plans_api.get(&new_plan_name).await?;
-                            emit_plan_event(
-                                ctx,
-                                resource,
-                                &new_plan,
-                                PlanEventType::Created {
-                                    change_count: summary.total,
-                                },
-                            )
-                            .await;
+                            if new_creation_result.is_created() {
+                                let plans_api: Api<PostgresPolicyPlan> =
+                                    Api::namespaced(ctx.kube_client.clone(), namespace);
+                                let new_plan = plans_api.get(&new_plan_name).await?;
+                                emit_plan_event(
+                                    ctx,
+                                    resource,
+                                    &new_plan,
+                                    PlanEventType::Created {
+                                        change_count: summary.total,
+                                    },
+                                )
+                                .await;
+                            }
 
                             crate::plan::update_policy_plan_ref(
                                 &ctx.kube_client,
@@ -1087,7 +1099,16 @@ async fn apply_under_lock(
                             "executing manually approved plan"
                         );
 
-                        crate::plan::mark_plan_approved(&ctx.kube_client, &current_plan).await?;
+                        emit_plan_event(ctx, resource, &current_plan, PlanEventType::Approved)
+                            .await;
+
+                        crate::plan::mark_plan_approved(
+                            &ctx.kube_client,
+                            &current_plan,
+                            "ManuallyApproved",
+                            "Plan approved via annotation",
+                        )
+                        .await?;
 
                         let plans_api: Api<PostgresPolicyPlan> =
                             Api::namespaced(ctx.kube_client.clone(), namespace);
@@ -1174,7 +1195,6 @@ async fn apply_under_lock(
                         ));
                     }
                     crate::plan::PlanApprovalState::Rejected => {
-                        // Mark the plan as rejected.
                         crate::plan::mark_plan_rejected(&ctx.kube_client, &current_plan).await?;
                         emit_plan_event(ctx, resource, &current_plan, PlanEventType::Rejected)
                             .await;
@@ -1184,7 +1204,26 @@ async fn apply_under_lock(
                             plan = %current_plan.name_any(),
                             "plan rejected via annotation"
                         );
-                        // Fall through to create a new plan on next cycle.
+
+                        // Update status to reflect rejection, but don't create a new plan
+                        // in the same cycle to avoid tight reject-create loops.
+                        update_status(ctx, resource, |status| {
+                            status.set_condition(ready_condition(
+                                true,
+                                "Planned",
+                                &format!(
+                                    "Plan {} rejected; new plan will be created on next reconcile",
+                                    current_plan.name_any()
+                                ),
+                            ));
+                            status.last_attempted_generation = generation;
+                            status.last_error = None;
+                            status.transient_failure_count = 0;
+                            status.current_plan_ref = None;
+                        })
+                        .await?;
+
+                        return Ok((Action::requeue(requeue_interval), ReconcileOutcome::Planned));
                     }
                     crate::plan::PlanApprovalState::Pending => {
                         // Plan exists and is pending — nothing to do, requeue.
@@ -1265,7 +1304,7 @@ async fn apply_under_lock(
             }
 
             // Create a new plan and wait for approval.
-            let plan_name = crate::plan::create_or_update_plan(
+            let creation_result = crate::plan::create_or_update_plan(
                 &ctx.kube_client,
                 resource,
                 &changes,
@@ -1276,20 +1315,23 @@ async fn apply_under_lock(
                 &summary,
             )
             .await?;
+            let plan_name = creation_result.plan_name().to_string();
 
-            // Emit PlanCreated event.
-            let plans_api: Api<PostgresPolicyPlan> =
-                Api::namespaced(ctx.kube_client.clone(), namespace);
-            let created_plan = plans_api.get(&plan_name).await?;
-            emit_plan_event(
-                ctx,
-                resource,
-                &created_plan,
-                PlanEventType::Created {
-                    change_count: summary.total,
-                },
-            )
-            .await;
+            // Only emit PlanCreated event for genuinely new plans, not dedup hits.
+            if creation_result.is_created() {
+                let plans_api: Api<PostgresPolicyPlan> =
+                    Api::namespaced(ctx.kube_client.clone(), namespace);
+                let created_plan = plans_api.get(&plan_name).await?;
+                emit_plan_event(
+                    ctx,
+                    resource,
+                    &created_plan,
+                    PlanEventType::Created {
+                        change_count: summary.total,
+                    },
+                )
+                .await;
+            }
 
             crate::plan::update_policy_plan_ref(&ctx.kube_client, resource, &plan_name).await?;
 
