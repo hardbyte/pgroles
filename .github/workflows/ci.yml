@@ -594,6 +594,9 @@ jobs:
 
           kubectl apply -f k8s/samples/insufficient-privileges-policy.yaml
           wait_for_ready_reason insufficient-privileges-policy InsufficientPrivileges
+          echo "DEBUG: last_error=$(kubectl get pgr insufficient-privileges-policy -o jsonpath='{.status.last_error}')"
+          echo "DEBUG: full status:"
+          kubectl get pgr insufficient-privileges-policy -o jsonpath='{.status}' | python3 -m json.tool 2>/dev/null || kubectl get pgr insufficient-privileges-policy -o jsonpath='{.status}'
           wait_for_last_error_contains insufficient-privileges-policy "permission denied to create role"
           assert_role_absent insufficient-privileges-user
 
