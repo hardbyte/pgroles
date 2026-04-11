@@ -935,7 +935,7 @@ jobs:
 
           # Cleanup
           kubectl delete pgr plan-approval-policy --wait=true
-          pg_query "DROP ROLE IF EXISTS approval_test_user;"
+          pg_query "REASSIGN OWNED BY approval_test_user TO postgres; DROP OWNED BY approval_test_user; DROP ROLE IF EXISTS approval_test_user;"
 
           # ================================================================
           # Group A continued: Rejection
@@ -1004,7 +1004,7 @@ jobs:
 
           # Cleanup
           kubectl delete pgr auto-approval-policy --wait=true
-          pg_query "DROP ROLE IF EXISTS auto_approved_user;"
+          pg_query "REASSIGN OWNED BY auto_approved_user TO postgres; DROP OWNED BY auto_approved_user; DROP ROLE IF EXISTS auto_approved_user;"
 
           # ================================================================
           # Group C: Plan supersede on policy change
@@ -1193,7 +1193,7 @@ jobs:
 
           # Cleanup
           kubectl delete pgr restart-test --wait=true
-          pg_query "DROP ROLE IF EXISTS restart_test_user;"
+          pg_query "REASSIGN OWNED BY restart_test_user TO postgres; DROP OWNED BY restart_test_user; DROP ROLE IF EXISTS restart_test_user;"
 
       - name: Cleanup
         if: always()
