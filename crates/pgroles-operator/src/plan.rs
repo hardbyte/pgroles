@@ -646,6 +646,9 @@ async fn update_plan_phase(
 }
 
 /// Set or update a condition in a conditions list.
+///
+/// Preserves `last_transition_time` when the status value is unchanged
+/// (only reason/message changed), matching Kubernetes condition conventions.
 fn set_plan_condition(
     conditions: &mut Vec<PolicyCondition>,
     condition_type: &str,
@@ -653,12 +656,25 @@ fn set_plan_condition(
     reason: &str,
     message: &str,
 ) {
+    let transition_time = if let Some(existing) = conditions
+        .iter()
+        .find(|c| c.condition_type == condition_type)
+    {
+        if existing.status == status {
+            existing.last_transition_time.clone()
+        } else {
+            Some(crate::crd::now_rfc3339())
+        }
+    } else {
+        Some(crate::crd::now_rfc3339())
+    };
+
     let condition = PolicyCondition {
         condition_type: condition_type.to_string(),
         status: status.to_string(),
         reason: Some(reason.to_string()),
         message: Some(message.to_string()),
-        last_transition_time: Some(crate::crd::now_rfc3339()),
+        last_transition_time: transition_time,
     };
     if let Some(existing) = conditions
         .iter_mut()
