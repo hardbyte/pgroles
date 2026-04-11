@@ -536,13 +536,15 @@ async fn reconcile_apply_inner(
     info!(name, namespace, "starting reconciliation");
 
     // Update status to "Reconciling".
+    // Note: do NOT clear last_error here — it should persist until a successful
+    // reconcile clears it. Clearing on every retry cycle would race with the
+    // error handler that sets it.
     update_status(ctx, resource, |status| {
         status.set_condition(reconciling_condition("Reconciliation in progress"));
         status
             .conditions
             .retain(|c| c.condition_type != "Paused" && c.condition_type != "Drifted");
         status.last_attempted_generation = generation;
-        status.last_error = None;
     })
     .await?;
 
