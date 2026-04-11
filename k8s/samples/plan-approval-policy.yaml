@@ -8,7 +8,7 @@ spec:
     secretRef:
       name: postgres-credentials
   interval: "30s"
-  mode: plan
+  mode: apply
   approval: manual
   roles:
     - name: approval_test_user
