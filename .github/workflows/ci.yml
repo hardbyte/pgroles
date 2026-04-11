@@ -648,6 +648,14 @@ jobs:
           wait_for_password_hash_stable genuser "$generated_initial_hash"
 
           kubectl delete secret generated-password-policy-pgr-genuser --wait=true
+          # Wait for the operator to reconcile and regenerate the secret.
+          for i in $(seq 1 30); do
+            if kubectl get secret generated-password-policy-pgr-genuser -o name 2>/dev/null; then
+              break
+            fi
+            echo "Waiting for secret regeneration... (attempt $i/30)"
+            sleep 3
+          done
           wait_for_ready_true generated-password-policy
           assert_secret_has_keys generated-password-policy-pgr-genuser password verifier
           wait_for_password_hash_change genuser "$generated_initial_hash"
