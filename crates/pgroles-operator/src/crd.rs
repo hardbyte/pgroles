@@ -931,16 +931,28 @@ impl PostgresPolicySpec {
 
 impl PostgresPolicyStatus {
     /// Set a condition, replacing any existing condition of the same type.
-    pub fn set_condition(&mut self, condition: PolicyCondition) {
+    ///
+    /// If the condition's `status` value has not changed, the existing
+    /// `last_transition_time` is preserved (per Kubernetes condition conventions).
+    pub fn set_condition(&mut self, new: PolicyCondition) {
         if let Some(existing) = self
             .conditions
-            .iter_mut()
-            .find(|c| c.condition_type == condition.condition_type)
+            .iter()
+            .find(|c| c.condition_type == new.condition_type)
+            && existing.status == new.status
         {
-            *existing = condition;
-        } else {
-            self.conditions.push(condition);
+            // Status unchanged — preserve the existing transition time.
+            let mut updated = new;
+            updated.last_transition_time = existing.last_transition_time.clone();
+            self.conditions
+                .retain(|c| c.condition_type != updated.condition_type);
+            self.conditions.push(updated);
+            return;
         }
+        // New condition or status changed — use the new timestamp.
+        self.conditions
+            .retain(|c| c.condition_type != new.condition_type);
+        self.conditions.push(new);
     }
 }
 

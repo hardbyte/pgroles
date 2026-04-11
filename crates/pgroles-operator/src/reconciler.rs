@@ -660,6 +660,39 @@ async fn apply_under_lock(
     namespace: &str,
     identity: &DatabaseIdentity,
 ) -> Result<(Action, ReconcileOutcome), ReconcileError> {
+    // 5b. Recover stuck Applying plans (operator may have crashed mid-apply).
+    if let Some(stuck_plan) =
+        crate::plan::get_plan_by_phase(&ctx.kube_client, resource, crate::crd::PlanPhase::Applying)
+            .await?
+    {
+        let applying_since_secs = stuck_plan
+            .status
+            .as_ref()
+            .and_then(|s| s.computed_at.as_deref())
+            .and_then(parse_rfc3339_to_epoch_secs);
+        if let Some(since_secs) = applying_since_secs {
+            let now_secs = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+            let elapsed_secs = now_secs.saturating_sub(since_secs);
+            let stuck_threshold_secs = 5 * 60; // 5 minutes
+            if elapsed_secs > stuck_threshold_secs {
+                tracing::warn!(
+                    plan = %stuck_plan.name_any(),
+                    elapsed_secs,
+                    "detected stuck Applying plan — marking as Failed"
+                );
+                crate::plan::mark_plan_failed(
+                    &ctx.kube_client,
+                    &stuck_plan,
+                    "execution interrupted: operator restarted during apply",
+                )
+                .await?;
+            }
+        }
+    }
+
     // 6. Inspect current state from the database.
     let has_database_grants = expanded
         .grants
@@ -714,7 +747,7 @@ async fn apply_under_lock(
     }
 
     let summary = summarize_changes(&changes);
-    let sql_ctx = detect_sql_context(pool).await?;
+    let sql_ctx = detect_sql_context(pool, &inspect_config).await?;
     let (planned_sql, planned_sql_truncated) = render_plan_sql_for_status(&changes, &sql_ctx);
 
     let effective_approval = resource.spec.effective_approval();
@@ -1603,13 +1636,53 @@ fn summarize_changes(changes: &[pgroles_core::diff::Change]) -> ChangeSummary {
     summary
 }
 
+/// Parse a simplified RFC 3339 / ISO 8601 timestamp (`YYYY-MM-DDTHH:MM:SSZ`)
+/// into seconds since the Unix epoch.
+///
+/// Returns `None` if the string does not match the expected format.
+fn parse_rfc3339_to_epoch_secs(timestamp: &str) -> Option<u64> {
+    // Expected format: "2026-03-31T12:34:56Z"
+    if timestamp.len() < 20 || !timestamp.ends_with('Z') {
+        return None;
+    }
+    let year: u64 = timestamp.get(0..4)?.parse().ok()?;
+    let month: u64 = timestamp.get(5..7)?.parse().ok()?;
+    let day: u64 = timestamp.get(8..10)?.parse().ok()?;
+    let hours: u64 = timestamp.get(11..13)?.parse().ok()?;
+    let minutes: u64 = timestamp.get(14..16)?.parse().ok()?;
+    let seconds: u64 = timestamp.get(17..19)?.parse().ok()?;
+
+    // Convert to days since epoch using the inverse of the civil algorithm.
+    let (y, m) = if month <= 2 {
+        (year - 1, month + 9)
+    } else {
+        (year, month - 3)
+    };
+    let era = y / 400;
+    let yoe = y - era * 400;
+    let doy = (153 * m + 2) / 5 + day - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days_since_epoch = era * 146097 + doe - 719468;
+
+    Some(days_since_epoch * 86400 + hours * 3600 + minutes * 60 + seconds)
+}
+
 async fn detect_sql_context(
     pool: &sqlx::PgPool,
+    inspect_config: &pgroles_inspect::InspectConfig,
 ) -> Result<pgroles_core::sql::SqlContext, ReconcileError> {
     let pg_version = pgroles_inspect::detect_pg_version(pool).await?;
-    Ok(pgroles_core::sql::SqlContext::from_version_num(
-        pg_version.version_num,
-    ))
+    let managed_schemas: Vec<&str> = inspect_config
+        .managed_schemas
+        .iter()
+        .map(|schema| schema.as_str())
+        .collect();
+    let relation_inventory =
+        pgroles_inspect::fetch_relation_inventory(pool, &managed_schemas).await?;
+    Ok(
+        pgroles_core::sql::SqlContext::from_version_num(pg_version.version_num)
+            .with_relation_inventory(relation_inventory),
+    )
 }
 
 fn render_plan_sql_for_status(
@@ -3052,5 +3125,39 @@ mod tests {
         let conflict = conflict.expect("expected overlapping peer to be reported");
         assert!(conflict.contains("overlapping-peer"));
         assert!(conflict.contains("roles: analytics"));
+    }
+
+    #[test]
+    fn parse_rfc3339_to_epoch_secs_known_timestamp() {
+        // 2024-01-01T00:00:00Z = 1704067200
+        let result = parse_rfc3339_to_epoch_secs("2024-01-01T00:00:00Z");
+        assert_eq!(result, Some(1704067200));
+    }
+
+    #[test]
+    fn parse_rfc3339_to_epoch_secs_with_time() {
+        // 2024-01-01T12:30:45Z = 1704067200 + 12*3600 + 30*60 + 45 = 1704112245
+        let result = parse_rfc3339_to_epoch_secs("2024-01-01T12:30:45Z");
+        assert_eq!(result, Some(1704112245));
+    }
+
+    #[test]
+    fn parse_rfc3339_to_epoch_secs_invalid_returns_none() {
+        assert_eq!(parse_rfc3339_to_epoch_secs("not-a-date"), None);
+        assert_eq!(parse_rfc3339_to_epoch_secs(""), None);
+    }
+
+    #[test]
+    fn parse_rfc3339_roundtrips_with_now_rfc3339() {
+        let timestamp = crate::crd::now_rfc3339();
+        let parsed = parse_rfc3339_to_epoch_secs(&timestamp);
+        assert!(parsed.is_some(), "should parse our own timestamps");
+        let now_secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        // Should be within 2 seconds of now.
+        let diff = now_secs.abs_diff(parsed.unwrap());
+        assert!(diff <= 2, "parsed time should be close to now, diff={diff}");
     }
 }

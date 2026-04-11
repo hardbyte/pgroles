@@ -516,18 +516,27 @@ pub(crate) fn compute_sql_hash(sql: &str) -> String {
 
 /// Generate a plan name from policy name and current timestamp.
 ///
-/// Format: `{policy-name}-plan-{YYYYMMDD-HHMMSS}`
+/// Format: `{policy-name}-plan-{YYYYMMDD-HHMMSS}-{millis}{random}`
+///
+/// A millisecond and random suffix is appended to avoid collisions when the
+/// operator retries within the same second.
 fn generate_plan_name(policy_name: &str) -> String {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default();
     let timestamp = format_timestamp_compact();
+    let millis = now.subsec_millis();
+    let random_suffix: u32 = rand::random::<u32>() % 1000;
+    let suffix = format!("{millis:03}{random_suffix:03}");
     // Kubernetes names must be <= 253 chars and DNS-compatible.
     // Truncate policy name if needed to leave room for suffix.
-    let max_prefix_len = 253 - "-plan-".len() - timestamp.len();
+    let max_prefix_len = 253 - "-plan-".len() - timestamp.len() - "-".len() - suffix.len();
     let prefix = if policy_name.len() > max_prefix_len {
         &policy_name[..max_prefix_len]
     } else {
         policy_name
     };
-    format!("{prefix}-plan-{timestamp}")
+    format!("{prefix}-plan-{timestamp}-{suffix}")
 }
 
 /// Format the current UTC time as `YYYYMMDD-HHMMSS`.
@@ -693,6 +702,71 @@ pub async fn get_current_pending_plan(
     });
 
     Ok(pending_plans.into_iter().next())
+}
+
+/// Look up the most recent plan for a policy in a given phase.
+pub async fn get_plan_by_phase(
+    client: &Client,
+    policy: &PostgresPolicy,
+    target_phase: PlanPhase,
+) -> Result<Option<PostgresPolicyPlan>, ReconcileError> {
+    let namespace = policy.namespace().ok_or(ReconcileError::NoNamespace)?;
+    let policy_name = policy.name_any();
+
+    let plans_api: Api<PostgresPolicyPlan> = Api::namespaced(client.clone(), &namespace);
+    let label_selector = format!("{LABEL_POLICY}={policy_name}");
+    let existing_plans = plans_api
+        .list(&ListParams::default().labels(&label_selector))
+        .await?;
+
+    let mut matching_plans: Vec<PostgresPolicyPlan> = existing_plans
+        .into_iter()
+        .filter(|plan| {
+            plan.status
+                .as_ref()
+                .map(|s| s.phase == target_phase)
+                .unwrap_or(false)
+        })
+        .collect();
+
+    matching_plans.sort_by(|a, b| {
+        let a_time = a.metadata.creation_timestamp.as_ref();
+        let b_time = b.metadata.creation_timestamp.as_ref();
+        b_time.cmp(&a_time) // newest first
+    });
+
+    Ok(matching_plans.into_iter().next())
+}
+
+/// Mark a plan as Failed with a given error message.
+pub async fn mark_plan_failed(
+    client: &Client,
+    plan: &PostgresPolicyPlan,
+    error_message: &str,
+) -> Result<(), ReconcileError> {
+    let namespace = plan.namespace().ok_or(ReconcileError::NoNamespace)?;
+    let plan_name = plan.name_any();
+    let plans_api: Api<PostgresPolicyPlan> = Api::namespaced(client.clone(), &namespace);
+
+    let mut status = plan.status.clone().unwrap_or_default();
+    status.phase = PlanPhase::Failed;
+    status.last_error = Some(error_message.to_string());
+
+    let patch = serde_json::json!({ "status": status });
+    plans_api
+        .patch_status(
+            &plan_name,
+            &PatchParams::apply("pgroles-operator"),
+            &Patch::Merge(&patch),
+        )
+        .await?;
+
+    info!(
+        plan = %plan_name,
+        "marked stuck Applying plan as Failed"
+    );
+
+    Ok(())
 }
 
 /// Mark a plan as Approved (by the operator, for auto-approval flows).
@@ -884,10 +958,21 @@ mod tests {
     fn generate_plan_name_has_expected_format() {
         let name = generate_plan_name("my-policy");
         assert!(name.starts_with("my-policy-plan-"));
-        // Should be "my-policy-plan-YYYYMMDD-HHMMSS"
+        // Should be "my-policy-plan-YYYYMMDD-HHMMSS-MMMRRR"
         let suffix = name.strip_prefix("my-policy-plan-").unwrap();
-        assert_eq!(suffix.len(), 15); // YYYYMMDD-HHMMSS
+        // YYYYMMDD-HHMMSS-MMMRRR = 15 + 1 + 6 = 22 chars
+        assert_eq!(suffix.len(), 22);
         assert_eq!(&suffix[8..9], "-");
+        assert_eq!(&suffix[15..16], "-");
+    }
+
+    #[test]
+    fn generate_plan_name_is_unique_across_calls() {
+        let name1 = generate_plan_name("my-policy");
+        let name2 = generate_plan_name("my-policy");
+        // With millisecond + random suffix, collisions are extremely unlikely
+        // (this test may very rarely fail, but demonstrates the intent).
+        assert_ne!(name1, name2);
     }
 
     #[test]
