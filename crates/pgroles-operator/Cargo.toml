@@ -37,6 +37,7 @@ opentelemetry_sdk = { workspace = true }
 opentelemetry-otlp = { workspace = true }
 rand = "0.9"
 base64 = "0.22"
+sha2 = "0.10"
 
 [[bin]]
 name = "pgroles-operator"

@@ -1,0 +1,309 @@
+{
+  "apiVersion": "apiextensions.k8s.io/v1",
+  "kind": "CustomResourceDefinition",
+  "metadata": {
+    "name": "postgrespolicyplans.pgroles.io"
+  },
+  "spec": {
+    "group": "pgroles.io",
+    "names": {
+      "categories": [
+        "pgroles"
+      ],
+      "kind": "PostgresPolicyPlan",
+      "plural": "postgrespolicyplans",
+      "shortNames": [
+        "pgplan"
+      ],
+      "singular": "postgrespolicyplan"
+    },
+    "scope": "Namespaced",
+    "versions": [
+      {
+        "additionalPrinterColumns": [
+          {
+            "jsonPath": ".spec.policyRef.name",
+            "name": "Policy",
+            "type": "string"
+          },
+          {
+            "jsonPath": ".spec.reconciliationMode",
+            "name": "Mode",
+            "type": "string"
+          },
+          {
+            "jsonPath": ".status.conditions[?(@.type==\"Approved\")].status",
+            "name": "Approved",
+            "type": "string"
+          },
+          {
+            "jsonPath": ".status.changeSummary.total",
+            "name": "Changes",
+            "type": "integer"
+          },
+          {
+            "jsonPath": ".status.phase",
+            "name": "Phase",
+            "type": "string"
+          },
+          {
+            "jsonPath": ".metadata.creationTimestamp",
+            "name": "Age",
+            "type": "date"
+          }
+        ],
+        "name": "v1alpha1",
+        "schema": {
+          "openAPIV3Schema": {
+            "description": "Auto-generated derived type for PostgresPolicyPlanSpec via `CustomResource`",
+            "properties": {
+              "spec": {
+                "description": "Spec for a `PostgresPolicyPlan` custom resource.\n\nRepresents a computed reconciliation plan for a `PostgresPolicy`. Plans are\ncreated by the operator and may require explicit approval before execution.",
+                "properties": {
+                  "managedDatabaseIdentity": {
+                    "description": "Database identity string for disambiguation in multi-db setups.",
+                    "type": "string"
+                  },
+                  "ownedRoles": {
+                    "default": [],
+                    "description": "Roles that this plan covers.",
+                    "items": {
+                      "type": "string"
+                    },
+                    "type": "array"
+                  },
+                  "ownedSchemas": {
+                    "default": [],
+                    "description": "Schemas that this plan covers.",
+                    "items": {
+                      "type": "string"
+                    },
+                    "type": "array"
+                  },
+                  "policyGeneration": {
+                    "description": "The policy's `.metadata.generation` at plan time.",
+                    "format": "int64",
+                    "type": "integer"
+                  },
+                  "policyRef": {
+                    "description": "Reference to the policy that generated this plan.",
+                    "properties": {
+                      "name": {
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "name"
+                    ],
+                    "type": "object"
+                  },
+                  "reconciliationMode": {
+                    "description": "Reconciliation mode used for this plan.",
+                    "enum": [
+                      "authoritative",
+                      "additive",
+                      "adopt"
+                    ],
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "managedDatabaseIdentity",
+                  "policyGeneration",
+                  "policyRef",
+                  "reconciliationMode"
+                ],
+                "type": "object"
+              },
+              "status": {
+                "description": "Status of a `PostgresPolicyPlan` resource.",
+                "nullable": true,
+                "properties": {
+                  "appliedAt": {
+                    "description": "Timestamp when the plan was applied (if applicable).",
+                    "nullable": true,
+                    "type": "string"
+                  },
+                  "applyingSince": {
+                    "description": "Timestamp when the plan entered Applying phase (for stuck detection).",
+                    "nullable": true,
+                    "type": "string"
+                  },
+                  "changeSummary": {
+                    "description": "Summary of changes in this plan.",
+                    "nullable": true,
+                    "properties": {
+                      "default_privileges_revoked": {
+                        "format": "int32",
+                        "type": "integer"
+                      },
+                      "default_privileges_set": {
+                        "format": "int32",
+                        "type": "integer"
+                      },
+                      "grants_added": {
+                        "format": "int32",
+                        "type": "integer"
+                      },
+                      "grants_revoked": {
+                        "format": "int32",
+                        "type": "integer"
+                      },
+                      "members_added": {
+                        "format": "int32",
+                        "type": "integer"
+                      },
+                      "members_removed": {
+                        "format": "int32",
+                        "type": "integer"
+                      },
+                      "passwords_set": {
+                        "format": "int32",
+                        "type": "integer"
+                      },
+                      "roles_altered": {
+                        "format": "int32",
+                        "type": "integer"
+                      },
+                      "roles_created": {
+                        "format": "int32",
+                        "type": "integer"
+                      },
+                      "roles_dropped": {
+                        "format": "int32",
+                        "type": "integer"
+                      },
+                      "sessions_terminated": {
+                        "format": "int32",
+                        "type": "integer"
+                      },
+                      "total": {
+                        "format": "int32",
+                        "type": "integer"
+                      }
+                    },
+                    "required": [
+                      "default_privileges_revoked",
+                      "default_privileges_set",
+                      "grants_added",
+                      "grants_revoked",
+                      "members_added",
+                      "members_removed",
+                      "passwords_set",
+                      "roles_altered",
+                      "roles_created",
+                      "roles_dropped",
+                      "sessions_terminated",
+                      "total"
+                    ],
+                    "type": "object"
+                  },
+                  "computedAt": {
+                    "description": "Timestamp when the plan was computed.",
+                    "nullable": true,
+                    "type": "string"
+                  },
+                  "conditions": {
+                    "default": [],
+                    "description": "Standard conditions: Computed, Approved, Applied.",
+                    "items": {
+                      "description": "A condition on the `PostgresPolicy` resource.",
+                      "properties": {
+                        "last_transition_time": {
+                          "description": "Last time the condition transitioned.",
+                          "nullable": true,
+                          "type": "string"
+                        },
+                        "message": {
+                          "description": "Human-readable message.",
+                          "nullable": true,
+                          "type": "string"
+                        },
+                        "reason": {
+                          "description": "Human-readable reason for the condition.",
+                          "nullable": true,
+                          "type": "string"
+                        },
+                        "status": {
+                          "description": "Status: \"True\", \"False\", or \"Unknown\".",
+                          "type": "string"
+                        },
+                        "type": {
+                          "description": "Type of condition: \"Ready\", \"Reconciling\", \"Degraded\".",
+                          "type": "string"
+                        }
+                      },
+                      "required": [
+                        "status",
+                        "type"
+                      ],
+                      "type": "object"
+                    },
+                    "type": "array"
+                  },
+                  "lastError": {
+                    "description": "Error message if apply failed.",
+                    "nullable": true,
+                    "type": "string"
+                  },
+                  "phase": {
+                    "default": "Pending",
+                    "description": "Phase: Pending, Approved, Applying, Applied, Failed, Superseded.",
+                    "enum": [
+                      "Pending",
+                      "Approved",
+                      "Applying",
+                      "Applied",
+                      "Failed",
+                      "Superseded",
+                      "Rejected"
+                    ],
+                    "type": "string"
+                  },
+                  "sqlHash": {
+                    "description": "SHA-256 hash of the planned SQL, used to detect duplicate plans.\nIf a newly computed plan has the same hash as the current pending plan,\nthe operator can skip creating a redundant plan.",
+                    "nullable": true,
+                    "type": "string"
+                  },
+                  "sqlInline": {
+                    "description": "Inline SQL for small plans (below a size threshold).",
+                    "nullable": true,
+                    "type": "string"
+                  },
+                  "sqlRef": {
+                    "description": "Reference to ConfigMap containing the full SQL (for large plans).",
+                    "nullable": true,
+                    "properties": {
+                      "key": {
+                        "type": "string"
+                      },
+                      "name": {
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "key",
+                      "name"
+                    ],
+                    "type": "object"
+                  }
+                },
+                "type": "object"
+              }
+            },
+            "required": [
+              "spec"
+            ],
+            "title": "PostgresPolicyPlan",
+            "type": "object"
+          }
+        },
+        "served": true,
+        "storage": true,
+        "subresources": {
+          "status": {}
+        }
+      }
+    ]
+  }
+}

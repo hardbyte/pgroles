@@ -15,11 +15,22 @@ rules:
   - apiGroups: ["pgroles.io"]
     resources: ["postgrespolicies/finalizers"]
     verbs: ["update"]
+  # Watch and manage PostgresPolicyPlan CRDs
+  - apiGroups: ["pgroles.io"]
+    resources: ["postgrespolicyplans"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  - apiGroups: ["pgroles.io"]
+    resources: ["postgrespolicyplans/status"]
+    verbs: ["get", "patch", "update"]
   # Read Secrets for database connection strings and password references;
   # create/update Secrets for operator-generated passwords.
   - apiGroups: [""]
     resources: ["secrets"]
     verbs: ["get", "list", "watch", "create", "update", "patch"]
+  # Create ConfigMaps for plan SQL storage
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    verbs: ["get", "list", "create", "update", "patch", "delete"]
   # Emit events for kubectl describe / operational debugging
   - apiGroups: ["events.k8s.io"]
     resources: ["events"]

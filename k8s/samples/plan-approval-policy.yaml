@@ -1,0 +1,21 @@
+apiVersion: pgroles.io/v1alpha1
+kind: PostgresPolicy
+metadata:
+  name: plan-approval-policy
+  namespace: default
+spec:
+  connection:
+    secretRef:
+      name: postgres-credentials
+  interval: "30s"
+  mode: apply
+  approval: manual
+  roles:
+    - name: approval_test_user
+      login: true
+  grants:
+    - role: approval_test_user
+      privileges: [CONNECT]
+      object:
+        type: database
+        name: postgres
