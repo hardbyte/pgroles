@@ -1,0 +1,131 @@
+name: Setup E2E Environment
+description: >
+  Creates a kind cluster, deploys PostgreSQL and the pgroles operator,
+  and verifies basic reconciliation. Shared across all E2E test suites.
+inputs:
+  cluster-name:
+    description: Name for the kind cluster
+    required: true
+runs:
+  using: composite
+  steps:
+    - uses: docker/setup-buildx-action@v4
+
+    - name: Install kind
+      shell: bash
+      run: |
+        [ -f /usr/local/bin/kind ] || {
+          curl -Lo /usr/local/bin/kind https://kind.sigs.k8s.io/dl/v0.24.0/kind-linux-amd64
+          echo "b89aada5a39d620da3fcd16435b7f28d858927dd53f92cbac77686b0588b600d  /usr/local/bin/kind" | sha256sum -c -
+          chmod +x /usr/local/bin/kind
+        }
+
+    - name: Create kind cluster
+      shell: bash
+      run: kind create cluster --name ${{ inputs.cluster-name }} --wait 60s
+
+    - name: Install CRDs
+      shell: bash
+      run: |
+        kubectl apply -f k8s/crd.yaml
+        kubectl apply -f k8s/postgrespolicyplan-crd.yaml
+
+    - name: Deploy dev PostgreSQL
+      shell: bash
+      run: |
+        kubectl apply -f k8s/dev/postgres.yaml
+        kubectl rollout status statefulset/postgres --timeout=120s
+
+    - name: Wait for PostgreSQL readiness
+      shell: bash
+      run: kubectl wait --for=condition=ready pod/postgres-0 --timeout=90s
+
+    - name: Seed PostgreSQL
+      shell: bash
+      run: |
+        kubectl exec -i postgres-0 -- psql -v ON_ERROR_STOP=1 -U postgres -d postgres <<'SQL'
+        SET password_encryption = 'scram-sha-256';
+        CREATE DATABASE loadtest;
+        CREATE TABLE IF NOT EXISTS public.inventory_items (
+          id integer generated always as identity primary key,
+          name text not null
+        );
+        CREATE SEQUENCE IF NOT EXISTS public.audit_seq;
+        DROP ROLE IF EXISTS limited_operator;
+        CREATE ROLE limited_operator LOGIN PASSWORD 'limitedpassword';
+        ALTER ROLE limited_operator
+          NOSUPERUSER
+          NOCREATEDB
+          NOCREATEROLE
+          INHERIT
+          NOREPLICATION
+          NOBYPASSRLS;
+        GRANT CONNECT ON DATABASE postgres TO limited_operator;
+        SQL
+
+    - name: Verify limited-privilege role can authenticate
+      shell: bash
+      run: |
+        kubectl exec postgres-0 -- env PGPASSWORD=limitedpassword \
+          psql -v ON_ERROR_STOP=1 \
+          -h postgres.default.svc.cluster.local \
+          -U limited_operator \
+          -d postgres \
+          -c 'SELECT current_user;' | tee /dev/stderr | grep -q 'limited_operator'
+
+    - name: Create database secrets
+      shell: bash
+      run: |
+        kubectl create secret generic limited-postgres-credentials \
+          --from-literal=DATABASE_URL='postgres://limited_operator:limitedpassword@postgres.default.svc.cluster.local:5432/postgres' \
+          --dry-run=client -o yaml | kubectl apply -f -
+
+        kubectl create secret generic loadtest-postgres-credentials \
+          --from-literal=DATABASE_URL='postgres://postgres:devpassword@postgres.default.svc.cluster.local:5432/loadtest' \
+          --dry-run=client -o yaml | kubectl apply -f -
+
+    - name: Build operator image
+      shell: bash
+      run: docker build -f docker/Dockerfile --target operator -t pgroles-operator:e2e .
+
+    - name: Load image into kind
+      shell: bash
+      run: kind load docker-image pgroles-operator:e2e --name ${{ inputs.cluster-name }}
+
+    - name: Deploy operator
+      shell: bash
+      run: |
+        kubectl apply -f k8s/deploy/namespace.yaml
+        kubectl apply -f k8s/deploy/rbac.yaml
+        kubectl apply -f k8s/dev/otel-collector.yaml
+        kubectl -n pgroles-system rollout status deployment/otel-collector --timeout=120s
+
+        sed 's|ghcr.io/hardbyte/pgroles-operator:latest|pgroles-operator:e2e|' \
+          k8s/deploy/deployment.yaml | \
+          sed 's|imagePullPolicy:.*|imagePullPolicy: Never|' | \
+          kubectl apply -f -
+
+        kubectl -n pgroles-system set env deployment/pgroles-operator \
+          OTEL_EXPORTER_OTLP_ENDPOINT=http://otel-collector.pgroles-system.svc.cluster.local:4317 \
+          OTEL_METRICS_EXPORTER=otlp \
+          OTEL_METRIC_EXPORT_INTERVAL=2000
+
+        kubectl -n pgroles-system rollout status deployment/pgroles-operator --timeout=60s
+
+    - name: Verify operator is running
+      shell: bash
+      run: |
+        kubectl apply -f k8s/samples/basic-policy.yaml
+        for i in $(seq 1 30); do
+          STATUS=$(kubectl get pgr basic-policy -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}' 2>/dev/null || echo "")
+          if [ "$STATUS" = "True" ]; then
+            echo "Operator verified — basic-policy reconciled"
+            exit 0
+          fi
+          echo "Waiting for reconciliation... (attempt $i/30)"
+          sleep 5
+        done
+        echo "::error::Operator health check failed"
+        kubectl get pgr basic-policy -o yaml
+        kubectl -n pgroles-system logs deployment/pgroles-operator --tail=50
+        exit 1
