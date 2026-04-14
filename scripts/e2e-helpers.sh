@@ -124,7 +124,15 @@ assert_role_exists() {
 }
 
 assert_role_absent() {
-  ! pg_query "SELECT 1 FROM pg_roles WHERE rolname = '$1'" | grep -qx "1"
+  local result
+  if ! result="$(pg_query "SELECT 1 FROM pg_roles WHERE rolname = '$1'")"; then
+    echo "::error::pg_query failed while checking absence of role $1"
+    return 1
+  fi
+  if echo "$result" | grep -qx "1"; then
+    echo "::error::Role $1 unexpectedly exists"
+    return 1
+  fi
 }
 
 get_password_hash() {
