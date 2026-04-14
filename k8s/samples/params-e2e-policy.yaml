@@ -1,0 +1,30 @@
+---
+apiVersion: pgroles.io/v1alpha1
+kind: PostgresPolicy
+metadata:
+  name: params-e2e-policy
+  namespace: default
+spec:
+  connection:
+    params:
+      host: postgres.default.svc.cluster.local
+      port: 5432
+      dbname: postgres
+      sslMode: disable
+      usernameSecret:
+        name: params-pg-credentials
+        key: username
+      passwordSecret:
+        name: params-pg-credentials
+        key: password
+  interval: "15s"
+
+  roles:
+    - name: params-test-role
+      login: false
+      comment: "E2E test: role created via params connection mode"
+
+  grants:
+    - role: params-test-role
+      privileges: [CONNECT]
+      object: { type: database, name: postgres }
