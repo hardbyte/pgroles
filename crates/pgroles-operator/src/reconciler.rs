@@ -48,6 +48,10 @@ const TRANSIENT_BACKOFF_MAX_SECS: u64 = 300;
 
 /// SQLSTATE returned by PostgreSQL for insufficient privileges.
 const SQLSTATE_INSUFFICIENT_PRIVILEGE: &str = "42501";
+const SQLSTATE_INVALID_SCHEMA_NAME: &str = "3F000";
+const SQLSTATE_UNDEFINED_TABLE: &str = "42P01";
+const SQLSTATE_UNDEFINED_FUNCTION: &str = "42883";
+const SQLSTATE_UNDEFINED_OBJECT: &str = "42704";
 
 /// Maximum amount of rendered planned SQL stored in status.
 const MAX_PLANNED_SQL_STATUS_BYTES: usize = 16 * 1024;
@@ -381,12 +385,37 @@ fn inspect_error_is_non_transient(error: &pgroles_inspect::InspectError) -> bool
     }
 }
 
-fn sqlx_error_is_non_transient(error: &sqlx::Error) -> bool {
-    error
+/// Classification of a database-level SQL error for retry and status reporting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SqlErrorKind {
+    /// Insufficient privileges (SQLSTATE 42501) — RBAC-style failure,
+    /// won't fix itself.
+    InsufficientPrivileges,
+    /// A referenced schema, relation, function, or object does not exist
+    /// (SQLSTATE 3F000, 42P01, 42883, 42704). Typically a policy/environment
+    /// mismatch that needs operator action.
+    MissingDatabaseObject,
+    /// Everything else — retry with exponential backoff.
+    Transient,
+}
+
+fn classify_sqlx_error(error: &sqlx::Error) -> SqlErrorKind {
+    match error
         .as_database_error()
         .and_then(|database_error| database_error.code())
         .as_deref()
-        == Some(SQLSTATE_INSUFFICIENT_PRIVILEGE)
+    {
+        Some(SQLSTATE_INSUFFICIENT_PRIVILEGE) => SqlErrorKind::InsufficientPrivileges,
+        Some(SQLSTATE_INVALID_SCHEMA_NAME)
+        | Some(SQLSTATE_UNDEFINED_TABLE)
+        | Some(SQLSTATE_UNDEFINED_FUNCTION)
+        | Some(SQLSTATE_UNDEFINED_OBJECT) => SqlErrorKind::MissingDatabaseObject,
+        _ => SqlErrorKind::Transient,
+    }
+}
+
+fn sqlx_error_is_non_transient(error: &sqlx::Error) -> bool {
+    !matches!(classify_sqlx_error(error), SqlErrorKind::Transient)
 }
 
 fn next_transient_failure_count(resource: &PostgresPolicy) -> u32 {
@@ -464,7 +493,9 @@ async fn reconcile_apply(
                 }
                 "InvalidSpec" => ctx.observability.record_invalid_spec(),
                 "ConflictingPolicy" => ctx.observability.record_policy_conflict(),
-                "ApplyFailed" => ctx.observability.record_apply_result("error"),
+                "ApplyFailed" | "MissingDatabaseObject" => {
+                    ctx.observability.record_apply_result("error")
+                }
                 _ => {}
             }
             reconcile_guard.record_result("error", error_reason);
@@ -1929,20 +1960,20 @@ impl ReconcileError {
                 ContextError::SecretMissing { .. } => "SecretMissing",
                 ContextError::DatabaseConnect { .. } => "DatabaseConnectionFailed",
             },
-            ReconcileError::Inspect(error) => {
-                if inspect_error_is_non_transient(error) {
-                    "InsufficientPrivileges"
-                } else {
-                    "DatabaseInspectionFailed"
+            ReconcileError::Inspect(error) => match error {
+                pgroles_inspect::InspectError::Database(sql_err) => {
+                    match classify_sqlx_error(sql_err) {
+                        SqlErrorKind::InsufficientPrivileges => "InsufficientPrivileges",
+                        SqlErrorKind::MissingDatabaseObject => "MissingDatabaseObject",
+                        SqlErrorKind::Transient => "DatabaseInspectionFailed",
+                    }
                 }
-            }
-            ReconcileError::SqlExec(error) => {
-                if sqlx_error_is_non_transient(error) {
-                    "InsufficientPrivileges"
-                } else {
-                    "ApplyFailed"
-                }
-            }
+            },
+            ReconcileError::SqlExec(error) => match classify_sqlx_error(error) {
+                SqlErrorKind::InsufficientPrivileges => "InsufficientPrivileges",
+                SqlErrorKind::MissingDatabaseObject => "MissingDatabaseObject",
+                SqlErrorKind::Transient => "ApplyFailed",
+            },
             ReconcileError::UnsafeRoleDrops(_) => "UnsafeRoleDrops",
             ReconcileError::EmptyPasswordSecret { .. } => "InvalidSpec",
             ReconcileError::PasswordGeneration(_) => "SecretFetchFailed",
@@ -2016,6 +2047,41 @@ mod tests {
         sqlx::Error::Database(Box::new(TestDatabaseError {
             message: "permission denied to create role".to_string(),
             code: Some(SQLSTATE_INSUFFICIENT_PRIVILEGE),
+        }))
+    }
+
+    fn missing_schema_sqlx_error() -> sqlx::Error {
+        sqlx::Error::Database(Box::new(TestDatabaseError {
+            message: "schema \"etl\" does not exist".to_string(),
+            code: Some(SQLSTATE_INVALID_SCHEMA_NAME),
+        }))
+    }
+
+    fn missing_table_sqlx_error() -> sqlx::Error {
+        sqlx::Error::Database(Box::new(TestDatabaseError {
+            message: "relation \"foo\" does not exist".to_string(),
+            code: Some(SQLSTATE_UNDEFINED_TABLE),
+        }))
+    }
+
+    fn missing_function_sqlx_error() -> sqlx::Error {
+        sqlx::Error::Database(Box::new(TestDatabaseError {
+            message: "function foo() does not exist".to_string(),
+            code: Some(SQLSTATE_UNDEFINED_FUNCTION),
+        }))
+    }
+
+    fn missing_object_sqlx_error() -> sqlx::Error {
+        sqlx::Error::Database(Box::new(TestDatabaseError {
+            message: "role \"nope\" does not exist".to_string(),
+            code: Some(SQLSTATE_UNDEFINED_OBJECT),
+        }))
+    }
+
+    fn transient_sqlx_error() -> sqlx::Error {
+        sqlx::Error::Database(Box::new(TestDatabaseError {
+            message: "connection timed out".to_string(),
+            code: Some("08006"),
         }))
     }
 
@@ -2731,6 +2797,76 @@ mod tests {
             pgroles_inspect::InspectError::Database(insufficient_privilege_sqlx_error()),
         ));
         assert_eq!(retry_class(&error), RetryClass::Slow);
+    }
+
+    #[test]
+    fn classify_sqlx_error_categories() {
+        assert_eq!(
+            classify_sqlx_error(&insufficient_privilege_sqlx_error()),
+            SqlErrorKind::InsufficientPrivileges
+        );
+        assert_eq!(
+            classify_sqlx_error(&missing_schema_sqlx_error()),
+            SqlErrorKind::MissingDatabaseObject
+        );
+        assert_eq!(
+            classify_sqlx_error(&missing_table_sqlx_error()),
+            SqlErrorKind::MissingDatabaseObject
+        );
+        assert_eq!(
+            classify_sqlx_error(&missing_function_sqlx_error()),
+            SqlErrorKind::MissingDatabaseObject
+        );
+        assert_eq!(
+            classify_sqlx_error(&missing_object_sqlx_error()),
+            SqlErrorKind::MissingDatabaseObject
+        );
+        assert_eq!(
+            classify_sqlx_error(&transient_sqlx_error()),
+            SqlErrorKind::Transient
+        );
+    }
+
+    #[test]
+    fn retry_classifies_sql_exec_missing_schema_as_slow() {
+        let error =
+            finalizer::Error::ApplyFailed(ReconcileError::SqlExec(missing_schema_sqlx_error()));
+        assert_eq!(retry_class(&error), RetryClass::Slow);
+    }
+
+    #[test]
+    fn retry_classifies_sql_exec_missing_table_as_slow() {
+        let error =
+            finalizer::Error::ApplyFailed(ReconcileError::SqlExec(missing_table_sqlx_error()));
+        assert_eq!(retry_class(&error), RetryClass::Slow);
+    }
+
+    #[test]
+    fn retry_classifies_inspect_missing_schema_as_slow() {
+        let error = finalizer::Error::ApplyFailed(ReconcileError::Inspect(
+            pgroles_inspect::InspectError::Database(missing_schema_sqlx_error()),
+        ));
+        assert_eq!(retry_class(&error), RetryClass::Slow);
+    }
+
+    #[test]
+    fn error_reason_sql_exec_missing_database_object() {
+        let err = ReconcileError::SqlExec(missing_schema_sqlx_error());
+        assert_eq!(err.reason(), "MissingDatabaseObject");
+    }
+
+    #[test]
+    fn error_reason_inspect_missing_database_object() {
+        let err = ReconcileError::Inspect(pgroles_inspect::InspectError::Database(
+            missing_table_sqlx_error(),
+        ));
+        assert_eq!(err.reason(), "MissingDatabaseObject");
+    }
+
+    #[test]
+    fn error_reason_sql_exec_transient_is_apply_failed() {
+        let err = ReconcileError::SqlExec(transient_sqlx_error());
+        assert_eq!(err.reason(), "ApplyFailed");
     }
 
     #[test]
