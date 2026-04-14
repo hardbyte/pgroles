@@ -301,8 +301,8 @@ Valid `sslMode` values: `disable`, `allow`, `prefer`, `require`, `verify-ca`, `v
 
 For required fields, exactly one of the literal or Secret variant must be set. For optional fields, at most one may be set. When a Secret referenced by `params` changes, the operator detects the `resourceVersion` change and reconnects automatically.
 
-{% callout type="warning" title="Cross-namespace DNS" %}
-The operator runs in `pgroles-system`, not the policy's namespace. The `host` field must resolve from the operator's namespace — use a fully qualified service name like `my-postgres.my-namespace.svc`, not a short name like `my-postgres`. Short names will fail with "Name does not resolve" because they are relative to the operator pod's namespace, not the policy's namespace.
+{% callout type="note" title="Host resolution" %}
+The `host` must be reachable from the operator pod. For an in-cluster database in a different namespace, use the fully qualified service name (e.g. `my-postgres.my-namespace.svc`). For a database outside the cluster, use the external hostname or IP directly (e.g. `db.example.com` or `10.0.1.50`).
 {% /callout %}
 
 ### Role passwords
