@@ -252,6 +252,25 @@ pub async fn create_or_update_plan(
         ),
     ]));
 
+    // Annotations for quick visibility in kubectl describe / Lens.
+    let sql_preview = redacted_sql.lines().take(5).collect::<Vec<_>>().join("\n");
+    let summary_text = format!(
+        "{}R {}G {}D {}DP {}M",
+        change_summary.roles_created + change_summary.roles_altered,
+        change_summary.grants_added,
+        change_summary.default_privileges_set,
+        change_summary.roles_dropped,
+        change_summary.members_added,
+    );
+    plan.metadata.annotations = Some(BTreeMap::from([
+        ("pgroles.io/sql-preview".to_string(), sql_preview),
+        ("pgroles.io/summary".to_string(), summary_text),
+        (
+            "pgroles.io/sql-hash".to_string(),
+            sql_hash[..12].to_string(),
+        ),
+    ]));
+
     let created_plan = plans_api.create(&PostParams::default(), &plan).await?;
     let plan_name = created_plan.name_any();
 
