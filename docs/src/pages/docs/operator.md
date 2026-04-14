@@ -301,6 +301,10 @@ Valid `sslMode` values: `disable`, `allow`, `prefer`, `require`, `verify-ca`, `v
 
 For required fields, exactly one of the literal or Secret variant must be set. For optional fields, at most one may be set. When a Secret referenced by `params` changes, the operator detects the `resourceVersion` change and reconnects automatically.
 
+{% callout type="warning" title="Cross-namespace DNS" %}
+The operator runs in `pgroles-system`, not the policy's namespace. The `host` field must resolve from the operator's namespace — use a fully qualified service name like `my-postgres.my-namespace.svc`, not a short name like `my-postgres`. Short names will fail with "Name does not resolve" because they are relative to the operator pod's namespace, not the policy's namespace.
+{% /callout %}
+
 ### Role passwords
 
 Roles can either sync a password from an existing Kubernetes Secret or ask the operator to generate and manage a per-role Secret. In both cases the password value is resolved at reconcile time and only sent to PostgreSQL inside the apply transaction.
