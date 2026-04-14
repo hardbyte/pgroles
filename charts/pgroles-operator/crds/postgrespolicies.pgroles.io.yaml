@@ -78,13 +78,221 @@
                   "connection": {
                     "description": "Database connection configuration.",
                     "properties": {
+                      "params": {
+                        "description": "Structured connection parameters. Each field is either a plain string\nor a reference to a Secret key. Mutually exclusive with `secretRef`.",
+                        "nullable": true,
+                        "properties": {
+                          "dbname": {
+                            "anyOf": [
+                              {},
+                              {
+                                "required": [
+                                  "secretKeyRef"
+                                ]
+                              }
+                            ],
+                            "description": "Database name.",
+                            "properties": {
+                              "secretKeyRef": {
+                                "description": "Reference to a specific key within a Kubernetes Secret.",
+                                "properties": {
+                                  "key": {
+                                    "description": "Key within the Secret.",
+                                    "type": "string"
+                                  },
+                                  "name": {
+                                    "description": "Name of the Secret.",
+                                    "type": "string"
+                                  }
+                                },
+                                "required": [
+                                  "key",
+                                  "name"
+                                ],
+                                "type": "object"
+                              }
+                            },
+                            "type": "object"
+                          },
+                          "host": {
+                            "anyOf": [
+                              {},
+                              {
+                                "required": [
+                                  "secretKeyRef"
+                                ]
+                              }
+                            ],
+                            "description": "PostgreSQL host (e.g. `partly-postgres` — K8s DNS, namespace-relative).",
+                            "properties": {
+                              "secretKeyRef": {
+                                "description": "Reference to a specific key within a Kubernetes Secret.",
+                                "properties": {
+                                  "key": {
+                                    "description": "Key within the Secret.",
+                                    "type": "string"
+                                  },
+                                  "name": {
+                                    "description": "Name of the Secret.",
+                                    "type": "string"
+                                  }
+                                },
+                                "required": [
+                                  "key",
+                                  "name"
+                                ],
+                                "type": "object"
+                              }
+                            },
+                            "type": "object"
+                          },
+                          "password": {
+                            "anyOf": [
+                              {},
+                              {
+                                "required": [
+                                  "secretKeyRef"
+                                ]
+                              }
+                            ],
+                            "description": "Password for authentication.",
+                            "properties": {
+                              "secretKeyRef": {
+                                "description": "Reference to a specific key within a Kubernetes Secret.",
+                                "properties": {
+                                  "key": {
+                                    "description": "Key within the Secret.",
+                                    "type": "string"
+                                  },
+                                  "name": {
+                                    "description": "Name of the Secret.",
+                                    "type": "string"
+                                  }
+                                },
+                                "required": [
+                                  "key",
+                                  "name"
+                                ],
+                                "type": "object"
+                              }
+                            },
+                            "type": "object"
+                          },
+                          "port": {
+                            "anyOf": [
+                              {},
+                              {
+                                "required": [
+                                  "secretKeyRef"
+                                ]
+                              }
+                            ],
+                            "description": "Port number. Defaults to `5432` if omitted.",
+                            "nullable": true,
+                            "properties": {
+                              "secretKeyRef": {
+                                "description": "Reference to a specific key within a Kubernetes Secret.",
+                                "properties": {
+                                  "key": {
+                                    "description": "Key within the Secret.",
+                                    "type": "string"
+                                  },
+                                  "name": {
+                                    "description": "Name of the Secret.",
+                                    "type": "string"
+                                  }
+                                },
+                                "required": [
+                                  "key",
+                                  "name"
+                                ],
+                                "type": "object"
+                              }
+                            },
+                            "type": "object"
+                          },
+                          "sslMode": {
+                            "anyOf": [
+                              {},
+                              {
+                                "required": [
+                                  "secretKeyRef"
+                                ]
+                              }
+                            ],
+                            "description": "SSL mode. One of: disable, allow, prefer, require, verify-ca, verify-full.",
+                            "nullable": true,
+                            "properties": {
+                              "secretKeyRef": {
+                                "description": "Reference to a specific key within a Kubernetes Secret.",
+                                "properties": {
+                                  "key": {
+                                    "description": "Key within the Secret.",
+                                    "type": "string"
+                                  },
+                                  "name": {
+                                    "description": "Name of the Secret.",
+                                    "type": "string"
+                                  }
+                                },
+                                "required": [
+                                  "key",
+                                  "name"
+                                ],
+                                "type": "object"
+                              }
+                            },
+                            "type": "object"
+                          },
+                          "username": {
+                            "anyOf": [
+                              {},
+                              {
+                                "required": [
+                                  "secretKeyRef"
+                                ]
+                              }
+                            ],
+                            "description": "Username for authentication.",
+                            "properties": {
+                              "secretKeyRef": {
+                                "description": "Reference to a specific key within a Kubernetes Secret.",
+                                "properties": {
+                                  "key": {
+                                    "description": "Key within the Secret.",
+                                    "type": "string"
+                                  },
+                                  "name": {
+                                    "description": "Name of the Secret.",
+                                    "type": "string"
+                                  }
+                                },
+                                "required": [
+                                  "key",
+                                  "name"
+                                ],
+                                "type": "object"
+                              }
+                            },
+                            "type": "object"
+                          }
+                        },
+                        "required": [
+                          "dbname",
+                          "host",
+                          "password",
+                          "username"
+                        ],
+                        "type": "object"
+                      },
                       "secretKey": {
-                        "default": "DATABASE_URL",
-                        "description": "Override the key in the Secret to read. Defaults to `DATABASE_URL`.",
+                        "description": "Key within the Secret to read. Defaults to `DATABASE_URL`.\nOnly used with `secretRef`.",
+                        "nullable": true,
                         "type": "string"
                       },
                       "secretRef": {
-                        "description": "Reference to a Kubernetes Secret containing the connection string.\nThe secret must have a key named `DATABASE_URL`.",
+                        "description": "Reference to a Kubernetes Secret containing a connection URL.\nMutually exclusive with `params`.",
+                        "nullable": true,
                         "properties": {
                           "name": {
                             "description": "Name of the Secret.",
@@ -97,9 +305,6 @@
                         "type": "object"
                       }
                     },
-                    "required": [
-                      "secretRef"
-                    ],
                     "type": "object"
                   },
                   "default_owner": {

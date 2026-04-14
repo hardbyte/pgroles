@@ -1,0 +1,43 @@
+---
+apiVersion: pgroles.io/v1alpha1
+kind: PostgresPolicy
+metadata:
+  name: params-connection-policy
+  namespace: default
+spec:
+  connection:
+    params:
+      host: partly-postgres
+      port: "5432"
+      dbname: partly
+      username:
+        secretKeyRef:
+          name: zalando-creds
+          key: username
+      password:
+        secretKeyRef:
+          name: zalando-creds
+          key: password
+      sslMode: require
+  interval: "5m"
+  default_owner: postgres
+
+  roles:
+    - name: app_reader
+      login: false
+    - name: app_writer
+      login: false
+
+  grants:
+    - role: app_reader
+      object: { type: schema, name: public }
+      privileges: [USAGE]
+    - role: app_reader
+      object: { type: table, name: "*", schema: public }
+      privileges: [SELECT]
+    - role: app_writer
+      object: { type: schema, name: public }
+      privileges: [USAGE]
+    - role: app_writer
+      object: { type: table, name: "*", schema: public }
+      privileges: [SELECT, INSERT, UPDATE, DELETE]

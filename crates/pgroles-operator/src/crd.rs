@@ -184,20 +184,182 @@ impl From<CrdReconciliationMode> for pgroles_core::diff::ReconciliationMode {
 }
 
 /// Database connection configuration.
+///
+/// Supports two mutually exclusive modes:
+///
+/// **Mode 1 — Single URL** (backward-compatible):
+/// ```yaml
+/// connection:
+///   secretRef: { name: my-secret }
+///   secretKey: DATABASE_URL        # optional, defaults to DATABASE_URL
+/// ```
+///
+/// **Mode 2 — Structured params** (for Zalando/CNPG/PGO secrets):
+/// ```yaml
+/// connection:
+///   params:
+///     host: partly-postgres
+///     port: "5432"
+///     dbname: partly
+///     username:
+///       secretKeyRef: { name: zalando-creds, key: username }
+///     password:
+///       secretKeyRef: { name: zalando-creds, key: password }
+/// ```
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct ConnectionSpec {
-    /// Reference to a Kubernetes Secret containing the connection string.
-    /// The secret must have a key named `DATABASE_URL`.
-    pub secret_ref: SecretReference,
+    /// Reference to a Kubernetes Secret containing a connection URL.
+    /// Mutually exclusive with `params`.
+    #[serde(default)]
+    pub secret_ref: Option<SecretReference>,
 
-    /// Override the key in the Secret to read. Defaults to `DATABASE_URL`.
-    #[serde(default = "default_secret_key")]
-    pub secret_key: String,
+    /// Key within the Secret to read. Defaults to `DATABASE_URL`.
+    /// Only used with `secretRef`.
+    #[serde(default)]
+    pub secret_key: Option<String>,
+
+    /// Structured connection parameters. Each field is either a plain string
+    /// or a reference to a Secret key. Mutually exclusive with `secretRef`.
+    #[serde(default)]
+    pub params: Option<ConnectionParams>,
 }
 
-fn default_secret_key() -> String {
-    "DATABASE_URL".to_string()
+impl ConnectionSpec {
+    /// Effective secret key for URL mode. Defaults to `DATABASE_URL`.
+    pub fn effective_secret_key(&self) -> &str {
+        self.secret_key.as_deref().unwrap_or("DATABASE_URL")
+    }
+
+    /// Collect all Secret names referenced by this connection spec.
+    pub fn collect_secret_names(&self, names: &mut BTreeSet<String>) {
+        if let Some(ref secret_ref) = self.secret_ref {
+            names.insert(secret_ref.name.clone());
+        }
+        if let Some(ref params) = self.params {
+            params.host.collect_secret_name(names);
+            if let Some(ref port) = params.port {
+                port.collect_secret_name(names);
+            }
+            params.dbname.collect_secret_name(names);
+            params.username.collect_secret_name(names);
+            params.password.collect_secret_name(names);
+            if let Some(ref ssl_mode) = params.ssl_mode {
+                ssl_mode.collect_secret_name(names);
+            }
+        }
+    }
+
+    /// Deterministic identity key for this connection spec.
+    ///
+    /// - URL mode: `{secret_ref.name}/{secret_key}`
+    /// - Params mode: canonical representation of the params
+    pub fn identity_key(&self) -> String {
+        if let Some(ref secret_ref) = self.secret_ref {
+            format!("{}/{}", secret_ref.name, self.effective_secret_key())
+        } else if let Some(ref params) = self.params {
+            format!(
+                "params:{}:{}:{}:{}",
+                params.host.identity_repr(),
+                params.dbname.identity_repr(),
+                params.username.identity_repr(),
+                params
+                    .port
+                    .as_ref()
+                    .map(|p| p.identity_repr())
+                    .unwrap_or_else(|| "5432".to_string()),
+            )
+        } else {
+            // Fallback for invalid specs (missing both modes).
+            "invalid-connection".to_string()
+        }
+    }
+
+    /// Cache key for pool lookup. Same as identity_key but could diverge if
+    /// needed in the future.
+    pub fn cache_key(&self, namespace: &str) -> String {
+        format!("{namespace}/{}", self.identity_key())
+    }
+}
+
+impl ValueSource {
+    /// Deterministic string representation for identity/cache keys.
+    pub fn identity_repr(&self) -> String {
+        match self {
+            ValueSource::Literal(value) => value.clone(),
+            ValueSource::SecretRef { secret_key_ref } => {
+                format!("secret:{}:{}", secret_key_ref.name, secret_key_ref.key)
+            }
+        }
+    }
+}
+
+impl ValueSource {
+    /// If this is a SecretRef, add the secret name to the set.
+    pub fn collect_secret_name(&self, names: &mut BTreeSet<String>) {
+        if let ValueSource::SecretRef { secret_key_ref } = self {
+            names.insert(secret_key_ref.name.clone());
+        }
+    }
+}
+
+/// Structured connection parameters for building a PostgreSQL connection URL.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ConnectionParams {
+    /// PostgreSQL host (e.g. `partly-postgres` — K8s DNS, namespace-relative).
+    pub host: ValueSource,
+
+    /// Port number. Defaults to `5432` if omitted.
+    #[serde(default)]
+    pub port: Option<ValueSource>,
+
+    /// Database name.
+    pub dbname: ValueSource,
+
+    /// Username for authentication.
+    pub username: ValueSource,
+
+    /// Password for authentication.
+    pub password: ValueSource,
+
+    /// SSL mode. One of: disable, allow, prefer, require, verify-ca, verify-full.
+    #[serde(default)]
+    pub ssl_mode: Option<ValueSource>,
+}
+
+/// A value that can come from a literal string or a Secret key reference.
+///
+/// Supports shorthand for the common case:
+/// ```yaml
+/// # Literal string (shorthand)
+/// host: partly-postgres
+///
+/// # Secret reference
+/// password:
+///   secretKeyRef:
+///     name: my-creds
+///     key: password
+/// ```
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(untagged)]
+pub enum ValueSource {
+    /// A literal string value.
+    Literal(String),
+    /// A reference to a key in a Kubernetes Secret.
+    SecretRef {
+        #[serde(rename = "secretKeyRef")]
+        secret_key_ref: SecretKeySelector,
+    },
+}
+
+/// Reference to a specific key within a Kubernetes Secret.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct SecretKeySelector {
+    /// Name of the Secret.
+    pub name: String,
+    /// Key within the Secret.
+    pub key: String,
 }
 
 /// Reference to a Kubernetes Secret in the same namespace.
@@ -366,6 +528,24 @@ pub enum PasswordValidationError {
         "role \"{role}\" password.generate.secretKey \"{key}\" is reserved for the SCRAM verifier"
     )]
     ReservedGeneratedSecretKey { role: String, key: String },
+}
+
+/// Errors from connection spec validation.
+#[derive(Debug, Clone, thiserror::Error)]
+pub enum ConnectionValidationError {
+    #[error("connection: exactly one of secretRef or params must be set, but both were provided")]
+    BothModesSet,
+
+    #[error("connection: exactly one of secretRef or params must be set, but neither was provided")]
+    NeitherModeSet,
+
+    #[error("connection.params.{field}: secretKeyRef {detail}")]
+    EmptySecretKeyRef { field: String, detail: String },
+
+    #[error(
+        "connection.params.sslMode: \"{value}\" is not valid (expected one of: disable, allow, prefer, require, verify-ca, verify-full)"
+    )]
+    InvalidSslMode { value: String },
 }
 
 /// Validate a Kubernetes Secret name per RFC 1123 DNS subdomain rules:
@@ -645,8 +825,9 @@ impl std::fmt::Display for PlanPhase {
 pub struct DatabaseIdentity(String);
 
 impl DatabaseIdentity {
-    pub fn new(namespace: &str, secret_name: &str, secret_key: &str) -> Self {
-        Self(format!("{namespace}/{secret_name}/{secret_key}"))
+    /// Create a database identity from the namespace and connection spec's identity key.
+    pub fn from_connection(namespace: &str, connection: &ConnectionSpec) -> Self {
+        Self(format!("{namespace}/{}", connection.identity_key()))
     }
 
     pub fn as_str(&self) -> &str {
@@ -762,6 +943,74 @@ impl PostgresPolicySpec {
         Ok(())
     }
 
+    /// Validate the connection spec.
+    ///
+    /// Ensures exactly one of `secretRef` or `params` is set, and that params
+    /// mode has all required fields with valid values.
+    pub fn validate_connection_spec(&self) -> Result<(), ConnectionValidationError> {
+        let conn = &self.connection;
+        match (&conn.secret_ref, &conn.params) {
+            (Some(_), None) => {
+                // URL mode — valid.
+                Ok(())
+            }
+            (None, Some(params)) => {
+                // Params mode — validate all secretKeyRef values have non-empty name/key.
+                fn validate_value_source(
+                    field: &str,
+                    value: &ValueSource,
+                ) -> Result<(), ConnectionValidationError> {
+                    if let ValueSource::SecretRef { secret_key_ref } = value {
+                        if secret_key_ref.name.is_empty() {
+                            return Err(ConnectionValidationError::EmptySecretKeyRef {
+                                field: field.to_string(),
+                                detail: "name must not be empty".to_string(),
+                            });
+                        }
+                        if secret_key_ref.key.is_empty() {
+                            return Err(ConnectionValidationError::EmptySecretKeyRef {
+                                field: field.to_string(),
+                                detail: "key must not be empty".to_string(),
+                            });
+                        }
+                    }
+                    Ok(())
+                }
+
+                validate_value_source("host", &params.host)?;
+                validate_value_source("dbname", &params.dbname)?;
+                validate_value_source("username", &params.username)?;
+                validate_value_source("password", &params.password)?;
+                if let Some(ref port) = params.port {
+                    validate_value_source("port", port)?;
+                }
+                if let Some(ref ssl_mode) = params.ssl_mode {
+                    validate_value_source("sslMode", ssl_mode)?;
+                    // Validate ssl_mode value if it's a literal.
+                    if let ValueSource::Literal(value) = ssl_mode {
+                        const VALID_SSL_MODES: &[&str] = &[
+                            "disable",
+                            "allow",
+                            "prefer",
+                            "require",
+                            "verify-ca",
+                            "verify-full",
+                        ];
+                        if !VALID_SSL_MODES.contains(&value.as_str()) {
+                            return Err(ConnectionValidationError::InvalidSslMode {
+                                value: value.clone(),
+                            });
+                        }
+                    }
+                }
+
+                Ok(())
+            }
+            (Some(_), Some(_)) => Err(ConnectionValidationError::BothModesSet),
+            (None, None) => Err(ConnectionValidationError::NeitherModeSet),
+        }
+    }
+
     /// All Kubernetes Secret names referenced by this spec.
     ///
     /// Includes the connection Secret, password `secretRef` Secrets, and
@@ -769,7 +1018,8 @@ impl PostgresPolicySpec {
     /// reconciliation when any of these Secrets change (or are deleted).
     pub fn referenced_secret_names(&self, policy_name: &str) -> BTreeSet<String> {
         let mut names = BTreeSet::new();
-        names.insert(self.connection.secret_ref.name.clone());
+        // Connection secrets — either URL mode or structured params.
+        self.connection.collect_secret_names(&mut names);
         for role in &self.roles {
             if let Some(pw) = &role.password {
                 if let Some(secret_ref) = &pw.secret_ref {
@@ -1098,10 +1348,11 @@ mod tests {
     fn spec_to_policy_manifest_roundtrip() {
         let spec = PostgresPolicySpec {
             connection: ConnectionSpec {
-                secret_ref: SecretReference {
+                secret_ref: Some(SecretReference {
                     name: "pg-secret".to_string(),
-                },
-                secret_key: "DATABASE_URL".to_string(),
+                }),
+                secret_key: Some("DATABASE_URL".to_string()),
+                params: None,
             },
             interval: "5m".to_string(),
             suspend: false,
@@ -1198,10 +1449,11 @@ mod tests {
 
         let spec = PostgresPolicySpec {
             connection: ConnectionSpec {
-                secret_ref: SecretReference {
+                secret_ref: Some(SecretReference {
                     name: "pg-secret".to_string(),
-                },
-                secret_key: "DATABASE_URL".to_string(),
+                }),
+                secret_key: Some("DATABASE_URL".to_string()),
+                params: None,
             },
             interval: "5m".to_string(),
             suspend: false,
@@ -1266,8 +1518,15 @@ mod tests {
     }
 
     #[test]
-    fn database_identity_uses_namespace_secret_and_key() {
-        let identity = DatabaseIdentity::new("prod", "db-creds", "DATABASE_URL");
+    fn database_identity_uses_namespace_and_identity_key() {
+        let conn = ConnectionSpec {
+            secret_ref: Some(SecretReference {
+                name: "db-creds".to_string(),
+            }),
+            secret_key: Some("DATABASE_URL".to_string()),
+            params: None,
+        };
+        let identity = DatabaseIdentity::from_connection("prod", &conn);
         assert_eq!(identity.as_str(), "prod/db-creds/DATABASE_URL");
     }
 
@@ -1370,17 +1629,38 @@ mod tests {
 
     #[test]
     fn database_identity_equality() {
-        let a = DatabaseIdentity::new("prod", "db-creds", "DATABASE_URL");
-        let b = DatabaseIdentity::new("prod", "db-creds", "DATABASE_URL");
-        let c = DatabaseIdentity::new("staging", "db-creds", "DATABASE_URL");
+        let conn_a = ConnectionSpec {
+            secret_ref: Some(SecretReference {
+                name: "db-creds".to_string(),
+            }),
+            secret_key: Some("DATABASE_URL".to_string()),
+            params: None,
+        };
+        let a = DatabaseIdentity::from_connection("prod", &conn_a);
+        let b = DatabaseIdentity::from_connection("prod", &conn_a);
+        let c = DatabaseIdentity::from_connection("staging", &conn_a);
         assert_eq!(a, b);
         assert_ne!(a, c);
     }
 
     #[test]
     fn database_identity_different_key() {
-        let a = DatabaseIdentity::new("prod", "db-creds", "DATABASE_URL");
-        let b = DatabaseIdentity::new("prod", "db-creds", "CUSTOM_URL");
+        let conn_a = ConnectionSpec {
+            secret_ref: Some(SecretReference {
+                name: "db-creds".to_string(),
+            }),
+            secret_key: Some("DATABASE_URL".to_string()),
+            params: None,
+        };
+        let conn_b = ConnectionSpec {
+            secret_ref: Some(SecretReference {
+                name: "db-creds".to_string(),
+            }),
+            secret_key: Some("CUSTOM_URL".to_string()),
+            params: None,
+        };
+        let a = DatabaseIdentity::from_connection("prod", &conn_a);
+        let b = DatabaseIdentity::from_connection("prod", &conn_b);
         assert_ne!(a, b);
     }
 
@@ -1717,10 +1997,11 @@ retirements:
     fn referenced_secret_names_includes_connection_secret() {
         let spec = PostgresPolicySpec {
             connection: ConnectionSpec {
-                secret_ref: SecretReference {
+                secret_ref: Some(SecretReference {
                     name: "pg-conn".to_string(),
-                },
-                secret_key: "DATABASE_URL".to_string(),
+                }),
+                secret_key: Some("DATABASE_URL".to_string()),
+                params: None,
             },
             interval: "5m".to_string(),
             suspend: false,
@@ -1746,10 +2027,11 @@ retirements:
     fn referenced_secret_names_includes_password_secrets() {
         let spec = PostgresPolicySpec {
             connection: ConnectionSpec {
-                secret_ref: SecretReference {
+                secret_ref: Some(SecretReference {
                     name: "pg-conn".to_string(),
-                },
-                secret_key: "DATABASE_URL".to_string(),
+                }),
+                secret_key: Some("DATABASE_URL".to_string()),
+                params: None,
             },
             interval: "5m".to_string(),
             suspend: false,
@@ -1841,10 +2123,11 @@ retirements:
     fn validate_password_specs_rejects_password_without_login() {
         let spec = PostgresPolicySpec {
             connection: ConnectionSpec {
-                secret_ref: SecretReference {
+                secret_ref: Some(SecretReference {
                     name: "pg-conn".to_string(),
-                },
-                secret_key: "DATABASE_URL".to_string(),
+                }),
+                secret_key: Some("DATABASE_URL".to_string()),
+                params: None,
             },
             interval: "5m".to_string(),
             suspend: false,
@@ -1890,10 +2173,11 @@ retirements:
     fn validate_password_specs_rejects_password_with_login_omitted() {
         let spec = PostgresPolicySpec {
             connection: ConnectionSpec {
-                secret_ref: SecretReference {
+                secret_ref: Some(SecretReference {
                     name: "pg-conn".to_string(),
-                },
-                secret_key: "DATABASE_URL".to_string(),
+                }),
+                secret_key: Some("DATABASE_URL".to_string()),
+                params: None,
             },
             interval: "5m".to_string(),
             suspend: false,
@@ -1939,10 +2223,11 @@ retirements:
     fn validate_password_specs_rejects_invalid_password_mode() {
         let spec = PostgresPolicySpec {
             connection: ConnectionSpec {
-                secret_ref: SecretReference {
+                secret_ref: Some(SecretReference {
                     name: "pg-conn".to_string(),
-                },
-                secret_key: "DATABASE_URL".to_string(),
+                }),
+                secret_key: Some("DATABASE_URL".to_string()),
+                params: None,
             },
             interval: "5m".to_string(),
             suspend: false,
@@ -1992,10 +2277,11 @@ retirements:
     fn validate_password_specs_rejects_invalid_generated_length() {
         let spec = PostgresPolicySpec {
             connection: ConnectionSpec {
-                secret_ref: SecretReference {
+                secret_ref: Some(SecretReference {
                     name: "pg-conn".to_string(),
-                },
-                secret_key: "DATABASE_URL".to_string(),
+                }),
+                secret_key: Some("DATABASE_URL".to_string()),
+                params: None,
             },
             interval: "5m".to_string(),
             suspend: false,
@@ -2043,10 +2329,11 @@ retirements:
     fn validate_password_specs_rejects_invalid_generated_secret_key() {
         let spec = PostgresPolicySpec {
             connection: ConnectionSpec {
-                secret_ref: SecretReference {
+                secret_ref: Some(SecretReference {
                     name: "pg-conn".to_string(),
-                },
-                secret_key: "DATABASE_URL".to_string(),
+                }),
+                secret_key: Some("DATABASE_URL".to_string()),
+                params: None,
             },
             interval: "5m".to_string(),
             suspend: false,
@@ -2095,10 +2382,11 @@ retirements:
     fn validate_password_specs_rejects_invalid_generated_secret_name() {
         let spec = PostgresPolicySpec {
             connection: ConnectionSpec {
-                secret_ref: SecretReference {
+                secret_ref: Some(SecretReference {
                     name: "pg-conn".to_string(),
-                },
-                secret_key: "DATABASE_URL".to_string(),
+                }),
+                secret_key: Some("DATABASE_URL".to_string()),
+                params: None,
             },
             interval: "5m".to_string(),
             suspend: false,
@@ -2146,10 +2434,11 @@ retirements:
     fn validate_password_specs_rejects_reserved_generated_secret_key() {
         let spec = PostgresPolicySpec {
             connection: ConnectionSpec {
-                secret_ref: SecretReference {
+                secret_ref: Some(SecretReference {
                     name: "pg-conn".to_string(),
-                },
-                secret_key: "DATABASE_URL".to_string(),
+                }),
+                secret_key: Some("DATABASE_URL".to_string()),
+                params: None,
             },
             interval: "5m".to_string(),
             suspend: false,
@@ -2226,10 +2515,11 @@ retirements:
     fn effective_approval_infers_from_mode() {
         let base = PostgresPolicySpec {
             connection: ConnectionSpec {
-                secret_ref: SecretReference {
+                secret_ref: Some(SecretReference {
                     name: "test".into(),
-                },
-                secret_key: "DATABASE_URL".into(),
+                }),
+                secret_key: Some("DATABASE_URL".into()),
+                params: None,
             },
             interval: "5m".into(),
             suspend: false,
@@ -2338,10 +2628,11 @@ retirements:
     fn effective_approval_explicit_auto_overrides_plan_mode() {
         let spec = PostgresPolicySpec {
             connection: ConnectionSpec {
-                secret_ref: SecretReference {
+                secret_ref: Some(SecretReference {
                     name: "test".into(),
-                },
-                secret_key: "DATABASE_URL".into(),
+                }),
+                secret_key: Some("DATABASE_URL".into()),
+                params: None,
             },
             interval: "5m".into(),
             suspend: false,
