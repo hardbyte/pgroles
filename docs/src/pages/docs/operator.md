@@ -315,16 +315,14 @@ This is the expected state when the database credential is valid but under-privi
 
 ### Missing database object
 
-If the policy references a schema, table, function, or other database object that does not exist in the target database, the operator sets a non-ready state instead of hot-looping. This catches common misconfigurations like a policy declaring a schema that hasn't been created, or being pointed at the wrong database.
-
-Current behavior:
+Before issuing any DDL, the operator validates that every schema referenced by the policy exists in the target database. If one is missing, the apply is aborted up front and the policy settles into a non-ready state with a clear message.
 
 - `Ready=False`
 - reason `MissingDatabaseObject`
-- `last_error` contains the PostgreSQL error message, for example `schema "etl" does not exist`
+- `last_error` lists the missing objects, e.g. `policy references objects that do not exist in target database: schema "etl". Either create the missing objects, remove them from the policy, or verify the policy is pointing at the intended database.`
 - the policy retries on its normal reconcile interval rather than exponential transient backoff
 
-Covered PostgreSQL error codes: `3F000` (invalid_schema_name), `42P01` (undefined_table), `42883` (undefined_function), `42704` (undefined_object). Either create the missing object, remove the reference from the policy, or verify the policy is pointing at the intended database.
+This catches common misconfigurations like a policy that declares a schema which hasn't been created, or a policy pointed at the wrong database. As a fallback, the same reason is also produced when a SQL-level error with PostgreSQL codes `3F000` (invalid_schema_name), `42P01` (undefined_table), `42883` (undefined_function), or `42704` (undefined_object) slips past the pre-flight validator.
 
 ### Interval
 

@@ -123,6 +123,13 @@ pub enum ReconcileError {
     #[error("invalid spec: {0}")]
     InvalidSpec(String),
 
+    #[error(
+        "policy references objects that do not exist in target database: {0}. Either create \
+         the missing objects, remove them from the policy, or verify the policy is pointing at \
+         the intended database."
+    )]
+    MissingDatabaseObjects(String),
+
     #[error("{0}")]
     ConflictingPolicy(String),
 
@@ -339,6 +346,7 @@ fn retry_class_for_reconcile_error(error: &ReconcileError) -> RetryClass {
         ReconcileError::ManifestExpansion(_)
         | ReconcileError::InvalidInterval(_, _)
         | ReconcileError::InvalidSpec(_)
+        | ReconcileError::MissingDatabaseObjects(_)
         | ReconcileError::ConflictingPolicy(_)
         | ReconcileError::UnsafeRoleDrops(_)
         | ReconcileError::EmptyPasswordSecret { .. }
@@ -430,6 +438,74 @@ fn next_transient_failure_count(resource: &PostgresPolicy) -> u32 {
 fn slow_retry_delay(resource: &PostgresPolicy) -> Duration {
     parse_interval(&resource.spec.interval)
         .unwrap_or_else(|_| Duration::from_secs(DEFAULT_REQUEUE_SECS))
+}
+
+/// Collect every schema name referenced by an expanded manifest.
+///
+/// Covers schema-type grants (where the schema is in `object.name`), grants on
+/// objects within a schema (where the schema is in `object.schema`), and
+/// default privileges (which always carry a schema).
+fn referenced_schema_names(
+    expanded: &pgroles_core::manifest::ExpandedManifest,
+) -> std::collections::BTreeSet<String> {
+    let mut names = std::collections::BTreeSet::new();
+    for grant in &expanded.grants {
+        if grant.object.object_type == pgroles_core::manifest::ObjectType::Schema
+            && let Some(name) = &grant.object.name
+        {
+            names.insert(name.clone());
+        }
+        if let Some(schema) = &grant.object.schema {
+            names.insert(schema.clone());
+        }
+    }
+    for dp in &expanded.default_privileges {
+        names.insert(dp.schema.clone());
+    }
+    names
+}
+
+/// Pre-flight check: ensure every schema referenced by the policy exists in
+/// the target database. Returns [`ReconcileError::MissingDatabaseObjects`]
+/// listing the missing schemas if any are absent.
+/// Returns true for PostgreSQL system schemas that always exist but are
+/// excluded from [`pgroles_inspect::fetch_existing_schemas`].
+fn is_system_schema(name: &str) -> bool {
+    name.starts_with("pg_") || name == "information_schema"
+}
+
+/// Pre-flight check: ensure every schema referenced by the policy exists in
+/// the target database. Returns [`ReconcileError::MissingDatabaseObjects`]
+/// listing the missing schemas if any are absent.
+///
+/// System schemas (`pg_*`, `information_schema`) are excluded from the check
+/// since they always exist but are filtered out of the inspect query.
+async fn validate_referenced_schemas_exist(
+    pool: &sqlx::PgPool,
+    expanded: &pgroles_core::manifest::ExpandedManifest,
+) -> Result<(), ReconcileError> {
+    let referenced: std::collections::BTreeSet<String> = referenced_schema_names(expanded)
+        .into_iter()
+        .filter(|name| !is_system_schema(name))
+        .collect();
+    if referenced.is_empty() {
+        return Ok(());
+    }
+    let existing = pgroles_inspect::fetch_existing_schemas(pool).await?;
+    let missing: Vec<String> = referenced
+        .into_iter()
+        .filter(|name| !existing.contains(name))
+        .collect();
+    if missing.is_empty() {
+        Ok(())
+    } else {
+        let formatted = missing
+            .iter()
+            .map(|name| format!("schema \"{name}\""))
+            .collect::<Vec<_>>()
+            .join(", ");
+        Err(ReconcileError::MissingDatabaseObjects(formatted))
+    }
 }
 
 /// Apply reconciliation — the main "ensure desired state" logic.
@@ -740,6 +816,12 @@ async fn apply_under_lock(
                     .map(|retirement| retirement.role.clone()),
             );
     let current = pgroles_inspect::inspect(pool, &inspect_config).await?;
+
+    // 6b. Pre-flight: validate that every schema referenced by the policy
+    // exists in the target database. This turns a mid-transaction
+    // `schema "X" does not exist` failure into a clear spec/environment
+    // mismatch error before we issue any DDL.
+    validate_referenced_schemas_exist(pool, expanded).await?;
 
     // 7. Compute diff, filter by reconciliation mode, then inject password
     // changes resolved from Kubernetes Secrets.
@@ -1976,6 +2058,7 @@ impl ReconcileError {
             },
             ReconcileError::UnsafeRoleDrops(_) => "UnsafeRoleDrops",
             ReconcileError::EmptyPasswordSecret { .. } => "InvalidSpec",
+            ReconcileError::MissingDatabaseObjects(_) => "MissingDatabaseObject",
             ReconcileError::PasswordGeneration(_) => "SecretFetchFailed",
             ReconcileError::Kube(_) => "KubernetesApiError",
             ReconcileError::NoNamespace => "InvalidResource",
@@ -2558,6 +2641,175 @@ mod tests {
     }
 
     #[test]
+    fn error_reason_missing_database_objects() {
+        let err = ReconcileError::MissingDatabaseObjects("schema \"etl\"".into());
+        assert_eq!(err.reason(), "MissingDatabaseObject");
+    }
+
+    #[test]
+    fn error_display_missing_database_objects_lists_schemas() {
+        let err = ReconcileError::MissingDatabaseObjects("schema \"etl\", schema \"jobs\"".into());
+        let msg = err.to_string();
+        assert!(msg.contains("schema \"etl\""));
+        assert!(msg.contains("schema \"jobs\""));
+        assert!(
+            msg.contains("pointing at the intended database"),
+            "message should include remediation hint"
+        );
+    }
+
+    #[test]
+    fn referenced_schema_names_from_schema_grants() {
+        use pgroles_core::manifest::{
+            ExpandedManifest, Grant, ObjectTarget, ObjectType, Privilege,
+        };
+        let expanded = ExpandedManifest {
+            roles: Vec::new(),
+            grants: vec![Grant {
+                role: "app".into(),
+                privileges: vec![Privilege::Usage],
+                object: ObjectTarget {
+                    object_type: ObjectType::Schema,
+                    schema: None,
+                    name: Some("etl".into()),
+                },
+            }],
+            default_privileges: Vec::new(),
+            memberships: Vec::new(),
+        };
+        let names = referenced_schema_names(&expanded);
+        assert!(names.contains("etl"));
+    }
+
+    #[test]
+    fn referenced_schema_names_from_table_grants() {
+        use pgroles_core::manifest::{
+            ExpandedManifest, Grant, ObjectTarget, ObjectType, Privilege,
+        };
+        let expanded = ExpandedManifest {
+            roles: Vec::new(),
+            grants: vec![Grant {
+                role: "app".into(),
+                privileges: vec![Privilege::Select],
+                object: ObjectTarget {
+                    object_type: ObjectType::Table,
+                    schema: Some("analytics".into()),
+                    name: Some("*".into()),
+                },
+            }],
+            default_privileges: Vec::new(),
+            memberships: Vec::new(),
+        };
+        let names = referenced_schema_names(&expanded);
+        assert!(names.contains("analytics"));
+    }
+
+    #[test]
+    fn referenced_schema_names_from_default_privileges() {
+        use pgroles_core::manifest::{
+            DefaultPrivilege, DefaultPrivilegeGrant, ExpandedManifest, ObjectType, Privilege,
+        };
+        let expanded = ExpandedManifest {
+            roles: Vec::new(),
+            grants: Vec::new(),
+            default_privileges: vec![DefaultPrivilege {
+                owner: Some("app_owner".into()),
+                schema: "reporting".into(),
+                grant: vec![DefaultPrivilegeGrant {
+                    role: Some("app".into()),
+                    privileges: vec![Privilege::Select],
+                    on_type: ObjectType::Table,
+                }],
+            }],
+            memberships: Vec::new(),
+        };
+        let names = referenced_schema_names(&expanded);
+        assert!(names.contains("reporting"));
+    }
+
+    #[test]
+    fn referenced_schema_names_deduplicates_across_sources() {
+        use pgroles_core::manifest::{
+            DefaultPrivilege, DefaultPrivilegeGrant, ExpandedManifest, Grant, ObjectTarget,
+            ObjectType, Privilege,
+        };
+        let expanded = ExpandedManifest {
+            roles: Vec::new(),
+            grants: vec![
+                Grant {
+                    role: "app".into(),
+                    privileges: vec![Privilege::Usage],
+                    object: ObjectTarget {
+                        object_type: ObjectType::Schema,
+                        schema: None,
+                        name: Some("shared".into()),
+                    },
+                },
+                Grant {
+                    role: "app".into(),
+                    privileges: vec![Privilege::Select],
+                    object: ObjectTarget {
+                        object_type: ObjectType::Table,
+                        schema: Some("shared".into()),
+                        name: Some("*".into()),
+                    },
+                },
+            ],
+            default_privileges: vec![DefaultPrivilege {
+                owner: Some("app_owner".into()),
+                schema: "shared".into(),
+                grant: vec![DefaultPrivilegeGrant {
+                    role: Some("app".into()),
+                    privileges: vec![Privilege::Select],
+                    on_type: ObjectType::Table,
+                }],
+            }],
+            memberships: Vec::new(),
+        };
+        let names = referenced_schema_names(&expanded);
+        // BTreeSet deduplicates so a schema referenced three ways appears once.
+        assert_eq!(names.len(), 1);
+        assert!(names.contains("shared"));
+    }
+
+    #[test]
+    fn referenced_schema_names_skips_database_and_roleless_grants() {
+        use pgroles_core::manifest::{
+            ExpandedManifest, Grant, ObjectTarget, ObjectType, Privilege,
+        };
+        let expanded = ExpandedManifest {
+            roles: Vec::new(),
+            grants: vec![Grant {
+                role: "app".into(),
+                privileges: vec![Privilege::Connect],
+                object: ObjectTarget {
+                    object_type: ObjectType::Database,
+                    schema: None,
+                    name: Some("mydb".into()),
+                },
+            }],
+            default_privileges: Vec::new(),
+            memberships: Vec::new(),
+        };
+        let names = referenced_schema_names(&expanded);
+        assert!(
+            names.is_empty(),
+            "database-level grants should not contribute schema names"
+        );
+    }
+
+    #[test]
+    fn is_system_schema_identifies_pg_and_information_schema() {
+        assert!(is_system_schema("pg_catalog"));
+        assert!(is_system_schema("pg_toast"));
+        assert!(is_system_schema("pg_temp_1"));
+        assert!(is_system_schema("information_schema"));
+        assert!(!is_system_schema("public"));
+        assert!(!is_system_schema("etl"));
+        assert!(!is_system_schema("analytics"));
+    }
+
+    #[test]
     fn error_reason_conflicting_policy() {
         let err = ReconcileError::ConflictingPolicy("overlaps with other".into());
         assert_eq!(err.reason(), "ConflictingPolicy");
@@ -2710,6 +2962,14 @@ mod tests {
         let error = finalizer::Error::ApplyFailed(ReconcileError::InvalidInterval(
             "oops".into(),
             "bad interval".into(),
+        ));
+        assert_eq!(retry_class(&error), RetryClass::Slow);
+    }
+
+    #[test]
+    fn retry_classifies_missing_database_objects_as_slow() {
+        let error = finalizer::Error::ApplyFailed(ReconcileError::MissingDatabaseObjects(
+            "schema \"etl\"".into(),
         ));
         assert_eq!(retry_class(&error), RetryClass::Slow);
     }
