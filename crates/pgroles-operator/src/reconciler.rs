@@ -468,11 +468,26 @@ fn referenced_schema_names(
 /// Pre-flight check: ensure every schema referenced by the policy exists in
 /// the target database. Returns [`ReconcileError::MissingDatabaseObjects`]
 /// listing the missing schemas if any are absent.
+/// Returns true for PostgreSQL system schemas that always exist but are
+/// excluded from [`pgroles_inspect::fetch_existing_schemas`].
+fn is_system_schema(name: &str) -> bool {
+    name.starts_with("pg_") || name == "information_schema"
+}
+
+/// Pre-flight check: ensure every schema referenced by the policy exists in
+/// the target database. Returns [`ReconcileError::MissingDatabaseObjects`]
+/// listing the missing schemas if any are absent.
+///
+/// System schemas (`pg_*`, `information_schema`) are excluded from the check
+/// since they always exist but are filtered out of the inspect query.
 async fn validate_referenced_schemas_exist(
     pool: &sqlx::PgPool,
     expanded: &pgroles_core::manifest::ExpandedManifest,
 ) -> Result<(), ReconcileError> {
-    let referenced = referenced_schema_names(expanded);
+    let referenced: std::collections::BTreeSet<String> = referenced_schema_names(expanded)
+        .into_iter()
+        .filter(|name| !is_system_schema(name))
+        .collect();
     if referenced.is_empty() {
         return Ok(());
     }
@@ -2781,6 +2796,17 @@ mod tests {
             names.is_empty(),
             "database-level grants should not contribute schema names"
         );
+    }
+
+    #[test]
+    fn is_system_schema_identifies_pg_and_information_schema() {
+        assert!(is_system_schema("pg_catalog"));
+        assert!(is_system_schema("pg_toast"));
+        assert!(is_system_schema("pg_temp_1"));
+        assert!(is_system_schema("information_schema"));
+        assert!(!is_system_schema("public"));
+        assert!(!is_system_schema("etl"));
+        assert!(!is_system_schema("analytics"));
     }
 
     #[test]
