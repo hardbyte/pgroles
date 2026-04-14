@@ -8,16 +8,14 @@ spec:
   connection:
     params:
       host: my-cluster-postgres
-      port: "5432"
+      port: 5432
       dbname: mydb
-      username:
-        secretKeyRef:
-          name: zalando-creds
-          key: username
-      password:
-        secretKeyRef:
-          name: zalando-creds
-          key: password
+      usernameSecret:
+        name: zalando-creds
+        key: username
+      passwordSecret:
+        name: zalando-creds
+        key: password
       sslMode: require
   interval: "5m"
   default_owner: postgres

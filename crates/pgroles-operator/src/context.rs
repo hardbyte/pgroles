@@ -9,7 +9,7 @@ use std::time::Duration;
 use sqlx::postgres::{PgPool, PgPoolOptions};
 use tokio::sync::{Mutex, RwLock};
 
-use crate::crd::{ConnectionSpec, ValueSource};
+use crate::crd::{ConnectionSpec, SecretKeySelector};
 use crate::observability::OperatorObservability;
 
 /// Minimum pool size required for reconciliation.
@@ -137,22 +137,25 @@ impl OperatorContext {
         })
     }
 
-    /// Resolve a [`ValueSource`] to its string value.
+    /// Resolve a param from either its literal value or a Secret reference.
     ///
-    /// For literals, returns the value directly. For secret references, fetches
-    /// the value from the Kubernetes API.
-    async fn resolve_value_source(
+    /// Returns `Ok(Some(value))` if one is set, `Ok(None)` if neither is set.
+    async fn resolve_param(
         &self,
         namespace: &str,
-        source: &ValueSource,
-    ) -> Result<String, ContextError> {
-        match source {
-            ValueSource::Literal(value) => Ok(value.clone()),
-            ValueSource::SecretRef { secret_key_ref } => {
-                self.fetch_secret_value(namespace, &secret_key_ref.name, &secret_key_ref.key)
-                    .await
-            }
+        literal: &Option<String>,
+        secret: &Option<SecretKeySelector>,
+    ) -> Result<Option<String>, ContextError> {
+        if let Some(val) = literal {
+            return Ok(Some(val.clone()));
         }
+        if let Some(sel) = secret {
+            return Ok(Some(
+                self.fetch_secret_value(namespace, &sel.name, &sel.key)
+                    .await?,
+            ));
+        }
+        Ok(None)
     }
 
     /// Resolve a [`ConnectionSpec`] into a PostgreSQL connection URL string.
@@ -174,40 +177,59 @@ impl OperatorContext {
             .await
         } else if let Some(ref params) = connection.params {
             // Params mode — resolve each field and build the URL.
-            let host = self.resolve_value_source(namespace, &params.host).await?;
+            let host = self
+                .resolve_param(namespace, &params.host, &params.host_secret)
+                .await?
+                .ok_or_else(|| ContextError::EmptyResolvedValue {
+                    field: "host".to_string(),
+                })?;
             if host.trim().is_empty() {
                 return Err(ContextError::EmptyResolvedValue {
                     field: "host".to_string(),
                 });
             }
-            let port = if let Some(ref port_source) = params.port {
-                let p = self.resolve_value_source(namespace, port_source).await?;
-                if p.trim().is_empty() {
-                    return Err(ContextError::EmptyResolvedValue {
-                        field: "port".to_string(),
-                    });
-                }
-                p
-            } else {
-                "5432".to_string()
-            };
-            let dbname = self.resolve_value_source(namespace, &params.dbname).await?;
+
+            let port_str = params.port.map(|p| p.to_string());
+            let port = self
+                .resolve_param(namespace, &port_str, &params.port_secret)
+                .await?
+                .unwrap_or_else(|| "5432".to_string());
+            if port.trim().is_empty() {
+                return Err(ContextError::EmptyResolvedValue {
+                    field: "port".to_string(),
+                });
+            }
+
+            let dbname = self
+                .resolve_param(namespace, &params.dbname, &params.dbname_secret)
+                .await?
+                .ok_or_else(|| ContextError::EmptyResolvedValue {
+                    field: "dbname".to_string(),
+                })?;
             if dbname.trim().is_empty() {
                 return Err(ContextError::EmptyResolvedValue {
                     field: "dbname".to_string(),
                 });
             }
+
             let username = self
-                .resolve_value_source(namespace, &params.username)
-                .await?;
+                .resolve_param(namespace, &params.username, &params.username_secret)
+                .await?
+                .ok_or_else(|| ContextError::EmptyResolvedValue {
+                    field: "username".to_string(),
+                })?;
             if username.trim().is_empty() {
                 return Err(ContextError::EmptyResolvedValue {
                     field: "username".to_string(),
                 });
             }
+
             let password = self
-                .resolve_value_source(namespace, &params.password)
-                .await?;
+                .resolve_param(namespace, &params.password, &params.password_secret)
+                .await?
+                .ok_or_else(|| ContextError::EmptyResolvedValue {
+                    field: "password".to_string(),
+                })?;
             if password.trim().is_empty() {
                 return Err(ContextError::EmptyResolvedValue {
                     field: "password".to_string(),
@@ -222,12 +244,12 @@ impl OperatorContext {
                 "postgresql://{encoded_username}:{encoded_password}@{host}:{port}/{dbname}"
             );
 
-            if let Some(ref ssl_mode_source) = params.ssl_mode {
-                let ssl_mode = self
-                    .resolve_value_source(namespace, ssl_mode_source)
-                    .await?;
+            if let Some(ssl_mode) = self
+                .resolve_param(namespace, &params.ssl_mode, &params.ssl_mode_secret)
+                .await?
+            {
                 // Validate sslMode at runtime — CRD validation only catches
-                // literal values; a secretKeyRef could resolve to anything.
+                // literal values; a secret ref could resolve to anything.
                 if !crate::crd::VALID_SSL_MODES.contains(&ssl_mode.as_str()) {
                     return Err(ContextError::InvalidResolvedSslMode { value: ssl_mode });
                 }

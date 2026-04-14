@@ -209,12 +209,10 @@ impl From<CrdReconciliationMode> for pgroles_core::diff::ReconciliationMode {
 /// connection:
 ///   params:
 ///     host: my-cluster-postgres
-///     port: "5432"
+///     port: 5432
 ///     dbname: mydb
-///     username:
-///       secretKeyRef: { name: zalando-creds, key: username }
-///     password:
-///       secretKeyRef: { name: zalando-creds, key: password }
+///     usernameSecret: { name: zalando-creds, key: username }
+///     passwordSecret: { name: zalando-creds, key: password }
 /// ```
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
@@ -247,15 +245,18 @@ impl ConnectionSpec {
             names.insert(secret_ref.name.clone());
         }
         if let Some(ref params) = self.params {
-            params.host.collect_secret_name(names);
-            if let Some(ref port) = params.port {
-                port.collect_secret_name(names);
-            }
-            params.dbname.collect_secret_name(names);
-            params.username.collect_secret_name(names);
-            params.password.collect_secret_name(names);
-            if let Some(ref ssl_mode) = params.ssl_mode {
-                ssl_mode.collect_secret_name(names);
+            for sel in [
+                &params.host_secret,
+                &params.port_secret,
+                &params.dbname_secret,
+                &params.username_secret,
+                &params.password_secret,
+                &params.ssl_mode_secret,
+            ]
+            .into_iter()
+            .flatten()
+            {
+                names.insert(sel.name.clone());
             }
         }
     }
@@ -273,13 +274,17 @@ impl ConnectionSpec {
         } else if let Some(ref params) = self.params {
             format!(
                 "params\0{}\0{}\0{}\0{}",
-                params.host.identity_repr(),
-                params.dbname.identity_repr(),
-                params.username.identity_repr(),
+                field_identity_repr(&params.host, &params.host_secret),
+                field_identity_repr(&params.dbname, &params.dbname_secret),
+                field_identity_repr(&params.username, &params.username_secret),
                 params
                     .port
                     .as_ref()
-                    .map(|p| p.identity_repr())
+                    .map(|p| format!("literal={p}"))
+                    .or_else(|| params
+                        .port_secret
+                        .as_ref()
+                        .map(|s| format!("secret={}\0{}", s.name, s.key)))
                     .unwrap_or_else(|| "5432".to_string()),
             )
         } else {
@@ -288,14 +293,20 @@ impl ConnectionSpec {
         }
     }
 
-    /// Cache key for pool lookup. Includes all params (identity + sslMode + port)
+    /// Cache key for pool lookup. Includes all params (identity + sslMode + password)
     /// so that any configuration change invalidates the cached pool.
     pub fn cache_key(&self, namespace: &str) -> String {
         if let Some(ref params) = self.params {
             let ssl_part = params
                 .ssl_mode
                 .as_ref()
-                .map(|s| s.identity_repr())
+                .map(|v| format!("literal={v}"))
+                .or_else(|| {
+                    params
+                        .ssl_mode_secret
+                        .as_ref()
+                        .map(|s| format!("secret={}\0{}", s.name, s.key))
+                })
                 .unwrap_or_default();
             format!("{namespace}/{}\0ssl={ssl_part}", self.identity_key())
         } else {
@@ -304,78 +315,84 @@ impl ConnectionSpec {
     }
 }
 
-impl ValueSource {
-    /// Deterministic string representation for identity/cache keys.
-    ///
-    /// Uses a `literal=` / `secret=` prefix scheme so that a literal value
-    /// can never collide with a secret reference representation.
-    pub fn identity_repr(&self) -> String {
-        match self {
-            ValueSource::Literal(value) => format!("literal={value}"),
-            ValueSource::SecretRef { secret_key_ref } => {
-                format!("secret={}\0{}", secret_key_ref.name, secret_key_ref.key)
-            }
-        }
-    }
-}
-
-impl ValueSource {
-    /// If this is a SecretRef, add the secret name to the set.
-    pub fn collect_secret_name(&self, names: &mut BTreeSet<String>) {
-        if let ValueSource::SecretRef { secret_key_ref } = self {
-            names.insert(secret_key_ref.name.clone());
-        }
+/// Deterministic string representation for a literal/secret field pair.
+///
+/// Uses a `literal=` / `secret=` prefix scheme so that a literal value
+/// can never collide with a secret reference representation.
+fn field_identity_repr(literal: &Option<String>, secret: &Option<SecretKeySelector>) -> String {
+    if let Some(value) = literal {
+        format!("literal={value}")
+    } else if let Some(sel) = secret {
+        format!("secret={}\0{}", sel.name, sel.key)
+    } else {
+        String::new()
     }
 }
 
 /// Structured connection parameters for building a PostgreSQL connection URL.
+///
+/// Each field supports either a literal value or a reference to a Kubernetes
+/// Secret key. For each parameter, set either the literal field or the
+/// corresponding `*Secret` field — not both.
+///
+/// ```yaml
+/// # Zalando pattern — literals for non-sensitive, secrets for credentials
+/// params:
+///   host: my-cluster-postgres
+///   port: 5432
+///   dbname: mydb
+///   sslMode: require
+///   usernameSecret:
+///     name: pg-creds
+///     key: username
+///   passwordSecret:
+///     name: pg-creds
+///     key: password
+/// ```
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct ConnectionParams {
-    /// PostgreSQL host (e.g. `my-cluster-postgres` — K8s DNS, namespace-relative).
-    pub host: ValueSource,
-
-    /// Port number. Defaults to `5432` if omitted.
+    /// PostgreSQL host as a literal value.
     #[serde(default)]
-    pub port: Option<ValueSource>,
-
-    /// Database name.
-    pub dbname: ValueSource,
-
-    /// Username for authentication.
-    pub username: ValueSource,
-
-    /// Password for authentication.
-    pub password: ValueSource,
-
-    /// SSL mode. One of: disable, allow, prefer, require, verify-ca, verify-full.
+    pub host: Option<String>,
+    /// PostgreSQL host from a Secret key.
     #[serde(default)]
-    pub ssl_mode: Option<ValueSource>,
-}
+    pub host_secret: Option<SecretKeySelector>,
 
-/// A value that can come from a literal string or a Secret key reference.
-///
-/// Supports shorthand for the common case:
-/// ```yaml
-/// # Literal string (shorthand)
-/// host: my-cluster-postgres
-///
-/// # Secret reference
-/// password:
-///   secretKeyRef:
-///     name: my-creds
-///     key: password
-/// ```
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(untagged)]
-pub enum ValueSource {
-    /// A literal string value.
-    Literal(String),
-    /// A reference to a key in a Kubernetes Secret.
-    SecretRef {
-        #[serde(rename = "secretKeyRef")]
-        secret_key_ref: SecretKeySelector,
-    },
+    /// Port as a literal value. Defaults to 5432 if neither port nor portSecret is set.
+    #[serde(default)]
+    pub port: Option<u16>,
+    /// Port from a Secret key.
+    #[serde(default)]
+    pub port_secret: Option<SecretKeySelector>,
+
+    /// Database name as a literal value.
+    #[serde(default)]
+    pub dbname: Option<String>,
+    /// Database name from a Secret key.
+    #[serde(default)]
+    pub dbname_secret: Option<SecretKeySelector>,
+
+    /// Username as a literal value.
+    #[serde(default)]
+    pub username: Option<String>,
+    /// Username from a Secret key.
+    #[serde(default)]
+    pub username_secret: Option<SecretKeySelector>,
+
+    /// Password as a literal value (not recommended for production).
+    #[serde(default)]
+    pub password: Option<String>,
+    /// Password from a Secret key (recommended).
+    #[serde(default)]
+    pub password_secret: Option<SecretKeySelector>,
+
+    /// SSL mode as a literal value.
+    #[serde(default)]
+    pub ssl_mode: Option<String>,
+    /// SSL mode from a Secret key.
+    #[serde(default)]
+    pub ssl_mode_secret: Option<SecretKeySelector>,
 }
 
 /// Reference to a specific key within a Kubernetes Secret.
@@ -385,42 +402,6 @@ pub struct SecretKeySelector {
     pub name: String,
     /// Key within the Secret.
     pub key: String,
-}
-
-/// Manual `JsonSchema` implementation for [`ValueSource`].
-///
-/// The derived schema for `#[serde(untagged)]` enums produces `type: object`
-/// which causes the K8s API server to reject plain string literals like
-/// `host: "my-cluster"`. We use `x-kubernetes-int-or-string` to tell the API
-/// server this field accepts heterogeneous types (string or object), and add
-/// a `oneOf` for documentation/validation.
-impl schemars::JsonSchema for ValueSource {
-    fn schema_name() -> std::borrow::Cow<'static, str> {
-        "ValueSource".into()
-    }
-
-    fn schema_id() -> std::borrow::Cow<'static, str> {
-        concat!(module_path!(), "::ValueSource").into()
-    }
-
-    fn json_schema(generator: &mut schemars::SchemaGenerator) -> schemars::Schema {
-        let secret_key_ref_schema = generator.subschema_for::<SecretKeySelector>();
-
-        schemars::json_schema!({
-            "x-kubernetes-int-or-string": true,
-            "oneOf": [
-                { "type": "string" },
-                {
-                    "type": "object",
-                    "required": ["secretKeyRef"],
-                    "properties": {
-                        "secretKeyRef": secret_key_ref_schema
-                    },
-                    "additionalProperties": false
-                }
-            ]
-        })
-    }
 }
 
 /// Reference to a Kubernetes Secret in the same namespace.
@@ -600,7 +581,7 @@ pub enum ConnectionValidationError {
     #[error("connection: exactly one of secretRef or params must be set, but neither was provided")]
     NeitherModeSet,
 
-    #[error("connection.params.{field}: secretKeyRef {detail}")]
+    #[error("connection.params.{field}: secret {detail}")]
     EmptySecretKeyRef { field: String, detail: String },
 
     #[error(
@@ -610,6 +591,14 @@ pub enum ConnectionValidationError {
 
     #[error("connection.params.{field}: literal value must not be empty or whitespace-only")]
     EmptyLiteral { field: String },
+
+    #[error("connection.params: exactly one of {field} or {field}Secret must be set")]
+    NeitherFieldSet { field: String },
+
+    #[error(
+        "connection.params: only one of {field} or {field}Secret may be set, but both were provided"
+    )]
+    BothFieldsSet { field: String },
 }
 
 /// Validate a Kubernetes Secret name per RFC 1123 DNS subdomain rules:
@@ -1019,53 +1008,101 @@ impl PostgresPolicySpec {
                 Ok(())
             }
             (None, Some(params)) => {
-                // Params mode — validate all values have non-empty content.
-                fn validate_value_source(
+                // Validate a required field pair: exactly one must be set.
+                fn validate_required_field(
                     field: &str,
-                    value: &ValueSource,
+                    literal: &Option<String>,
+                    secret: &Option<SecretKeySelector>,
                 ) -> Result<(), ConnectionValidationError> {
-                    match value {
-                        ValueSource::Literal(s) if s.trim().is_empty() => {
-                            return Err(ConnectionValidationError::EmptyLiteral {
+                    match (literal, secret) {
+                        (Some(_), Some(_)) => {
+                            return Err(ConnectionValidationError::BothFieldsSet {
                                 field: field.to_string(),
                             });
                         }
-                        ValueSource::SecretRef { secret_key_ref } => {
-                            if secret_key_ref.name.is_empty() {
-                                return Err(ConnectionValidationError::EmptySecretKeyRef {
+                        (None, None) => {
+                            return Err(ConnectionValidationError::NeitherFieldSet {
+                                field: field.to_string(),
+                            });
+                        }
+                        (Some(s), None) => {
+                            if s.trim().is_empty() {
+                                return Err(ConnectionValidationError::EmptyLiteral {
                                     field: field.to_string(),
-                                    detail: "name must not be empty".to_string(),
-                                });
-                            }
-                            if secret_key_ref.key.is_empty() {
-                                return Err(ConnectionValidationError::EmptySecretKeyRef {
-                                    field: field.to_string(),
-                                    detail: "key must not be empty".to_string(),
                                 });
                             }
                         }
-                        _ => {}
+                        (None, Some(sel)) => {
+                            validate_secret_selector(field, sel)?;
+                        }
                     }
                     Ok(())
                 }
 
-                validate_value_source("host", &params.host)?;
-                validate_value_source("dbname", &params.dbname)?;
-                validate_value_source("username", &params.username)?;
-                validate_value_source("password", &params.password)?;
-                if let Some(ref port) = params.port {
-                    validate_value_source("port", port)?;
-                }
-                if let Some(ref ssl_mode) = params.ssl_mode {
-                    validate_value_source("sslMode", ssl_mode)?;
-                    // Validate ssl_mode value if it's a literal.
-                    if let ValueSource::Literal(value) = ssl_mode
-                        && !VALID_SSL_MODES.contains(&value.as_str())
-                    {
-                        return Err(ConnectionValidationError::InvalidSslMode {
-                            value: value.clone(),
+                // Validate an optional field pair: at most one may be set.
+                fn validate_optional_field(
+                    field: &str,
+                    literal: &Option<impl AsRef<str>>,
+                    secret: &Option<SecretKeySelector>,
+                ) -> Result<(), ConnectionValidationError> {
+                    let has_literal = literal.is_some();
+                    if has_literal && secret.is_some() {
+                        return Err(ConnectionValidationError::BothFieldsSet {
+                            field: field.to_string(),
                         });
                     }
+                    if let Some(s) = literal
+                        && s.as_ref().trim().is_empty()
+                    {
+                        return Err(ConnectionValidationError::EmptyLiteral {
+                            field: field.to_string(),
+                        });
+                    }
+                    if let Some(sel) = secret {
+                        validate_secret_selector(field, sel)?;
+                    }
+                    Ok(())
+                }
+
+                fn validate_secret_selector(
+                    field: &str,
+                    sel: &SecretKeySelector,
+                ) -> Result<(), ConnectionValidationError> {
+                    if sel.name.trim().is_empty() {
+                        return Err(ConnectionValidationError::EmptySecretKeyRef {
+                            field: field.to_string(),
+                            detail: "name must not be empty".to_string(),
+                        });
+                    }
+                    if sel.key.trim().is_empty() {
+                        return Err(ConnectionValidationError::EmptySecretKeyRef {
+                            field: field.to_string(),
+                            detail: "key must not be empty".to_string(),
+                        });
+                    }
+                    Ok(())
+                }
+
+                // Required fields: host, dbname, username, password.
+                validate_required_field("host", &params.host, &params.host_secret)?;
+                validate_required_field("dbname", &params.dbname, &params.dbname_secret)?;
+                validate_required_field("username", &params.username, &params.username_secret)?;
+                validate_required_field("password", &params.password, &params.password_secret)?;
+
+                // Optional fields: port, sslMode.
+                // Port is u16 so we wrap it for the generic check.
+                let port_str = params.port.map(|p| p.to_string());
+                validate_optional_field("port", &port_str, &params.port_secret)?;
+
+                validate_optional_field("sslMode", &params.ssl_mode, &params.ssl_mode_secret)?;
+
+                // Validate sslMode value if it's a literal.
+                if let Some(value) = &params.ssl_mode
+                    && !VALID_SSL_MODES.contains(&value.as_str())
+                {
+                    return Err(ConnectionValidationError::InvalidSslMode {
+                        value: value.clone(),
+                    });
                 }
 
                 Ok(())
@@ -1602,29 +1639,39 @@ mod tests {
             secret_ref: None,
             secret_key: None,
             params: Some(ConnectionParams {
-                host: ValueSource::Literal("my-host".into()),
+                host: Some("my-host".into()),
+                host_secret: None,
                 port: None,
-                dbname: ValueSource::Literal("mydb".into()),
-                username: ValueSource::Literal("secret=creds\0password".into()),
-                password: ValueSource::Literal("pass".into()),
+                port_secret: None,
+                dbname: Some("mydb".into()),
+                dbname_secret: None,
+                username: Some("secret=creds\0password".into()),
+                username_secret: None,
+                password: Some("pass".into()),
+                password_secret: None,
                 ssl_mode: None,
+                ssl_mode_secret: None,
             }),
         };
         let secret_conn = ConnectionSpec {
             secret_ref: None,
             secret_key: None,
             params: Some(ConnectionParams {
-                host: ValueSource::Literal("my-host".into()),
+                host: Some("my-host".into()),
+                host_secret: None,
                 port: None,
-                dbname: ValueSource::Literal("mydb".into()),
-                username: ValueSource::SecretRef {
-                    secret_key_ref: SecretKeySelector {
-                        name: "creds".into(),
-                        key: "password".into(),
-                    },
-                },
-                password: ValueSource::Literal("pass".into()),
+                port_secret: None,
+                dbname: Some("mydb".into()),
+                dbname_secret: None,
+                username: None,
+                username_secret: Some(SecretKeySelector {
+                    name: "creds".into(),
+                    key: "password".into(),
+                }),
+                password: Some("pass".into()),
+                password_secret: None,
                 ssl_mode: None,
+                ssl_mode_secret: None,
             }),
         };
 
@@ -1641,24 +1688,36 @@ mod tests {
             secret_ref: None,
             secret_key: None,
             params: Some(ConnectionParams {
-                host: ValueSource::Literal("host".into()),
+                host: Some("host".into()),
+                host_secret: None,
                 port: None,
-                dbname: ValueSource::Literal("db".into()),
-                username: ValueSource::Literal("user".into()),
-                password: ValueSource::Literal("pass".into()),
+                port_secret: None,
+                dbname: Some("db".into()),
+                dbname_secret: None,
+                username: Some("user".into()),
+                username_secret: None,
+                password: Some("pass".into()),
+                password_secret: None,
                 ssl_mode: None,
+                ssl_mode_secret: None,
             }),
         };
         let conn_with_ssl = ConnectionSpec {
             secret_ref: None,
             secret_key: None,
             params: Some(ConnectionParams {
-                host: ValueSource::Literal("host".into()),
+                host: Some("host".into()),
+                host_secret: None,
                 port: None,
-                dbname: ValueSource::Literal("db".into()),
-                username: ValueSource::Literal("user".into()),
-                password: ValueSource::Literal("pass".into()),
-                ssl_mode: Some(ValueSource::Literal("require".into())),
+                port_secret: None,
+                dbname: Some("db".into()),
+                dbname_secret: None,
+                username: Some("user".into()),
+                username_secret: None,
+                password: Some("pass".into()),
+                password_secret: None,
+                ssl_mode: Some("require".into()),
+                ssl_mode_secret: None,
             }),
         };
 
@@ -1671,33 +1730,24 @@ mod tests {
 
     #[test]
     fn validate_connection_rejects_empty_literal_host() {
-        let spec = PostgresPolicySpec {
-            connection: ConnectionSpec {
-                secret_ref: None,
-                secret_key: None,
-                params: Some(ConnectionParams {
-                    host: ValueSource::Literal("".into()),
-                    port: None,
-                    dbname: ValueSource::Literal("mydb".into()),
-                    username: ValueSource::Literal("user".into()),
-                    password: ValueSource::Literal("pass".into()),
-                    ssl_mode: None,
-                }),
-            },
-            interval: "5m".into(),
-            suspend: false,
-            mode: PolicyMode::Apply,
-            reconciliation_mode: CrdReconciliationMode::default(),
-            default_owner: None,
-            profiles: Default::default(),
-            schemas: vec![],
-            roles: vec![],
-            grants: vec![],
-            default_privileges: vec![],
-            memberships: vec![],
-            retirements: vec![],
-            approval: None,
-        };
+        let spec = spec_with_connection(ConnectionSpec {
+            secret_ref: None,
+            secret_key: None,
+            params: Some(ConnectionParams {
+                host: Some("".into()),
+                host_secret: None,
+                port: None,
+                port_secret: None,
+                dbname: Some("mydb".into()),
+                dbname_secret: None,
+                username: Some("user".into()),
+                username_secret: None,
+                password: Some("pass".into()),
+                password_secret: None,
+                ssl_mode: None,
+                ssl_mode_secret: None,
+            }),
+        });
 
         let err = spec.validate_connection_spec().unwrap_err();
         assert!(
@@ -1708,33 +1758,24 @@ mod tests {
 
     #[test]
     fn validate_connection_rejects_whitespace_literal_dbname() {
-        let spec = PostgresPolicySpec {
-            connection: ConnectionSpec {
-                secret_ref: None,
-                secret_key: None,
-                params: Some(ConnectionParams {
-                    host: ValueSource::Literal("host".into()),
-                    port: None,
-                    dbname: ValueSource::Literal("  ".into()),
-                    username: ValueSource::Literal("user".into()),
-                    password: ValueSource::Literal("pass".into()),
-                    ssl_mode: None,
-                }),
-            },
-            interval: "5m".into(),
-            suspend: false,
-            mode: PolicyMode::Apply,
-            reconciliation_mode: CrdReconciliationMode::default(),
-            default_owner: None,
-            profiles: Default::default(),
-            schemas: vec![],
-            roles: vec![],
-            grants: vec![],
-            default_privileges: vec![],
-            memberships: vec![],
-            retirements: vec![],
-            approval: None,
-        };
+        let spec = spec_with_connection(ConnectionSpec {
+            secret_ref: None,
+            secret_key: None,
+            params: Some(ConnectionParams {
+                host: Some("host".into()),
+                host_secret: None,
+                port: None,
+                port_secret: None,
+                dbname: Some("  ".into()),
+                dbname_secret: None,
+                username: Some("user".into()),
+                username_secret: None,
+                password: Some("pass".into()),
+                password_secret: None,
+                ssl_mode: None,
+                ssl_mode_secret: None,
+            }),
+        });
 
         let err = spec.validate_connection_spec().unwrap_err();
         assert!(
@@ -1778,22 +1819,24 @@ mod tests {
             secret_ref: None,
             secret_key: None,
             params: Some(ConnectionParams {
-                host: ValueSource::Literal("my-postgres".into()),
+                host: Some("my-postgres".into()),
+                host_secret: None,
                 port: None,
-                dbname: ValueSource::Literal("mydb".into()),
-                username: ValueSource::SecretRef {
-                    secret_key_ref: SecretKeySelector {
-                        name: "pg-creds".into(),
-                        key: "username".into(),
-                    },
-                },
-                password: ValueSource::SecretRef {
-                    secret_key_ref: SecretKeySelector {
-                        name: "pg-creds".into(),
-                        key: "password".into(),
-                    },
-                },
+                port_secret: None,
+                dbname: Some("mydb".into()),
+                dbname_secret: None,
+                username: None,
+                username_secret: Some(SecretKeySelector {
+                    name: "pg-creds".into(),
+                    key: "username".into(),
+                }),
+                password: None,
+                password_secret: Some(SecretKeySelector {
+                    name: "pg-creds".into(),
+                    key: "password".into(),
+                }),
                 ssl_mode: None,
+                ssl_mode_secret: None,
             }),
         }
     }
@@ -1820,12 +1863,18 @@ mod tests {
             }),
             secret_key: None,
             params: Some(ConnectionParams {
-                host: ValueSource::Literal("host".into()),
+                host: Some("host".into()),
+                host_secret: None,
                 port: None,
-                dbname: ValueSource::Literal("db".into()),
-                username: ValueSource::Literal("user".into()),
-                password: ValueSource::Literal("pass".into()),
+                port_secret: None,
+                dbname: Some("db".into()),
+                dbname_secret: None,
+                username: Some("user".into()),
+                username_secret: None,
+                password: Some("pass".into()),
+                password_secret: None,
                 ssl_mode: None,
+                ssl_mode_secret: None,
             }),
         });
         assert!(matches!(
@@ -1850,12 +1899,18 @@ mod tests {
             secret_ref: None,
             secret_key: None,
             params: Some(ConnectionParams {
-                host: ValueSource::Literal("host".into()),
+                host: Some("host".into()),
+                host_secret: None,
                 port: None,
-                dbname: ValueSource::Literal("db".into()),
-                username: ValueSource::Literal("user".into()),
-                password: ValueSource::Literal("pass".into()),
-                ssl_mode: Some(ValueSource::Literal("invalid-mode".into())),
+                port_secret: None,
+                dbname: Some("db".into()),
+                dbname_secret: None,
+                username: Some("user".into()),
+                username_secret: None,
+                password: Some("pass".into()),
+                password_secret: None,
+                ssl_mode: Some("invalid-mode".into()),
+                ssl_mode_secret: None,
             }),
         });
         assert!(spec.validate_connection_spec().is_err());
@@ -1875,12 +1930,18 @@ mod tests {
                 secret_ref: None,
                 secret_key: None,
                 params: Some(ConnectionParams {
-                    host: ValueSource::Literal("host".into()),
+                    host: Some("host".into()),
+                    host_secret: None,
                     port: None,
-                    dbname: ValueSource::Literal("db".into()),
-                    username: ValueSource::Literal("user".into()),
-                    password: ValueSource::Literal("pass".into()),
-                    ssl_mode: Some(ValueSource::Literal((*mode).into())),
+                    port_secret: None,
+                    dbname: Some("db".into()),
+                    dbname_secret: None,
+                    username: Some("user".into()),
+                    username_secret: None,
+                    password: Some("pass".into()),
+                    password_secret: None,
+                    ssl_mode: Some((*mode).into()),
+                    ssl_mode_secret: None,
                 }),
             });
             assert!(
@@ -1891,51 +1952,84 @@ mod tests {
     }
 
     #[test]
-    fn validate_connection_rejects_empty_secret_key_ref_name() {
+    fn validate_connection_rejects_empty_secret_name() {
         let spec = spec_with_connection(ConnectionSpec {
             secret_ref: None,
             secret_key: None,
             params: Some(ConnectionParams {
-                host: ValueSource::Literal("host".into()),
+                host: Some("host".into()),
+                host_secret: None,
                 port: None,
-                dbname: ValueSource::Literal("db".into()),
-                username: ValueSource::SecretRef {
-                    secret_key_ref: SecretKeySelector {
-                        name: "".into(),
-                        key: "username".into(),
-                    },
-                },
-                password: ValueSource::Literal("pass".into()),
+                port_secret: None,
+                dbname: Some("db".into()),
+                dbname_secret: None,
+                username: None,
+                username_secret: Some(SecretKeySelector {
+                    name: "".into(),
+                    key: "username".into(),
+                }),
+                password: Some("pass".into()),
+                password_secret: None,
                 ssl_mode: None,
+                ssl_mode_secret: None,
             }),
         });
         assert!(spec.validate_connection_spec().is_err());
     }
 
-    // -- ValueSource serde tests ---------------------------------------------
-
     #[test]
-    fn value_source_deserializes_plain_string() {
-        let yaml = r#""my-host""#;
-        let vs: ValueSource = serde_yaml::from_str(yaml).unwrap();
-        assert!(matches!(vs, ValueSource::Literal(ref s) if s == "my-host"));
+    fn validate_connection_rejects_both_literal_and_secret_for_same_field() {
+        let spec = spec_with_connection(ConnectionSpec {
+            secret_ref: None,
+            secret_key: None,
+            params: Some(ConnectionParams {
+                host: Some("host".into()),
+                host_secret: Some(SecretKeySelector {
+                    name: "s".into(),
+                    key: "k".into(),
+                }),
+                port: None,
+                port_secret: None,
+                dbname: Some("db".into()),
+                dbname_secret: None,
+                username: Some("user".into()),
+                username_secret: None,
+                password: Some("pass".into()),
+                password_secret: None,
+                ssl_mode: None,
+                ssl_mode_secret: None,
+            }),
+        });
+        assert!(matches!(
+            spec.validate_connection_spec(),
+            Err(ConnectionValidationError::BothFieldsSet { ref field }) if field == "host"
+        ));
     }
 
     #[test]
-    fn value_source_deserializes_secret_key_ref() {
-        let yaml = r#"
-secretKeyRef:
-  name: my-secret
-  key: password
-"#;
-        let vs: ValueSource = serde_yaml::from_str(yaml).unwrap();
-        match vs {
-            ValueSource::SecretRef { secret_key_ref } => {
-                assert_eq!(secret_key_ref.name, "my-secret");
-                assert_eq!(secret_key_ref.key, "password");
-            }
-            _ => panic!("expected SecretRef variant"),
-        }
+    fn validate_connection_rejects_neither_literal_nor_secret_for_required_field() {
+        let spec = spec_with_connection(ConnectionSpec {
+            secret_ref: None,
+            secret_key: None,
+            params: Some(ConnectionParams {
+                host: None,
+                host_secret: None,
+                port: None,
+                port_secret: None,
+                dbname: Some("db".into()),
+                dbname_secret: None,
+                username: Some("user".into()),
+                username_secret: None,
+                password: Some("pass".into()),
+                password_secret: None,
+                ssl_mode: None,
+                ssl_mode_secret: None,
+            }),
+        });
+        assert!(matches!(
+            spec.validate_connection_spec(),
+            Err(ConnectionValidationError::NeitherFieldSet { ref field }) if field == "host"
+        ));
     }
 
     // -- ConnectionSpec backward compatibility --------------------------------
@@ -1965,28 +2059,58 @@ secretRef:
     }
 
     #[test]
-    fn connection_spec_params_mode_deserializes() {
+    fn connection_spec_params_mode_deserializes_keycloak_style() {
         let yaml = r#"
 params:
   host: my-postgres
-  port: "5432"
+  port: 5432
   dbname: mydb
-  username:
-    secretKeyRef:
-      name: creds
-      key: username
-  password:
-    secretKeyRef:
-      name: creds
-      key: password
+  usernameSecret:
+    name: creds
+    key: username
+  passwordSecret:
+    name: creds
+    key: password
   sslMode: require
 "#;
         let conn: ConnectionSpec = serde_yaml::from_str(yaml).unwrap();
         assert!(conn.secret_ref.is_none());
         let params = conn.params.unwrap();
-        assert!(matches!(params.host, ValueSource::Literal(ref s) if s == "my-postgres"));
-        assert!(matches!(params.username, ValueSource::SecretRef { .. }));
-        assert!(matches!(params.ssl_mode, Some(ValueSource::Literal(ref s)) if s == "require"));
+        assert_eq!(params.host.as_deref(), Some("my-postgres"));
+        assert_eq!(params.port, Some(5432));
+        assert!(params.username_secret.is_some());
+        assert_eq!(params.username_secret.as_ref().unwrap().name, "creds");
+        assert_eq!(params.ssl_mode.as_deref(), Some("require"));
+    }
+
+    #[test]
+    fn connection_spec_params_mode_all_secrets() {
+        // CNPG/PGO pattern — everything from one secret.
+        let yaml = r#"
+params:
+  hostSecret:
+    name: cluster-app
+    key: host
+  portSecret:
+    name: cluster-app
+    key: port
+  dbnameSecret:
+    name: cluster-app
+    key: dbname
+  usernameSecret:
+    name: cluster-app
+    key: user
+  passwordSecret:
+    name: cluster-app
+    key: password
+"#;
+        let conn: ConnectionSpec = serde_yaml::from_str(yaml).unwrap();
+        let params = conn.params.unwrap();
+        assert!(params.host.is_none());
+        assert!(params.host_secret.is_some());
+        assert_eq!(params.host_secret.as_ref().unwrap().name, "cluster-app");
+        assert!(params.port.is_none());
+        assert!(params.port_secret.is_some());
     }
 
     // -- referenced_secret_names with params mode ----------------------------
@@ -2050,6 +2174,10 @@ params:
         assert!(
             params.port.is_none(),
             "port should default to None (resolved as 5432 at runtime)"
+        );
+        assert!(
+            params.port_secret.is_none(),
+            "portSecret should also default to None"
         );
     }
 
