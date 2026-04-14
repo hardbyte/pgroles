@@ -171,7 +171,7 @@ pub async fn create_or_update_plan(
     //
     // Uses `status.failed_at` (not `creation_timestamp`) so that plans which
     // waited for approval before failing are measured from the failure time.
-    let now_ts = chrono_now_epoch_secs();
+    let now_ts = now_epoch_secs();
     for plan in &existing_plans {
         if let Some(ref status) = plan.status
             && status.phase == PlanPhase::Failed
@@ -637,7 +637,7 @@ fn sanitize_label_value(value: &str) -> String {
 }
 
 /// Current time as Unix epoch seconds (for dedup window checks).
-fn chrono_now_epoch_secs() -> i64 {
+fn now_epoch_secs() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
@@ -1128,8 +1128,8 @@ mod tests {
     }
 
     #[test]
-    fn chrono_now_epoch_secs_returns_plausible_value() {
-        let now = chrono_now_epoch_secs();
+    fn now_epoch_secs_returns_plausible_value() {
+        let now = now_epoch_secs();
         // Should be after 2025-01-01 and before 2100-01-01.
         let y2025 = 1_735_689_600_i64;
         let y2100 = 4_102_444_800_i64;
