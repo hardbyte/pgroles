@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Structured connection parameters** — the operator now supports `connection.params` with individual fields for host, port, dbname, username, password, and sslMode. Each field accepts either a literal value or a `*Secret` reference (SecretKeySelector). This integrates natively with Zalando postgres-operator, CloudNativePG, and CrunchyData PGO without requiring an ExternalSecret intermediary. The existing `secretRef` + `secretKey` (DATABASE_URL) mode is unchanged. (#86)
+
 ### Fixed
 
 - **Wildcard grant convergence on empty schemas** — wildcard grants (`name: "*"`) on sequences, functions, and other types now converge correctly when a schema contains no objects of that type. Previously the operator re-issued the grant on every reconcile, causing unbounded plan creation. (#84)
