@@ -216,36 +216,46 @@ pub(crate) async fn fetch_privileges_with_wildcards(
     ))
 }
 
+/// Insert a vacuously-satisfied wildcard into the grants map. Used when no
+/// objects of the target type exist in the schema — the wildcard is satisfied
+/// by definition, so we populate the current state with the desired privileges
+/// to prevent the diff engine from re-issuing the grant on every reconcile.
+fn insert_vacuous_wildcard(
+    grants: &mut BTreeMap<GrantKey, GrantState>,
+    wildcard: &WildcardGrantPattern,
+) {
+    let wildcard_key = GrantKey {
+        role: wildcard.role.clone(),
+        object_type: wildcard.object_type,
+        schema: Some(wildcard.schema.clone()),
+        name: Some("*".to_string()),
+    };
+    grants.insert(
+        wildcard_key,
+        GrantState {
+            privileges: wildcard.privileges.clone(),
+        },
+    );
+}
+
 fn normalize_wildcard_grants(
     mut grants: BTreeMap<GrantKey, GrantState>,
     inventory: &BTreeMap<(ObjectType, String), BTreeSet<String>>,
     wildcard_grants: &[WildcardGrantPattern],
 ) -> BTreeMap<GrantKey, GrantState> {
     for wildcard in wildcard_grants {
-        let object_names = inventory.get(&(wildcard.object_type, wildcard.schema.clone()));
+        let Some(object_names) = inventory.get(&(wildcard.object_type, wildcard.schema.clone()))
+        else {
+            // No inventory entry at all — insert vacuous wildcard.
+            insert_vacuous_wildcard(&mut grants, wildcard);
+            continue;
+        };
 
-        // When no objects of this type exist in the schema, the wildcard grant
-        // is vacuously satisfied — all zero objects have the requested
-        // privileges. Insert the wildcard key with the exact desired privileges
-        // so the diff engine sees parity and does not re-issue
-        // `GRANT ... ON ALL <type> IN SCHEMA` on every reconcile.
-        if object_names.is_none() || object_names.is_some_and(|names| names.is_empty()) {
-            let wildcard_key = GrantKey {
-                role: wildcard.role.clone(),
-                object_type: wildcard.object_type,
-                schema: Some(wildcard.schema.clone()),
-                name: Some("*".to_string()),
-            };
-            grants.insert(
-                wildcard_key,
-                GrantState {
-                    privileges: wildcard.privileges.clone(),
-                },
-            );
+        if object_names.is_empty() {
+            // Inventory entry exists but is empty — same treatment.
+            insert_vacuous_wildcard(&mut grants, wildcard);
             continue;
         }
-
-        let object_names = object_names.unwrap();
         let mut shared_privileges = all_privileges();
 
         for object_name in object_names {
@@ -730,9 +740,13 @@ mod tests {
             name: Some("*".to_string()),
         };
 
-        assert!(
-            result.contains_key(&wildcard_key),
-            "vacuous wildcard should be present for empty object set"
+        let entry = result
+            .get(&wildcard_key)
+            .expect("vacuous wildcard should be present for empty object set");
+        assert_eq!(
+            entry.privileges,
+            BTreeSet::from([Privilege::Execute]),
+            "vacuous wildcard should carry the desired privileges"
         );
     }
 
