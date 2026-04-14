@@ -205,8 +205,8 @@ memberships:
 
 | Field | Default | Description |
 |---|---|---|
-| `inherit` | `true` | Member inherits the role's privileges |
-| `admin` | `false` | Member can administer the role (grant it to others) |
+| `inherit` | `true` | Member inherits the role's privileges (optional, omit for default) |
+| `admin` | `false` | Member can administer the role (optional, omit for default) |
 
 ## Convergent model
 

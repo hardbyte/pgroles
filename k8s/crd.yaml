@@ -269,14 +269,16 @@
                       "properties": {
                         "members": {
                           "items": {
-                            "description": "A single member of a role.",
+                            "description": "A single member of a role.\n\nBoth `inherit` and `admin` are optional. When omitted, they default to\n`inherit: true` and `admin: false` at resolution time (in `RoleGraph`\nconstruction). Keeping them optional in the CRD avoids Kubernetes\ninjecting default values into the stored resource, which causes\nperpetual diffs in GitOps tools like ArgoCD.",
                             "properties": {
                               "admin": {
-                                "default": false,
+                                "description": "Whether the member can administer the role. Defaults to `false`.",
+                                "nullable": true,
                                 "type": "boolean"
                               },
                               "inherit": {
-                                "default": true,
+                                "description": "Whether the member inherits the role's privileges. Defaults to `true`.",
+                                "nullable": true,
                                 "type": "boolean"
                               },
                               "name": {

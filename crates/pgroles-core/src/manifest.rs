@@ -372,19 +372,35 @@ pub struct Membership {
 }
 
 /// A single member of a role.
+///
+/// Both `inherit` and `admin` are optional. When omitted, they default to
+/// `inherit: true` and `admin: false` at resolution time (in `RoleGraph`
+/// construction). Keeping them optional in the CRD avoids Kubernetes
+/// injecting default values into the stored resource, which causes
+/// perpetual diffs in GitOps tools like ArgoCD.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct MemberSpec {
     pub name: String,
 
-    #[serde(default = "default_true")]
-    pub inherit: bool,
+    /// Whether the member inherits the role's privileges. Defaults to `true`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inherit: Option<bool>,
 
-    #[serde(default)]
-    pub admin: bool,
+    /// Whether the member can administer the role. Defaults to `false`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub admin: Option<bool>,
 }
 
-fn default_true() -> bool {
-    true
+impl MemberSpec {
+    /// Resolve `inherit` with its default (true).
+    pub fn inherit(&self) -> bool {
+        self.inherit.unwrap_or(true)
+    }
+
+    /// Resolve `admin` with its default (false).
+    pub fn admin(&self) -> bool {
+        self.admin.unwrap_or(false)
+    }
 }
 
 /// Declarative workflow for retiring an existing role.
@@ -1077,8 +1093,8 @@ memberships:
         assert_eq!(manifest.memberships.len(), 1);
         assert_eq!(manifest.memberships[0].members.len(), 2);
         assert_eq!(manifest.memberships[0].members[0].name, "alice@example.com");
-        assert!(manifest.memberships[0].members[0].inherit);
-        assert!(manifest.memberships[0].members[1].admin);
+        assert_eq!(manifest.memberships[0].members[0].inherit, Some(true));
+        assert_eq!(manifest.memberships[0].members[1].admin, Some(true));
     }
 
     #[test]
@@ -1090,9 +1106,12 @@ memberships:
       - name: user1
 "#;
         let manifest = parse_manifest(yaml).unwrap();
-        // inherit defaults to true, admin defaults to false
-        assert!(manifest.memberships[0].members[0].inherit);
-        assert!(!manifest.memberships[0].members[0].admin);
+        // When omitted, both fields are None (defaults applied at resolution time).
+        assert_eq!(manifest.memberships[0].members[0].inherit, None);
+        assert_eq!(manifest.memberships[0].members[0].admin, None);
+        // Accessor methods still return the expected defaults.
+        assert!(manifest.memberships[0].members[0].inherit());
+        assert!(!manifest.memberships[0].members[0].admin());
     }
 
     #[test]
