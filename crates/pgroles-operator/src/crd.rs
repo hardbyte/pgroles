@@ -198,9 +198,9 @@ impl From<CrdReconciliationMode> for pgroles_core::diff::ReconciliationMode {
 /// ```yaml
 /// connection:
 ///   params:
-///     host: partly-postgres
+///     host: my-cluster-postgres
 ///     port: "5432"
-///     dbname: partly
+///     dbname: mydb
 ///     username:
 ///       secretKeyRef: { name: zalando-creds, key: username }
 ///     password:
@@ -307,7 +307,7 @@ impl ValueSource {
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct ConnectionParams {
-    /// PostgreSQL host (e.g. `partly-postgres` — K8s DNS, namespace-relative).
+    /// PostgreSQL host (e.g. `my-cluster-postgres` — K8s DNS, namespace-relative).
     pub host: ValueSource,
 
     /// Port number. Defaults to `5432` if omitted.
@@ -333,7 +333,7 @@ pub struct ConnectionParams {
 /// Supports shorthand for the common case:
 /// ```yaml
 /// # Literal string (shorthand)
-/// host: partly-postgres
+/// host: my-cluster-postgres
 ///
 /// # Secret reference
 /// password:

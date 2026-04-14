@@ -7,9 +7,9 @@ metadata:
 spec:
   connection:
     params:
-      host: partly-postgres
+      host: my-cluster-postgres
       port: "5432"
-      dbname: partly
+      dbname: mydb
       username:
         secretKeyRef:
           name: zalando-creds

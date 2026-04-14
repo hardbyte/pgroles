@@ -123,7 +123,7 @@
                                 ]
                               }
                             ],
-                            "description": "PostgreSQL host (e.g. `partly-postgres` — K8s DNS, namespace-relative).",
+                            "description": "PostgreSQL host (e.g. `my-cluster-postgres` — K8s DNS, namespace-relative).",
                             "properties": {
                               "secretKeyRef": {
                                 "description": "Reference to a specific key within a Kubernetes Secret.",
