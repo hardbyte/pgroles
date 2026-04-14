@@ -54,6 +54,11 @@ const SQL_CONFIGMAP_KEY: &str = "plan.sql";
 /// Default maximum number of historical plans to retain per policy.
 const DEFAULT_MAX_PLANS: usize = 10;
 
+/// How recently a Failed plan must have been created (in seconds) for the
+/// dedup check to consider it a match. Plans older than this are ignored so
+/// that retries after the user fixes the environment are not blocked.
+const FAILED_PLAN_DEDUP_WINDOW_SECS: i64 = 120;
+
 // ---------------------------------------------------------------------------
 // Plan approval check
 // ---------------------------------------------------------------------------
@@ -156,6 +161,37 @@ pub async fn create_or_update_plan(
                 "existing pending plan has identical SQL hash, skipping creation"
             );
             return Ok(PlanCreationResult::Deduplicated(plan_name));
+        }
+    }
+
+    // 5b. Check for recently-failed plan with the same hash. If a plan with
+    // this exact SQL already failed within the dedup window, creating another
+    // identical one is pointless — it would produce the same error. The window
+    // ensures we don't block retries after the user fixes the environment.
+    //
+    // Uses `status.failed_at` (not `creation_timestamp`) so that plans which
+    // waited for approval before failing are measured from the failure time.
+    let now_ts = now_epoch_secs();
+    for plan in &existing_plans {
+        if let Some(ref status) = plan.status
+            && status.phase == PlanPhase::Failed
+            && status.sql_hash.as_deref() == Some(&sql_hash)
+        {
+            let failed_ts = status
+                .failed_at
+                .as_deref()
+                .and_then(parse_rfc3339_epoch_secs)
+                .unwrap_or(0);
+            if failed_ts > 0 && now_ts - failed_ts < FAILED_PLAN_DEDUP_WINDOW_SECS {
+                let plan_name = plan.name_any();
+                info!(
+                    plan = %plan_name,
+                    policy = %policy_name,
+                    age_secs = now_ts - failed_ts,
+                    "recently-failed plan has identical SQL hash, skipping creation"
+                );
+                return Ok(PlanCreationResult::Deduplicated(plan_name));
+            }
         }
     }
 
@@ -287,6 +323,7 @@ pub async fn create_or_update_plan(
         last_error: None,
         sql_hash: Some(sql_hash),
         applying_since: None,
+        failed_at: None,
     };
 
     let status_patch = serde_json::json!({ "status": plan_status });
@@ -372,6 +409,7 @@ pub async fn execute_plan(
             let mut failed_status = plan.status.clone().unwrap_or_default();
             failed_status.phase = PlanPhase::Failed;
             failed_status.last_error = Some(error_message);
+            failed_status.failed_at = Some(crate::crd::now_rfc3339());
 
             let patch = serde_json::json!({ "status": failed_status });
             if let Err(status_err) = plans_api
@@ -598,6 +636,24 @@ fn sanitize_label_value(value: &str) -> String {
     sanitized
 }
 
+/// Current time as Unix epoch seconds (for dedup window checks).
+fn now_epoch_secs() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64
+}
+
+/// Parse an RFC 3339 timestamp string to Unix epoch seconds.
+/// Returns `None` if parsing fails.
+fn parse_rfc3339_epoch_secs(rfc3339: &str) -> Option<i64> {
+    // Use jiff (already a transitive dep via k8s-openapi) for RFC 3339 parsing.
+    rfc3339
+        .parse::<jiff::Timestamp>()
+        .ok()
+        .map(|t| t.as_second())
+}
+
 /// Build an OwnerReference pointing from a plan to its parent policy.
 fn build_owner_reference(policy: &PostgresPolicy) -> OwnerReference {
     OwnerReference {
@@ -798,6 +854,7 @@ pub async fn mark_plan_failed(
     let mut status = plan.status.clone().unwrap_or_default();
     status.phase = PlanPhase::Failed;
     status.last_error = Some(error_message.to_string());
+    status.failed_at = Some(crate::crd::now_rfc3339());
 
     let patch = serde_json::json!({ "status": status });
     plans_api
@@ -1068,5 +1125,17 @@ mod tests {
         let full = render_full_sql(&changes, &ctx);
 
         assert!(full.contains("super_secret") || full.contains("SCRAM-SHA-256"));
+    }
+
+    #[test]
+    fn now_epoch_secs_returns_plausible_value() {
+        let now = now_epoch_secs();
+        // Should be after 2025-01-01 and before 2100-01-01.
+        let y2025 = 1_735_689_600_i64;
+        let y2100 = 4_102_444_800_i64;
+        assert!(
+            now > y2025 && now < y2100,
+            "epoch secs {now} should be between 2025 and 2100"
+        );
     }
 }

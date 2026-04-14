@@ -36,6 +36,7 @@ opentelemetry = { workspace = true }
 opentelemetry_sdk = { workspace = true }
 opentelemetry-otlp = { workspace = true }
 rand = "0.9"
+jiff = "0.2"
 base64 = "0.22"
 sha2 = "0.10"
 
