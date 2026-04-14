@@ -1743,6 +1743,316 @@ mod tests {
         );
     }
 
+    /// Helper to build a minimal spec with the given connection and no roles/grants.
+    fn spec_with_connection(connection: ConnectionSpec) -> PostgresPolicySpec {
+        PostgresPolicySpec {
+            connection,
+            interval: "5m".into(),
+            suspend: false,
+            mode: PolicyMode::Apply,
+            reconciliation_mode: CrdReconciliationMode::default(),
+            default_owner: None,
+            profiles: Default::default(),
+            schemas: vec![],
+            roles: vec![],
+            grants: vec![],
+            default_privileges: vec![],
+            memberships: vec![],
+            retirements: vec![],
+            approval: None,
+        }
+    }
+
+    fn url_mode_connection() -> ConnectionSpec {
+        ConnectionSpec {
+            secret_ref: Some(SecretReference {
+                name: "pg-creds".into(),
+            }),
+            secret_key: Some("DATABASE_URL".into()),
+            params: None,
+        }
+    }
+
+    fn params_mode_connection() -> ConnectionSpec {
+        ConnectionSpec {
+            secret_ref: None,
+            secret_key: None,
+            params: Some(ConnectionParams {
+                host: ValueSource::Literal("my-postgres".into()),
+                port: None,
+                dbname: ValueSource::Literal("mydb".into()),
+                username: ValueSource::SecretRef {
+                    secret_key_ref: SecretKeySelector {
+                        name: "pg-creds".into(),
+                        key: "username".into(),
+                    },
+                },
+                password: ValueSource::SecretRef {
+                    secret_key_ref: SecretKeySelector {
+                        name: "pg-creds".into(),
+                        key: "password".into(),
+                    },
+                },
+                ssl_mode: None,
+            }),
+        }
+    }
+
+    // -- Connection validation tests -----------------------------------------
+
+    #[test]
+    fn validate_connection_accepts_url_mode() {
+        let spec = spec_with_connection(url_mode_connection());
+        assert!(spec.validate_connection_spec().is_ok());
+    }
+
+    #[test]
+    fn validate_connection_accepts_params_mode() {
+        let spec = spec_with_connection(params_mode_connection());
+        assert!(spec.validate_connection_spec().is_ok());
+    }
+
+    #[test]
+    fn validate_connection_rejects_both_modes_set() {
+        let spec = spec_with_connection(ConnectionSpec {
+            secret_ref: Some(SecretReference {
+                name: "pg-creds".into(),
+            }),
+            secret_key: None,
+            params: Some(ConnectionParams {
+                host: ValueSource::Literal("host".into()),
+                port: None,
+                dbname: ValueSource::Literal("db".into()),
+                username: ValueSource::Literal("user".into()),
+                password: ValueSource::Literal("pass".into()),
+                ssl_mode: None,
+            }),
+        });
+        assert!(matches!(
+            spec.validate_connection_spec(),
+            Err(ConnectionValidationError::BothModesSet)
+        ));
+    }
+
+    #[test]
+    fn validate_connection_rejects_neither_mode_set() {
+        let spec = spec_with_connection(ConnectionSpec {
+            secret_ref: None,
+            secret_key: None,
+            params: None,
+        });
+        assert!(spec.validate_connection_spec().is_err());
+    }
+
+    #[test]
+    fn validate_connection_rejects_invalid_ssl_mode() {
+        let spec = spec_with_connection(ConnectionSpec {
+            secret_ref: None,
+            secret_key: None,
+            params: Some(ConnectionParams {
+                host: ValueSource::Literal("host".into()),
+                port: None,
+                dbname: ValueSource::Literal("db".into()),
+                username: ValueSource::Literal("user".into()),
+                password: ValueSource::Literal("pass".into()),
+                ssl_mode: Some(ValueSource::Literal("invalid-mode".into())),
+            }),
+        });
+        assert!(spec.validate_connection_spec().is_err());
+    }
+
+    #[test]
+    fn validate_connection_accepts_valid_ssl_modes() {
+        for mode in &[
+            "disable",
+            "allow",
+            "prefer",
+            "require",
+            "verify-ca",
+            "verify-full",
+        ] {
+            let spec = spec_with_connection(ConnectionSpec {
+                secret_ref: None,
+                secret_key: None,
+                params: Some(ConnectionParams {
+                    host: ValueSource::Literal("host".into()),
+                    port: None,
+                    dbname: ValueSource::Literal("db".into()),
+                    username: ValueSource::Literal("user".into()),
+                    password: ValueSource::Literal("pass".into()),
+                    ssl_mode: Some(ValueSource::Literal((*mode).into())),
+                }),
+            });
+            assert!(
+                spec.validate_connection_spec().is_ok(),
+                "sslMode '{mode}' should be accepted"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_connection_rejects_empty_secret_key_ref_name() {
+        let spec = spec_with_connection(ConnectionSpec {
+            secret_ref: None,
+            secret_key: None,
+            params: Some(ConnectionParams {
+                host: ValueSource::Literal("host".into()),
+                port: None,
+                dbname: ValueSource::Literal("db".into()),
+                username: ValueSource::SecretRef {
+                    secret_key_ref: SecretKeySelector {
+                        name: "".into(),
+                        key: "username".into(),
+                    },
+                },
+                password: ValueSource::Literal("pass".into()),
+                ssl_mode: None,
+            }),
+        });
+        assert!(spec.validate_connection_spec().is_err());
+    }
+
+    // -- ValueSource serde tests ---------------------------------------------
+
+    #[test]
+    fn value_source_deserializes_plain_string() {
+        let yaml = r#""my-host""#;
+        let vs: ValueSource = serde_yaml::from_str(yaml).unwrap();
+        assert!(matches!(vs, ValueSource::Literal(ref s) if s == "my-host"));
+    }
+
+    #[test]
+    fn value_source_deserializes_secret_key_ref() {
+        let yaml = r#"
+secretKeyRef:
+  name: my-secret
+  key: password
+"#;
+        let vs: ValueSource = serde_yaml::from_str(yaml).unwrap();
+        match vs {
+            ValueSource::SecretRef { secret_key_ref } => {
+                assert_eq!(secret_key_ref.name, "my-secret");
+                assert_eq!(secret_key_ref.key, "password");
+            }
+            _ => panic!("expected SecretRef variant"),
+        }
+    }
+
+    // -- ConnectionSpec backward compatibility --------------------------------
+
+    #[test]
+    fn connection_spec_backward_compat_url_mode() {
+        // The old format with required secretRef should still deserialize.
+        let yaml = r#"
+secretRef:
+  name: pg-creds
+secretKey: DATABASE_URL
+"#;
+        let conn: ConnectionSpec = serde_yaml::from_str(yaml).unwrap();
+        assert!(conn.secret_ref.is_some());
+        assert_eq!(conn.effective_secret_key(), "DATABASE_URL");
+        assert!(conn.params.is_none());
+    }
+
+    #[test]
+    fn connection_spec_backward_compat_default_secret_key() {
+        let yaml = r#"
+secretRef:
+  name: pg-creds
+"#;
+        let conn: ConnectionSpec = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(conn.effective_secret_key(), "DATABASE_URL");
+    }
+
+    #[test]
+    fn connection_spec_params_mode_deserializes() {
+        let yaml = r#"
+params:
+  host: my-postgres
+  port: "5432"
+  dbname: mydb
+  username:
+    secretKeyRef:
+      name: creds
+      key: username
+  password:
+    secretKeyRef:
+      name: creds
+      key: password
+  sslMode: require
+"#;
+        let conn: ConnectionSpec = serde_yaml::from_str(yaml).unwrap();
+        assert!(conn.secret_ref.is_none());
+        let params = conn.params.unwrap();
+        assert!(matches!(params.host, ValueSource::Literal(ref s) if s == "my-postgres"));
+        assert!(matches!(params.username, ValueSource::SecretRef { .. }));
+        assert!(matches!(params.ssl_mode, Some(ValueSource::Literal(ref s)) if s == "require"));
+    }
+
+    // -- referenced_secret_names with params mode ----------------------------
+
+    #[test]
+    fn referenced_secret_names_includes_params_secrets() {
+        let spec = spec_with_connection(params_mode_connection());
+        let names = spec.referenced_secret_names("test-policy");
+        assert!(
+            names.contains("pg-creds"),
+            "should include the credential secret from params"
+        );
+    }
+
+    #[test]
+    fn referenced_secret_names_deduplicates_across_modes() {
+        // Same secret name used in both connection and password secretRef.
+        let mut spec = spec_with_connection(params_mode_connection());
+        spec.roles = vec![RoleSpec {
+            name: "app".into(),
+            login: Some(true),
+            password: Some(PasswordSpec {
+                secret_ref: Some(SecretReference {
+                    name: "pg-creds".into(),
+                }),
+                secret_key: Some("app-password".into()),
+                generate: None,
+            }),
+            password_valid_until: None,
+            superuser: None,
+            createdb: None,
+            createrole: None,
+            inherit: None,
+            replication: None,
+            bypassrls: None,
+            connection_limit: None,
+            comment: None,
+        }];
+        let names = spec.referenced_secret_names("test-policy");
+        // pg-creds appears in both connection params and password — should be deduped.
+        assert_eq!(
+            names.iter().filter(|n| *n == "pg-creds").count(),
+            1,
+            "BTreeSet should deduplicate"
+        );
+    }
+
+    // -- ConnectionParams port default ---------------------------------------
+
+    #[test]
+    fn connection_params_port_defaults_to_none() {
+        let yaml = r#"
+params:
+  host: my-host
+  dbname: mydb
+  username: user
+  password: pass
+"#;
+        let conn: ConnectionSpec = serde_yaml::from_str(yaml).unwrap();
+        let params = conn.params.unwrap();
+        assert!(
+            params.port.is_none(),
+            "port should default to None (resolved as 5432 at runtime)"
+        );
+    }
+
     #[test]
     fn now_rfc3339_produces_valid_format() {
         let ts = now_rfc3339();

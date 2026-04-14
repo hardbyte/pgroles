@@ -3117,6 +3117,45 @@ mod tests {
     }
 
     #[test]
+    fn retry_classifies_empty_resolved_value_as_slow() {
+        let error = finalizer::Error::ApplyFailed(ReconcileError::Context(Box::new(
+            crate::context::ContextError::EmptyResolvedValue {
+                field: "password".to_string(),
+            },
+        )));
+        assert_eq!(retry_class(&error), RetryClass::Slow);
+    }
+
+    #[test]
+    fn error_reason_empty_resolved_value() {
+        let err =
+            ReconcileError::Context(Box::new(crate::context::ContextError::EmptyResolvedValue {
+                field: "host".to_string(),
+            }));
+        assert_eq!(err.reason(), "InvalidConnectionParams");
+    }
+
+    #[test]
+    fn retry_classifies_invalid_resolved_ssl_mode_as_slow() {
+        let error = finalizer::Error::ApplyFailed(ReconcileError::Context(Box::new(
+            crate::context::ContextError::InvalidResolvedSslMode {
+                value: "bogus".to_string(),
+            },
+        )));
+        assert_eq!(retry_class(&error), RetryClass::Slow);
+    }
+
+    #[test]
+    fn error_reason_invalid_resolved_ssl_mode() {
+        let err = ReconcileError::Context(Box::new(
+            crate::context::ContextError::InvalidResolvedSslMode {
+                value: "bogus".to_string(),
+            },
+        ));
+        assert_eq!(err.reason(), "InvalidConnectionParams");
+    }
+
+    #[test]
     fn error_reason_sql_exec_transient_is_apply_failed() {
         let err = ReconcileError::SqlExec(transient_sqlx_error());
         assert_eq!(err.reason(), "ApplyFailed");
