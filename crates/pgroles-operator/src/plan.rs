@@ -54,6 +54,11 @@ const SQL_CONFIGMAP_KEY: &str = "plan.sql";
 /// Default maximum number of historical plans to retain per policy.
 const DEFAULT_MAX_PLANS: usize = 10;
 
+/// How recently a Failed plan must have been created (in seconds) for the
+/// dedup check to consider it a match. Plans older than this are ignored so
+/// that retries after the user fixes the environment are not blocked.
+const FAILED_PLAN_DEDUP_WINDOW_SECS: i64 = 120;
+
 // ---------------------------------------------------------------------------
 // Plan approval check
 // ---------------------------------------------------------------------------
@@ -156,6 +161,35 @@ pub async fn create_or_update_plan(
                 "existing pending plan has identical SQL hash, skipping creation"
             );
             return Ok(PlanCreationResult::Deduplicated(plan_name));
+        }
+    }
+
+    // 5b. Check for recently-failed plan with the same hash. If a plan with
+    // this exact SQL already failed within the dedup window, creating another
+    // identical one is pointless — it would produce the same error. The window
+    // ensures we don't block retries after the user fixes the environment.
+    let now_ts = chrono_now_epoch_secs();
+    for plan in &existing_plans {
+        if let Some(ref status) = plan.status
+            && status.phase == PlanPhase::Failed
+            && status.sql_hash.as_deref() == Some(&sql_hash)
+        {
+            let created_ts = plan
+                .metadata
+                .creation_timestamp
+                .as_ref()
+                .map(|t| t.0.as_second())
+                .unwrap_or(0);
+            if now_ts - created_ts < FAILED_PLAN_DEDUP_WINDOW_SECS {
+                let plan_name = plan.name_any();
+                info!(
+                    plan = %plan_name,
+                    policy = %policy_name,
+                    age_secs = now_ts - created_ts,
+                    "recently-failed plan has identical SQL hash, skipping creation"
+                );
+                return Ok(PlanCreationResult::Deduplicated(plan_name));
+            }
         }
     }
 
@@ -596,6 +630,14 @@ fn sanitize_label_value(value: &str) -> String {
         .take(63)
         .collect();
     sanitized
+}
+
+/// Current time as Unix epoch seconds (for dedup window checks).
+fn chrono_now_epoch_secs() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64
 }
 
 /// Build an OwnerReference pointing from a plan to its parent policy.
@@ -1068,5 +1110,17 @@ mod tests {
         let full = render_full_sql(&changes, &ctx);
 
         assert!(full.contains("super_secret") || full.contains("SCRAM-SHA-256"));
+    }
+
+    #[test]
+    fn chrono_now_epoch_secs_returns_plausible_value() {
+        let now = chrono_now_epoch_secs();
+        // Should be after 2025-01-01 and before 2100-01-01.
+        let y2025 = 1_735_689_600_i64;
+        let y2100 = 4_102_444_800_i64;
+        assert!(
+            now > y2025 && now < y2100,
+            "epoch secs {now} should be between 2025 and 2100"
+        );
     }
 }
