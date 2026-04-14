@@ -5,6 +5,16 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- **Wildcard grant convergence on empty schemas** — wildcard grants (`name: "*"`) on sequences, functions, and other types now converge correctly when a schema contains no objects of that type. Previously the operator re-issued the grant on every reconcile, causing unbounded plan creation. (#84)
+- **Missing-object SQL errors classified as non-transient** — errors like `schema "etl" does not exist` (SQLSTATE 3F000, 42P01, 42883, 42704) are now classified as `Slow` retry with a `MissingDatabaseObject` reason instead of hot-looping with exponential backoff. (#79)
+- **Pre-flight schema validation** — the operator validates that every schema referenced by the policy exists in the target database before issuing DDL, surfacing a clear `MissingDatabaseObject` status condition. (#80)
+- **Plan resource deduplication** — recently-failed plans with the same SQL hash are deduplicated within a 120-second window to prevent accumulation during fast retries. (#81)
+- **MemberSpec defaults removed from CRD** — `inherit` and `admin` fields on membership entries are now `Option<bool>` with defaults applied at resolution time, avoiding perpetual ArgoCD diffs when using ServerSideApply. (#83)
+
 ## [0.2.0] - 2026-03-12
 
 ### Added

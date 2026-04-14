@@ -13,7 +13,7 @@ mod roles;
 mod safety;
 mod version;
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use sqlx::PgPool;
 use thiserror::Error;
@@ -48,6 +48,10 @@ pub(crate) struct WildcardGrantPattern {
     pub role: String,
     pub object_type: pgroles_core::manifest::ObjectType,
     pub schema: String,
+    /// The desired privileges for this wildcard grant. Used to construct a
+    /// vacuously-satisfied wildcard when no objects of this type exist in the
+    /// schema, so the diff engine sees exact parity and produces no change.
+    pub privileges: std::collections::BTreeSet<pgroles_core::manifest::Privilege>,
 }
 
 // ---------------------------------------------------------------------------
@@ -85,7 +89,10 @@ impl InspectConfig {
     ) -> Self {
         let mut managed_roles: BTreeSet<String> = BTreeSet::new();
         let mut managed_schemas: BTreeSet<String> = BTreeSet::new();
-        let mut wildcard_grants: BTreeSet<WildcardGrantPattern> = BTreeSet::new();
+        // Key for deduplicating wildcard grants: (role, object_type, schema).
+        type WildcardKey = (String, pgroles_core::manifest::ObjectType, String);
+        let mut wildcard_map: BTreeMap<WildcardKey, BTreeSet<pgroles_core::manifest::Privilege>> =
+            BTreeMap::new();
 
         // Collect role names
         for role_def in &expanded.roles {
@@ -111,11 +118,11 @@ impl InspectConfig {
                 )
                 && let Some(schema) = &grant.object.schema
             {
-                wildcard_grants.insert(WildcardGrantPattern {
-                    role: grant.role.clone(),
-                    object_type: grant.object.object_type,
-                    schema: schema.clone(),
-                });
+                let key = (grant.role.clone(), grant.object.object_type, schema.clone());
+                wildcard_map
+                    .entry(key)
+                    .or_default()
+                    .extend(grant.privileges.iter().copied());
             }
         }
 
@@ -128,7 +135,17 @@ impl InspectConfig {
             managed_roles: managed_roles.into_iter().collect(),
             managed_schemas: managed_schemas.into_iter().collect(),
             include_database_privileges,
-            wildcard_grants: wildcard_grants.into_iter().collect(),
+            wildcard_grants: wildcard_map
+                .into_iter()
+                .map(
+                    |((role, object_type, schema), privileges)| WildcardGrantPattern {
+                        role,
+                        object_type,
+                        schema,
+                        privileges,
+                    },
+                )
+                .collect(),
         }
     }
 
