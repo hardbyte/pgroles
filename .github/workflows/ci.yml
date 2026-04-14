@@ -160,10 +160,10 @@ jobs:
             diff -f smoke-test.yaml --no-exit-code
 
   # ---------------------------------------------------------------------------
-  # Job 5: E2E — kind cluster + operator deployment
+  # Job 5a: E2E — Operator Scenarios
   # ---------------------------------------------------------------------------
-  e2e:
-    name: E2E Tests
+  e2e-operator:
+    name: "E2E: Operator Scenarios"
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
@@ -172,394 +172,13 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
-      - uses: docker/setup-buildx-action@v4
+      - uses: ./.github/actions/setup-e2e
+        with:
+          cluster-name: pgroles-e2e-operator
 
-      - name: Install kind
+      - name: Run operator scenarios
         run: |
-          [ -f /usr/local/bin/kind ] || {
-            curl -Lo /usr/local/bin/kind https://kind.sigs.k8s.io/dl/v0.24.0/kind-linux-amd64
-            echo "b89aada5a39d620da3fcd16435b7f28d858927dd53f92cbac77686b0588b600d  /usr/local/bin/kind" | sha256sum -c -
-            chmod +x /usr/local/bin/kind
-          }
-
-      - name: Create kind cluster
-        run: kind create cluster --name pgroles-e2e --wait 60s
-
-      - name: Install CRDs
-        run: |
-          kubectl apply -f k8s/crd.yaml
-          kubectl apply -f k8s/postgrespolicyplan-crd.yaml
-
-      - name: Deploy dev PostgreSQL
-        run: |
-          kubectl apply -f k8s/dev/postgres.yaml
-          kubectl rollout status statefulset/postgres --timeout=120s
-
-      - name: Wait for PostgreSQL readiness
-        run: |
-          kubectl wait --for=condition=ready pod/postgres-0 --timeout=90s
-
-      - name: Seed PostgreSQL objects for grant reconciliation
-        run: |
-          kubectl exec -i postgres-0 -- psql -v ON_ERROR_STOP=1 -U postgres -d postgres <<'SQL'
-          SET password_encryption = 'scram-sha-256';
-          CREATE DATABASE loadtest;
-          CREATE TABLE IF NOT EXISTS public.inventory_items (
-            id integer generated always as identity primary key,
-            name text not null
-          );
-          CREATE SEQUENCE IF NOT EXISTS public.audit_seq;
-          DROP ROLE IF EXISTS limited_operator;
-          CREATE ROLE limited_operator LOGIN PASSWORD 'limitedpassword';
-          ALTER ROLE limited_operator
-            NOSUPERUSER
-            NOCREATEDB
-            NOCREATEROLE
-            INHERIT
-            NOREPLICATION
-            NOBYPASSRLS;
-          GRANT CONNECT ON DATABASE postgres TO limited_operator;
-          SQL
-
-      - name: Verify limited-privilege role can authenticate
-        run: |
-          kubectl exec postgres-0 -- env PGPASSWORD=limitedpassword \
-            psql -v ON_ERROR_STOP=1 \
-            -h postgres.default.svc.cluster.local \
-            -U limited_operator \
-            -d postgres \
-            -c 'SELECT current_user;' | tee /dev/stderr | grep -q 'limited_operator'
-
-      - name: Create limited-privilege database secret
-        run: |
-          kubectl create secret generic limited-postgres-credentials \
-            --from-literal=DATABASE_URL='postgres://limited_operator:limitedpassword@postgres.default.svc.cluster.local:5432/postgres' \
-            --dry-run=client -o yaml | kubectl apply -f -
-
-          kubectl create secret generic loadtest-postgres-credentials \
-            --from-literal=DATABASE_URL='postgres://postgres:devpassword@postgres.default.svc.cluster.local:5432/loadtest' \
-            --dry-run=client -o yaml | kubectl apply -f -
-
-      - name: Build operator image and load into kind
-        run: docker build -f docker/Dockerfile --target operator -t pgroles-operator:e2e .
-
-      - name: Load image into kind
-        run: kind load docker-image pgroles-operator:e2e --name pgroles-e2e
-
-      - name: Deploy operator
-        run: |
-          kubectl apply -f k8s/deploy/namespace.yaml
-          kubectl apply -f k8s/deploy/rbac.yaml
-          kubectl apply -f k8s/dev/otel-collector.yaml
-          kubectl -n pgroles-system rollout status deployment/otel-collector --timeout=120s
-
-          # Patch deployment to use the locally-built image.
-          sed 's|ghcr.io/hardbyte/pgroles-operator:latest|pgroles-operator:e2e|' \
-            k8s/deploy/deployment.yaml | \
-            sed 's|imagePullPolicy:.*|imagePullPolicy: Never|' | \
-            kubectl apply -f -
-
-          kubectl -n pgroles-system set env deployment/pgroles-operator \
-            OTEL_EXPORTER_OTLP_ENDPOINT=http://otel-collector.pgroles-system.svc.cluster.local:4317 \
-            OTEL_METRICS_EXPORTER=otlp \
-            OTEL_METRIC_EXPORT_INTERVAL=2000
-
-          kubectl -n pgroles-system rollout status deployment/pgroles-operator --timeout=60s
-
-      - name: Apply sample policy
-        run: kubectl apply -f k8s/samples/basic-policy.yaml
-
-      - name: Wait for reconciliation
-        run: |
-          for i in $(seq 1 30); do
-            STATUS=$(kubectl get pgr basic-policy -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}' 2>/dev/null || echo "")
-            if [ "$STATUS" = "True" ]; then
-              echo "Policy reconciled successfully"
-              exit 0
-            fi
-            echo "Waiting for reconciliation... (attempt $i/30)"
-            sleep 5
-          done
-          echo "::error::Policy did not reach Ready=True within timeout"
-          kubectl get pgr basic-policy -o yaml
-          kubectl -n pgroles-system logs deployment/pgroles-operator --tail=50
-          exit 1
-
-      - name: Verify roles exist in PostgreSQL
-        run: |
-          kubectl exec postgres-0 -- psql -U postgres -c "SELECT rolname FROM pg_roles WHERE rolname LIKE 'public-%' ORDER BY rolname;" | tee /dev/stderr | grep -q "public-editor"
-
-      - name: Run additional operator scenarios
-        run: |
-          wait_for_ready_true() {
-            policy="$1"
-            attempts="${2:-30}"
-            sleep_secs="${3:-3}"
-            for i in $(seq 1 "$attempts"); do
-              status="$(kubectl get pgr "$policy" -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}' 2>/dev/null || true)"
-              if [ "$status" = "True" ]; then
-                echo "$policy reached Ready=True"
-                return 0
-              fi
-              echo "Waiting for $policy Ready=True... (attempt $i/$attempts)"
-              sleep "$sleep_secs"
-            done
-            echo "::error::$policy did not reach Ready=True"
-            kubectl get pgr "$policy" -o yaml || true
-            kubectl -n pgroles-system logs deployment/pgroles-operator --tail=200 || true
-            return 1
-          }
-
-          wait_for_ready_status_reason() {
-            policy="$1"
-            expected_status="$2"
-            expected_reason="$3"
-            for i in $(seq 1 30); do
-              status="$(kubectl get pgr "$policy" -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}' 2>/dev/null || true)"
-              reason="$(kubectl get pgr "$policy" -o jsonpath='{.status.conditions[?(@.type=="Ready")].reason}' 2>/dev/null || true)"
-              if [ "$status" = "$expected_status" ] && [ "$reason" = "$expected_reason" ]; then
-                echo "$policy reached Ready=$expected_status with reason=$expected_reason"
-                return 0
-              fi
-              echo "Waiting for $policy Ready=$expected_status/$expected_reason... (attempt $i/30)"
-              sleep 3
-            done
-            echo "::error::$policy did not reach Ready=$expected_status with reason=$expected_reason"
-            kubectl get pgr "$policy" -o yaml || true
-            kubectl -n pgroles-system logs deployment/pgroles-operator --tail=200 || true
-            return 1
-          }
-
-          wait_for_ready_reason() {
-            policy="$1"
-            expected_reason="$2"
-            wait_for_ready_status_reason "$policy" "False" "$expected_reason"
-          }
-
-          wait_for_drift_status() {
-            policy="$1"
-            expected_status="$2"
-            for i in $(seq 1 30); do
-              status="$(kubectl get pgr "$policy" -o jsonpath='{.status.conditions[?(@.type=="Drifted")].status}' 2>/dev/null || true)"
-              if [ "$status" = "$expected_status" ]; then
-                echo "$policy reached Drifted=$expected_status"
-                return 0
-              fi
-              echo "Waiting for $policy Drifted=$expected_status... (attempt $i/30)"
-              sleep 3
-            done
-            echo "::error::$policy did not reach Drifted=$expected_status"
-            kubectl get pgr "$policy" -o yaml || true
-            kubectl -n pgroles-system logs deployment/pgroles-operator --tail=200 || true
-            return 1
-          }
-
-          wait_for_last_error_contains() {
-            policy="$1"
-            expected_substring="$2"
-            for i in $(seq 1 30); do
-              last_error="$(kubectl get pgr "$policy" -o jsonpath='{.status.last_error}' 2>/dev/null || true)"
-              normalized_last_error="$(printf '%s' "$last_error" | tr '\n' ' ' | tr -s ' ')"
-              if printf '%s' "$normalized_last_error" | grep -Fq "$expected_substring"; then
-                echo "$policy reported expected error substring: $expected_substring"
-                return 0
-              fi
-              echo "Waiting for $policy lastError to contain '$expected_substring'... (attempt $i/30)"
-              sleep 3
-            done
-            echo "::error::$policy lastError did not contain $expected_substring"
-            kubectl get pgr "$policy" -o yaml || true
-            kubectl -n pgroles-system logs deployment/pgroles-operator --tail=200 || true
-            return 1
-          }
-
-          wait_for_event_reason() {
-            policy="$1"
-            expected_reason="$2"
-            namespace="${3:-default}"
-            for i in $(seq 1 30); do
-              events="$(
-                kubectl get events.events.k8s.io -n "$namespace" \
-                  -o jsonpath='{range .items[*]}{.regarding.name}{"\t"}{.reason}{"\n"}{end}' \
-                  2>/dev/null || true
-              )"
-              if printf '%s\n' "$events" | grep -Fxq "$policy	$expected_reason"; then
-                echo "$policy emitted Event reason=$expected_reason"
-                return 0
-              fi
-              echo "Waiting for $policy Event/$expected_reason... (attempt $i/30)"
-              sleep 3
-            done
-            echo "::error::$policy did not emit Event reason=$expected_reason"
-            kubectl get events.events.k8s.io -n "$namespace" || true
-            kubectl describe pgr "$policy" || true
-            kubectl -n pgroles-system logs deployment/pgroles-operator --tail=200 || true
-            return 1
-          }
-
-          # -- PostgreSQL helpers --------------------------------------------------
-
-          pg_query() {
-            local db="${2:-postgres}"
-            kubectl exec postgres-0 -- psql -U postgres -d "$db" -tAc "$1"
-          }
-
-          assert_role_exists() {
-            pg_query "SELECT rolname FROM pg_roles WHERE rolname = '$1'" | grep -qx "$1"
-          }
-
-          assert_role_absent() {
-            ! pg_query "SELECT 1 FROM pg_roles WHERE rolname = '$1'" | grep -qx "1"
-          }
-
-          get_password_hash() {
-            pg_query "SELECT rolpassword FROM pg_authid WHERE rolname = '$1'"
-          }
-
-          assert_password_set() {
-            local hash
-            hash="$(get_password_hash "$1")"
-            if [ -z "$hash" ] || [ "$hash" = "" ]; then
-              echo "::error::Password hash is null/empty for role $1"
-              return 1
-            fi
-            echo "Password hash present for $1: ${hash:0:20}..."
-          }
-
-          wait_for_password_hash_change() {
-            local role="$1" previous_hash="$2"
-            for i in $(seq 1 40); do
-              local current
-              current="$(get_password_hash "$role")"
-              if [ -n "$current" ] && [ "$current" != "$previous_hash" ]; then
-                echo "Password hash changed for $role"
-                return 0
-              fi
-              echo "Waiting for $role password hash to change... (attempt $i/40)"
-              sleep 5
-            done
-            echo "::error::Password hash for $role did not change"
-            echo "Previous: $previous_hash"
-            echo "Current:  $(get_password_hash "$role")"
-            return 1
-          }
-
-          wait_for_password_hash_stable() {
-            local role="$1" expected_hash="$2"
-            for i in $(seq 1 6); do
-              sleep 5
-              local current
-              current="$(get_password_hash "$role")"
-              if [ -z "$current" ] || [ "$current" != "$expected_hash" ]; then
-                echo "::error::Password hash for $role changed unexpectedly"
-                echo "Expected: $expected_hash"
-                echo "Current:  $current"
-                return 1
-              fi
-              echo "Password hash still stable for $role (attempt $i/6)"
-            done
-          }
-
-          assert_secret_has_keys() {
-            local name="$1"; shift
-            for key in "$@"; do
-              local value
-              value="$(kubectl get secret "$name" -o "jsonpath={.data.$key}" 2>/dev/null || true)"
-              if [ -z "$value" ]; then
-                echo "::error::Secret $name is missing key $key"
-                return 1
-              fi
-            done
-            echo "Secret $name contains expected keys: $*"
-          }
-
-          upsert_secret() {
-            local name="$1"; shift
-            local args=()
-            for kv in "$@"; do
-              args+=(--from-literal="$kv")
-            done
-            kubectl create secret generic "$name" "${args[@]}" \
-              --dry-run=client -o yaml | kubectl apply -f -
-          }
-
-          assert_operator_logs_clean() {
-            local forbidden="$1"
-            local logs
-            logs="$(kubectl -n pgroles-system logs deployment/pgroles-operator --tail=500 2>/dev/null || true)"
-            if printf '%s' "$logs" | grep -qF "$forbidden"; then
-              echo "::error::Operator logs contain forbidden string: $forbidden"
-              return 1
-            fi
-            echo "Operator logs clean (no '$forbidden')"
-          }
-
-          # -- Plan helpers --------------------------------------------------------
-
-          wait_for_plan_phase() {
-            local plan="$1" expected_phase="$2"
-            for i in $(seq 1 30); do
-              phase="$(kubectl get pgplan "$plan" -o jsonpath='{.status.phase}' 2>/dev/null || true)"
-              if [ "$phase" = "$expected_phase" ]; then
-                echo "✓ $plan reached phase=$expected_phase"
-                return 0
-              fi
-              echo "  Waiting for $plan phase=$expected_phase (current=$phase)... ($i/30)"
-              sleep 3
-            done
-            echo "::error::$plan did not reach phase=$expected_phase within timeout"
-            kubectl get pgplan "$plan" -o yaml || true
-            return 1
-          }
-
-          approve_plan() {
-            local plan="$1"
-            kubectl annotate pgplan "$plan" pgroles.io/approved=true --overwrite
-          }
-
-          reject_plan() {
-            local plan="$1"
-            kubectl annotate pgplan "$plan" pgroles.io/rejected=true --overwrite
-          }
-
-          get_plan_sql() {
-            local plan="$1"
-            local inline
-            inline="$(kubectl get pgplan "$plan" -o jsonpath='{.status.sqlInline}' 2>/dev/null || true)"
-            if [ -n "$inline" ]; then
-              echo "$inline"
-              return 0
-            fi
-            local cm_name cm_key
-            cm_name="$(kubectl get pgplan "$plan" -o jsonpath='{.status.sqlRef.name}' 2>/dev/null || true)"
-            cm_key="$(kubectl get pgplan "$plan" -o jsonpath='{.status.sqlRef.key}' 2>/dev/null || true)"
-            if [ -n "$cm_name" ] && [ -n "$cm_key" ]; then
-              kubectl get configmap "$cm_name" -o jsonpath="{.data.${cm_key}}" 2>/dev/null || true
-              return 0
-            fi
-            echo ""
-          }
-
-          wait_for_current_plan_ref() {
-            local policy="$1"
-            for i in $(seq 1 30); do
-              local plan_name
-              plan_name="$(kubectl get pgr "$policy" -o jsonpath='{.status.current_plan_ref.name}' 2>/dev/null || true)"
-              if [ -n "$plan_name" ]; then
-                echo "$plan_name"
-                return 0
-              fi
-              echo "  Waiting for $policy currentPlanRef... ($i/30)"
-              sleep 3
-            done
-            echo "::error::$policy did not get currentPlanRef within timeout"
-            return 1
-          }
-
-          get_plan_count() {
-            local policy="$1"
-            kubectl get pgplan -l "pgroles.io/policy=$policy" --no-headers 2>/dev/null | wc -l | tr -d ' '
-          }
+          source scripts/e2e-helpers.sh
 
           kubectl delete pgr basic-policy --wait=true
 
@@ -688,6 +307,49 @@ jobs:
           assert_password_set empty-pw-user
           wait_for_event_reason empty-password-secret-policy Recovered
 
+      - name: Verify OTLP metrics reach the collector
+        run: |
+          for i in $(seq 1 30); do
+            LOGS="$(kubectl -n pgroles-system logs deployment/otel-collector --tail=2000 2>/dev/null || true)"
+            printf '%s\n' "$LOGS" | grep -q 'pgroles.policy.conflicts\|pgroles.apply.total\|pgroles.plan.total' && \
+            printf '%s\n' "$LOGS" | grep -q 'pgroles.apply.statements\|pgroles.plan.changes' && \
+            printf '%s\n' "$LOGS" | grep -q '"otelcol.component.kind": "exporter"' && {
+              echo "Collector received operator metrics"
+              exit 0
+            }
+            echo "Waiting for OTLP metrics export... (attempt $i/30)"
+            sleep 5
+          done
+          echo "::error::Collector did not receive expected operator metrics"
+          kubectl -n pgroles-system logs deployment/pgroles-operator --tail=100
+          kubectl -n pgroles-system logs deployment/otel-collector --tail=200
+          exit 1
+
+      - name: Cleanup
+        if: always()
+        run: kind delete cluster --name pgroles-e2e-operator
+
+  # ---------------------------------------------------------------------------
+  # Job 5b: E2E — Load Tests
+  # ---------------------------------------------------------------------------
+  e2e-load:
+    name: "E2E: Load Tests"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - uses: ./.github/actions/setup-e2e
+        with:
+          cluster-name: pgroles-e2e-load
+
+      - name: Run load tests
+        run: |
+          source scripts/e2e-helpers.sh
+
           bash scripts/generate-load-policy.sh 20 /tmp/load-policy.yaml load-policy postgres-credentials loada
           bash scripts/generate-load-policy.sh 10 /tmp/load-policy-secondary.yaml load-policy-secondary loadtest-postgres-credentials loadb
           {
@@ -729,163 +391,30 @@ jobs:
           pg_query "SELECT has_table_privilege('loadb_10-viewer', 'loadb_10.items', 'SELECT')" loadtest | grep -qx "t"
           pg_query "SELECT has_sequence_privilege('loadb_05-editor', 'loadb_05.audit_seq', 'USAGE')" loadtest | grep -qx "t"
 
-      - name: Verify OTLP metrics reach the collector
+      - name: Cleanup
+        if: always()
+        run: kind delete cluster --name pgroles-e2e-load
+
+  # ---------------------------------------------------------------------------
+  # Job 5c: E2E — Plan Lifecycle
+  # ---------------------------------------------------------------------------
+  e2e-plans:
+    name: "E2E: Plan Lifecycle"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - uses: ./.github/actions/setup-e2e
+        with:
+          cluster-name: pgroles-e2e-plans
+
+      - name: Run plan lifecycle scenarios
         run: |
-          for i in $(seq 1 30); do
-            LOGS="$(kubectl -n pgroles-system logs deployment/otel-collector --tail=2000 2>/dev/null || true)"
-            printf '%s\n' "$LOGS" | grep -q 'pgroles.policy.conflicts\|pgroles.apply.total\|pgroles.plan.total' && \
-            printf '%s\n' "$LOGS" | grep -q 'pgroles.apply.statements\|pgroles.plan.changes' && \
-            printf '%s\n' "$LOGS" | grep -q '"otelcol.component.kind": "exporter"' && {
-              echo "Collector received operator metrics"
-              exit 0
-            }
-            echo "Waiting for OTLP metrics export... (attempt $i/30)"
-            sleep 5
-          done
-          echo "::error::Collector did not receive expected operator metrics"
-          kubectl -n pgroles-system logs deployment/pgroles-operator --tail=100
-          kubectl -n pgroles-system logs deployment/otel-collector --tail=200
-          exit 1
-
-      - name: Run plan lifecycle E2E scenarios
-        run: |
-          # -- Helper functions (same as above) -----------------------------------
-          wait_for_ready_true() {
-            policy="$1"
-            attempts="${2:-30}"
-            sleep_secs="${3:-3}"
-            for i in $(seq 1 "$attempts"); do
-              status="$(kubectl get pgr "$policy" -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}' 2>/dev/null || true)"
-              if [ "$status" = "True" ]; then
-                echo "$policy reached Ready=True"
-                return 0
-              fi
-              echo "Waiting for $policy Ready=True... (attempt $i/$attempts)"
-              sleep "$sleep_secs"
-            done
-            echo "::error::$policy did not reach Ready=True"
-            kubectl get pgr "$policy" -o yaml || true
-            kubectl -n pgroles-system logs deployment/pgroles-operator --tail=200 || true
-            return 1
-          }
-
-          wait_for_ready_status_reason() {
-            policy="$1"
-            expected_status="$2"
-            expected_reason="$3"
-            for i in $(seq 1 30); do
-              status="$(kubectl get pgr "$policy" -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}' 2>/dev/null || true)"
-              reason="$(kubectl get pgr "$policy" -o jsonpath='{.status.conditions[?(@.type=="Ready")].reason}' 2>/dev/null || true)"
-              if [ "$status" = "$expected_status" ] && [ "$reason" = "$expected_reason" ]; then
-                echo "$policy reached Ready=$expected_status with reason=$expected_reason"
-                return 0
-              fi
-              echo "Waiting for $policy Ready=$expected_status/$expected_reason... (attempt $i/30)"
-              sleep 3
-            done
-            echo "::error::$policy did not reach Ready=$expected_status with reason=$expected_reason"
-            kubectl get pgr "$policy" -o yaml || true
-            kubectl -n pgroles-system logs deployment/pgroles-operator --tail=200 || true
-            return 1
-          }
-
-          wait_for_drift_status() {
-            policy="$1"
-            expected_status="$2"
-            for i in $(seq 1 30); do
-              status="$(kubectl get pgr "$policy" -o jsonpath='{.status.conditions[?(@.type=="Drifted")].status}' 2>/dev/null || true)"
-              if [ "$status" = "$expected_status" ]; then
-                echo "$policy reached Drifted=$expected_status"
-                return 0
-              fi
-              echo "Waiting for $policy Drifted=$expected_status... (attempt $i/30)"
-              sleep 3
-            done
-            echo "::error::$policy did not reach Drifted=$expected_status"
-            kubectl get pgr "$policy" -o yaml || true
-            kubectl -n pgroles-system logs deployment/pgroles-operator --tail=200 || true
-            return 1
-          }
-
-          wait_for_event_reason() {
-            policy="$1"
-            expected_reason="$2"
-            namespace="${3:-default}"
-            for i in $(seq 1 30); do
-              events="$(
-                kubectl get events.events.k8s.io -n "$namespace" \
-                  -o jsonpath='{range .items[*]}{.regarding.name}{"\t"}{.reason}{"\n"}{end}' \
-                  2>/dev/null || true
-              )"
-              if printf '%s\n' "$events" | grep -Fxq "$policy	$expected_reason"; then
-                echo "$policy emitted Event reason=$expected_reason"
-                return 0
-              fi
-              echo "Waiting for $policy Event/$expected_reason... (attempt $i/30)"
-              sleep 3
-            done
-            echo "::error::$policy did not emit Event reason=$expected_reason"
-            kubectl get events.events.k8s.io -n "$namespace" || true
-            kubectl describe pgr "$policy" || true
-            kubectl -n pgroles-system logs deployment/pgroles-operator --tail=200 || true
-            return 1
-          }
-
-          pg_query() {
-            local db="${2:-postgres}"
-            kubectl exec postgres-0 -- psql -U postgres -d "$db" -tAc "$1"
-          }
-
-          assert_role_exists() {
-            pg_query "SELECT rolname FROM pg_roles WHERE rolname = '$1'" | grep -qx "$1"
-          }
-
-          wait_for_plan_phase() {
-            local plan="$1" expected_phase="$2"
-            for i in $(seq 1 30); do
-              phase="$(kubectl get pgplan "$plan" -o jsonpath='{.status.phase}' 2>/dev/null || true)"
-              if [ "$phase" = "$expected_phase" ]; then
-                echo "Plan $plan reached phase=$expected_phase"
-                return 0
-              fi
-              echo "  Waiting for $plan phase=$expected_phase (current=$phase)... ($i/30)"
-              sleep 3
-            done
-            echo "::error::$plan did not reach phase=$expected_phase within timeout"
-            kubectl get pgplan "$plan" -o yaml || true
-            return 1
-          }
-
-          approve_plan() {
-            local plan="$1"
-            kubectl annotate pgplan "$plan" pgroles.io/approved=true --overwrite
-          }
-
-          reject_plan() {
-            local plan="$1"
-            kubectl annotate pgplan "$plan" pgroles.io/rejected=true --overwrite
-          }
-
-          wait_for_current_plan_ref() {
-            local policy="$1"
-            for i in $(seq 1 30); do
-              local plan_name
-              plan_name="$(kubectl get pgr "$policy" -o jsonpath='{.status.current_plan_ref.name}' 2>/dev/null || true)"
-              if [ -n "$plan_name" ]; then
-                echo "$plan_name"
-                return 0
-              fi
-              echo "  Waiting for $policy currentPlanRef... ($i/30)"
-              sleep 3
-            done
-            echo "::error::$policy did not get currentPlanRef within timeout"
-            return 1
-          }
-
-          get_plan_count() {
-            local policy="$1"
-            kubectl get pgplan -l "pgroles.io/policy=$policy" --no-headers 2>/dev/null | wc -l | tr -d ' '
-          }
+          source scripts/e2e-helpers.sh
 
           # ================================================================
           # Group A: Manual approval flow
@@ -1197,4 +726,4 @@ jobs:
 
       - name: Cleanup
         if: always()
-        run: kind delete cluster --name pgroles-e2e
+        run: kind delete cluster --name pgroles-e2e-plans
