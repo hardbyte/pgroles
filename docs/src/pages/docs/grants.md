@@ -80,6 +80,8 @@ requested type in that schema. That keeps `table`, `view`, and
 `materialized_view` grants scoped correctly instead of letting one subtype
 touch the others.
 
+If a schema has no objects of the declared type (e.g. no sequences yet), the wildcard grant is treated as vacuously satisfied — pgroles will not re-issue the statement on subsequent reconciles. When objects are later added, the next reconcile detects the new objects and applies the appropriate grants.
+
 ### Specific object
 
 ```yaml
