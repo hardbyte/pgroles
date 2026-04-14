@@ -136,7 +136,10 @@ pub async fn create_or_update_plan(
     // 2. Compute SHA-256 hash of the full SQL.
     let sql_hash = compute_sql_hash(&full_sql);
 
-    // 3. Render redacted SQL for display (passwords masked).
+    // 3. Count SQL statements (after wildcard expansion).
+    let sql_statement_count = full_sql.lines().filter(|l| !l.trim().is_empty()).count() as i64;
+
+    // 4. Render redacted SQL for display (passwords masked).
     let redacted_sql = render_redacted_sql(changes, sql_context);
 
     let plans_api: Api<PostgresPolicyPlan> = Api::namespaced(client.clone(), &namespace);
@@ -343,6 +346,7 @@ pub async fn create_or_update_plan(
         sql_hash: Some(sql_hash),
         applying_since: None,
         failed_at: None,
+        sql_statements: Some(sql_statement_count),
     };
 
     let status_patch = serde_json::json!({ "status": plan_status });

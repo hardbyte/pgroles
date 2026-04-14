@@ -780,6 +780,7 @@ pub struct ChangeSummary {
     printcolumn = r#"{"name":"Mode","type":"string","jsonPath":".spec.reconciliationMode"}"#,
     printcolumn = r#"{"name":"Approved","type":"string","jsonPath":".status.conditions[?(@.type==\"Approved\")].status"}"#,
     printcolumn = r#"{"name":"Changes","type":"integer","jsonPath":".status.changeSummary.total"}"#,
+    printcolumn = r#"{"name":"SQL Stmts","type":"integer","jsonPath":".status.sqlStatements","priority":1}"#,
     printcolumn = r#"{"name":"Phase","type":"string","jsonPath":".status.phase"}"#,
     printcolumn = r#"{"name":"SQL","type":"string","jsonPath":".status.sqlRef.name","priority":1}"#,
     printcolumn = r#"{"name":"Hash","type":"string","jsonPath":".status.sqlHash","priority":1}"#,
@@ -848,6 +849,11 @@ pub struct PostgresPolicyPlanStatus {
     /// Timestamp when the plan entered Failed phase (for dedup window).
     #[serde(default)]
     pub failed_at: Option<String>,
+    /// Number of SQL statements in the plan (after wildcard expansion).
+    /// May be significantly larger than `changeSummary.total` when wildcard
+    /// grants expand to many per-object statements.
+    #[serde(default)]
+    pub sql_statements: Option<i64>,
 }
 
 /// Reference to a ConfigMap containing SQL for a plan.

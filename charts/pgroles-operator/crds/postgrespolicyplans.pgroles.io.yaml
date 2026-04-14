@@ -42,6 +42,12 @@
             "type": "integer"
           },
           {
+            "jsonPath": ".status.sqlStatements",
+            "name": "SQL Stmts",
+            "priority": 1,
+            "type": "integer"
+          },
+          {
             "jsonPath": ".status.phase",
             "name": "Phase",
             "type": "string"
@@ -303,6 +309,12 @@
                       "name"
                     ],
                     "type": "object"
+                  },
+                  "sqlStatements": {
+                    "description": "Number of SQL statements in the plan (after wildcard expansion).\nMay be significantly larger than `changeSummary.total` when wildcard\ngrants expand to many per-object statements.",
+                    "format": "int64",
+                    "nullable": true,
+                    "type": "integer"
                   }
                 },
                 "type": "object"
