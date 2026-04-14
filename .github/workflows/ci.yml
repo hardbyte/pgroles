@@ -235,6 +235,27 @@ jobs:
           wait_for_event_reason rotated-secret-policy Recovered
 
           # ----------------------------------------------------------------
+          # Structured params connection mode (#86): create, verify, rotate credentials
+          # ----------------------------------------------------------------
+          upsert_secret params-pg-credentials username=postgres password=devpassword
+          kubectl apply -f k8s/samples/params-e2e-policy.yaml
+          wait_for_ready_true params-e2e-policy
+
+          assert_role_exists params-test-role
+          echo "params-mode: basic reconciliation works"
+
+          # Rotate credential Secret to bad password — should fail to connect
+          upsert_secret params-pg-credentials username=postgres password=wrongpassword
+          wait_for_ready_reason params-e2e-policy DatabaseConnectionFailed
+          echo "params-mode: credential rotation detected (bad password)"
+
+          # Rotate back to correct password — should recover
+          upsert_secret params-pg-credentials username=postgres password=devpassword
+          wait_for_ready_true params-e2e-policy
+          wait_for_event_reason params-e2e-policy Recovered
+          echo "params-mode: credential rotation recovery works"
+
+          # ----------------------------------------------------------------
           # Password lifecycle (#46): create with Secret, verify, rotate
           # ----------------------------------------------------------------
           upsert_secret role-passwords password-user='e2e_initial_pw!'

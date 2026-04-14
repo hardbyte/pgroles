@@ -78,13 +78,168 @@
                   "connection": {
                     "description": "Database connection configuration.",
                     "properties": {
+                      "params": {
+                        "description": "Structured connection parameters. Each field is either a plain string\nor a reference to a Secret key. Mutually exclusive with `secretRef`.",
+                        "nullable": true,
+                        "properties": {
+                          "dbname": {
+                            "description": "Database name as a literal value.",
+                            "nullable": true,
+                            "type": "string"
+                          },
+                          "dbnameSecret": {
+                            "description": "Database name from a Secret key.",
+                            "nullable": true,
+                            "properties": {
+                              "key": {
+                                "description": "Key within the Secret.",
+                                "type": "string"
+                              },
+                              "name": {
+                                "description": "Name of the Secret.",
+                                "type": "string"
+                              }
+                            },
+                            "required": [
+                              "key",
+                              "name"
+                            ],
+                            "type": "object"
+                          },
+                          "host": {
+                            "description": "PostgreSQL host as a literal value.",
+                            "nullable": true,
+                            "type": "string"
+                          },
+                          "hostSecret": {
+                            "description": "PostgreSQL host from a Secret key.",
+                            "nullable": true,
+                            "properties": {
+                              "key": {
+                                "description": "Key within the Secret.",
+                                "type": "string"
+                              },
+                              "name": {
+                                "description": "Name of the Secret.",
+                                "type": "string"
+                              }
+                            },
+                            "required": [
+                              "key",
+                              "name"
+                            ],
+                            "type": "object"
+                          },
+                          "password": {
+                            "description": "Password as a literal value (not recommended for production).",
+                            "nullable": true,
+                            "type": "string"
+                          },
+                          "passwordSecret": {
+                            "description": "Password from a Secret key (recommended).",
+                            "nullable": true,
+                            "properties": {
+                              "key": {
+                                "description": "Key within the Secret.",
+                                "type": "string"
+                              },
+                              "name": {
+                                "description": "Name of the Secret.",
+                                "type": "string"
+                              }
+                            },
+                            "required": [
+                              "key",
+                              "name"
+                            ],
+                            "type": "object"
+                          },
+                          "port": {
+                            "description": "Port as a literal value. Defaults to 5432 if neither port nor portSecret is set.",
+                            "format": "uint16",
+                            "maximum": 65535.0,
+                            "minimum": 0.0,
+                            "nullable": true,
+                            "type": "integer"
+                          },
+                          "portSecret": {
+                            "description": "Port from a Secret key.",
+                            "nullable": true,
+                            "properties": {
+                              "key": {
+                                "description": "Key within the Secret.",
+                                "type": "string"
+                              },
+                              "name": {
+                                "description": "Name of the Secret.",
+                                "type": "string"
+                              }
+                            },
+                            "required": [
+                              "key",
+                              "name"
+                            ],
+                            "type": "object"
+                          },
+                          "sslMode": {
+                            "description": "SSL mode as a literal value.",
+                            "nullable": true,
+                            "type": "string"
+                          },
+                          "sslModeSecret": {
+                            "description": "SSL mode from a Secret key.",
+                            "nullable": true,
+                            "properties": {
+                              "key": {
+                                "description": "Key within the Secret.",
+                                "type": "string"
+                              },
+                              "name": {
+                                "description": "Name of the Secret.",
+                                "type": "string"
+                              }
+                            },
+                            "required": [
+                              "key",
+                              "name"
+                            ],
+                            "type": "object"
+                          },
+                          "username": {
+                            "description": "Username as a literal value.",
+                            "nullable": true,
+                            "type": "string"
+                          },
+                          "usernameSecret": {
+                            "description": "Username from a Secret key.",
+                            "nullable": true,
+                            "properties": {
+                              "key": {
+                                "description": "Key within the Secret.",
+                                "type": "string"
+                              },
+                              "name": {
+                                "description": "Name of the Secret.",
+                                "type": "string"
+                              }
+                            },
+                            "required": [
+                              "key",
+                              "name"
+                            ],
+                            "type": "object"
+                          }
+                        },
+                        "type": "object"
+                      },
                       "secretKey": {
-                        "default": "DATABASE_URL",
-                        "description": "Override the key in the Secret to read. Defaults to `DATABASE_URL`.",
+                        "description": "Key within the Secret to read. Defaults to `DATABASE_URL`.\nOnly used with `secretRef`.",
+                        "nullable": true,
                         "type": "string"
                       },
                       "secretRef": {
-                        "description": "Reference to a Kubernetes Secret containing the connection string.\nThe secret must have a key named `DATABASE_URL`.",
+                        "description": "Reference to a Kubernetes Secret containing a connection URL.\nMutually exclusive with `params`.",
+                        "nullable": true,
                         "properties": {
                           "name": {
                             "description": "Name of the Secret.",
@@ -97,9 +252,6 @@
                         "type": "object"
                       }
                     },
-                    "required": [
-                      "secretRef"
-                    ],
                     "type": "object"
                   },
                   "default_owner": {

@@ -214,10 +214,11 @@ mod tests {
     fn test_policy() -> PostgresPolicy {
         let spec = PostgresPolicySpec {
             connection: ConnectionSpec {
-                secret_ref: SecretReference {
+                secret_ref: Some(SecretReference {
                     name: "db-credentials".to_string(),
-                },
-                secret_key: "DATABASE_URL".to_string(),
+                }),
+                secret_key: Some("DATABASE_URL".to_string()),
+                params: None,
             },
             interval: "5m".to_string(),
             suspend: false,

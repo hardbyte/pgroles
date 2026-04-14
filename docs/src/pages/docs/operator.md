@@ -157,7 +157,7 @@ Scheduled coverage on `main` additionally exercises:
 
 ## Custom resource
 
-A `PostgresPolicy` spec mirrors the CLI manifest format with added Kubernetes-specific fields for connection and scheduling.
+A `PostgresPolicy` spec mirrors the CLI manifest format with added Kubernetes-specific fields for connection and scheduling. The example below uses a connection URL Secret; see [Database connection](#database-connection) for structured parameter support (Zalando, CloudNativePG, PGO).
 
 ```yaml
 apiVersion: pgroles.io/v1alpha1
@@ -222,7 +222,11 @@ spec:
       drop_owned: true
 ```
 
-### Database secret
+### Database connection
+
+The operator supports two connection modes: a single connection URL from a Secret, or structured parameters with separate fields for host, port, database, and credentials.
+
+#### Connection URL (single Secret)
 
 Create a Secret containing your PostgreSQL connection string:
 
@@ -231,7 +235,71 @@ kubectl create secret generic mydb-credentials \
   --from-literal=DATABASE_URL='postgresql://user:password@host:5432/database'
 ```
 
-The operator reads the Secret from the same namespace as the `PostgresPolicy` resource. When the Secret's `resourceVersion` changes (e.g. credential rotation), the operator automatically reconnects with updated credentials.
+Reference it in the policy:
+
+```yaml
+connection:
+  secretRef:
+    name: mydb-credentials
+  secretKey: DATABASE_URL  # optional, defaults to DATABASE_URL
+```
+
+When the Secret's `resourceVersion` changes (e.g. credential rotation), the operator automatically reconnects with updated credentials.
+
+#### Structured parameters
+
+Use `connection.params` to build the connection from individual fields. Each field is either a literal value or a reference to a key in a Kubernetes Secret. This integrates natively with PostgreSQL operators that create credential Secrets (Zalando, CloudNativePG, CrunchyData PGO).
+
+**Zalando postgres-operator** — credentials in a Secret, host/port/database as literals:
+
+```yaml
+connection:
+  params:
+    host: my-cluster-postgres              # K8s service name (namespace-relative)
+    port: 5432
+    dbname: mydb
+    sslMode: require
+    usernameSecret:
+      name: postgres.my-cluster-postgres.credentials.postgresql.acid.zalan.do
+      key: username
+    passwordSecret:
+      name: postgres.my-cluster-postgres.credentials.postgresql.acid.zalan.do
+      key: password
+```
+
+**CloudNativePG / CrunchyData PGO** — all fields from the operator-created Secret:
+
+```yaml
+connection:
+  params:
+    hostSecret:
+      name: cluster-example-app
+      key: host
+    dbnameSecret:
+      name: cluster-example-app
+      key: dbname
+    usernameSecret:
+      name: cluster-example-app
+      key: user
+    passwordSecret:
+      name: cluster-example-app
+      key: password
+```
+
+Each connection field supports a literal value and a `*Secret` variant:
+
+| Field | Literal | Secret | Required |
+|---|---|---|---|
+| `host` / `hostSecret` | Hostname string | SecretKeySelector | Yes (exactly one) |
+| `port` / `portSecret` | Integer (default 5432) | SecretKeySelector | No |
+| `dbname` / `dbnameSecret` | Database name | SecretKeySelector | Yes (exactly one) |
+| `username` / `usernameSecret` | Username string | SecretKeySelector | Yes (exactly one) |
+| `password` / `passwordSecret` | Password string | SecretKeySelector | Yes (exactly one) |
+| `sslMode` / `sslModeSecret` | SSL mode string | SecretKeySelector | No |
+
+Valid `sslMode` values: `disable`, `allow`, `prefer`, `require`, `verify-ca`, `verify-full`.
+
+For required fields, exactly one of the literal or Secret variant must be set. For optional fields, at most one may be set. When a Secret referenced by `params` changes, the operator detects the `resourceVersion` change and reconnects automatically.
 
 ### Role passwords
 
@@ -414,6 +482,7 @@ The operator also emits transition-based Kubernetes Events such as:
 - `PlanClean`
 - `DatabaseConnectionFailed`
 - `InsufficientPrivileges`
+- `InvalidConnectionParams`
 - `MissingDatabaseObject`
 - `UnsafeRoleDropsBlocked`
 

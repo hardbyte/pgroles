@@ -368,6 +368,8 @@ fn retry_class_for_reconcile_error(error: &ReconcileError) -> RetryClass {
                 }
             }
             ContextError::DatabaseConnect { .. } => RetryClass::Transient,
+            ContextError::EmptyResolvedValue { .. }
+            | ContextError::InvalidResolvedSslMode { .. } => RetryClass::Slow,
         },
         ReconcileError::Inspect(error) => {
             if inspect_error_is_non_transient(error) {
@@ -520,11 +522,7 @@ async fn reconcile_apply(
 
     // Derive database identity early so we can acquire the in-process lock.
     let namespace = resource.namespace().ok_or(ReconcileError::NoNamespace)?;
-    let identity = DatabaseIdentity::new(
-        &namespace,
-        &resource.spec.connection.secret_ref.name,
-        &resource.spec.connection.secret_key,
-    );
+    let identity = DatabaseIdentity::from_connection(&namespace, &resource.spec.connection);
 
     // Acquire in-process lock for this database target.
     let _db_lock = match ctx.try_lock_database(identity.as_str()).await {
@@ -655,6 +653,8 @@ async fn reconcile_apply_inner(
     })
     .await?;
 
+    spec.validate_connection_spec()
+        .map_err(|err| ReconcileError::InvalidSpec(err.to_string()))?;
     spec.validate_password_specs(&name)
         .map_err(|err| ReconcileError::InvalidSpec(err.to_string()))?;
 
@@ -707,11 +707,7 @@ async fn reconcile_apply_inner(
 
     // 4. Get a database pool.
     let pool = ctx
-        .get_or_create_pool(
-            &namespace,
-            &spec.connection.secret_ref.name,
-            &spec.connection.secret_key,
-        )
+        .get_or_create_pool(&namespace, &spec.connection)
         .await
         .map_err(Box::new)?;
 
@@ -1738,13 +1734,8 @@ async fn reconcile_cleanup(
 
     info!(name, namespace, "cleaning up (resource deleted)");
 
-    // Evict any cached pool for this resource's secret.
-    ctx.evict_pool(
-        &namespace,
-        &resource.spec.connection.secret_ref.name,
-        &resource.spec.connection.secret_key,
-    )
-    .await;
+    // Evict any cached pool for this resource's connection.
+    ctx.evict_pool(&namespace, &resource.spec.connection).await;
 
     // Note: we do NOT revoke grants on deletion. The resource being deleted
     // means the user no longer wants pgroles to manage these roles — it does
@@ -1981,11 +1972,7 @@ fn detect_policy_conflict_in_list(
             continue;
         }
 
-        let other_identity = DatabaseIdentity::new(
-            &other_ns,
-            &other.spec.connection.secret_ref.name,
-            &other.spec.connection.secret_key,
-        );
+        let other_identity = DatabaseIdentity::from_connection(&other_ns, &other.spec.connection);
         if &other_identity != identity {
             continue;
         }
@@ -2041,6 +2028,8 @@ impl ReconcileError {
                 ContextError::SecretFetch { .. } => "SecretFetchFailed",
                 ContextError::SecretMissing { .. } => "SecretMissing",
                 ContextError::DatabaseConnect { .. } => "DatabaseConnectionFailed",
+                ContextError::EmptyResolvedValue { .. } => "InvalidConnectionParams",
+                ContextError::InvalidResolvedSslMode { .. } => "InvalidConnectionParams",
             },
             ReconcileError::Inspect(error) => match error {
                 pgroles_inspect::InspectError::Database(sql_err) => {
@@ -2171,10 +2160,11 @@ mod tests {
     fn test_policy(interval: &str, transient_failure_count: i32) -> Arc<PostgresPolicy> {
         let spec = PostgresPolicySpec {
             connection: ConnectionSpec {
-                secret_ref: SecretReference {
+                secret_ref: Some(SecretReference {
                     name: "db-credentials".to_string(),
-                },
-                secret_key: "DATABASE_URL".to_string(),
+                }),
+                secret_key: Some("DATABASE_URL".to_string()),
+                params: None,
             },
             interval: interval.to_string(),
             suspend: false,
@@ -2210,10 +2200,11 @@ mod tests {
             name,
             PostgresPolicySpec {
                 connection: ConnectionSpec {
-                    secret_ref: SecretReference {
+                    secret_ref: Some(SecretReference {
                         name: secret_name.to_string(),
-                    },
-                    secret_key: "DATABASE_URL".to_string(),
+                    }),
+                    secret_key: Some("DATABASE_URL".to_string()),
+                    params: None,
                 },
                 interval: "5m".to_string(),
                 suspend: false,
@@ -2250,10 +2241,11 @@ mod tests {
             name,
             PostgresPolicySpec {
                 connection: ConnectionSpec {
-                    secret_ref: SecretReference {
+                    secret_ref: Some(SecretReference {
                         name: secret_name.to_string(),
-                    },
-                    secret_key: "DATABASE_URL".to_string(),
+                    }),
+                    secret_key: Some("DATABASE_URL".to_string()),
+                    params: None,
                 },
                 interval: "5m".to_string(),
                 suspend: false,
@@ -2282,10 +2274,11 @@ mod tests {
             "password-policy",
             PostgresPolicySpec {
                 connection: ConnectionSpec {
-                    secret_ref: SecretReference {
+                    secret_ref: Some(SecretReference {
                         name: "db-credentials".to_string(),
-                    },
-                    secret_key: "DATABASE_URL".to_string(),
+                    }),
+                    secret_key: Some("DATABASE_URL".to_string()),
+                    params: None,
                 },
                 interval: "5m".to_string(),
                 suspend: false,
@@ -3124,6 +3117,45 @@ mod tests {
     }
 
     #[test]
+    fn retry_classifies_empty_resolved_value_as_slow() {
+        let error = finalizer::Error::ApplyFailed(ReconcileError::Context(Box::new(
+            crate::context::ContextError::EmptyResolvedValue {
+                field: "password".to_string(),
+            },
+        )));
+        assert_eq!(retry_class(&error), RetryClass::Slow);
+    }
+
+    #[test]
+    fn error_reason_empty_resolved_value() {
+        let err =
+            ReconcileError::Context(Box::new(crate::context::ContextError::EmptyResolvedValue {
+                field: "host".to_string(),
+            }));
+        assert_eq!(err.reason(), "InvalidConnectionParams");
+    }
+
+    #[test]
+    fn retry_classifies_invalid_resolved_ssl_mode_as_slow() {
+        let error = finalizer::Error::ApplyFailed(ReconcileError::Context(Box::new(
+            crate::context::ContextError::InvalidResolvedSslMode {
+                value: "bogus".to_string(),
+            },
+        )));
+        assert_eq!(retry_class(&error), RetryClass::Slow);
+    }
+
+    #[test]
+    fn error_reason_invalid_resolved_ssl_mode() {
+        let err = ReconcileError::Context(Box::new(
+            crate::context::ContextError::InvalidResolvedSslMode {
+                value: "bogus".to_string(),
+            },
+        ));
+        assert_eq!(err.reason(), "InvalidConnectionParams");
+    }
+
+    #[test]
     fn error_reason_sql_exec_transient_is_apply_failed() {
         let err = ReconcileError::SqlExec(transient_sqlx_error());
         assert_eq!(err.reason(), "ApplyFailed");
@@ -3311,7 +3343,7 @@ mod tests {
     #[test]
     fn conflict_detection_ignores_invalid_peer_policies() {
         let resource = valid_role_policy("valid-policy", "analytics", "shared-db-secret");
-        let identity = DatabaseIdentity::new("default", "shared-db-secret", "DATABASE_URL");
+        let identity = DatabaseIdentity::from_connection("default", &resource.spec.connection);
         let ownership = resource.spec.ownership_claims().unwrap();
         let invalid_peer = invalid_profile_policy("invalid-peer", "shared-db-secret");
 
@@ -3549,7 +3581,7 @@ mod tests {
     #[test]
     fn conflict_detection_still_reports_overlapping_valid_peers() {
         let resource = valid_role_policy("valid-policy", "analytics", "shared-db-secret");
-        let identity = DatabaseIdentity::new("default", "shared-db-secret", "DATABASE_URL");
+        let identity = DatabaseIdentity::from_connection("default", &resource.spec.connection);
         let ownership = resource.spec.ownership_claims().unwrap();
         let overlapping_peer =
             valid_role_policy("overlapping-peer", "analytics", "shared-db-secret");

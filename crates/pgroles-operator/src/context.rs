@@ -9,6 +9,7 @@ use std::time::Duration;
 use sqlx::postgres::{PgPool, PgPoolOptions};
 use tokio::sync::{Mutex, RwLock};
 
+use crate::crd::{ConnectionSpec, SecretKeySelector};
 use crate::observability::OperatorObservability;
 
 /// Minimum pool size required for reconciliation.
@@ -26,6 +27,8 @@ const _: () = assert!(POOL_MAX_CONNECTIONS >= 2);
 #[derive(Clone)]
 struct CachedPool {
     resource_version: Option<String>,
+    /// Fingerprint of all referenced secrets' resourceVersions (params mode).
+    secret_fingerprint: Option<String>,
     pool: PgPool,
 }
 
@@ -134,61 +137,216 @@ impl OperatorContext {
         })
     }
 
-    /// Get or create a PgPool for the given secret reference.
+    /// Resolve a param from either its literal value or a Secret reference.
     ///
-    /// Reads the `DATABASE_URL` (or custom key) from the referenced Secret,
+    /// Returns `Ok(Some(value))` if one is set, `Ok(None)` if neither is set.
+    async fn resolve_param(
+        &self,
+        namespace: &str,
+        literal: &Option<String>,
+        secret: &Option<SecretKeySelector>,
+    ) -> Result<Option<String>, ContextError> {
+        if let Some(val) = literal {
+            return Ok(Some(val.clone()));
+        }
+        if let Some(sel) = secret {
+            return Ok(Some(
+                self.fetch_secret_value(namespace, &sel.name, &sel.key)
+                    .await?,
+            ));
+        }
+        Ok(None)
+    }
+
+    /// Resolve a [`ConnectionSpec`] into a PostgreSQL connection URL string.
+    ///
+    /// - **URL mode** (`secret_ref` is Some): reads the Secret key as a connection URL.
+    /// - **Params mode** (`params` is Some): resolves each field and constructs a URL.
+    pub async fn resolve_connection_url(
+        &self,
+        namespace: &str,
+        connection: &ConnectionSpec,
+    ) -> Result<String, ContextError> {
+        if let Some(ref secret_ref) = connection.secret_ref {
+            // URL mode — read the full connection URL from the Secret.
+            self.fetch_secret_value(
+                namespace,
+                &secret_ref.name,
+                connection.effective_secret_key(),
+            )
+            .await
+        } else if let Some(ref params) = connection.params {
+            // Params mode — resolve each field and build the URL.
+            let host = self
+                .resolve_param(namespace, &params.host, &params.host_secret)
+                .await?
+                .ok_or_else(|| ContextError::EmptyResolvedValue {
+                    field: "host".to_string(),
+                })?;
+            if host.trim().is_empty() {
+                return Err(ContextError::EmptyResolvedValue {
+                    field: "host".to_string(),
+                });
+            }
+
+            let port_str = params.port.map(|p| p.to_string());
+            let port = self
+                .resolve_param(namespace, &port_str, &params.port_secret)
+                .await?
+                .unwrap_or_else(|| "5432".to_string());
+            if port.trim().is_empty() {
+                return Err(ContextError::EmptyResolvedValue {
+                    field: "port".to_string(),
+                });
+            }
+
+            let dbname = self
+                .resolve_param(namespace, &params.dbname, &params.dbname_secret)
+                .await?
+                .ok_or_else(|| ContextError::EmptyResolvedValue {
+                    field: "dbname".to_string(),
+                })?;
+            if dbname.trim().is_empty() {
+                return Err(ContextError::EmptyResolvedValue {
+                    field: "dbname".to_string(),
+                });
+            }
+
+            let username = self
+                .resolve_param(namespace, &params.username, &params.username_secret)
+                .await?
+                .ok_or_else(|| ContextError::EmptyResolvedValue {
+                    field: "username".to_string(),
+                })?;
+            if username.trim().is_empty() {
+                return Err(ContextError::EmptyResolvedValue {
+                    field: "username".to_string(),
+                });
+            }
+
+            let password = self
+                .resolve_param(namespace, &params.password, &params.password_secret)
+                .await?
+                .ok_or_else(|| ContextError::EmptyResolvedValue {
+                    field: "password".to_string(),
+                })?;
+            if password.trim().is_empty() {
+                return Err(ContextError::EmptyResolvedValue {
+                    field: "password".to_string(),
+                });
+            }
+
+            use percent_encoding::{NON_ALPHANUMERIC, utf8_percent_encode};
+            let encoded_username = utf8_percent_encode(&username, NON_ALPHANUMERIC).to_string();
+            let encoded_password = utf8_percent_encode(&password, NON_ALPHANUMERIC).to_string();
+
+            let mut url = format!(
+                "postgresql://{encoded_username}:{encoded_password}@{host}:{port}/{dbname}"
+            );
+
+            if let Some(ssl_mode) = self
+                .resolve_param(namespace, &params.ssl_mode, &params.ssl_mode_secret)
+                .await?
+            {
+                // Validate sslMode at runtime — CRD validation only catches
+                // literal values; a secret ref could resolve to anything.
+                if !crate::crd::VALID_SSL_MODES.contains(&ssl_mode.as_str()) {
+                    return Err(ContextError::InvalidResolvedSslMode { value: ssl_mode });
+                }
+                url.push_str("?sslmode=");
+                url.push_str(&ssl_mode);
+            }
+
+            Ok(url)
+        } else {
+            Err(ContextError::SecretMissing {
+                name: "connection".to_string(),
+                key: "neither secretRef nor params is set".to_string(),
+            })
+        }
+    }
+
+    /// Get or create a PgPool for the given connection spec.
+    ///
+    /// Resolves the connection URL from the referenced Secret(s),
     /// and caches the resulting pool for reuse.
     pub async fn get_or_create_pool(
         &self,
         namespace: &str,
-        secret_name: &str,
-        secret_key: &str,
+        connection: &ConnectionSpec,
     ) -> Result<PgPool, ContextError> {
-        let cache_key = format!("{namespace}/{secret_name}/{secret_key}");
+        let cache_key = connection.cache_key(namespace);
 
-        // Fetch secret from k8s API.
-        let secrets_api: kube::Api<k8s_openapi::api::core::v1::Secret> =
-            kube::Api::namespaced(self.kube_client.clone(), namespace);
-
-        let secret =
-            secrets_api
-                .get(secret_name)
-                .await
-                .map_err(|err| ContextError::SecretFetch {
-                    name: secret_name.to_string(),
-                    namespace: namespace.to_string(),
-                    source: err,
+        // For URL mode, we can do resource-version-based cache invalidation.
+        // For params mode, compute a fingerprint from all referenced secrets'
+        // resourceVersions so that secret rotations invalidate the cache.
+        let (resource_version, secret_fingerprint) =
+            if let Some(ref secret_ref) = connection.secret_ref {
+                let secrets_api: kube::Api<k8s_openapi::api::core::v1::Secret> =
+                    kube::Api::namespaced(self.kube_client.clone(), namespace);
+                let secret = secrets_api.get(&secret_ref.name).await.map_err(|err| {
+                    ContextError::SecretFetch {
+                        name: secret_ref.name.clone(),
+                        namespace: namespace.to_string(),
+                        source: err,
+                    }
                 })?;
+                (secret.metadata.resource_version, None)
+            } else if connection.params.is_some() {
+                // Params mode — collect all referenced secret names and fetch their
+                // resourceVersions to build a fingerprint.
+                let mut secret_names = std::collections::BTreeSet::new();
+                connection.collect_secret_names(&mut secret_names);
 
-        let resource_version = secret.metadata.resource_version.clone();
+                if secret_names.is_empty() {
+                    // All values are literals — no secrets to watch.
+                    (None, Some(String::new()))
+                } else {
+                    let secrets_api: kube::Api<k8s_openapi::api::core::v1::Secret> =
+                        kube::Api::namespaced(self.kube_client.clone(), namespace);
+                    let mut fingerprint_parts = Vec::new();
+                    for name in &secret_names {
+                        let secret = secrets_api.get(name).await.map_err(|err| {
+                            ContextError::SecretFetch {
+                                name: name.clone(),
+                                namespace: namespace.to_string(),
+                                source: err,
+                            }
+                        })?;
+                        let rv = secret
+                            .metadata
+                            .resource_version
+                            .unwrap_or_else(|| "unknown".to_string());
+                        fingerprint_parts.push(format!("{name}={rv}"));
+                    }
+                    (None, Some(fingerprint_parts.join(",")))
+                }
+            } else {
+                (None, None)
+            };
 
-        // Check cache after reading the current Secret version.
+        // Check cache.
         {
             let cache = self.pool_cache.read().await;
-            if let Some(cached) = cache.get(&cache_key)
-                && cached.resource_version == resource_version
-            {
-                return Ok(cached.pool.clone());
+            if let Some(cached) = cache.get(&cache_key) {
+                // URL mode: reuse if the Secret's resource_version matches.
+                // Params mode: reuse if the secret fingerprint matches.
+                let version_matches = match (&resource_version, &cached.resource_version) {
+                    (Some(current), Some(cached_rv)) => current == cached_rv,
+                    _ => true,
+                };
+                let fingerprint_matches = match (&secret_fingerprint, &cached.secret_fingerprint) {
+                    (Some(current), Some(cached_fp)) => current == cached_fp,
+                    (None, None) => true,
+                    _ => false,
+                };
+                if version_matches && fingerprint_matches {
+                    return Ok(cached.pool.clone());
+                }
             }
         }
 
-        let data = secret.data.ok_or_else(|| ContextError::SecretMissing {
-            name: secret_name.to_string(),
-            key: secret_key.to_string(),
-        })?;
-
-        let url_bytes = data
-            .get(secret_key)
-            .ok_or_else(|| ContextError::SecretMissing {
-                name: secret_name.to_string(),
-                key: secret_key.to_string(),
-            })?;
-
-        let database_url =
-            String::from_utf8(url_bytes.0.clone()).map_err(|_| ContextError::SecretMissing {
-                name: secret_name.to_string(),
-                key: secret_key.to_string(),
-            })?;
+        let database_url = self.resolve_connection_url(namespace, connection).await?;
 
         // Create pool with explicit sizing. Reconciliation holds one dedicated
         // connection for PostgreSQL advisory locking and needs additional pool
@@ -207,6 +365,7 @@ impl OperatorContext {
                 cache_key,
                 CachedPool {
                     resource_version,
+                    secret_fingerprint,
                     pool: pool.clone(),
                 },
             );
@@ -256,8 +415,8 @@ impl OperatorContext {
     }
 
     /// Remove a cached pool (e.g. when secret changes or CR is deleted).
-    pub async fn evict_pool(&self, namespace: &str, secret_name: &str, secret_key: &str) {
-        let cache_key = format!("{namespace}/{secret_name}/{secret_key}");
+    pub async fn evict_pool(&self, namespace: &str, connection: &ConnectionSpec) {
+        let cache_key = connection.cache_key(namespace);
         let mut cache = self.pool_cache.write().await;
         cache.remove(&cache_key);
     }
@@ -278,6 +437,14 @@ pub enum ContextError {
 
     #[error("failed to connect to database: {source}")]
     DatabaseConnect { source: sqlx::Error },
+
+    #[error("connection param \"{field}\" resolved to an empty or whitespace-only value")]
+    EmptyResolvedValue { field: String },
+
+    #[error(
+        "connection param sslMode resolved to invalid value \"{value}\" (expected one of: disable, allow, prefer, require, verify-ca, verify-full)"
+    )]
+    InvalidResolvedSslMode { value: String },
 }
 
 impl ContextError {
