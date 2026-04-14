@@ -222,15 +222,30 @@ fn normalize_wildcard_grants(
     wildcard_grants: &[WildcardGrantPattern],
 ) -> BTreeMap<GrantKey, GrantState> {
     for wildcard in wildcard_grants {
-        let Some(object_names) = inventory.get(&(wildcard.object_type, wildcard.schema.clone()))
-        else {
-            continue;
-        };
+        let object_names = inventory.get(&(wildcard.object_type, wildcard.schema.clone()));
 
-        if object_names.is_empty() {
+        // When no objects of this type exist in the schema, the wildcard grant
+        // is vacuously satisfied — all zero objects have the requested
+        // privileges. Insert the wildcard key with the exact desired privileges
+        // so the diff engine sees parity and does not re-issue
+        // `GRANT ... ON ALL <type> IN SCHEMA` on every reconcile.
+        if object_names.is_none() || object_names.is_some_and(|names| names.is_empty()) {
+            let wildcard_key = GrantKey {
+                role: wildcard.role.clone(),
+                object_type: wildcard.object_type,
+                schema: Some(wildcard.schema.clone()),
+                name: Some("*".to_string()),
+            };
+            grants.insert(
+                wildcard_key,
+                GrantState {
+                    privileges: wildcard.privileges.clone(),
+                },
+            );
             continue;
         }
 
+        let object_names = object_names.unwrap();
         let mut shared_privileges = all_privileges();
 
         for object_name in object_names {
@@ -623,6 +638,12 @@ mod tests {
             role: "inventory-editor".to_string(),
             object_type: ObjectType::Table,
             schema: "inventory".to_string(),
+            privileges: BTreeSet::from([
+                Privilege::Select,
+                Privilege::Insert,
+                Privilege::Update,
+                Privilege::Delete,
+            ]),
         }];
 
         let normalized = normalize_wildcard_grants(grants, &inventory, &selectors);
@@ -646,5 +667,137 @@ mod tests {
             })
             .expect("extra object-specific privileges should remain");
         assert_eq!(specific.privileges, BTreeSet::from([Privilege::Insert]));
+    }
+
+    #[test]
+    fn normalize_wildcard_empty_inventory_inserts_vacuous_wildcard() {
+        // When no objects of the wildcard type exist in the schema, the
+        // normalizer should insert a wildcard key with all privileges so
+        // the diff sees the desired wildcard as already satisfied.
+        let grants = BTreeMap::new();
+        let inventory = BTreeMap::new(); // empty — no sequences in "accounts"
+
+        let desired_privs =
+            BTreeSet::from([Privilege::Select, Privilege::Update, Privilege::Usage]);
+        let wildcards = vec![WildcardGrantPattern {
+            role: "accounts-editor".to_string(),
+            object_type: ObjectType::Sequence,
+            schema: "accounts".to_string(),
+            privileges: desired_privs.clone(),
+        }];
+
+        let result = normalize_wildcard_grants(grants, &inventory, &wildcards);
+
+        let wildcard_key = GrantKey {
+            role: "accounts-editor".to_string(),
+            object_type: ObjectType::Sequence,
+            schema: Some("accounts".to_string()),
+            name: Some("*".to_string()),
+        };
+
+        let entry = result
+            .get(&wildcard_key)
+            .expect("vacuous wildcard should be present");
+        assert_eq!(
+            entry.privileges, desired_privs,
+            "vacuous wildcard should have the desired privileges"
+        );
+    }
+
+    #[test]
+    fn normalize_wildcard_empty_set_in_inventory_inserts_vacuous_wildcard() {
+        // Same as above but the inventory has the key with an empty set.
+        let grants = BTreeMap::new();
+        let mut inventory: BTreeMap<(ObjectType, String), BTreeSet<String>> = BTreeMap::new();
+        inventory.insert(
+            (ObjectType::Function, "accounts".to_string()),
+            BTreeSet::new(),
+        );
+
+        let wildcards = vec![WildcardGrantPattern {
+            role: "accounts-editor".to_string(),
+            object_type: ObjectType::Function,
+            schema: "accounts".to_string(),
+            privileges: BTreeSet::from([Privilege::Execute]),
+        }];
+
+        let result = normalize_wildcard_grants(grants, &inventory, &wildcards);
+
+        let wildcard_key = GrantKey {
+            role: "accounts-editor".to_string(),
+            object_type: ObjectType::Function,
+            schema: Some("accounts".to_string()),
+            name: Some("*".to_string()),
+        };
+
+        assert!(
+            result.contains_key(&wildcard_key),
+            "vacuous wildcard should be present for empty object set"
+        );
+    }
+
+    #[test]
+    fn normalize_wildcard_nonempty_inventory_still_collapses() {
+        // Ensure the existing behavior for non-empty inventories is preserved.
+        let mut grants = BTreeMap::new();
+        grants.insert(
+            GrantKey {
+                role: "app".to_string(),
+                object_type: ObjectType::Sequence,
+                schema: Some("public".to_string()),
+                name: Some("seq1".to_string()),
+            },
+            GrantState {
+                privileges: BTreeSet::from([Privilege::Select, Privilege::Usage]),
+            },
+        );
+        grants.insert(
+            GrantKey {
+                role: "app".to_string(),
+                object_type: ObjectType::Sequence,
+                schema: Some("public".to_string()),
+                name: Some("seq2".to_string()),
+            },
+            GrantState {
+                privileges: BTreeSet::from([
+                    Privilege::Select,
+                    Privilege::Usage,
+                    Privilege::Update,
+                ]),
+            },
+        );
+
+        let mut inventory: BTreeMap<(ObjectType, String), BTreeSet<String>> = BTreeMap::new();
+        inventory.insert(
+            (ObjectType::Sequence, "public".to_string()),
+            BTreeSet::from(["seq1".to_string(), "seq2".to_string()]),
+        );
+
+        let wildcards = vec![WildcardGrantPattern {
+            role: "app".to_string(),
+            object_type: ObjectType::Sequence,
+            schema: "public".to_string(),
+            privileges: BTreeSet::from([Privilege::Select, Privilege::Update, Privilege::Usage]),
+        }];
+
+        let result = normalize_wildcard_grants(grants, &inventory, &wildcards);
+
+        let wildcard_key = GrantKey {
+            role: "app".to_string(),
+            object_type: ObjectType::Sequence,
+            schema: Some("public".to_string()),
+            name: Some("*".to_string()),
+        };
+
+        let entry = result
+            .get(&wildcard_key)
+            .expect("wildcard should be present");
+        // shared privileges are Select + Usage (the intersection)
+        assert!(entry.privileges.contains(&Privilege::Select));
+        assert!(entry.privileges.contains(&Privilege::Usage));
+        assert!(
+            !entry.privileges.contains(&Privilege::Update),
+            "Update is not shared across all sequences"
+        );
     }
 }
