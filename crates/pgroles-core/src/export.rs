@@ -119,8 +119,8 @@ pub fn role_graph_to_manifest(graph: &RoleGraph) -> PolicyManifest {
             .or_default()
             .push(MemberSpec {
                 name: edge.member.clone(),
-                inherit: edge.inherit,
-                admin: edge.admin,
+                inherit: if edge.inherit { None } else { Some(false) },
+                admin: if edge.admin { Some(true) } else { None },
             });
     }
     let memberships: Vec<Membership> = membership_map

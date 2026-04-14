@@ -23,8 +23,10 @@ memberships:
 | Field | Default | Description |
 |---|---|---|
 | `name` | *required* | The member role name |
-| `inherit` | `true` | Whether the member inherits the role's privileges |
-| `admin` | `false` | Whether the member can grant the role to others |
+| `inherit` | `true` | Whether the member inherits the role's privileges (omit for default) |
+| `admin` | `false` | Whether the member can grant the role to others (omit for default) |
+
+Both `inherit` and `admin` can be omitted entirely — they default to `true` and `false` respectively. Omitting default values is recommended because it keeps the Kubernetes resource minimal and avoids perpetual diffs in GitOps tools like ArgoCD.
 
 ## Generated SQL
 

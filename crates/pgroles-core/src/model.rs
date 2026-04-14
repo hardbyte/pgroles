@@ -275,8 +275,8 @@ impl RoleGraph {
                 graph.memberships.insert(MembershipEdge {
                     role: membership.role.clone(),
                     member: member_spec.name.clone(),
-                    inherit: member_spec.inherit,
-                    admin: member_spec.admin,
+                    inherit: member_spec.inherit(),
+                    admin: member_spec.admin(),
                 });
             }
         }
