@@ -268,35 +268,45 @@ impl ConnectionSpec {
     ///
     /// Uses `\0` as field separator since null bytes cannot appear in K8s names
     /// or secret values, avoiding ambiguity from colons in literal values.
+    /// Deterministic identity key for per-database locking and conflict detection.
+    ///
+    /// Identifies the target database (host + port + dbname) but NOT the
+    /// credentials. Two policies targeting the same database with different
+    /// users should still be considered as targeting the same database for
+    /// locking and overlap checks.
     pub fn identity_key(&self) -> String {
         if let Some(ref secret_ref) = self.secret_ref {
             format!("{}/{}", secret_ref.name, self.effective_secret_key())
         } else if let Some(ref params) = self.params {
-            format!(
-                "params\0{}\0{}\0{}\0{}",
-                field_identity_repr(&params.host, &params.host_secret),
-                field_identity_repr(&params.dbname, &params.dbname_secret),
-                field_identity_repr(&params.username, &params.username_secret),
-                params
-                    .port
-                    .as_ref()
-                    .map(|p| format!("literal={p}"))
-                    .or_else(|| params
+            let port_part = params
+                .port
+                .as_ref()
+                .map(|p| format!("literal={p}"))
+                .or_else(|| {
+                    params
                         .port_secret
                         .as_ref()
-                        .map(|s| format!("secret={}\0{}", s.name, s.key)))
-                    .unwrap_or_else(|| "5432".to_string()),
+                        .map(|s| format!("secret={}\0{}", s.name, s.key))
+                })
+                .unwrap_or_else(|| "5432".to_string());
+            format!(
+                "params\0{}\0{}\0{}",
+                field_identity_repr(&params.host, &params.host_secret),
+                field_identity_repr(&params.dbname, &params.dbname_secret),
+                port_part,
             )
         } else {
-            // Fallback for invalid specs (missing both modes).
             "invalid-connection".to_string()
         }
     }
 
-    /// Cache key for pool lookup. Includes all params (identity + sslMode + password)
-    /// so that any configuration change invalidates the cached pool.
+    /// Cache key for pool lookup. Includes ALL connection params so that any
+    /// configuration change (credentials, sslMode, host, etc.) invalidates
+    /// the cached pool. This is strictly more specific than `identity_key`.
     pub fn cache_key(&self, namespace: &str) -> String {
         if let Some(ref params) = self.params {
+            let user_part = field_identity_repr(&params.username, &params.username_secret);
+            let pass_part = field_identity_repr(&params.password, &params.password_secret);
             let ssl_part = params
                 .ssl_mode
                 .as_ref()
@@ -308,7 +318,10 @@ impl ConnectionSpec {
                         .map(|s| format!("secret={}\0{}", s.name, s.key))
                 })
                 .unwrap_or_default();
-            format!("{namespace}/{}\0ssl={ssl_part}", self.identity_key())
+            format!(
+                "{namespace}/{}\0user={user_part}\0pass={pass_part}\0ssl={ssl_part}",
+                self.identity_key()
+            )
         } else {
             format!("{namespace}/{}", self.identity_key())
         }
@@ -1632,9 +1645,63 @@ mod tests {
     }
 
     #[test]
-    fn identity_key_no_collision_between_literal_and_secret() {
-        // A literal value containing "secret=" should not collide with a
-        // real secret reference.
+    fn identity_key_same_database_different_users_are_equal() {
+        // Two policies targeting the same database but with different users
+        // should have the SAME identity key (for locking/conflict detection).
+        let user_a = ConnectionSpec {
+            secret_ref: None,
+            secret_key: None,
+            params: Some(ConnectionParams {
+                host: Some("my-host".into()),
+                host_secret: None,
+                port: None,
+                port_secret: None,
+                dbname: Some("mydb".into()),
+                dbname_secret: None,
+                username: Some("alice".into()),
+                username_secret: None,
+                password: Some("pass-a".into()),
+                password_secret: None,
+                ssl_mode: None,
+                ssl_mode_secret: None,
+            }),
+        };
+        let user_b = ConnectionSpec {
+            secret_ref: None,
+            secret_key: None,
+            params: Some(ConnectionParams {
+                host: Some("my-host".into()),
+                host_secret: None,
+                port: None,
+                port_secret: None,
+                dbname: Some("mydb".into()),
+                dbname_secret: None,
+                username: Some("bob".into()),
+                username_secret: None,
+                password: Some("pass-b".into()),
+                password_secret: None,
+                ssl_mode: None,
+                ssl_mode_secret: None,
+            }),
+        };
+
+        assert_eq!(
+            user_a.identity_key(),
+            user_b.identity_key(),
+            "same database with different users should have the same identity key"
+        );
+        // But cache keys should differ (different credentials = different pool).
+        assert_ne!(
+            user_a.cache_key("default"),
+            user_b.cache_key("default"),
+            "different credentials should produce different cache keys"
+        );
+    }
+
+    #[test]
+    fn cache_key_no_collision_between_literal_and_secret_username() {
+        // A literal username containing "secret=" should not collide with a
+        // real secret reference in the cache key.
         let literal_conn = ConnectionSpec {
             secret_ref: None,
             secret_key: None,
@@ -1676,9 +1743,9 @@ mod tests {
         };
 
         assert_ne!(
-            literal_conn.identity_key(),
-            secret_conn.identity_key(),
-            "literal and secret ref should produce different identity keys"
+            literal_conn.cache_key("default"),
+            secret_conn.cache_key("default"),
+            "literal and secret ref should produce different cache keys"
         );
     }
 
