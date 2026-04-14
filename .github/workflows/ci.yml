@@ -168,10 +168,6 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
-      - uses: dtolnay/rust-toolchain@stable
-
-      - uses: Swatinem/rust-cache@v2
-
       - uses: ./.github/actions/setup-e2e
         with:
           cluster-name: pgroles-e2e-operator
@@ -338,10 +334,6 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
-      - uses: dtolnay/rust-toolchain@stable
-
-      - uses: Swatinem/rust-cache@v2
-
       - uses: ./.github/actions/setup-e2e
         with:
           cluster-name: pgroles-e2e-load
@@ -403,10 +395,6 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
-
-      - uses: dtolnay/rust-toolchain@stable
-
-      - uses: Swatinem/rust-cache@v2
 
       - uses: ./.github/actions/setup-e2e
         with:
@@ -583,12 +571,19 @@ jobs:
                 login: true
           EOF
 
-          # Wait for the new plan to appear
-          sleep 10
-          second_plan=$(wait_for_current_plan_ref supersede-test)
+          # Wait for currentPlanRef to change (not just exist)
+          second_plan=""
+          for i in $(seq 1 30); do
+            second_plan="$(kubectl get pgr supersede-test -o jsonpath='{.status.current_plan_ref.name}' 2>/dev/null || true)"
+            if [ -n "$second_plan" ] && [ "$second_plan" != "$first_plan" ]; then
+              break
+            fi
+            echo "Waiting for supersede-test currentPlanRef to change... ($i/30)"
+            sleep 3
+          done
           echo "Second plan: $second_plan"
 
-          if [ "$first_plan" = "$second_plan" ]; then
+          if [ -z "$second_plan" ] || [ "$first_plan" = "$second_plan" ]; then
             echo "::error::Expected a new plan after policy change"
             exit 1
           fi
@@ -632,13 +627,12 @@ jobs:
 
           # Delete the policy - plans should be GC'd via ownerReferences
           kubectl delete pgr cleanup-test --wait=true
-          sleep 5
 
-          # Verify plan was cleaned up
-          if kubectl get pgplan "$plan_name" 2>/dev/null; then
+          # Wait for GC to clean up the plan (async via ownerReferences)
+          kubectl wait --for=delete "pgplan/${plan_name}" --timeout=30s || {
             echo "::error::Plan $plan_name should have been garbage collected"
             exit 1
-          fi
+          }
           echo "Plan garbage collected after policy deletion"
 
           # ================================================================
