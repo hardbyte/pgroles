@@ -313,6 +313,19 @@ Current behavior:
 
 This is the expected state when the database credential is valid but under-privileged for the requested manifest.
 
+### Missing database object
+
+If the policy references a schema, table, function, or other database object that does not exist in the target database, the operator sets a non-ready state instead of hot-looping. This catches common misconfigurations like a policy declaring a schema that hasn't been created, or being pointed at the wrong database.
+
+Current behavior:
+
+- `Ready=False`
+- reason `MissingDatabaseObject`
+- `last_error` contains the PostgreSQL error message, for example `schema "etl" does not exist`
+- the policy retries on its normal reconcile interval rather than exponential transient backoff
+
+Covered PostgreSQL error codes: `3F000` (invalid_schema_name), `42P01` (undefined_table), `42883` (undefined_function), `42704` (undefined_object). Either create the missing object, remove the reference from the policy, or verify the policy is pointing at the intended database.
+
 ### Interval
 
 The `interval` field controls how often the operator re-reconciles, even when the resource hasn't changed. This catches drift from manual SQL changes. Supports durations like `30s`, `5m`, `1h`, or compound forms like `1h30m`. Defaults to `5m`.
@@ -403,6 +416,7 @@ The operator also emits transition-based Kubernetes Events such as:
 - `PlanClean`
 - `DatabaseConnectionFailed`
 - `InsufficientPrivileges`
+- `MissingDatabaseObject`
 - `UnsafeRoleDropsBlocked`
 
 ### Deletion behaviour
