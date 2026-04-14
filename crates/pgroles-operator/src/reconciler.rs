@@ -493,7 +493,9 @@ async fn reconcile_apply(
                 }
                 "InvalidSpec" => ctx.observability.record_invalid_spec(),
                 "ConflictingPolicy" => ctx.observability.record_policy_conflict(),
-                "ApplyFailed" => ctx.observability.record_apply_result("error"),
+                "ApplyFailed" | "MissingDatabaseObject" => {
+                    ctx.observability.record_apply_result("error")
+                }
                 _ => {}
             }
             reconcile_guard.record_result("error", error_reason);
