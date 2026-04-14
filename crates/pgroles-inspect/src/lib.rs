@@ -316,6 +316,29 @@ pub async fn inspect(pool: &PgPool, config: &InspectConfig) -> Result<RoleGraph,
     Ok(graph)
 }
 
+/// Fetch the names of all non-system schemas in the target database.
+///
+/// Used for pre-flight validation — the operator checks that every schema
+/// referenced by a policy exists before rendering GRANT statements that would
+/// otherwise fail mid-transaction with `schema "X" does not exist`.
+///
+/// Returns a [`BTreeSet`] for efficient membership lookup. Excludes
+/// `pg_catalog`, `pg_toast`, other `pg_*` schemas, and `information_schema`.
+pub async fn fetch_existing_schemas(
+    pool: &PgPool,
+) -> Result<std::collections::BTreeSet<String>, InspectError> {
+    let rows: Vec<(String,)> = sqlx::query_as(
+        r#"
+        SELECT nspname::text FROM pg_namespace
+        WHERE nspname NOT LIKE 'pg_%'
+          AND nspname <> 'information_schema'
+        "#,
+    )
+    .fetch_all(pool)
+    .await?;
+    Ok(rows.into_iter().map(|r| r.0).collect())
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
