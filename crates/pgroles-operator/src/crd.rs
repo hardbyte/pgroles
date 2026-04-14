@@ -13,6 +13,16 @@ use pgroles_core::manifest::{
     DefaultPrivilege, Grant, Membership, ObjectType, Privilege, RoleRetirement, SchemaBinding,
 };
 
+/// Valid PostgreSQL SSL modes for connection params.
+pub const VALID_SSL_MODES: &[&str] = &[
+    "disable",
+    "allow",
+    "prefer",
+    "require",
+    "verify-ca",
+    "verify-full",
+];
+
 // ---------------------------------------------------------------------------
 // CRD spec
 // ---------------------------------------------------------------------------
@@ -254,12 +264,15 @@ impl ConnectionSpec {
     ///
     /// - URL mode: `{secret_ref.name}/{secret_key}`
     /// - Params mode: canonical representation of the params
+    ///
+    /// Uses `\0` as field separator since null bytes cannot appear in K8s names
+    /// or secret values, avoiding ambiguity from colons in literal values.
     pub fn identity_key(&self) -> String {
         if let Some(ref secret_ref) = self.secret_ref {
             format!("{}/{}", secret_ref.name, self.effective_secret_key())
         } else if let Some(ref params) = self.params {
             format!(
-                "params:{}:{}:{}:{}",
+                "params\0{}\0{}\0{}\0{}",
                 params.host.identity_repr(),
                 params.dbname.identity_repr(),
                 params.username.identity_repr(),
@@ -275,20 +288,32 @@ impl ConnectionSpec {
         }
     }
 
-    /// Cache key for pool lookup. Same as identity_key but could diverge if
-    /// needed in the future.
+    /// Cache key for pool lookup. Includes all params (identity + sslMode + port)
+    /// so that any configuration change invalidates the cached pool.
     pub fn cache_key(&self, namespace: &str) -> String {
-        format!("{namespace}/{}", self.identity_key())
+        if let Some(ref params) = self.params {
+            let ssl_part = params
+                .ssl_mode
+                .as_ref()
+                .map(|s| s.identity_repr())
+                .unwrap_or_default();
+            format!("{namespace}/{}\0ssl={ssl_part}", self.identity_key())
+        } else {
+            format!("{namespace}/{}", self.identity_key())
+        }
     }
 }
 
 impl ValueSource {
     /// Deterministic string representation for identity/cache keys.
+    ///
+    /// Uses a `literal=` / `secret=` prefix scheme so that a literal value
+    /// can never collide with a secret reference representation.
     pub fn identity_repr(&self) -> String {
         match self {
-            ValueSource::Literal(value) => value.clone(),
+            ValueSource::Literal(value) => format!("literal={value}"),
             ValueSource::SecretRef { secret_key_ref } => {
-                format!("secret:{}:{}", secret_key_ref.name, secret_key_ref.key)
+                format!("secret={}\0{}", secret_key_ref.name, secret_key_ref.key)
             }
         }
     }
@@ -341,7 +366,7 @@ pub struct ConnectionParams {
 ///     name: my-creds
 ///     key: password
 /// ```
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum ValueSource {
     /// A literal string value.
@@ -360,6 +385,42 @@ pub struct SecretKeySelector {
     pub name: String,
     /// Key within the Secret.
     pub key: String,
+}
+
+/// Manual `JsonSchema` implementation for [`ValueSource`].
+///
+/// The derived schema for `#[serde(untagged)]` enums produces `type: object`
+/// which causes the K8s API server to reject plain string literals like
+/// `host: "my-cluster"`. We use `x-kubernetes-int-or-string` to tell the API
+/// server this field accepts heterogeneous types (string or object), and add
+/// a `oneOf` for documentation/validation.
+impl schemars::JsonSchema for ValueSource {
+    fn schema_name() -> std::borrow::Cow<'static, str> {
+        "ValueSource".into()
+    }
+
+    fn schema_id() -> std::borrow::Cow<'static, str> {
+        concat!(module_path!(), "::ValueSource").into()
+    }
+
+    fn json_schema(generator: &mut schemars::SchemaGenerator) -> schemars::Schema {
+        let secret_key_ref_schema = generator.subschema_for::<SecretKeySelector>();
+
+        schemars::json_schema!({
+            "x-kubernetes-int-or-string": true,
+            "oneOf": [
+                { "type": "string" },
+                {
+                    "type": "object",
+                    "required": ["secretKeyRef"],
+                    "properties": {
+                        "secretKeyRef": secret_key_ref_schema
+                    },
+                    "additionalProperties": false
+                }
+            ]
+        })
+    }
 }
 
 /// Reference to a Kubernetes Secret in the same namespace.
@@ -546,6 +607,9 @@ pub enum ConnectionValidationError {
         "connection.params.sslMode: \"{value}\" is not valid (expected one of: disable, allow, prefer, require, verify-ca, verify-full)"
     )]
     InvalidSslMode { value: String },
+
+    #[error("connection.params.{field}: literal value must not be empty or whitespace-only")]
+    EmptyLiteral { field: String },
 }
 
 /// Validate a Kubernetes Secret name per RFC 1123 DNS subdomain rules:
@@ -955,24 +1019,32 @@ impl PostgresPolicySpec {
                 Ok(())
             }
             (None, Some(params)) => {
-                // Params mode — validate all secretKeyRef values have non-empty name/key.
+                // Params mode — validate all values have non-empty content.
                 fn validate_value_source(
                     field: &str,
                     value: &ValueSource,
                 ) -> Result<(), ConnectionValidationError> {
-                    if let ValueSource::SecretRef { secret_key_ref } = value {
-                        if secret_key_ref.name.is_empty() {
-                            return Err(ConnectionValidationError::EmptySecretKeyRef {
+                    match value {
+                        ValueSource::Literal(s) if s.trim().is_empty() => {
+                            return Err(ConnectionValidationError::EmptyLiteral {
                                 field: field.to_string(),
-                                detail: "name must not be empty".to_string(),
                             });
                         }
-                        if secret_key_ref.key.is_empty() {
-                            return Err(ConnectionValidationError::EmptySecretKeyRef {
-                                field: field.to_string(),
-                                detail: "key must not be empty".to_string(),
-                            });
+                        ValueSource::SecretRef { secret_key_ref } => {
+                            if secret_key_ref.name.is_empty() {
+                                return Err(ConnectionValidationError::EmptySecretKeyRef {
+                                    field: field.to_string(),
+                                    detail: "name must not be empty".to_string(),
+                                });
+                            }
+                            if secret_key_ref.key.is_empty() {
+                                return Err(ConnectionValidationError::EmptySecretKeyRef {
+                                    field: field.to_string(),
+                                    detail: "key must not be empty".to_string(),
+                                });
+                            }
                         }
+                        _ => {}
                     }
                     Ok(())
                 }
@@ -987,20 +1059,12 @@ impl PostgresPolicySpec {
                 if let Some(ref ssl_mode) = params.ssl_mode {
                     validate_value_source("sslMode", ssl_mode)?;
                     // Validate ssl_mode value if it's a literal.
-                    if let ValueSource::Literal(value) = ssl_mode {
-                        const VALID_SSL_MODES: &[&str] = &[
-                            "disable",
-                            "allow",
-                            "prefer",
-                            "require",
-                            "verify-ca",
-                            "verify-full",
-                        ];
-                        if !VALID_SSL_MODES.contains(&value.as_str()) {
-                            return Err(ConnectionValidationError::InvalidSslMode {
-                                value: value.clone(),
-                            });
-                        }
+                    if let ValueSource::Literal(value) = ssl_mode
+                        && !VALID_SSL_MODES.contains(&value.as_str())
+                    {
+                        return Err(ConnectionValidationError::InvalidSslMode {
+                            value: value.clone(),
+                        });
                     }
                 }
 
@@ -1528,6 +1592,155 @@ mod tests {
         };
         let identity = DatabaseIdentity::from_connection("prod", &conn);
         assert_eq!(identity.as_str(), "prod/db-creds/DATABASE_URL");
+    }
+
+    #[test]
+    fn identity_key_no_collision_between_literal_and_secret() {
+        // A literal value containing "secret=" should not collide with a
+        // real secret reference.
+        let literal_conn = ConnectionSpec {
+            secret_ref: None,
+            secret_key: None,
+            params: Some(ConnectionParams {
+                host: ValueSource::Literal("my-host".into()),
+                port: None,
+                dbname: ValueSource::Literal("mydb".into()),
+                username: ValueSource::Literal("secret=creds\0password".into()),
+                password: ValueSource::Literal("pass".into()),
+                ssl_mode: None,
+            }),
+        };
+        let secret_conn = ConnectionSpec {
+            secret_ref: None,
+            secret_key: None,
+            params: Some(ConnectionParams {
+                host: ValueSource::Literal("my-host".into()),
+                port: None,
+                dbname: ValueSource::Literal("mydb".into()),
+                username: ValueSource::SecretRef {
+                    secret_key_ref: SecretKeySelector {
+                        name: "creds".into(),
+                        key: "password".into(),
+                    },
+                },
+                password: ValueSource::Literal("pass".into()),
+                ssl_mode: None,
+            }),
+        };
+
+        assert_ne!(
+            literal_conn.identity_key(),
+            secret_conn.identity_key(),
+            "literal and secret ref should produce different identity keys"
+        );
+    }
+
+    #[test]
+    fn cache_key_includes_ssl_mode() {
+        let conn_no_ssl = ConnectionSpec {
+            secret_ref: None,
+            secret_key: None,
+            params: Some(ConnectionParams {
+                host: ValueSource::Literal("host".into()),
+                port: None,
+                dbname: ValueSource::Literal("db".into()),
+                username: ValueSource::Literal("user".into()),
+                password: ValueSource::Literal("pass".into()),
+                ssl_mode: None,
+            }),
+        };
+        let conn_with_ssl = ConnectionSpec {
+            secret_ref: None,
+            secret_key: None,
+            params: Some(ConnectionParams {
+                host: ValueSource::Literal("host".into()),
+                port: None,
+                dbname: ValueSource::Literal("db".into()),
+                username: ValueSource::Literal("user".into()),
+                password: ValueSource::Literal("pass".into()),
+                ssl_mode: Some(ValueSource::Literal("require".into())),
+            }),
+        };
+
+        assert_ne!(
+            conn_no_ssl.cache_key("ns"),
+            conn_with_ssl.cache_key("ns"),
+            "cache key should differ when sslMode is present"
+        );
+    }
+
+    #[test]
+    fn validate_connection_rejects_empty_literal_host() {
+        let spec = PostgresPolicySpec {
+            connection: ConnectionSpec {
+                secret_ref: None,
+                secret_key: None,
+                params: Some(ConnectionParams {
+                    host: ValueSource::Literal("".into()),
+                    port: None,
+                    dbname: ValueSource::Literal("mydb".into()),
+                    username: ValueSource::Literal("user".into()),
+                    password: ValueSource::Literal("pass".into()),
+                    ssl_mode: None,
+                }),
+            },
+            interval: "5m".into(),
+            suspend: false,
+            mode: PolicyMode::Apply,
+            reconciliation_mode: CrdReconciliationMode::default(),
+            default_owner: None,
+            profiles: Default::default(),
+            schemas: vec![],
+            roles: vec![],
+            grants: vec![],
+            default_privileges: vec![],
+            memberships: vec![],
+            retirements: vec![],
+            approval: None,
+        };
+
+        let err = spec.validate_connection_spec().unwrap_err();
+        assert!(
+            matches!(err, ConnectionValidationError::EmptyLiteral { ref field } if field == "host"),
+            "expected EmptyLiteral for host, got: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_connection_rejects_whitespace_literal_dbname() {
+        let spec = PostgresPolicySpec {
+            connection: ConnectionSpec {
+                secret_ref: None,
+                secret_key: None,
+                params: Some(ConnectionParams {
+                    host: ValueSource::Literal("host".into()),
+                    port: None,
+                    dbname: ValueSource::Literal("  ".into()),
+                    username: ValueSource::Literal("user".into()),
+                    password: ValueSource::Literal("pass".into()),
+                    ssl_mode: None,
+                }),
+            },
+            interval: "5m".into(),
+            suspend: false,
+            mode: PolicyMode::Apply,
+            reconciliation_mode: CrdReconciliationMode::default(),
+            default_owner: None,
+            profiles: Default::default(),
+            schemas: vec![],
+            roles: vec![],
+            grants: vec![],
+            default_privileges: vec![],
+            memberships: vec![],
+            retirements: vec![],
+            approval: None,
+        };
+
+        let err = spec.validate_connection_spec().unwrap_err();
+        assert!(
+            matches!(err, ConnectionValidationError::EmptyLiteral { ref field } if field == "dbname"),
+            "expected EmptyLiteral for dbname, got: {err}"
+        );
     }
 
     #[test]

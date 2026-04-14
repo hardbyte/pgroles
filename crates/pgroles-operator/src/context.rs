@@ -27,6 +27,8 @@ const _: () = assert!(POOL_MAX_CONNECTIONS >= 2);
 #[derive(Clone)]
 struct CachedPool {
     resource_version: Option<String>,
+    /// Fingerprint of all referenced secrets' resourceVersions (params mode).
+    secret_fingerprint: Option<String>,
     pool: PgPool,
 }
 
@@ -173,18 +175,44 @@ impl OperatorContext {
         } else if let Some(ref params) = connection.params {
             // Params mode — resolve each field and build the URL.
             let host = self.resolve_value_source(namespace, &params.host).await?;
+            if host.trim().is_empty() {
+                return Err(ContextError::EmptyResolvedValue {
+                    field: "host".to_string(),
+                });
+            }
             let port = if let Some(ref port_source) = params.port {
-                self.resolve_value_source(namespace, port_source).await?
+                let p = self.resolve_value_source(namespace, port_source).await?;
+                if p.trim().is_empty() {
+                    return Err(ContextError::EmptyResolvedValue {
+                        field: "port".to_string(),
+                    });
+                }
+                p
             } else {
                 "5432".to_string()
             };
             let dbname = self.resolve_value_source(namespace, &params.dbname).await?;
+            if dbname.trim().is_empty() {
+                return Err(ContextError::EmptyResolvedValue {
+                    field: "dbname".to_string(),
+                });
+            }
             let username = self
                 .resolve_value_source(namespace, &params.username)
                 .await?;
+            if username.trim().is_empty() {
+                return Err(ContextError::EmptyResolvedValue {
+                    field: "username".to_string(),
+                });
+            }
             let password = self
                 .resolve_value_source(namespace, &params.password)
                 .await?;
+            if password.trim().is_empty() {
+                return Err(ContextError::EmptyResolvedValue {
+                    field: "password".to_string(),
+                });
+            }
 
             use percent_encoding::{NON_ALPHANUMERIC, utf8_percent_encode};
             let encoded_username = utf8_percent_encode(&username, NON_ALPHANUMERIC).to_string();
@@ -198,6 +226,11 @@ impl OperatorContext {
                 let ssl_mode = self
                     .resolve_value_source(namespace, ssl_mode_source)
                     .await?;
+                // Validate sslMode at runtime — CRD validation only catches
+                // literal values; a secretKeyRef could resolve to anything.
+                if !crate::crd::VALID_SSL_MODES.contains(&ssl_mode.as_str()) {
+                    return Err(ContextError::InvalidResolvedSslMode { value: ssl_mode });
+                }
                 url.push_str("?sslmode=");
                 url.push_str(&ssl_mode);
             }
@@ -223,30 +256,69 @@ impl OperatorContext {
         let cache_key = connection.cache_key(namespace);
 
         // For URL mode, we can do resource-version-based cache invalidation.
-        // For params mode, we skip version checking (multiple secrets may be involved).
-        let resource_version = if let Some(ref secret_ref) = connection.secret_ref {
-            let secrets_api: kube::Api<k8s_openapi::api::core::v1::Secret> =
-                kube::Api::namespaced(self.kube_client.clone(), namespace);
-            let secret = secrets_api.get(&secret_ref.name).await.map_err(|err| {
-                ContextError::SecretFetch {
-                    name: secret_ref.name.clone(),
-                    namespace: namespace.to_string(),
-                    source: err,
+        // For params mode, compute a fingerprint from all referenced secrets'
+        // resourceVersions so that secret rotations invalidate the cache.
+        let (resource_version, secret_fingerprint) =
+            if let Some(ref secret_ref) = connection.secret_ref {
+                let secrets_api: kube::Api<k8s_openapi::api::core::v1::Secret> =
+                    kube::Api::namespaced(self.kube_client.clone(), namespace);
+                let secret = secrets_api.get(&secret_ref.name).await.map_err(|err| {
+                    ContextError::SecretFetch {
+                        name: secret_ref.name.clone(),
+                        namespace: namespace.to_string(),
+                        source: err,
+                    }
+                })?;
+                (secret.metadata.resource_version, None)
+            } else if connection.params.is_some() {
+                // Params mode — collect all referenced secret names and fetch their
+                // resourceVersions to build a fingerprint.
+                let mut secret_names = std::collections::BTreeSet::new();
+                connection.collect_secret_names(&mut secret_names);
+
+                if secret_names.is_empty() {
+                    // All values are literals — no secrets to watch.
+                    (None, Some(String::new()))
+                } else {
+                    let secrets_api: kube::Api<k8s_openapi::api::core::v1::Secret> =
+                        kube::Api::namespaced(self.kube_client.clone(), namespace);
+                    let mut fingerprint_parts = Vec::new();
+                    for name in &secret_names {
+                        let secret = secrets_api.get(name).await.map_err(|err| {
+                            ContextError::SecretFetch {
+                                name: name.clone(),
+                                namespace: namespace.to_string(),
+                                source: err,
+                            }
+                        })?;
+                        let rv = secret
+                            .metadata
+                            .resource_version
+                            .unwrap_or_else(|| "unknown".to_string());
+                        fingerprint_parts.push(format!("{name}={rv}"));
+                    }
+                    (None, Some(fingerprint_parts.join(",")))
                 }
-            })?;
-            secret.metadata.resource_version
-        } else {
-            // Params mode — no single resource version, always re-resolve.
-            None
-        };
+            } else {
+                (None, None)
+            };
 
         // Check cache.
         {
             let cache = self.pool_cache.read().await;
             if let Some(cached) = cache.get(&cache_key) {
-                // For URL mode, only reuse if the Secret hasn't changed.
-                // For params mode (resource_version is None), always reuse cached pool.
-                if resource_version.is_none() || cached.resource_version == resource_version {
+                // URL mode: reuse if the Secret's resource_version matches.
+                // Params mode: reuse if the secret fingerprint matches.
+                let version_matches = match (&resource_version, &cached.resource_version) {
+                    (Some(current), Some(cached_rv)) => current == cached_rv,
+                    _ => true,
+                };
+                let fingerprint_matches = match (&secret_fingerprint, &cached.secret_fingerprint) {
+                    (Some(current), Some(cached_fp)) => current == cached_fp,
+                    (None, None) => true,
+                    _ => false,
+                };
+                if version_matches && fingerprint_matches {
                     return Ok(cached.pool.clone());
                 }
             }
@@ -271,6 +343,7 @@ impl OperatorContext {
                 cache_key,
                 CachedPool {
                     resource_version,
+                    secret_fingerprint,
                     pool: pool.clone(),
                 },
             );
@@ -342,6 +415,14 @@ pub enum ContextError {
 
     #[error("failed to connect to database: {source}")]
     DatabaseConnect { source: sqlx::Error },
+
+    #[error("connection param \"{field}\" resolved to an empty or whitespace-only value")]
+    EmptyResolvedValue { field: String },
+
+    #[error(
+        "connection param sslMode resolved to invalid value \"{value}\" (expected one of: disable, allow, prefer, require, verify-ca, verify-full)"
+    )]
+    InvalidResolvedSslMode { value: String },
 }
 
 impl ContextError {

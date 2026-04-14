@@ -368,6 +368,8 @@ fn retry_class_for_reconcile_error(error: &ReconcileError) -> RetryClass {
                 }
             }
             ContextError::DatabaseConnect { .. } => RetryClass::Transient,
+            ContextError::EmptyResolvedValue { .. }
+            | ContextError::InvalidResolvedSslMode { .. } => RetryClass::Slow,
         },
         ReconcileError::Inspect(error) => {
             if inspect_error_is_non_transient(error) {
@@ -2026,6 +2028,8 @@ impl ReconcileError {
                 ContextError::SecretFetch { .. } => "SecretFetchFailed",
                 ContextError::SecretMissing { .. } => "SecretMissing",
                 ContextError::DatabaseConnect { .. } => "DatabaseConnectionFailed",
+                ContextError::EmptyResolvedValue { .. } => "InvalidConnectionParams",
+                ContextError::InvalidResolvedSslMode { .. } => "InvalidConnectionParams",
             },
             ReconcileError::Inspect(error) => match error {
                 pgroles_inspect::InspectError::Database(sql_err) => {
