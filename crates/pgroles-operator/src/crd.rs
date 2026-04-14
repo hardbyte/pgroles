@@ -597,6 +597,9 @@ pub struct PostgresPolicyPlanStatus {
     /// Timestamp when the plan entered Applying phase (for stuck detection).
     #[serde(default)]
     pub applying_since: Option<String>,
+    /// Timestamp when the plan entered Failed phase (for dedup window).
+    #[serde(default)]
+    pub failed_at: Option<String>,
 }
 
 /// Reference to a ConfigMap containing SQL for a plan.

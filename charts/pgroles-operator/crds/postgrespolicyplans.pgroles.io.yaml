@@ -241,6 +241,11 @@
                     },
                     "type": "array"
                   },
+                  "failedAt": {
+                    "description": "Timestamp when the plan entered Failed phase (for dedup window).",
+                    "nullable": true,
+                    "type": "string"
+                  },
                   "lastError": {
                     "description": "Error message if apply failed.",
                     "nullable": true,

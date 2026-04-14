@@ -168,24 +168,26 @@ pub async fn create_or_update_plan(
     // this exact SQL already failed within the dedup window, creating another
     // identical one is pointless — it would produce the same error. The window
     // ensures we don't block retries after the user fixes the environment.
+    //
+    // Uses `status.failed_at` (not `creation_timestamp`) so that plans which
+    // waited for approval before failing are measured from the failure time.
     let now_ts = chrono_now_epoch_secs();
     for plan in &existing_plans {
         if let Some(ref status) = plan.status
             && status.phase == PlanPhase::Failed
             && status.sql_hash.as_deref() == Some(&sql_hash)
         {
-            let created_ts = plan
-                .metadata
-                .creation_timestamp
-                .as_ref()
-                .map(|t| t.0.as_second())
+            let failed_ts = status
+                .failed_at
+                .as_deref()
+                .and_then(parse_rfc3339_epoch_secs)
                 .unwrap_or(0);
-            if now_ts - created_ts < FAILED_PLAN_DEDUP_WINDOW_SECS {
+            if failed_ts > 0 && now_ts - failed_ts < FAILED_PLAN_DEDUP_WINDOW_SECS {
                 let plan_name = plan.name_any();
                 info!(
                     plan = %plan_name,
                     policy = %policy_name,
-                    age_secs = now_ts - created_ts,
+                    age_secs = now_ts - failed_ts,
                     "recently-failed plan has identical SQL hash, skipping creation"
                 );
                 return Ok(PlanCreationResult::Deduplicated(plan_name));
@@ -321,6 +323,7 @@ pub async fn create_or_update_plan(
         last_error: None,
         sql_hash: Some(sql_hash),
         applying_since: None,
+        failed_at: None,
     };
 
     let status_patch = serde_json::json!({ "status": plan_status });
@@ -406,6 +409,7 @@ pub async fn execute_plan(
             let mut failed_status = plan.status.clone().unwrap_or_default();
             failed_status.phase = PlanPhase::Failed;
             failed_status.last_error = Some(error_message);
+            failed_status.failed_at = Some(crate::crd::now_rfc3339());
 
             let patch = serde_json::json!({ "status": failed_status });
             if let Err(status_err) = plans_api
@@ -640,6 +644,16 @@ fn chrono_now_epoch_secs() -> i64 {
         .as_secs() as i64
 }
 
+/// Parse an RFC 3339 timestamp string to Unix epoch seconds.
+/// Returns `None` if parsing fails.
+fn parse_rfc3339_epoch_secs(rfc3339: &str) -> Option<i64> {
+    // Use jiff (already a transitive dep via k8s-openapi) for RFC 3339 parsing.
+    rfc3339
+        .parse::<jiff::Timestamp>()
+        .ok()
+        .map(|t| t.as_second())
+}
+
 /// Build an OwnerReference pointing from a plan to its parent policy.
 fn build_owner_reference(policy: &PostgresPolicy) -> OwnerReference {
     OwnerReference {
@@ -840,6 +854,7 @@ pub async fn mark_plan_failed(
     let mut status = plan.status.clone().unwrap_or_default();
     status.phase = PlanPhase::Failed;
     status.last_error = Some(error_message.to_string());
+    status.failed_at = Some(crate::crd::now_rfc3339());
 
     let patch = serde_json::json!({ "status": status });
     plans_api
