@@ -414,6 +414,10 @@ pub async fn fetch_schemas(
 }
 
 fn remove_redundant_schema_owner_grants(graph: &mut RoleGraph) {
+    // PostgreSQL records the schema owner's inherent CREATE/USAGE privileges in
+    // the schema ACL. Those are part of ownership, not user-declared grants.
+    // Filtering them here keeps `diff` from trying to revoke owner self-grants
+    // after a schema is created or its ownership changes.
     graph.grants.retain(|key, _| {
         if key.object_type != pgroles_core::manifest::ObjectType::Schema {
             return true;
@@ -508,5 +512,52 @@ roles:
         assert_eq!(config.managed_roles.len(), 2);
         assert!(config.managed_roles.contains(&"analytics".to_string()));
         assert!(config.managed_roles.contains(&"legacy-app".to_string()));
+    }
+
+    #[test]
+    fn remove_redundant_schema_owner_grants_keeps_only_non_owner_schema_grants() {
+        let mut graph = RoleGraph::default();
+        graph.schemas.insert(
+            "inventory".to_string(),
+            pgroles_core::model::SchemaState {
+                owner: Some("inventory_owner".to_string()),
+            },
+        );
+        graph.grants.insert(
+            pgroles_core::model::GrantKey {
+                role: "inventory_owner".to_string(),
+                object_type: pgroles_core::manifest::ObjectType::Schema,
+                schema: None,
+                name: Some("inventory".to_string()),
+            },
+            pgroles_core::model::GrantState {
+                privileges: [pgroles_core::manifest::Privilege::Usage]
+                    .into_iter()
+                    .collect(),
+            },
+        );
+        graph.grants.insert(
+            pgroles_core::model::GrantKey {
+                role: "inventory_reader".to_string(),
+                object_type: pgroles_core::manifest::ObjectType::Schema,
+                schema: None,
+                name: Some("inventory".to_string()),
+            },
+            pgroles_core::model::GrantState {
+                privileges: [pgroles_core::manifest::Privilege::Usage]
+                    .into_iter()
+                    .collect(),
+            },
+        );
+
+        remove_redundant_schema_owner_grants(&mut graph);
+
+        assert_eq!(graph.grants.len(), 1);
+        assert!(
+            graph
+                .grants
+                .keys()
+                .all(|key| key.role == "inventory_reader")
+        );
     }
 }

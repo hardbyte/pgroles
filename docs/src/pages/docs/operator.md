@@ -199,6 +199,7 @@ spec:
 
   schemas:
     - name: inventory
+      owner: app_owner
       profiles: [editor]
 
   roles:
@@ -221,6 +222,8 @@ spec:
       reassign_owned_to: app_owner
       drop_owned: true
 ```
+
+Declared schemas can be created and have ownership converged by the operator. Schemas that are only referenced from top-level grants or default privileges must already exist in the database.
 
 ### Database connection
 

@@ -1764,8 +1764,8 @@ fn accumulate_summary(summary: &mut ChangeSummary, change: &pgroles_core::diff::
     use pgroles_core::diff::Change;
     match change {
         Change::CreateRole { .. } => summary.roles_created += 1,
-        Change::CreateSchema { .. } => summary.grants_added += 1,
-        Change::AlterSchemaOwner { .. } => summary.grants_added += 1,
+        Change::CreateSchema { .. } => summary.schemas_created += 1,
+        Change::AlterSchemaOwner { .. } => summary.schema_owners_altered += 1,
         Change::AlterRole { .. } => summary.roles_altered += 1,
         Change::SetComment { .. } => summary.roles_altered += 1,
         Change::DropRole { .. } => summary.roles_dropped += 1,
@@ -1789,6 +1789,8 @@ fn summarize_changes(changes: &[pgroles_core::diff::Change]) -> ChangeSummary {
     }
     summary.total = summary.roles_created
         + summary.roles_altered
+        + summary.schemas_created
+        + summary.schema_owners_altered
         + summary.roles_dropped
         + summary.sessions_terminated
         + summary.grants_added
@@ -2464,6 +2466,32 @@ mod tests {
     }
 
     #[test]
+    fn accumulate_summary_counts_schema_changes_separately() {
+        use pgroles_core::diff::Change;
+
+        let mut summary = ChangeSummary::default();
+
+        accumulate_summary(
+            &mut summary,
+            &Change::CreateSchema {
+                name: "inventory".to_string(),
+                owner: Some("inventory_owner".to_string()),
+            },
+        );
+        accumulate_summary(
+            &mut summary,
+            &Change::AlterSchemaOwner {
+                name: "catalog".to_string(),
+                owner: "catalog_owner".to_string(),
+            },
+        );
+
+        assert_eq!(summary.schemas_created, 1);
+        assert_eq!(summary.schema_owners_altered, 1);
+        assert_eq!(summary.grants_added, 0);
+    }
+
+    #[test]
     fn summarize_changes_sets_total() {
         use pgroles_core::diff::Change;
         use pgroles_core::model::RoleState;
@@ -2472,6 +2500,10 @@ mod tests {
             Change::CreateRole {
                 name: "test".to_string(),
                 state: RoleState::default(),
+            },
+            Change::CreateSchema {
+                name: "inventory".to_string(),
+                owner: Some("inventory_owner".to_string()),
             },
             Change::Grant {
                 role: "test".to_string(),
@@ -2486,8 +2518,9 @@ mod tests {
 
         let summary = summarize_changes(&changes);
         assert_eq!(summary.roles_created, 1);
+        assert_eq!(summary.schemas_created, 1);
         assert_eq!(summary.grants_added, 1);
-        assert_eq!(summary.total, 2);
+        assert_eq!(summary.total, 3);
     }
 
     #[test]
@@ -2518,6 +2551,20 @@ mod tests {
             &Change::AlterRole {
                 name: "r1".to_string(),
                 attributes: vec![pgroles_core::model::RoleAttribute::Login(true)],
+            },
+        );
+        accumulate_summary(
+            &mut summary,
+            &Change::CreateSchema {
+                name: "schema1".to_string(),
+                owner: Some("owner1".to_string()),
+            },
+        );
+        accumulate_summary(
+            &mut summary,
+            &Change::AlterSchemaOwner {
+                name: "schema2".to_string(),
+                owner: "owner2".to_string(),
             },
         );
         accumulate_summary(
@@ -2620,6 +2667,8 @@ mod tests {
         assert_eq!(summary.roles_created, 1);
         // AlterRole + SetComment both increment roles_altered
         assert_eq!(summary.roles_altered, 2);
+        assert_eq!(summary.schemas_created, 1);
+        assert_eq!(summary.schema_owners_altered, 1);
         assert_eq!(summary.roles_dropped, 1);
         assert_eq!(summary.sessions_terminated, 1);
         assert_eq!(summary.grants_added, 1);

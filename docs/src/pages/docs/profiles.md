@@ -123,7 +123,7 @@ By default, profile-generated roles have `login: false` (NOLOGIN).
 
 ## Owner overrides
 
-Each schema binding can override the `default_owner` for its default privileges:
+Each schema binding can override the `default_owner` for its default privileges and, when declared, the schema owner itself:
 
 ```yaml
 default_owner: app_owner
@@ -136,7 +136,7 @@ schemas:
     owner: legacy_admin
 ```
 
-Here, `inventory`'s default privileges use `app_owner`, while `legacy`'s use `legacy_admin`.
+Here, `inventory`'s default privileges use `app_owner`, while `legacy`'s use `legacy_admin`. If those schemas are managed by pgroles, the same owner resolution is used for `CREATE SCHEMA` and `ALTER SCHEMA ... OWNER TO ...`.
 
 ## Combining profiles with one-off definitions
 

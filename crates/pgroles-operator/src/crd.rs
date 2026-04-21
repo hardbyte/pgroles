@@ -747,6 +747,8 @@ pub struct PlanReference {
 pub struct ChangeSummary {
     pub roles_created: i32,
     pub roles_altered: i32,
+    pub schemas_created: i32,
+    pub schema_owners_altered: i32,
     pub roles_dropped: i32,
     pub sessions_terminated: i32,
     pub grants_added: i32,

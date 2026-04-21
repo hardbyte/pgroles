@@ -3,7 +3,7 @@ title: Manifest format
 description: Complete reference for the pgroles YAML manifest schema.
 ---
 
-A pgroles manifest is a YAML file that declares the desired state of your PostgreSQL roles, grants, default privileges, and memberships. {% .lead %}
+A pgroles manifest is a YAML file that declares the desired state of your PostgreSQL roles, schemas, grants, default privileges, and memberships. {% .lead %}
 
 ---
 
@@ -13,7 +13,7 @@ A pgroles manifest is a YAML file that declares the desired state of your Postgr
 default_owner: pgloader_pg       # Owner for ALTER DEFAULT PRIVILEGES
 auth_providers: []                # Cloud IAM provider declarations
 profiles: {}                      # Reusable privilege templates
-schemas: []                       # Schema-profile bindings
+schemas: []                       # Managed schemas and schema-profile bindings
 roles: []                         # Role definitions
 grants: []                        # Object privilege grants
 default_privileges: []            # Default privilege rules
@@ -67,6 +67,44 @@ default_owner: pgloader_pg
 ```
 
 Individual schemas can override this with their own `owner` field.
+
+## schemas
+
+The `schemas` section serves two related purposes:
+
+- declare schemas pgroles should manage
+- bind profiles to those schemas so profile-generated roles and grants are expanded
+
+```yaml
+schemas:
+  - name: inventory
+    owner: app_owner
+    profiles: [editor, viewer]
+
+  - name: cdc
+    owner: cdc_owner
+    profiles: []
+```
+
+### Schema fields
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `name` | string | *required* | Schema name |
+| `profiles` | list[string] | `[]` | Profiles to expand for this schema |
+| `owner` | string | `default_owner` | Desired schema owner; if omitted and `default_owner` is unset, pgroles only ensures the schema exists |
+| `role_pattern` | string | `"{schema}-{profile}"` | Naming pattern for profile-generated roles |
+
+### Schema ownership and creation
+
+When a schema is declared under `schemas:`:
+
+- pgroles can create it if it does not exist
+- pgroles can converge its owner with `ALTER SCHEMA ... OWNER TO ...`
+- pgroles does not manage dropping schemas
+- pgroles does not reassign ownership of objects inside the schema
+
+If a schema is only referenced from top-level `grants:` or `default_privileges:` and is not declared under `schemas:`, it must already exist.
 
 ## roles
 
@@ -211,7 +249,7 @@ memberships:
 ## Convergent model
 
 {% callout type="warning" title="pgroles is convergent" %}
-The manifest represents the **entire desired state**. Roles, grants, default privileges, and memberships that exist in the database but are absent from the manifest will be dropped or revoked. Only declare roles that pgroles should manage.
+The manifest represents the **entire desired state**. Roles, grants, default privileges, and memberships that exist in the database but are absent from the manifest will be dropped or revoked. Declared schemas are created and their owner may be converged, but schemas are not dropped automatically. Only declare roles and schemas that pgroles should manage.
 {% /callout %}
 
 ## retirements
