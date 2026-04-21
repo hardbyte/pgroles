@@ -1,0 +1,19 @@
+---
+apiVersion: pgroles.io/v1alpha1
+kind: PostgresPolicy
+metadata:
+  name: schema-owner-policy
+  namespace: default
+spec:
+  connection:
+    secretRef:
+      name: postgres-credentials
+  interval: "5m"
+
+  schemas:
+    - name: operator_owned_schema
+      owner: operator_schema_owner
+      profiles: []
+
+  roles:
+    - name: operator_schema_owner
