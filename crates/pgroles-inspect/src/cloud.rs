@@ -184,6 +184,7 @@ pub fn validate_changes_for_privilege_level(
                     ));
                 }
             }
+            Change::CreateSchema { .. } | Change::AlterSchemaOwner { .. } => {}
             Change::AlterRole { name, attributes } => {
                 for attr in attributes {
                     let attr_name = match attr {

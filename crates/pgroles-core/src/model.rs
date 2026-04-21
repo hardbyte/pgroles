@@ -121,6 +121,18 @@ pub enum RoleAttribute {
 }
 
 // ---------------------------------------------------------------------------
+// Schemas
+// ---------------------------------------------------------------------------
+
+/// The schema state managed by pgroles.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct SchemaState {
+    /// Desired owner for the schema. `None` means ensure existence only.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub owner: Option<String>,
+}
+
+// ---------------------------------------------------------------------------
 // Grants
 // ---------------------------------------------------------------------------
 
@@ -197,6 +209,8 @@ pub struct MembershipEdge {
 pub struct RoleGraph {
     /// Managed roles, keyed by role name.
     pub roles: BTreeMap<String, RoleState>,
+    /// Managed schemas, keyed by schema name.
+    pub schemas: BTreeMap<String, SchemaState>,
     /// Object privilege grants, keyed by grant target.
     pub grants: BTreeMap<GrantKey, GrantState>,
     /// Default privilege rules, keyed by (owner, schema, type, grantee).
@@ -220,6 +234,16 @@ impl RoleGraph {
         for role_def in &expanded.roles {
             let state = RoleState::from_definition(role_def);
             graph.roles.insert(role_def.name.clone(), state);
+        }
+
+        // --- Schemas ---
+        for schema in &expanded.schemas {
+            graph.schemas.insert(
+                schema.name.clone(),
+                SchemaState {
+                    owner: schema.owner.clone(),
+                },
+            );
         }
 
         // --- Grants ---
@@ -436,6 +460,13 @@ memberships:
         assert_eq!(graph.roles.len(), 2);
         assert!(graph.roles.contains_key("inventory-editor"));
         assert!(graph.roles.contains_key("analytics"));
+
+        // Managed schema state includes the declared schema and resolved owner.
+        assert_eq!(graph.schemas.len(), 1);
+        assert_eq!(
+            graph.schemas["inventory"].owner.as_deref(),
+            Some("app_owner")
+        );
 
         // inventory-editor is NOLOGIN, analytics is LOGIN
         assert!(!graph.roles["inventory-editor"].login);

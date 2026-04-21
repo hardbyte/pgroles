@@ -450,7 +450,11 @@ fn slow_retry_delay(resource: &PostgresPolicy) -> Duration {
 fn referenced_schema_names(
     expanded: &pgroles_core::manifest::ExpandedManifest,
 ) -> std::collections::BTreeSet<String> {
-    let mut names = std::collections::BTreeSet::new();
+    let mut names: std::collections::BTreeSet<String> = expanded
+        .schemas
+        .iter()
+        .map(|schema| schema.name.clone())
+        .collect();
     for grant in &expanded.grants {
         if grant.object.object_type == pgroles_core::manifest::ObjectType::Schema
             && let Some(name) = &grant.object.name
@@ -465,6 +469,16 @@ fn referenced_schema_names(
         names.insert(dp.schema.clone());
     }
     names
+}
+
+fn declared_schema_names(
+    expanded: &pgroles_core::manifest::ExpandedManifest,
+) -> std::collections::BTreeSet<String> {
+    expanded
+        .schemas
+        .iter()
+        .map(|schema| schema.name.clone())
+        .collect()
 }
 
 /// Pre-flight check: ensure every schema referenced by the policy exists in
@@ -486,9 +500,10 @@ async fn validate_referenced_schemas_exist(
     pool: &sqlx::PgPool,
     expanded: &pgroles_core::manifest::ExpandedManifest,
 ) -> Result<(), ReconcileError> {
+    let declared = declared_schema_names(expanded);
     let referenced: std::collections::BTreeSet<String> = referenced_schema_names(expanded)
         .into_iter()
-        .filter(|name| !is_system_schema(name))
+        .filter(|name| !is_system_schema(name) && !declared.contains(name))
         .collect();
     if referenced.is_empty() {
         return Ok(());
@@ -1749,6 +1764,8 @@ fn accumulate_summary(summary: &mut ChangeSummary, change: &pgroles_core::diff::
     use pgroles_core::diff::Change;
     match change {
         Change::CreateRole { .. } => summary.roles_created += 1,
+        Change::CreateSchema { .. } => summary.grants_added += 1,
+        Change::AlterSchemaOwner { .. } => summary.grants_added += 1,
         Change::AlterRole { .. } => summary.roles_altered += 1,
         Change::SetComment { .. } => summary.roles_altered += 1,
         Change::DropRole { .. } => summary.roles_dropped += 1,
@@ -2657,6 +2674,7 @@ mod tests {
             ExpandedManifest, Grant, ObjectTarget, ObjectType, Privilege,
         };
         let expanded = ExpandedManifest {
+            schemas: Vec::new(),
             roles: Vec::new(),
             grants: vec![Grant {
                 role: "app".into(),
@@ -2680,6 +2698,7 @@ mod tests {
             ExpandedManifest, Grant, ObjectTarget, ObjectType, Privilege,
         };
         let expanded = ExpandedManifest {
+            schemas: Vec::new(),
             roles: Vec::new(),
             grants: vec![Grant {
                 role: "app".into(),
@@ -2703,6 +2722,7 @@ mod tests {
             DefaultPrivilege, DefaultPrivilegeGrant, ExpandedManifest, ObjectType, Privilege,
         };
         let expanded = ExpandedManifest {
+            schemas: Vec::new(),
             roles: Vec::new(),
             grants: Vec::new(),
             default_privileges: vec![DefaultPrivilege {
@@ -2727,6 +2747,7 @@ mod tests {
             ObjectType, Privilege,
         };
         let expanded = ExpandedManifest {
+            schemas: Vec::new(),
             roles: Vec::new(),
             grants: vec![
                 Grant {
@@ -2771,6 +2792,7 @@ mod tests {
             ExpandedManifest, Grant, ObjectTarget, ObjectType, Privilege,
         };
         let expanded = ExpandedManifest {
+            schemas: Vec::new(),
             roles: Vec::new(),
             grants: vec![Grant {
                 role: "app".into(),
@@ -2800,6 +2822,45 @@ mod tests {
         assert!(!is_system_schema("public"));
         assert!(!is_system_schema("etl"));
         assert!(!is_system_schema("analytics"));
+    }
+
+    #[test]
+    fn referenced_schema_names_include_declared_schemas() {
+        use pgroles_core::manifest::{ExpandedManifest, ExpandedSchema};
+
+        let expanded = ExpandedManifest {
+            schemas: vec![ExpandedSchema {
+                name: "cdc".into(),
+                owner: Some("cdc_owner".into()),
+            }],
+            roles: Vec::new(),
+            grants: Vec::new(),
+            default_privileges: Vec::new(),
+            memberships: Vec::new(),
+        };
+
+        let names = referenced_schema_names(&expanded);
+        assert!(names.contains("cdc"));
+    }
+
+    #[test]
+    fn declared_schema_names_returns_declared_only() {
+        use pgroles_core::manifest::{ExpandedManifest, ExpandedSchema};
+
+        let expanded = ExpandedManifest {
+            schemas: vec![ExpandedSchema {
+                name: "cdc".into(),
+                owner: Some("cdc_owner".into()),
+            }],
+            roles: Vec::new(),
+            grants: Vec::new(),
+            default_privileges: Vec::new(),
+            memberships: Vec::new(),
+        };
+
+        let names = declared_schema_names(&expanded);
+        assert_eq!(names.len(), 1);
+        assert!(names.contains("cdc"));
     }
 
     #[test]

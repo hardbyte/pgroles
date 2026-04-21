@@ -786,6 +786,35 @@ mod live_db {
         })
     }
 
+    fn query_default_acl_owner(schema: &str, grantee: &str, object_type: &str) -> Option<String> {
+        with_runtime(async {
+            let pool = PgPool::connect(&database_url())
+                .await
+                .expect("failed to connect to live test database");
+            let row = sqlx::query(
+                r#"
+                SELECT owner_role.rolname AS owner
+                FROM pg_default_acl da
+                JOIN pg_roles owner_role ON owner_role.oid = da.defaclrole
+                JOIN pg_namespace n ON n.oid = da.defaclnamespace
+                CROSS JOIN LATERAL aclexplode(da.defaclacl) AS acl
+                JOIN pg_roles grantee_role ON grantee_role.oid = acl.grantee
+                WHERE n.nspname = $1
+                  AND grantee_role.rolname = $2
+                  AND da.defaclobjtype::text = $3
+                LIMIT 1
+                "#,
+            )
+            .bind(schema)
+            .bind(grantee)
+            .bind(object_type)
+            .fetch_optional(&pool)
+            .await
+            .expect("failed to query default privilege owner");
+            row.map(|row| row.get("owner"))
+        })
+    }
+
     async fn open_role_connection(role: &str, password: &str) -> PgConnection {
         let options = PgConnectOptions::from_str(&database_url())
             .expect("failed to parse DATABASE_URL")
@@ -794,6 +823,161 @@ mod live_db {
         PgConnection::connect_with(&options)
             .await
             .expect("failed to connect as retired role")
+    }
+
+    #[test]
+    #[ignore]
+    fn apply_creates_declared_schema_with_owner() {
+        let schema = unique_name("owned_schema");
+        let owner_role = unique_name("owned_schema_owner");
+
+        execute_sql(&format!(
+            r#"
+            DROP SCHEMA IF EXISTS "{schema}" CASCADE;
+            DROP ROLE IF EXISTS "{owner_role}";
+            "#
+        ));
+
+        let manifest_file = write_temp_manifest(&format!(
+            r#"
+default_owner: postgres
+
+schemas:
+  - name: {schema}
+    owner: {owner_role}
+    profiles: []
+
+roles:
+  - name: {owner_role}
+"#
+        ));
+
+        pgroles_cmd()
+            .args([
+                "apply",
+                "--file",
+                manifest_file.path().to_str().unwrap(),
+                "--database-url",
+                &database_url(),
+            ])
+            .assert()
+            .success();
+
+        assert_eq!(
+            query_schema_owner(&schema).as_deref(),
+            Some(owner_role.as_str()),
+            "schema should be created with the declared owner"
+        );
+
+        pgroles_cmd()
+            .args([
+                "diff",
+                "--file",
+                manifest_file.path().to_str().unwrap(),
+                "--database-url",
+                &database_url(),
+                "--format",
+                "summary",
+            ])
+            .assert()
+            .success()
+            .stdout(predicate::str::contains("No changes needed"));
+
+        execute_sql(&format!(
+            r#"
+            DROP SCHEMA IF EXISTS "{schema}" CASCADE;
+            DROP ROLE IF EXISTS "{owner_role}";
+            "#
+        ));
+    }
+
+    #[test]
+    #[ignore]
+    fn apply_converges_existing_schema_owner_and_uses_owner_for_default_privileges() {
+        let schema = unique_name("schema_owner");
+        let old_owner = unique_name("old_owner");
+        let new_owner = unique_name("new_owner");
+
+        execute_sql(&format!(
+            r#"
+            DROP SCHEMA IF EXISTS "{schema}" CASCADE;
+            DROP ROLE IF EXISTS "{schema}-editor";
+            DROP ROLE IF EXISTS "{new_owner}";
+            DROP ROLE IF EXISTS "{old_owner}";
+            CREATE ROLE "{old_owner}";
+            CREATE ROLE "{new_owner}";
+            CREATE SCHEMA "{schema}" AUTHORIZATION "{old_owner}";
+            "#
+        ));
+
+        let manifest_file = write_temp_manifest(&format!(
+            r#"
+profiles:
+  editor:
+    grants:
+      - privileges: [USAGE]
+        object: {{ type: schema }}
+      - privileges: [SELECT]
+        object: {{ type: table, name: "*" }}
+    default_privileges:
+      - privileges: [SELECT]
+        on_type: table
+
+schemas:
+  - name: {schema}
+    owner: {new_owner}
+    profiles: [editor]
+
+roles:
+  - name: {old_owner}
+  - name: {new_owner}
+"#
+        ));
+
+        pgroles_cmd()
+            .args([
+                "apply",
+                "--file",
+                manifest_file.path().to_str().unwrap(),
+                "--database-url",
+                &database_url(),
+            ])
+            .assert()
+            .success();
+
+        assert_eq!(
+            query_schema_owner(&schema).as_deref(),
+            Some(new_owner.as_str()),
+            "schema owner should be converged"
+        );
+        assert_eq!(
+            query_default_acl_owner(&schema, &format!("{schema}-editor"), "r").as_deref(),
+            Some(new_owner.as_str()),
+            "default privileges should be attached to the schema owner"
+        );
+
+        pgroles_cmd()
+            .args([
+                "diff",
+                "--file",
+                manifest_file.path().to_str().unwrap(),
+                "--database-url",
+                &database_url(),
+                "--format",
+                "summary",
+            ])
+            .assert()
+            .success()
+            .stdout(predicate::str::contains("No changes needed"));
+
+        execute_sql(&format!(
+            r#"
+            DROP SCHEMA IF EXISTS "{schema}" CASCADE;
+            DROP ROLE IF EXISTS "{schema}-editor";
+            DROP ROLE IF EXISTS "{new_owner}";
+            DROP ROLE IF EXISTS "{old_owner}";
+            "#
+        ));
     }
 
     #[test]

@@ -430,10 +430,17 @@ pub struct RoleRetirement {
 /// default privileges, and memberships. Ready to be converted into a `RoleGraph`.
 #[derive(Debug, Clone)]
 pub struct ExpandedManifest {
+    pub schemas: Vec<ExpandedSchema>,
     pub roles: Vec<RoleDefinition>,
     pub grants: Vec<Grant>,
     pub default_privileges: Vec<DefaultPrivilege>,
     pub memberships: Vec<Membership>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExpandedSchema {
+    pub name: String,
+    pub owner: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -467,6 +474,17 @@ pub fn parse_manifest(yaml: &str) -> Result<PolicyManifest, ManifestError> {
 /// roles, grants, and default privileges. Merges with one-off definitions.
 /// Validates no duplicate role names.
 pub fn expand_manifest(manifest: &PolicyManifest) -> Result<ExpandedManifest, ManifestError> {
+    let schemas: Vec<ExpandedSchema> = manifest
+        .schemas
+        .iter()
+        .map(|schema_binding| ExpandedSchema {
+            name: schema_binding.name.clone(),
+            owner: schema_binding
+                .owner
+                .clone()
+                .or(manifest.default_owner.clone()),
+        })
+        .collect();
     let mut roles: Vec<RoleDefinition> = Vec::new();
     let mut grants: Vec<Grant> = Vec::new();
     let mut default_privileges: Vec<DefaultPrivilege> = Vec::new();
@@ -627,6 +645,7 @@ pub fn expand_manifest(manifest: &PolicyManifest) -> Result<ExpandedManifest, Ma
     }
 
     Ok(ExpandedManifest {
+        schemas,
         roles,
         grants,
         default_privileges,
@@ -849,6 +868,63 @@ schemas:
             Some("myschema".to_string())
         );
         assert_eq!(expanded.grants[1].object.name, Some("*".to_string()));
+    }
+
+    #[test]
+    fn expand_schema_owner_overrides_default_owner() {
+        let yaml = r#"
+default_owner: app_owner
+
+profiles:
+  editor:
+    default_privileges:
+      - privileges: [SELECT]
+        on_type: table
+
+schemas:
+  - name: inventory
+    owner: inventory_owner
+    profiles: [editor]
+  - name: catalog
+    profiles: [editor]
+"#;
+
+        let manifest = parse_manifest(yaml).unwrap();
+        let expanded = expand_manifest(&manifest).unwrap();
+
+        assert_eq!(
+            expanded.schemas,
+            vec![
+                ExpandedSchema {
+                    name: "inventory".to_string(),
+                    owner: Some("inventory_owner".to_string()),
+                },
+                ExpandedSchema {
+                    name: "catalog".to_string(),
+                    owner: Some("app_owner".to_string()),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn expand_declared_schema_with_no_profiles() {
+        let yaml = r#"
+schemas:
+  - name: cdc
+    owner: cdc_owner
+    profiles: []
+"#;
+
+        let manifest = parse_manifest(yaml).unwrap();
+        let expanded = expand_manifest(&manifest).unwrap();
+
+        assert_eq!(expanded.schemas.len(), 1);
+        assert_eq!(expanded.schemas[0].name, "cdc");
+        assert_eq!(expanded.schemas[0].owner.as_deref(), Some("cdc_owner"));
+        assert!(expanded.roles.is_empty());
+        assert!(expanded.grants.is_empty());
+        assert!(expanded.default_privileges.is_empty());
     }
 
     #[test]

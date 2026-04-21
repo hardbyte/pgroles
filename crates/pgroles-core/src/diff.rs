@@ -34,6 +34,12 @@ pub enum Change {
     /// Create a new role with the given attributes.
     CreateRole { name: String, state: RoleState },
 
+    /// Create a schema, optionally assigning an owner up front.
+    CreateSchema { name: String, owner: Option<String> },
+
+    /// Change an existing schema's owner.
+    AlterSchemaOwner { name: String, owner: String },
+
     /// Alter an existing role's attributes.
     AlterRole {
         name: String,
@@ -228,6 +234,7 @@ fn is_role_drop_or_retirement(change: &Change) -> bool {
 pub fn diff(current: &RoleGraph, desired: &RoleGraph) -> Vec<Change> {
     let mut creates = Vec::new();
     let mut alters = Vec::new();
+    let mut schema_changes = Vec::new();
     let mut grants = Vec::new();
     let mut set_defaults = Vec::new();
     let mut add_members = Vec::new();
@@ -274,6 +281,10 @@ pub fn diff(current: &RoleGraph, desired: &RoleGraph) -> Vec<Change> {
         }
     }
 
+    // ----- Schemas -----
+
+    diff_schemas(current, desired, &mut schema_changes);
+
     // ----- Grants -----
 
     diff_grants(current, desired, &mut grants, &mut revokes);
@@ -290,6 +301,7 @@ pub fn diff(current: &RoleGraph, desired: &RoleGraph) -> Vec<Change> {
     let mut changes = Vec::new();
     changes.extend(creates);
     changes.extend(alters);
+    changes.extend(schema_changes);
     changes.extend(grants);
     changes.extend(set_defaults);
     changes.extend(remove_members);
@@ -298,6 +310,27 @@ pub fn diff(current: &RoleGraph, desired: &RoleGraph) -> Vec<Change> {
     changes.extend(revokes);
     changes.extend(drops);
     changes
+}
+
+fn diff_schemas(current: &RoleGraph, desired: &RoleGraph, out: &mut Vec<Change>) {
+    for (name, desired_state) in &desired.schemas {
+        match current.schemas.get(name) {
+            None => out.push(Change::CreateSchema {
+                name: name.clone(),
+                owner: desired_state.owner.clone(),
+            }),
+            Some(current_state) => {
+                if current_state.owner != desired_state.owner
+                    && let Some(owner) = &desired_state.owner
+                {
+                    out.push(Change::AlterSchemaOwner {
+                        name: name.clone(),
+                        owner: owner.clone(),
+                    });
+                }
+            }
+        }
+    }
 }
 
 /// Augment a diff plan with explicit role-retirement actions.
@@ -654,7 +687,7 @@ fn diff_memberships(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{DefaultPrivState, GrantState};
+    use crate::model::{DefaultPrivState, GrantState, SchemaState};
 
     /// Helper: build an empty graph.
     fn empty_graph() -> RoleGraph {
@@ -718,6 +751,72 @@ mod tests {
             }
             other => panic!("expected AlterRole, got: {other:?}"),
         }
+    }
+
+    #[test]
+    fn diff_creates_missing_schema() {
+        let current = empty_graph();
+        let mut desired = empty_graph();
+        desired.schemas.insert(
+            "inventory".to_string(),
+            SchemaState {
+                owner: Some("inventory_owner".to_string()),
+            },
+        );
+
+        let changes = diff(&current, &desired);
+        assert_eq!(changes.len(), 1);
+        assert!(matches!(
+            &changes[0],
+            Change::CreateSchema { name, owner }
+                if name == "inventory" && owner.as_deref() == Some("inventory_owner")
+        ));
+    }
+
+    #[test]
+    fn diff_alters_schema_owner_when_different() {
+        let mut current = empty_graph();
+        current.schemas.insert(
+            "inventory".to_string(),
+            SchemaState {
+                owner: Some("old_owner".to_string()),
+            },
+        );
+
+        let mut desired = empty_graph();
+        desired.schemas.insert(
+            "inventory".to_string(),
+            SchemaState {
+                owner: Some("new_owner".to_string()),
+            },
+        );
+
+        let changes = diff(&current, &desired);
+        assert_eq!(changes.len(), 1);
+        assert!(matches!(
+            &changes[0],
+            Change::AlterSchemaOwner { name, owner }
+                if name == "inventory" && owner == "new_owner"
+        ));
+    }
+
+    #[test]
+    fn diff_does_not_alter_schema_owner_when_unmanaged() {
+        let mut current = empty_graph();
+        current.schemas.insert(
+            "inventory".to_string(),
+            SchemaState {
+                owner: Some("old_owner".to_string()),
+            },
+        );
+
+        let mut desired = empty_graph();
+        desired
+            .schemas
+            .insert("inventory".to_string(), SchemaState { owner: None });
+
+        let changes = diff(&current, &desired);
+        assert!(changes.is_empty());
     }
 
     #[test]
@@ -952,11 +1051,16 @@ mod tests {
             .iter()
             .position(|c| matches!(c, Change::CreateRole { .. }))
             .unwrap();
+        let schema_idx = changes
+            .iter()
+            .position(|c| matches!(c, Change::CreateSchema { .. }))
+            .unwrap_or(create_idx);
         let drop_idx = changes
             .iter()
             .position(|c| matches!(c, Change::DropRole { .. }))
             .unwrap();
-        assert!(create_idx < drop_idx);
+        assert!(create_idx <= schema_idx);
+        assert!(schema_idx < drop_idx);
     }
 
     #[test]
@@ -1012,6 +1116,7 @@ profiles:
 
 schemas:
   - name: inventory
+    owner: inventory_owner
     profiles: [editor]
 
 memberships:
@@ -1028,10 +1133,14 @@ memberships:
         let current = RoleGraph::default();
         let changes = diff(&current, &desired);
 
-        // Should have: 1 CreateRole, 2 Grants, 1 SetDefaultPrivilege, 1 AddMember
+        // Should have: 1 CreateRole, 1 CreateSchema, 2 Grants, 1 SetDefaultPrivilege, 1 AddMember
         let create_count = changes
             .iter()
             .filter(|c| matches!(c, Change::CreateRole { .. }))
+            .count();
+        let create_schema_count = changes
+            .iter()
+            .filter(|c| matches!(c, Change::CreateSchema { .. }))
             .count();
         let grant_count = changes
             .iter()
@@ -1047,6 +1156,7 @@ memberships:
             .count();
 
         assert_eq!(create_count, 1);
+        assert_eq!(create_schema_count, 1);
         assert_eq!(grant_count, 2); // schema USAGE + table *
         assert_eq!(dp_count, 1);
         assert_eq!(member_count, 1);
@@ -1066,6 +1176,14 @@ memberships:
             Change::CreateRole {
                 name: "new-role".to_string(),
                 state: RoleState::default(),
+            },
+            Change::CreateSchema {
+                name: "inventory".to_string(),
+                owner: Some("inventory_owner".to_string()),
+            },
+            Change::AlterSchemaOwner {
+                name: "catalog".to_string(),
+                owner: "catalog_owner".to_string(),
             },
             Change::AlterRole {
                 name: "altered-role".to_string(),
@@ -1141,8 +1259,8 @@ memberships:
     fn filter_additive_keeps_only_constructive_changes() {
         let filtered = filter_changes(all_change_variants(), ReconciliationMode::Additive);
 
-        // Should keep: CreateRole, AlterRole, SetComment, Grant, SetDefaultPrivilege, AddMember
-        assert_eq!(filtered.len(), 6);
+        // Should keep: CreateRole, CreateSchema, AlterSchemaOwner, AlterRole, SetComment, Grant, SetDefaultPrivilege, AddMember
+        assert_eq!(filtered.len(), 8);
 
         // Verify no destructive changes remain
         for change in &filtered {
@@ -1166,6 +1284,16 @@ memberships:
             filtered
                 .iter()
                 .any(|c| matches!(c, Change::CreateRole { .. }))
+        );
+        assert!(
+            filtered
+                .iter()
+                .any(|c| matches!(c, Change::CreateSchema { .. }))
+        );
+        assert!(
+            filtered
+                .iter()
+                .any(|c| matches!(c, Change::AlterSchemaOwner { .. }))
         );
         assert!(
             filtered
@@ -1195,7 +1323,7 @@ memberships:
         let filtered = filter_changes(all_change_variants(), ReconciliationMode::Adopt);
 
         // Should keep everything except: DropRole, DropOwned, ReassignOwned, TerminateSessions
-        assert_eq!(filtered.len(), 9);
+        assert_eq!(filtered.len(), 11);
 
         // Verify no role-drop/retirement changes remain
         for change in &filtered {

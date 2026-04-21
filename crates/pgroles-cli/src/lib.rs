@@ -151,6 +151,8 @@ fn redacted_changes(changes: &[Change]) -> Vec<Change> {
 pub struct PlanSummary {
     pub roles_created: usize,
     pub roles_altered: usize,
+    pub schemas_created: usize,
+    pub schema_owners_altered: usize,
     pub roles_dropped: usize,
     pub comments_changed: usize,
     pub sessions_terminated: usize,
@@ -172,6 +174,8 @@ impl PlanSummary {
         for change in changes {
             match change {
                 Change::CreateRole { .. } => summary.roles_created += 1,
+                Change::CreateSchema { .. } => summary.schemas_created += 1,
+                Change::AlterSchemaOwner { .. } => summary.schema_owners_altered += 1,
                 Change::AlterRole { .. } => summary.roles_altered += 1,
                 Change::DropRole { .. } => summary.roles_dropped += 1,
                 Change::SetComment { .. } => summary.comments_changed += 1,
@@ -194,6 +198,8 @@ impl PlanSummary {
     pub fn total(&self) -> usize {
         self.roles_created
             + self.roles_altered
+            + self.schemas_created
+            + self.schema_owners_altered
             + self.roles_dropped
             + self.comments_changed
             + self.sessions_terminated
@@ -241,6 +247,8 @@ impl PlanSummary {
         let items: Vec<(&str, usize)> = vec![
             ("role(s) to create", self.roles_created),
             ("role(s) to alter", self.roles_altered),
+            ("schema(s) to create", self.schemas_created),
+            ("schema owner change(s)", self.schema_owners_altered),
             ("role(s) to drop", self.roles_dropped),
             ("comment(s) to change", self.comments_changed),
             ("session termination step(s)", self.sessions_terminated),
@@ -279,6 +287,10 @@ pub fn format_validation_result(validated: &ValidatedManifest) -> String {
     let mut output = String::new();
     output.push_str("Manifest is valid.\n");
     output.push_str(&format!(
+        "  {} schema(s) defined\n",
+        validated.expanded.schemas.len()
+    ));
+    output.push_str(&format!(
         "  {} role(s) defined\n",
         validated.expanded.roles.len()
     ));
@@ -309,6 +321,13 @@ pub fn format_role_graph_summary(graph: &RoleGraph) -> String {
         let login_marker = if state.login { "LOGIN" } else { "NOLOGIN" };
         output.push_str(&format!("  {name} ({login_marker})\n"));
     }
+    output.push_str(&format!("Schemas: {}\n", graph.schemas.len()));
+    for (name, state) in &graph.schemas {
+        match &state.owner {
+            Some(owner) => output.push_str(&format!("  {name} (owner: {owner})\n")),
+            None => output.push_str(&format!("  {name}\n")),
+        }
+    }
     output.push_str(&format!("Grants: {}\n", graph.grants.len()));
     output.push_str(&format!(
         "Default privileges: {}\n",
@@ -331,6 +350,11 @@ mod tests {
 
     const MINIMAL_MANIFEST: &str = r#"
 default_owner: app_owner
+
+schemas:
+  - name: analytics
+    owner: app_owner
+    profiles: []
 
 roles:
   - name: analytics
@@ -431,6 +455,7 @@ schemas:
     fn expand_profile_manifest() {
         let expanded = parse_and_expand(PROFILE_MANIFEST).unwrap();
 
+        assert_eq!(expanded.schemas.len(), 2);
         // inventory-editor, inventory-viewer, catalog-viewer, app-service
         assert_eq!(expanded.roles.len(), 4);
 
@@ -486,6 +511,7 @@ schemas:
 
         let summary = PlanSummary::from_changes(&changes);
         assert_eq!(summary.roles_created, 4); // inventory-editor, inventory-viewer, catalog-viewer, app-service
+        assert_eq!(summary.schemas_created, 2); // inventory, catalog
         assert!(summary.grants > 0);
         assert!(!summary.is_empty());
     }
@@ -509,6 +535,10 @@ schemas:
         let changes = compute_plan(&current, &validated.desired);
 
         let sql_output = format_plan_sql(&changes);
+        assert!(
+            sql_output.contains("CREATE SCHEMA"),
+            "expected CREATE SCHEMA in: {sql_output}"
+        );
         assert!(
             sql_output.contains("CREATE ROLE"),
             "expected CREATE ROLE in: {sql_output}"
@@ -577,13 +607,15 @@ schemas:
     fn plan_summary_display_with_changes() {
         let summary = PlanSummary {
             roles_created: 2,
+            schemas_created: 1,
             grants: 5,
             members_added: 1,
             ..Default::default()
         };
         let display = summary.to_string();
-        assert!(display.contains("8 change(s)"), "got: {display}");
+        assert!(display.contains("9 change(s)"), "got: {display}");
         assert!(display.contains("2 role(s) to create"), "got: {display}");
+        assert!(display.contains("1 schema(s) to create"), "got: {display}");
         assert!(display.contains("5 grant(s) to add"), "got: {display}");
         assert!(display.contains("1 membership(s) to add"), "got: {display}");
         // Should not mention zero-count items
@@ -600,6 +632,7 @@ schemas:
         let validated = validate_manifest(PROFILE_MANIFEST).unwrap();
         let output = format_validation_result(&validated);
         assert!(output.contains("Manifest is valid"), "got: {output}");
+        assert!(output.contains("2 schema(s)"), "got: {output}");
         assert!(output.contains("4 role(s)"), "got: {output}");
     }
 
@@ -627,6 +660,7 @@ schemas:
         let validated = validate_manifest(MINIMAL_MANIFEST).unwrap();
         let summary = format_role_graph_summary(&validated.desired);
         assert!(summary.contains("Roles: 1"), "got: {summary}");
+        assert!(summary.contains("Schemas: 1"), "got: {summary}");
         assert!(summary.contains("analytics (LOGIN)"), "got: {summary}");
     }
 
@@ -638,6 +672,7 @@ schemas:
     fn has_structural_changes_true_for_non_password_changes() {
         let summary = PlanSummary {
             roles_created: 1,
+            schemas_created: 1,
             grants: 2,
             ..Default::default()
         };
@@ -807,16 +842,18 @@ schemas:
     fn format_applied_uses_applied_header() {
         let summary = PlanSummary {
             roles_created: 1,
+            schemas_created: 1,
             grants: 2,
             ..Default::default()
         };
 
         let display = summary.format_applied();
         assert!(
-            display.starts_with("Applied: 3 change(s)\n"),
+            display.starts_with("Applied: 4 change(s)\n"),
             "got: {display}"
         );
         assert!(display.contains("1 role(s) to create"), "got: {display}");
+        assert!(display.contains("1 schema(s) to create"), "got: {display}");
         assert!(display.contains("2 grant(s) to add"), "got: {display}");
         assert!(!display.contains("Plan:"), "got: {display}");
     }

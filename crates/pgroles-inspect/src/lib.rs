@@ -131,6 +131,10 @@ impl InspectConfig {
             managed_schemas.insert(dp.schema.clone());
         }
 
+        for schema in &expanded.schemas {
+            managed_schemas.insert(schema.name.clone());
+        }
+
         Self {
             managed_roles: managed_roles.into_iter().collect(),
             managed_schemas: managed_schemas.into_iter().collect(),
@@ -220,6 +224,17 @@ pub async fn inspect_all(
         graph.memberships.insert(row.to_membership_edge());
     }
 
+    // Schemas
+    let schema_rows = fetch_schemas(pool, &schema_refs).await?;
+    for row in &schema_rows {
+        graph.schemas.insert(
+            row.schema_name.clone(),
+            pgroles_core::model::SchemaState {
+                owner: Some(row.owner_name.clone()),
+            },
+        );
+    }
+
     // Object privileges (no wildcard patterns for unscoped inspection)
     if !schema_refs.is_empty() {
         let privilege_grants = privileges::fetch_privileges_with_wildcards(
@@ -232,6 +247,7 @@ pub async fn inspect_all(
         for (key, state) in privilege_grants {
             graph.grants.insert(key, state);
         }
+        remove_redundant_schema_owner_grants(&mut graph);
     }
 
     // Database privileges
@@ -285,6 +301,21 @@ pub async fn inspect(pool: &PgPool, config: &InspectConfig) -> Result<RoleGraph,
     // The fetch above already handles this (filters on group role = managed).
     debug!(found = graph.memberships.len(), "memberships inspected");
 
+    // --- Schemas ---
+    if !schema_refs.is_empty() {
+        debug!(schemas = ?schema_refs, "inspecting schemas from pg_namespace");
+        let schema_rows = fetch_schemas(pool, &schema_refs).await?;
+        for row in &schema_rows {
+            graph.schemas.insert(
+                row.schema_name.clone(),
+                pgroles_core::model::SchemaState {
+                    owner: Some(row.owner_name.clone()),
+                },
+            );
+        }
+        debug!(found = graph.schemas.len(), "schemas inspected");
+    }
+
     // --- Object privileges ---
     if !schema_refs.is_empty() {
         debug!(
@@ -301,6 +332,7 @@ pub async fn inspect(pool: &PgPool, config: &InspectConfig) -> Result<RoleGraph,
         for (key, state) in privilege_grants {
             graph.grants.insert(key, state);
         }
+        remove_redundant_schema_owner_grants(&mut graph);
         debug!(found = graph.grants.len(), "privilege grants inspected");
     }
 
@@ -354,6 +386,49 @@ pub async fn fetch_existing_schemas(
     .fetch_all(pool)
     .await?;
     Ok(rows.into_iter().map(|r| r.0).collect())
+}
+
+#[derive(Debug, sqlx::FromRow)]
+pub struct SchemaRow {
+    pub schema_name: String,
+    pub owner_name: String,
+}
+
+pub async fn fetch_schemas(
+    pool: &PgPool,
+    managed_schemas: &[&str],
+) -> Result<Vec<SchemaRow>, InspectError> {
+    let rows = sqlx::query_as::<_, SchemaRow>(
+        r#"
+        SELECT n.nspname AS schema_name, owner_role.rolname AS owner_name
+        FROM pg_namespace n
+        JOIN pg_roles owner_role ON owner_role.oid = n.nspowner
+        WHERE n.nspname = ANY($1)
+        ORDER BY n.nspname
+        "#,
+    )
+    .bind(managed_schemas)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows)
+}
+
+fn remove_redundant_schema_owner_grants(graph: &mut RoleGraph) {
+    graph.grants.retain(|key, _| {
+        if key.object_type != pgroles_core::manifest::ObjectType::Schema {
+            return true;
+        }
+
+        let Some(schema_name) = key.name.as_deref() else {
+            return true;
+        };
+
+        let Some(schema_state) = graph.schemas.get(schema_name) else {
+            return true;
+        };
+
+        schema_state.owner.as_deref() != Some(key.role.as_str())
+    });
 }
 
 // ---------------------------------------------------------------------------

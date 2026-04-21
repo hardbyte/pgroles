@@ -8,7 +8,7 @@ use std::collections::{BTreeMap, HashMap};
 
 use crate::manifest::{
     DefaultPrivilege, DefaultPrivilegeGrant, Grant, MemberSpec, Membership, ObjectTarget,
-    PolicyManifest, RoleDefinition,
+    PolicyManifest, RoleDefinition, SchemaBinding,
 };
 use crate::model::RoleGraph;
 
@@ -88,6 +88,18 @@ pub fn role_graph_to_manifest(graph: &RoleGraph) -> PolicyManifest {
         })
         .collect();
 
+    // --- Schemas ---
+    let schemas: Vec<SchemaBinding> = graph
+        .schemas
+        .iter()
+        .map(|(name, state)| SchemaBinding {
+            name: name.clone(),
+            profiles: Vec::new(),
+            role_pattern: "{schema}-{profile}".to_string(),
+            owner: state.owner.clone(),
+        })
+        .collect();
+
     // --- Default privileges ---
     // Group by (owner, schema) to produce compact default_privileges entries.
     let mut dp_groups: BTreeMap<(String, String), Vec<DefaultPrivilegeGrant>> = BTreeMap::new();
@@ -132,7 +144,7 @@ pub fn role_graph_to_manifest(graph: &RoleGraph) -> PolicyManifest {
         default_owner: None,
         auth_providers: Vec::new(),
         profiles: HashMap::new(),
-        schemas: Vec::new(),
+        schemas,
         roles,
         grants,
         default_privileges,
@@ -171,6 +183,7 @@ profiles:
 
 schemas:
   - name: inventory
+    owner: inventory_owner
     profiles: [editor]
 
 roles:
@@ -204,6 +217,9 @@ memberships:
             changes.is_empty(),
             "round-trip produced unexpected changes: {changes:?}"
         );
+
+        assert_eq!(exported_manifest.schemas.len(), 1);
+        assert_eq!(exported_manifest.schemas[0].name, "inventory");
     }
 
     #[test]
@@ -236,6 +252,23 @@ roles:
             .unwrap();
         assert_eq!(login.login, Some(true));
         assert_eq!(login.connection_limit, Some(5));
+    }
+
+    #[test]
+    fn export_includes_managed_schemas() {
+        let mut graph = RoleGraph::default();
+        graph.schemas.insert(
+            "cdc".to_string(),
+            crate::model::SchemaState {
+                owner: Some("cdc_owner".to_string()),
+            },
+        );
+
+        let exported = role_graph_to_manifest(&graph);
+        assert_eq!(exported.schemas.len(), 1);
+        assert_eq!(exported.schemas[0].name, "cdc");
+        assert_eq!(exported.schemas[0].owner.as_deref(), Some("cdc_owner"));
+        assert!(exported.schemas[0].profiles.is_empty());
     }
 
     #[test]
