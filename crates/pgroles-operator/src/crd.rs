@@ -745,19 +745,33 @@ pub struct PlanReference {
 /// Summary of changes applied during reconciliation.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
 pub struct ChangeSummary {
+    #[serde(default)]
     pub roles_created: i32,
+    #[serde(default)]
     pub roles_altered: i32,
+    #[serde(default)]
     pub schemas_created: i32,
+    #[serde(default)]
     pub schema_owners_altered: i32,
+    #[serde(default)]
     pub roles_dropped: i32,
+    #[serde(default)]
     pub sessions_terminated: i32,
+    #[serde(default)]
     pub grants_added: i32,
+    #[serde(default)]
     pub grants_revoked: i32,
+    #[serde(default)]
     pub default_privileges_set: i32,
+    #[serde(default)]
     pub default_privileges_revoked: i32,
+    #[serde(default)]
     pub members_added: i32,
+    #[serde(default)]
     pub members_removed: i32,
+    #[serde(default)]
     pub passwords_set: i32,
+    #[serde(default)]
     pub total: i32,
 }
 
