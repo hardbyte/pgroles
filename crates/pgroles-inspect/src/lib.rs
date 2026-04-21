@@ -197,10 +197,6 @@ pub async fn inspect_all(
     }
     debug!(found = graph.roles.len(), "roles discovered for generation");
 
-    if graph.roles.is_empty() {
-        return Ok(graph);
-    }
-
     let role_names: Vec<String> = graph.roles.keys().cloned().collect();
     let role_refs: Vec<&str> = role_names.iter().map(|s| s.as_str()).collect();
 
@@ -233,6 +229,10 @@ pub async fn inspect_all(
                 owner: Some(row.owner_name.clone()),
             },
         );
+    }
+
+    if graph.roles.is_empty() && graph.schemas.is_empty() {
+        return Ok(graph);
     }
 
     // Object privileges (no wildcard patterns for unscoped inspection)

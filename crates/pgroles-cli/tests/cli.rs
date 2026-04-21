@@ -825,11 +825,33 @@ mod live_db {
             .expect("failed to connect as retired role")
     }
 
+    struct TestDbCleanup {
+        sql: String,
+    }
+
+    impl TestDbCleanup {
+        fn new(sql: String) -> Self {
+            Self { sql }
+        }
+    }
+
+    impl Drop for TestDbCleanup {
+        fn drop(&mut self) {
+            execute_sql(&self.sql);
+        }
+    }
+
     #[test]
     #[ignore]
     fn apply_creates_declared_schema_with_owner() {
         let schema = unique_name("owned_schema");
         let owner_role = unique_name("owned_schema_owner");
+        let _cleanup = TestDbCleanup::new(format!(
+            r#"
+            DROP SCHEMA IF EXISTS "{schema}" CASCADE;
+            DROP ROLE IF EXISTS "{owner_role}";
+            "#
+        ));
 
         execute_sql(&format!(
             r#"
@@ -882,13 +904,6 @@ roles:
             .assert()
             .success()
             .stdout(predicate::str::contains("No changes needed"));
-
-        execute_sql(&format!(
-            r#"
-            DROP SCHEMA IF EXISTS "{schema}" CASCADE;
-            DROP ROLE IF EXISTS "{owner_role}";
-            "#
-        ));
     }
 
     #[test]
@@ -897,6 +912,14 @@ roles:
         let schema = unique_name("schema_owner");
         let old_owner = unique_name("old_owner");
         let new_owner = unique_name("new_owner");
+        let _cleanup = TestDbCleanup::new(format!(
+            r#"
+            DROP SCHEMA IF EXISTS "{schema}" CASCADE;
+            DROP ROLE IF EXISTS "{schema}-editor";
+            DROP ROLE IF EXISTS "{new_owner}";
+            DROP ROLE IF EXISTS "{old_owner}";
+            "#
+        ));
 
         execute_sql(&format!(
             r#"
@@ -969,15 +992,6 @@ roles:
             .assert()
             .success()
             .stdout(predicate::str::contains("No changes needed"));
-
-        execute_sql(&format!(
-            r#"
-            DROP SCHEMA IF EXISTS "{schema}" CASCADE;
-            DROP ROLE IF EXISTS "{schema}-editor";
-            DROP ROLE IF EXISTS "{new_owner}";
-            DROP ROLE IF EXISTS "{old_owner}";
-            "#
-        ));
     }
 
     #[test]

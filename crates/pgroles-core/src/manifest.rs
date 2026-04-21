@@ -15,6 +15,9 @@ pub enum ManifestError {
     #[error("duplicate role name: \"{0}\"")]
     DuplicateRole(String),
 
+    #[error("duplicate schema name: \"{0}\"")]
+    DuplicateSchema(String),
+
     #[error("profile \"{0}\" referenced by schema \"{1}\" is not defined")]
     UndefinedProfile(String, String),
 
@@ -474,6 +477,13 @@ pub fn parse_manifest(yaml: &str) -> Result<PolicyManifest, ManifestError> {
 /// roles, grants, and default privileges. Merges with one-off definitions.
 /// Validates no duplicate role names.
 pub fn expand_manifest(manifest: &PolicyManifest) -> Result<ExpandedManifest, ManifestError> {
+    let mut seen_schemas: HashSet<String> = HashSet::new();
+    for schema_binding in &manifest.schemas {
+        if !seen_schemas.insert(schema_binding.name.clone()) {
+            return Err(ManifestError::DuplicateSchema(schema_binding.name.clone()));
+        }
+    }
+
     let schemas: Vec<ExpandedSchema> = manifest
         .schemas
         .iter()
@@ -1005,6 +1015,22 @@ roles:
                 .to_string()
                 .contains("duplicate role name")
         );
+    }
+
+    #[test]
+    fn expand_rejects_duplicate_schema_name() {
+        let yaml = r#"
+schemas:
+  - name: inventory
+    profiles: []
+  - name: inventory
+    owner: inventory_owner
+    profiles: []
+"#;
+
+        let manifest = parse_manifest(yaml).unwrap();
+        let error = expand_manifest(&manifest).unwrap_err();
+        assert!(error.to_string().contains("duplicate schema name"));
     }
 
     #[test]

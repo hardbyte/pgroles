@@ -202,7 +202,8 @@ pub fn filter_changes(changes: Vec<Change>, mode: ReconciliationMode) -> Vec<Cha
 fn is_destructive(change: &Change) -> bool {
     matches!(
         change,
-        Change::Revoke { .. }
+        Change::AlterSchemaOwner { .. }
+            | Change::Revoke { .. }
             | Change::RevokeDefaultPrivilege { .. }
             | Change::RemoveMember { .. }
             | Change::DropRole { .. }
@@ -1259,15 +1260,16 @@ memberships:
     fn filter_additive_keeps_only_constructive_changes() {
         let filtered = filter_changes(all_change_variants(), ReconciliationMode::Additive);
 
-        // Should keep: CreateRole, CreateSchema, AlterSchemaOwner, AlterRole, SetComment, Grant, SetDefaultPrivilege, AddMember
-        assert_eq!(filtered.len(), 8);
+        // Should keep: CreateRole, CreateSchema, AlterRole, SetComment, Grant, SetDefaultPrivilege, AddMember
+        assert_eq!(filtered.len(), 7);
 
         // Verify no destructive changes remain
         for change in &filtered {
             assert!(
                 !matches!(
                     change,
-                    Change::Revoke { .. }
+                    Change::AlterSchemaOwner { .. }
+                        | Change::Revoke { .. }
                         | Change::RevokeDefaultPrivilege { .. }
                         | Change::RemoveMember { .. }
                         | Change::DropRole { .. }
@@ -1289,11 +1291,6 @@ memberships:
             filtered
                 .iter()
                 .any(|c| matches!(c, Change::CreateSchema { .. }))
-        );
-        assert!(
-            filtered
-                .iter()
-                .any(|c| matches!(c, Change::AlterSchemaOwner { .. }))
         );
         assert!(
             filtered
