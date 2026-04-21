@@ -500,11 +500,7 @@ async fn validate_referenced_schemas_exist(
     pool: &sqlx::PgPool,
     expanded: &pgroles_core::manifest::ExpandedManifest,
 ) -> Result<(), ReconcileError> {
-    let declared = declared_schema_names(expanded);
-    let referenced: std::collections::BTreeSet<String> = referenced_schema_names(expanded)
-        .into_iter()
-        .filter(|name| !is_system_schema(name) && !declared.contains(name))
-        .collect();
+    let referenced = externally_required_schema_names(expanded);
     if referenced.is_empty() {
         return Ok(());
     }
@@ -523,6 +519,16 @@ async fn validate_referenced_schemas_exist(
             .join(", ");
         Err(ReconcileError::MissingDatabaseObjects(formatted))
     }
+}
+
+fn externally_required_schema_names(
+    expanded: &pgroles_core::manifest::ExpandedManifest,
+) -> std::collections::BTreeSet<String> {
+    let declared = declared_schema_names(expanded);
+    referenced_schema_names(expanded)
+        .into_iter()
+        .filter(|name| !is_system_schema(name) && !declared.contains(name))
+        .collect()
 }
 
 /// Apply reconciliation — the main "ensure desired state" logic.
@@ -2910,6 +2916,48 @@ mod tests {
         let names = declared_schema_names(&expanded);
         assert_eq!(names.len(), 1);
         assert!(names.contains("cdc"));
+    }
+
+    #[test]
+    fn externally_required_schema_names_excludes_declared_schemas() {
+        use pgroles_core::manifest::{
+            ExpandedManifest, ExpandedSchema, Grant, ObjectTarget, ObjectType, Privilege,
+        };
+
+        let expanded = ExpandedManifest {
+            schemas: vec![ExpandedSchema {
+                name: "managed".into(),
+                owner: Some("managed_owner".into()),
+            }],
+            roles: Vec::new(),
+            grants: vec![
+                Grant {
+                    role: "app".into(),
+                    privileges: vec![Privilege::Usage],
+                    object: ObjectTarget {
+                        object_type: ObjectType::Schema,
+                        schema: None,
+                        name: Some("managed".into()),
+                    },
+                },
+                Grant {
+                    role: "app".into(),
+                    privileges: vec![Privilege::Select],
+                    object: ObjectTarget {
+                        object_type: ObjectType::Table,
+                        schema: Some("external".into()),
+                        name: Some("*".into()),
+                    },
+                },
+            ],
+            default_privileges: Vec::new(),
+            memberships: Vec::new(),
+        };
+
+        let names = externally_required_schema_names(&expanded);
+        assert_eq!(names.len(), 1);
+        assert!(names.contains("external"));
+        assert!(!names.contains("managed"));
     }
 
     #[test]

@@ -173,6 +173,27 @@ fn validate_undefined_profile() {
 }
 
 #[test]
+fn validate_duplicate_schema_name() {
+    let manifest_file = write_temp_manifest(
+        r#"
+schemas:
+  - name: inventory
+    profiles: []
+  - name: inventory
+    owner: inventory_owner
+    profiles: []
+"#,
+    );
+
+    pgroles_cmd()
+        .args(["validate", "--file", manifest_file.path().to_str().unwrap()])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("duplicate schema name"))
+        .stderr(predicate::str::contains("inventory"));
+}
+
+#[test]
 fn validate_nonexistent_file() {
     pgroles_cmd()
         .args([
@@ -908,6 +929,81 @@ roles:
 
     #[test]
     #[ignore]
+    fn additive_mode_does_not_transfer_schema_owner() {
+        let schema = unique_name("schema_owner_additive");
+        let old_owner = unique_name("old_owner");
+        let new_owner = unique_name("new_owner");
+        let _cleanup = TestDbCleanup::new(format!(
+            r#"
+            DROP SCHEMA IF EXISTS "{schema}" CASCADE;
+            DROP ROLE IF EXISTS "{new_owner}";
+            DROP ROLE IF EXISTS "{old_owner}";
+            "#
+        ));
+
+        execute_sql(&format!(
+            r#"
+            DROP SCHEMA IF EXISTS "{schema}" CASCADE;
+            DROP ROLE IF EXISTS "{new_owner}";
+            DROP ROLE IF EXISTS "{old_owner}";
+            CREATE ROLE "{old_owner}";
+            CREATE ROLE "{new_owner}";
+            CREATE SCHEMA "{schema}" AUTHORIZATION "{old_owner}";
+            "#
+        ));
+
+        let manifest_file = write_temp_manifest(&format!(
+            r#"
+schemas:
+  - name: {schema}
+    owner: {new_owner}
+    profiles: []
+
+roles:
+  - name: {old_owner}
+  - name: {new_owner}
+"#
+        ));
+
+        pgroles_cmd()
+            .args([
+                "apply",
+                "--file",
+                manifest_file.path().to_str().unwrap(),
+                "--database-url",
+                &database_url(),
+                "--mode",
+                "additive",
+            ])
+            .assert()
+            .success()
+            .stdout(predicate::str::contains("No changes needed"));
+
+        assert_eq!(
+            query_schema_owner(&schema).as_deref(),
+            Some(old_owner.as_str()),
+            "additive mode should not transfer schema ownership"
+        );
+
+        pgroles_cmd()
+            .args([
+                "diff",
+                "--file",
+                manifest_file.path().to_str().unwrap(),
+                "--database-url",
+                &database_url(),
+                "--mode",
+                "additive",
+                "--format",
+                "summary",
+            ])
+            .assert()
+            .success()
+            .stdout(predicate::str::contains("No changes needed"));
+    }
+
+    #[test]
+    #[ignore]
     fn apply_converges_existing_schema_owner_and_uses_owner_for_default_privileges() {
         let schema = unique_name("schema_owner");
         let old_owner = unique_name("old_owner");
@@ -996,6 +1092,42 @@ roles:
 
     #[test]
     #[ignore]
+    fn apply_declared_schema_with_missing_owner_role_fails_clearly() {
+        let schema = unique_name("missing_owner_schema");
+        let missing_owner = unique_name("missing_owner_role");
+        let _cleanup = TestDbCleanup::new(format!(
+            r#"
+            DROP SCHEMA IF EXISTS "{schema}" CASCADE;
+            DROP ROLE IF EXISTS "{missing_owner}";
+            "#
+        ));
+
+        execute_sql(&format!(r#"DROP SCHEMA IF EXISTS "{schema}" CASCADE;"#));
+
+        let manifest_file = write_temp_manifest(&format!(
+            r#"
+schemas:
+  - name: {schema}
+    owner: {missing_owner}
+    profiles: []
+"#
+        ));
+
+        pgroles_cmd()
+            .args([
+                "apply",
+                "--file",
+                manifest_file.path().to_str().unwrap(),
+                "--database-url",
+                &database_url(),
+            ])
+            .assert()
+            .failure()
+            .stderr(predicate::str::contains(missing_owner.as_str()));
+    }
+
+    #[test]
+    #[ignore]
     fn generate_output_to_stdout_has_no_nulls() {
         let output = pgroles_cmd()
             .args(["generate", "--database-url", &database_url()])
@@ -1011,6 +1143,46 @@ roles:
             "generated YAML should not contain null fields"
         );
         assert!(yaml.contains("roles:"), "expected roles section in output");
+    }
+
+    #[test]
+    #[ignore]
+    fn generate_includes_schema_owned_by_postgres_without_user_roles() {
+        let schema = unique_name("generate_schema_only");
+        let _cleanup = TestDbCleanup::new(format!(
+            r#"
+            DROP SCHEMA IF EXISTS "{schema}" CASCADE;
+            "#
+        ));
+
+        execute_sql(&format!(
+            r#"
+            DROP SCHEMA IF EXISTS "{schema}" CASCADE;
+            CREATE SCHEMA "{schema}" AUTHORIZATION postgres;
+            "#
+        ));
+
+        let output = pgroles_cmd()
+            .args(["generate", "--database-url", &database_url()])
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone();
+
+        let yaml = String::from_utf8(output).expect("output is not valid UTF-8");
+        assert!(
+            yaml.contains("schemas:"),
+            "expected schemas section in output"
+        );
+        assert!(
+            yaml.contains(&format!("- name: {schema}")),
+            "expected generated manifest to include schema {schema}: {yaml}"
+        );
+        assert!(
+            yaml.contains("owner: postgres"),
+            "expected generated manifest to include postgres schema owner: {yaml}"
+        );
     }
 
     #[test]
