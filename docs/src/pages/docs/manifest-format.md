@@ -106,6 +106,29 @@ When a schema is declared under `schemas:`:
 
 If a schema is only referenced from top-level `grants:` or `default_privileges:` and is not declared under `schemas:`, it must already exist.
 
+### Declared vs referenced example
+
+```yaml
+schemas:
+  - name: app_managed
+    owner: app_owner
+    profiles: []
+
+grants:
+  - role: reporting
+    privileges: [USAGE]
+    object: { type: schema, name: app_managed }
+
+  - role: reporting
+    privileges: [SELECT]
+    object: { type: table, schema: existing_warehouse, name: "*" }
+```
+
+In this example:
+
+- `app_managed` is declared under `schemas:`, so pgroles can create it and set its owner.
+- `existing_warehouse` is only referenced from a top-level grant, so it must already exist before `apply` runs.
+
 ## roles
 
 Each role definition specifies a PostgreSQL role and its attributes:
