@@ -1778,7 +1778,9 @@ fn accumulate_summary(summary: &mut ChangeSummary, change: &pgroles_core::diff::
         Change::TerminateSessions { .. } => summary.sessions_terminated += 1,
         Change::ReassignOwned { .. } => {}
         Change::DropOwned { .. } => {}
-        Change::Grant { .. } => summary.grants_added += 1,
+        Change::Grant { .. } | Change::EnsureSchemaOwnerPrivileges { .. } => {
+            summary.grants_added += 1
+        }
         Change::Revoke { .. } => summary.grants_revoked += 1,
         Change::SetDefaultPrivilege { .. } => summary.default_privileges_set += 1,
         Change::RevokeDefaultPrivilege { .. } => summary.default_privileges_revoked += 1,
@@ -1845,13 +1847,13 @@ async fn detect_sql_context(
     inspect_config: &pgroles_inspect::InspectConfig,
 ) -> Result<pgroles_core::sql::SqlContext, ReconcileError> {
     let pg_version = pgroles_inspect::detect_pg_version(pool).await?;
-    let managed_schemas: Vec<&str> = inspect_config
-        .managed_schemas
+    let privilege_schemas: Vec<&str> = inspect_config
+        .privilege_schemas
         .iter()
         .map(|schema| schema.as_str())
         .collect();
     let relation_inventory =
-        pgroles_inspect::fetch_relation_inventory(pool, &managed_schemas).await?;
+        pgroles_inspect::fetch_relation_inventory(pool, &privilege_schemas).await?;
     Ok(
         pgroles_core::sql::SqlContext::from_version_num(pg_version.version_num)
             .with_relation_inventory(relation_inventory),

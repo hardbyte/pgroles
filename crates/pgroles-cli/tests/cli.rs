@@ -7,7 +7,7 @@
 
 use assert_cmd::cargo::cargo_bin_cmd;
 use predicates::prelude::*;
-use tempfile::NamedTempFile;
+use tempfile::{NamedTempFile, TempDir};
 
 use std::io::Write;
 
@@ -23,6 +23,18 @@ fn write_temp_manifest(content: &str) -> NamedTempFile {
         .expect("failed to write temp manifest");
     file.flush().expect("failed to flush temp manifest");
     file
+}
+
+fn write_temp_bundle(bundle: &str, documents: &[(&str, &str)]) -> (TempDir, std::path::PathBuf) {
+    let dir = tempfile::tempdir().expect("failed to create temp bundle dir");
+    let bundle_path = dir.path().join("bundle.yaml");
+    std::fs::write(&bundle_path, bundle).expect("failed to write bundle file");
+
+    for (name, content) in documents {
+        std::fs::write(dir.path().join(name), content).expect("failed to write policy document");
+    }
+
+    (dir, bundle_path)
 }
 
 fn pgroles_cmd() -> assert_cmd::Command {
@@ -191,6 +203,314 @@ schemas:
         .failure()
         .stderr(predicate::str::contains("duplicate schema name"))
         .stderr(predicate::str::contains("inventory"));
+}
+
+#[test]
+fn validate_bundle_with_split_schema_ownership() {
+    let (bundle_dir, bundle_path) = write_temp_bundle(
+        r#"
+shared:
+  profiles:
+    editor:
+      grants:
+        - privileges: [USAGE]
+          object: { type: schema }
+sources:
+  - file: platform.yaml
+  - file: app.yaml
+"#,
+        &[
+            (
+                "platform.yaml",
+                r#"
+policy:
+  name: platform
+scope:
+  roles: [app_owner]
+  schemas:
+    - name: inventory
+      facets: [owner]
+roles:
+  - name: app_owner
+    login: false
+schemas:
+  - name: inventory
+    owner: app_owner
+"#,
+            ),
+            (
+                "app.yaml",
+                r#"
+policy:
+  name: app
+scope:
+  schemas:
+    - name: inventory
+      facets: [bindings]
+schemas:
+  - name: inventory
+    profiles: [editor]
+"#,
+            ),
+        ],
+    );
+
+    let _keep_dir = bundle_dir;
+
+    pgroles_cmd()
+        .args([
+            "validate",
+            "--bundle",
+            bundle_path.to_str().expect("bundle path should be utf-8"),
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Policy bundle is valid"))
+        .stdout(predicate::str::contains("2 source document(s) loaded"))
+        .stdout(predicate::str::contains("2 role(s) defined"));
+}
+
+#[test]
+fn validate_bundle_rejects_role_outside_scope() {
+    let (bundle_dir, bundle_path) = write_temp_bundle(
+        r#"
+sources:
+  - file: app.yaml
+"#,
+        &[(
+            "app.yaml",
+            r#"
+roles:
+  - name: app
+    login: true
+"#,
+        )],
+    );
+
+    let _keep_dir = bundle_dir;
+
+    pgroles_cmd()
+        .args([
+            "validate",
+            "--bundle",
+            bundle_path.to_str().expect("bundle path should be utf-8"),
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "defines role \"app\" outside its declared scope",
+        ));
+}
+
+// =========================================================================
+// graph subcommand
+// =========================================================================
+
+#[test]
+fn graph_desired_tree_renders_managed_roles() {
+    let manifest_file = write_temp_manifest(VALID_PROFILES);
+
+    pgroles_cmd()
+        .args([
+            "graph",
+            "desired",
+            "--file",
+            manifest_file.path().to_str().unwrap(),
+            "--format",
+            "tree",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("inventory-editor"))
+        .stdout(predicate::str::contains("catalog-viewer"))
+        .stdout(predicate::str::contains("app-service"));
+}
+
+#[test]
+fn graph_desired_bundle_tree_renders_composed_roles() {
+    let (bundle_dir, bundle_path) = write_temp_bundle(
+        r#"
+shared:
+  profiles:
+    editor:
+      grants:
+        - privileges: [USAGE]
+          object: { type: schema }
+sources:
+  - file: platform.yaml
+  - file: app.yaml
+"#,
+        &[
+            (
+                "platform.yaml",
+                r#"
+policy:
+  name: platform
+scope:
+  roles: [app_owner]
+  schemas:
+    - name: inventory
+      facets: [owner]
+roles:
+  - name: app_owner
+    login: false
+schemas:
+  - name: inventory
+    owner: app_owner
+"#,
+            ),
+            (
+                "app.yaml",
+                r#"
+policy:
+  name: app
+scope:
+  schemas:
+    - name: inventory
+      facets: [bindings]
+schemas:
+  - name: inventory
+    profiles: [editor]
+"#,
+            ),
+        ],
+    );
+    let _keep_dir = bundle_dir;
+
+    pgroles_cmd()
+        .args([
+            "graph",
+            "desired",
+            "--bundle",
+            bundle_path.to_str().expect("bundle path should be utf-8"),
+            "--format",
+            "tree",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("inventory-editor"))
+        .stdout(predicate::str::contains("app_owner"));
+}
+
+#[test]
+fn graph_desired_bundle_json_includes_managed_scope_metadata() {
+    let (bundle_dir, bundle_path) = write_temp_bundle(
+        r#"
+shared:
+  profiles:
+    editor:
+      grants:
+        - privileges: [USAGE]
+          object: { type: schema }
+sources:
+  - file: platform.yaml
+  - file: app.yaml
+"#,
+        &[
+            (
+                "platform.yaml",
+                r#"
+policy:
+  name: platform
+scope:
+  roles: [app_owner]
+  schemas:
+    - name: inventory
+      facets: [owner]
+roles:
+  - name: app_owner
+    login: false
+schemas:
+  - name: inventory
+    owner: app_owner
+"#,
+            ),
+            (
+                "app.yaml",
+                r#"
+policy:
+  name: app
+scope:
+  schemas:
+    - name: inventory
+      facets: [bindings]
+schemas:
+  - name: inventory
+    profiles: [editor]
+"#,
+            ),
+        ],
+    );
+    let _keep_dir = bundle_dir;
+
+    let output = pgroles_cmd()
+        .args([
+            "graph",
+            "desired",
+            "--bundle",
+            bundle_path.to_str().expect("bundle path should be utf-8"),
+            "--format",
+            "json",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    let parsed: serde_json::Value =
+        serde_json::from_slice(&output).expect("graph json should parse");
+    assert_eq!(parsed["schema_version"], "pgroles.visual_graph.v1");
+    assert_eq!(parsed["meta"]["managed_scope"]["roles"][0], "app_owner");
+    assert_eq!(
+        parsed["meta"]["managed_scope"]["schemas"][0]["name"],
+        "inventory"
+    );
+    assert_eq!(parsed["meta"]["managed_scope"]["schemas"][0]["owner"], true);
+}
+
+#[test]
+fn graph_desired_output_file_writes_requested_format() {
+    let manifest_file = write_temp_manifest(VALID_PROFILES);
+    let output_dir = tempfile::tempdir().expect("failed to create temp output dir");
+    let output_path = output_dir.path().join("graph.json");
+
+    pgroles_cmd()
+        .args([
+            "graph",
+            "desired",
+            "--file",
+            manifest_file.path().to_str().unwrap(),
+            "--format",
+            "json",
+            "--output",
+            output_path.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+
+    let graph_json =
+        std::fs::read_to_string(&output_path).expect("failed to read rendered graph output");
+    assert!(graph_json.contains("\"inventory-editor\""));
+    assert!(graph_json.contains("\"catalog-viewer\""));
+}
+
+#[test]
+fn graph_current_managed_requires_file() {
+    pgroles_cmd()
+        .args([
+            "graph",
+            "current",
+            "--database-url",
+            "postgres://unused",
+            "--scope",
+            "managed",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "--file or --bundle is required when --scope=managed",
+        ));
 }
 
 #[test]
@@ -628,6 +948,40 @@ fn diff_with_invalid_manifest_accepts_no_exit_code_flag() {
 }
 
 #[test]
+fn diff_with_invalid_bundle_fails_before_connecting() {
+    let (bundle_dir, bundle_path) = write_temp_bundle(
+        r#"
+sources:
+  - file: app.yaml
+"#,
+        &[(
+            "app.yaml",
+            r#"
+roles:
+  - name: app
+    login: true
+"#,
+        )],
+    );
+
+    let _keep_dir = bundle_dir;
+
+    pgroles_cmd()
+        .args([
+            "diff",
+            "--bundle",
+            bundle_path.to_str().expect("bundle path should be utf-8"),
+            "--database-url",
+            "postgres://localhost/test",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "defines role \"app\" outside its declared scope",
+        ));
+}
+
+#[test]
 fn apply_with_invalid_manifest() {
     let manifest_file = write_temp_manifest(INVALID_YAML);
 
@@ -642,6 +996,40 @@ fn apply_with_invalid_manifest() {
         .assert()
         .failure()
         .stderr(predicate::str::contains("YAML parse error"));
+}
+
+#[test]
+fn apply_with_invalid_bundle_fails_before_connecting() {
+    let (bundle_dir, bundle_path) = write_temp_bundle(
+        r#"
+sources:
+  - file: app.yaml
+"#,
+        &[(
+            "app.yaml",
+            r#"
+roles:
+  - name: app
+    login: true
+"#,
+        )],
+    );
+
+    let _keep_dir = bundle_dir;
+
+    pgroles_cmd()
+        .args([
+            "apply",
+            "--bundle",
+            bundle_path.to_str().expect("bundle path should be utf-8"),
+            "--database-url",
+            "postgres://localhost/test",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "defines role \"app\" outside its declared scope",
+        ));
 }
 
 // =========================================================================
@@ -836,6 +1224,38 @@ mod live_db {
         })
     }
 
+    fn query_has_database_privilege(role: &str, database: &str, privilege: &str) -> bool {
+        with_runtime(async {
+            let pool = PgPool::connect(&database_url())
+                .await
+                .expect("failed to connect to live test database");
+            let row = sqlx::query("SELECT has_database_privilege($1, $2, $3) AS allowed")
+                .bind(role)
+                .bind(database)
+                .bind(privilege)
+                .fetch_one(&pool)
+                .await
+                .expect("failed to query database privilege");
+            row.get("allowed")
+        })
+    }
+
+    fn query_has_schema_privilege(role: &str, schema: &str, privilege: &str) -> bool {
+        with_runtime(async {
+            let pool = PgPool::connect(&database_url())
+                .await
+                .expect("failed to connect to live test database");
+            let row = sqlx::query("SELECT has_schema_privilege($1, $2, $3) AS allowed")
+                .bind(role)
+                .bind(schema)
+                .bind(privilege)
+                .fetch_one(&pool)
+                .await
+                .expect("failed to query schema privilege");
+            row.get("allowed")
+        })
+    }
+
     async fn open_role_connection(role: &str, password: &str) -> PgConnection {
         let options = PgConnectOptions::from_str(&database_url())
             .expect("failed to parse DATABASE_URL")
@@ -860,6 +1280,575 @@ mod live_db {
         fn drop(&mut self) {
             execute_sql(&self.sql);
         }
+    }
+
+    #[test]
+    #[ignore]
+    fn graph_current_all_renders_live_roles() {
+        let live_role = unique_name("graph_all_role");
+        let _cleanup = TestDbCleanup::new(format!(r#"DROP ROLE IF EXISTS "{live_role}";"#));
+
+        execute_sql(&format!(
+            r#"
+            DROP ROLE IF EXISTS "{live_role}";
+            CREATE ROLE "{live_role}" LOGIN;
+            "#
+        ));
+
+        pgroles_cmd()
+            .args([
+                "graph",
+                "current",
+                "--database-url",
+                &database_url(),
+                "--scope",
+                "all",
+                "--format",
+                "tree",
+            ])
+            .assert()
+            .success()
+            .stdout(predicate::str::contains(live_role.as_str()));
+    }
+
+    #[test]
+    #[ignore]
+    fn graph_current_managed_scopes_to_manifest_roles() {
+        let managed_role = unique_name("graph_managed_role");
+        let extra_role = unique_name("graph_extra_role");
+        let _cleanup = TestDbCleanup::new(format!(
+            r#"
+            DROP ROLE IF EXISTS "{extra_role}";
+            DROP ROLE IF EXISTS "{managed_role}";
+            "#
+        ));
+
+        execute_sql(&format!(
+            r#"
+            DROP ROLE IF EXISTS "{extra_role}";
+            DROP ROLE IF EXISTS "{managed_role}";
+            CREATE ROLE "{managed_role}" LOGIN;
+            CREATE ROLE "{extra_role}" LOGIN;
+            "#
+        ));
+
+        let manifest_file = write_temp_manifest(&format!(
+            r#"
+roles:
+  - name: {managed_role}
+    login: true
+"#
+        ));
+
+        pgroles_cmd()
+            .args([
+                "graph",
+                "current",
+                "--file",
+                manifest_file.path().to_str().unwrap(),
+                "--database-url",
+                &database_url(),
+                "--scope",
+                "managed",
+                "--format",
+                "tree",
+            ])
+            .assert()
+            .success()
+            .stdout(predicate::str::contains(managed_role.as_str()))
+            .stdout(predicate::str::contains(extra_role.as_str()).not());
+    }
+
+    #[test]
+    #[ignore]
+    fn diff_bundle_owner_only_scope_ignores_unmanaged_schema_grants() {
+        let schema = unique_name("bundle_owner_schema");
+        let owner_role = unique_name("bundle_owner");
+        let extra_role = unique_name("bundle_extra");
+        let _cleanup = TestDbCleanup::new(format!(
+            r#"
+            DROP SCHEMA IF EXISTS "{schema}" CASCADE;
+            DROP ROLE IF EXISTS "{extra_role}";
+            DROP ROLE IF EXISTS "{owner_role}";
+            "#
+        ));
+
+        execute_sql(&format!(
+            r#"
+            DROP SCHEMA IF EXISTS "{schema}" CASCADE;
+            DROP ROLE IF EXISTS "{extra_role}";
+            DROP ROLE IF EXISTS "{owner_role}";
+            CREATE ROLE "{owner_role}" NOLOGIN;
+            CREATE ROLE "{extra_role}" NOLOGIN;
+            CREATE SCHEMA "{schema}" AUTHORIZATION "{owner_role}";
+            GRANT USAGE ON SCHEMA "{schema}" TO "{extra_role}";
+            "#
+        ));
+
+        let (bundle_dir, bundle_path) = write_temp_bundle(
+            r#"
+sources:
+  - file: platform.yaml
+"#,
+            &[(
+                "platform.yaml",
+                &format!(
+                    r#"
+policy:
+  name: platform
+scope:
+  roles: [{owner_role}]
+  schemas:
+    - name: {schema}
+      facets: [owner]
+roles:
+  - name: {owner_role}
+    login: false
+schemas:
+  - name: {schema}
+    owner: {owner_role}
+"#
+                ),
+            )],
+        );
+        let _keep_dir = bundle_dir;
+
+        pgroles_cmd()
+            .args([
+                "diff",
+                "--bundle",
+                bundle_path.to_str().expect("bundle path should be utf-8"),
+                "--database-url",
+                &database_url(),
+                "--format",
+                "sql",
+            ])
+            .assert()
+            .success()
+            .stdout(predicate::str::contains("No changes needed"))
+            .stdout(predicate::str::contains("REVOKE").not());
+    }
+
+    #[test]
+    #[ignore]
+    fn apply_bundle_owner_only_scope_ignores_unmanaged_schema_grants() {
+        let schema = unique_name("bundle_apply_owner_schema");
+        let owner_role = unique_name("bundle_apply_owner");
+        let extra_role = unique_name("bundle_apply_extra");
+        let _cleanup = TestDbCleanup::new(format!(
+            r#"
+            DROP SCHEMA IF EXISTS "{schema}" CASCADE;
+            DROP ROLE IF EXISTS "{extra_role}";
+            DROP ROLE IF EXISTS "{owner_role}";
+            "#
+        ));
+
+        execute_sql(&format!(
+            r#"
+            DROP SCHEMA IF EXISTS "{schema}" CASCADE;
+            DROP ROLE IF EXISTS "{extra_role}";
+            DROP ROLE IF EXISTS "{owner_role}";
+            CREATE ROLE "{owner_role}" NOLOGIN;
+            CREATE ROLE "{extra_role}" NOLOGIN;
+            CREATE SCHEMA "{schema}" AUTHORIZATION "{owner_role}";
+            GRANT USAGE ON SCHEMA "{schema}" TO "{extra_role}";
+            "#
+        ));
+
+        let (bundle_dir, bundle_path) = write_temp_bundle(
+            r#"
+sources:
+  - file: platform.yaml
+"#,
+            &[(
+                "platform.yaml",
+                &format!(
+                    r#"
+policy:
+  name: platform
+scope:
+  roles: [{owner_role}]
+  schemas:
+    - name: {schema}
+      facets: [owner]
+roles:
+  - name: {owner_role}
+    login: false
+schemas:
+  - name: {schema}
+    owner: {owner_role}
+"#
+                ),
+            )],
+        );
+        let _keep_dir = bundle_dir;
+
+        pgroles_cmd()
+            .args([
+                "apply",
+                "--bundle",
+                bundle_path.to_str().expect("bundle path should be utf-8"),
+                "--database-url",
+                &database_url(),
+            ])
+            .assert()
+            .success()
+            .stdout(predicate::str::contains("No changes needed"));
+
+        assert!(
+            query_has_schema_privilege(&extra_role, &schema, "USAGE"),
+            "owner-only bundle scope should not revoke unmanaged schema grants"
+        );
+
+        pgroles_cmd()
+            .args([
+                "diff",
+                "--bundle",
+                bundle_path.to_str().expect("bundle path should be utf-8"),
+                "--database-url",
+                &database_url(),
+                "--format",
+                "summary",
+            ])
+            .assert()
+            .success()
+            .stdout(predicate::str::contains("No changes needed"));
+    }
+
+    #[test]
+    #[ignore]
+    fn apply_bundle_revokes_removed_database_grants_for_managed_role() {
+        let managed_role = unique_name("bundle_db_role");
+        let _cleanup = TestDbCleanup::new(format!(r#"DROP ROLE IF EXISTS "{managed_role}";"#));
+
+        execute_sql(&format!(
+            r#"
+            DROP ROLE IF EXISTS "{managed_role}";
+            CREATE ROLE "{managed_role}" NOLOGIN;
+            GRANT CREATE ON DATABASE pgroles_test TO "{managed_role}";
+            "#
+        ));
+
+        assert!(
+            query_has_database_privilege(&managed_role, "pgroles_test", "CREATE"),
+            "test setup should grant database create privilege"
+        );
+
+        let (bundle_dir, bundle_path) = write_temp_bundle(
+            r#"
+sources:
+  - file: app.yaml
+"#,
+            &[(
+                "app.yaml",
+                &format!(
+                    r#"
+policy:
+  name: app
+scope:
+  roles: [{managed_role}]
+roles:
+  - name: {managed_role}
+    login: false
+"#
+                ),
+            )],
+        );
+        let _keep_dir = bundle_dir;
+
+        pgroles_cmd()
+            .args([
+                "apply",
+                "--bundle",
+                bundle_path.to_str().expect("bundle path should be utf-8"),
+                "--database-url",
+                &database_url(),
+            ])
+            .assert()
+            .success()
+            .stdout(predicate::str::contains("1 grant(s) to revoke"));
+
+        assert!(
+            !query_has_database_privilege(&managed_role, "pgroles_test", "CREATE"),
+            "bundle apply should revoke removed database grants for managed roles"
+        );
+
+        pgroles_cmd()
+            .args([
+                "diff",
+                "--bundle",
+                bundle_path.to_str().expect("bundle path should be utf-8"),
+                "--database-url",
+                &database_url(),
+                "--format",
+                "summary",
+            ])
+            .assert()
+            .success()
+            .stdout(predicate::str::contains("No changes needed"));
+    }
+
+    #[test]
+    #[ignore]
+    fn apply_bundle_with_split_schema_ownership_converges() {
+        let schema = unique_name("bundle_split_schema");
+        let owner_role = unique_name("bundle_split_owner");
+        let generated_role = format!("{schema}-editor");
+        let _cleanup = TestDbCleanup::new(format!(
+            r#"
+            DROP SCHEMA IF EXISTS "{schema}" CASCADE;
+            DROP ROLE IF EXISTS "{generated_role}";
+            DROP ROLE IF EXISTS "{owner_role}";
+            "#
+        ));
+
+        execute_sql(&format!(
+            r#"
+            DROP SCHEMA IF EXISTS "{schema}" CASCADE;
+            DROP ROLE IF EXISTS "{generated_role}";
+            DROP ROLE IF EXISTS "{owner_role}";
+            "#
+        ));
+
+        let (bundle_dir, bundle_path) = write_temp_bundle(
+            r#"
+shared:
+  profiles:
+    editor:
+      grants:
+        - privileges: [USAGE]
+          object: { type: schema }
+        - privileges: [SELECT]
+          object: { type: table, name: "*" }
+      default_privileges:
+        - privileges: [SELECT]
+          on_type: table
+sources:
+  - file: platform.yaml
+  - file: app.yaml
+"#,
+            &[
+                (
+                    "platform.yaml",
+                    &format!(
+                        r#"
+policy:
+  name: platform
+scope:
+  roles: [{owner_role}]
+  schemas:
+    - name: {schema}
+      facets: [owner]
+roles:
+  - name: {owner_role}
+    login: false
+schemas:
+  - name: {schema}
+    owner: {owner_role}
+"#
+                    ),
+                ),
+                (
+                    "app.yaml",
+                    &format!(
+                        r#"
+policy:
+  name: app
+scope:
+  schemas:
+    - name: {schema}
+      facets: [bindings]
+schemas:
+  - name: {schema}
+    profiles: [editor]
+"#
+                    ),
+                ),
+            ],
+        );
+        let _keep_dir = bundle_dir;
+
+        pgroles_cmd()
+            .args([
+                "apply",
+                "--bundle",
+                bundle_path.to_str().expect("bundle path should be utf-8"),
+                "--database-url",
+                &database_url(),
+            ])
+            .assert()
+            .success()
+            .stdout(predicate::str::contains("Applied"))
+            .stdout(predicate::str::contains("No changes needed").not());
+
+        assert_eq!(
+            query_schema_owner(&schema).as_deref(),
+            Some(owner_role.as_str()),
+            "bundle apply should create the schema with the platform-owned owner"
+        );
+        assert!(
+            query_role_exists(&generated_role),
+            "bundle apply should create generated profile roles"
+        );
+        assert!(
+            query_has_schema_privilege(&generated_role, &schema, "USAGE"),
+            "bundle apply should grant schema usage from the binding profile"
+        );
+        assert_eq!(
+            query_default_acl_owner(&schema, &generated_role, "r").as_deref(),
+            Some(owner_role.as_str()),
+            "bundle apply should bind default privileges to the declared schema owner"
+        );
+
+        pgroles_cmd()
+            .args([
+                "diff",
+                "--bundle",
+                bundle_path.to_str().expect("bundle path should be utf-8"),
+                "--database-url",
+                &database_url(),
+                "--format",
+                "summary",
+            ])
+            .assert()
+            .success()
+            .stdout(predicate::str::contains("No changes needed"));
+    }
+
+    #[test]
+    #[ignore]
+    fn additive_mode_bundle_skips_owner_bound_default_privileges_when_transfer_is_skipped() {
+        let schema = unique_name("bundle_additive_schema");
+        let old_owner = unique_name("bundle_old_owner");
+        let new_owner = unique_name("bundle_new_owner");
+        let generated_role = format!("{schema}-editor");
+        let _cleanup = TestDbCleanup::new(format!(
+            r#"
+            DROP SCHEMA IF EXISTS "{schema}" CASCADE;
+            DROP ROLE IF EXISTS "{generated_role}";
+            DROP ROLE IF EXISTS "{new_owner}";
+            DROP ROLE IF EXISTS "{old_owner}";
+            "#
+        ));
+
+        execute_sql(&format!(
+            r#"
+            DROP SCHEMA IF EXISTS "{schema}" CASCADE;
+            DROP ROLE IF EXISTS "{generated_role}";
+            DROP ROLE IF EXISTS "{new_owner}";
+            DROP ROLE IF EXISTS "{old_owner}";
+            CREATE ROLE "{old_owner}";
+            CREATE ROLE "{new_owner}";
+            CREATE SCHEMA "{schema}" AUTHORIZATION "{old_owner}";
+            "#
+        ));
+
+        let (bundle_dir, bundle_path) = write_temp_bundle(
+            r#"
+shared:
+  profiles:
+    editor:
+      grants:
+        - privileges: [USAGE]
+          object: { type: schema }
+      default_privileges:
+        - privileges: [SELECT]
+          on_type: table
+sources:
+  - file: platform.yaml
+  - file: app.yaml
+"#,
+            &[
+                (
+                    "platform.yaml",
+                    &format!(
+                        r#"
+policy:
+  name: platform
+scope:
+  roles: [{new_owner}]
+  schemas:
+    - name: {schema}
+      facets: [owner]
+roles:
+  - name: {new_owner}
+schemas:
+  - name: {schema}
+    owner: {new_owner}
+"#
+                    ),
+                ),
+                (
+                    "app.yaml",
+                    &format!(
+                        r#"
+policy:
+  name: app
+scope:
+  schemas:
+    - name: {schema}
+      facets: [bindings]
+schemas:
+  - name: {schema}
+    profiles: [editor]
+"#
+                    ),
+                ),
+            ],
+        );
+        let _keep_dir = bundle_dir;
+
+        pgroles_cmd()
+            .args([
+                "apply",
+                "--bundle",
+                bundle_path.to_str().expect("bundle path should be utf-8"),
+                "--database-url",
+                &database_url(),
+                "--mode",
+                "additive",
+            ])
+            .assert()
+            .success()
+            .stdout(predicate::str::contains("Applied: 2 change(s)"))
+            .stdout(predicate::str::contains("1 role(s) to create"))
+            .stdout(predicate::str::contains("1 grant(s) to add"))
+            .stdout(predicate::str::contains("No changes needed").not());
+
+        assert_eq!(
+            query_schema_owner(&schema).as_deref(),
+            Some(old_owner.as_str()),
+            "additive bundle apply should not transfer schema ownership"
+        );
+        assert!(
+            query_role_exists(&generated_role),
+            "additive bundle apply should still create generated binding roles"
+        );
+        assert!(
+            query_has_schema_privilege(&generated_role, &schema, "USAGE"),
+            "additive bundle apply should still grant non-owner-bound schema privileges"
+        );
+        assert_eq!(
+            query_default_acl_owner(&schema, &generated_role, "r"),
+            None,
+            "owner-bound default privileges should be skipped until ownership transfer is allowed"
+        );
+
+        pgroles_cmd()
+            .args([
+                "diff",
+                "--bundle",
+                bundle_path.to_str().expect("bundle path should be utf-8"),
+                "--database-url",
+                &database_url(),
+                "--mode",
+                "additive",
+                "--format",
+                "summary",
+            ])
+            .assert()
+            .success()
+            .stdout(predicate::str::contains("No changes needed"));
     }
 
     #[test]
@@ -1004,6 +1993,100 @@ roles:
 
     #[test]
     #[ignore]
+    fn additive_mode_skips_owner_bound_default_privileges_when_transfer_is_skipped() {
+        let schema = unique_name("schema_owner_additive_defaults");
+        let old_owner = unique_name("old_owner");
+        let new_owner = unique_name("new_owner");
+        let _cleanup = TestDbCleanup::new(format!(
+            r#"
+            DROP SCHEMA IF EXISTS "{schema}" CASCADE;
+            DROP ROLE IF EXISTS "{schema}-editor";
+            DROP ROLE IF EXISTS "{new_owner}";
+            DROP ROLE IF EXISTS "{old_owner}";
+            "#
+        ));
+
+        execute_sql(&format!(
+            r#"
+            DROP SCHEMA IF EXISTS "{schema}" CASCADE;
+            DROP ROLE IF EXISTS "{schema}-editor";
+            DROP ROLE IF EXISTS "{new_owner}";
+            DROP ROLE IF EXISTS "{old_owner}";
+            CREATE ROLE "{old_owner}";
+            CREATE ROLE "{new_owner}";
+            CREATE SCHEMA "{schema}" AUTHORIZATION "{old_owner}";
+            "#
+        ));
+
+        let manifest_file = write_temp_manifest(&format!(
+            r#"
+profiles:
+  editor:
+    grants:
+      - privileges: [USAGE]
+        object: {{ type: schema }}
+    default_privileges:
+      - privileges: [SELECT]
+        on_type: table
+
+schemas:
+  - name: {schema}
+    owner: {new_owner}
+    profiles: [editor]
+
+roles:
+  - name: {old_owner}
+  - name: {new_owner}
+"#
+        ));
+
+        pgroles_cmd()
+            .args([
+                "apply",
+                "--file",
+                manifest_file.path().to_str().unwrap(),
+                "--database-url",
+                &database_url(),
+                "--mode",
+                "additive",
+            ])
+            .assert()
+            .success()
+            .stdout(predicate::str::contains("Applied: 2 change(s)"))
+            .stdout(predicate::str::contains("1 role(s) to create"))
+            .stdout(predicate::str::contains("1 grant(s) to add"))
+            .stdout(predicate::str::contains("No changes needed").not());
+
+        assert_eq!(
+            query_schema_owner(&schema).as_deref(),
+            Some(old_owner.as_str()),
+            "additive mode should not transfer schema ownership"
+        );
+        assert_eq!(
+            query_default_acl_owner(&schema, &format!("{schema}-editor"), "r"),
+            None,
+            "owner-bound default privileges should be skipped until ownership transfer is allowed"
+        );
+
+        pgroles_cmd()
+            .args([
+                "diff",
+                "--file",
+                manifest_file.path().to_str().unwrap(),
+                "--database-url",
+                &database_url(),
+                "--mode",
+                "additive",
+                "--format",
+                "summary",
+            ])
+            .assert()
+            .success()
+            .stdout(predicate::str::contains("No changes needed"));
+    }
+
+    #[test]
+    #[ignore]
     fn apply_converges_existing_schema_owner_and_uses_owner_for_default_privileges() {
         let schema = unique_name("schema_owner");
         let old_owner = unique_name("old_owner");
@@ -1073,6 +2156,85 @@ roles:
             query_default_acl_owner(&schema, &format!("{schema}-editor"), "r").as_deref(),
             Some(new_owner.as_str()),
             "default privileges should be attached to the schema owner"
+        );
+
+        pgroles_cmd()
+            .args([
+                "diff",
+                "--file",
+                manifest_file.path().to_str().unwrap(),
+                "--database-url",
+                &database_url(),
+                "--format",
+                "summary",
+            ])
+            .assert()
+            .success()
+            .stdout(predicate::str::contains("No changes needed"));
+    }
+
+    #[test]
+    #[ignore]
+    fn apply_restores_owner_schema_privileges_after_revoke_all() {
+        let schema = unique_name("schema_owner_acl");
+        let owner = unique_name("schema_owner");
+        let _cleanup = TestDbCleanup::new(format!(
+            r#"
+            DROP SCHEMA IF EXISTS "{schema}" CASCADE;
+            DROP ROLE IF EXISTS "{owner}";
+            "#
+        ));
+
+        execute_sql(&format!(
+            r#"
+            DROP SCHEMA IF EXISTS "{schema}" CASCADE;
+            DROP ROLE IF EXISTS "{owner}";
+            CREATE ROLE "{owner}";
+            CREATE SCHEMA "{schema}" AUTHORIZATION "{owner}";
+            REVOKE ALL ON SCHEMA "{schema}" FROM "{owner}";
+            "#
+        ));
+
+        assert!(
+            !query_has_schema_privilege(&owner, &schema, "CREATE"),
+            "test setup should remove CREATE from schema owner"
+        );
+        assert!(
+            !query_has_schema_privilege(&owner, &schema, "USAGE"),
+            "test setup should remove USAGE from schema owner"
+        );
+
+        let manifest_file = write_temp_manifest(&format!(
+            r#"
+schemas:
+  - name: {schema}
+    owner: {owner}
+    profiles: []
+
+roles:
+  - name: {owner}
+"#
+        ));
+
+        pgroles_cmd()
+            .args([
+                "apply",
+                "--file",
+                manifest_file.path().to_str().unwrap(),
+                "--database-url",
+                &database_url(),
+            ])
+            .assert()
+            .success()
+            .stdout(predicate::str::contains("1 grant(s) to add"));
+
+        assert!(
+            query_has_schema_privilege(&owner, &schema, "CREATE"),
+            "apply should restore CREATE to the schema owner"
+        );
+        assert!(
+            query_has_schema_privilege(&owner, &schema, "USAGE"),
+            "apply should restore USAGE to the schema owner"
         );
 
         pgroles_cmd()
@@ -1284,6 +2446,197 @@ schemas:
             .stdout(predicate::str::contains("Roles:"))
             .stdout(predicate::str::contains("Grants:"))
             .stdout(predicate::str::contains("PUBLIC grants"));
+    }
+
+    #[test]
+    #[ignore]
+    fn inspect_bundle_shows_managed_scope_summary() {
+        let managed_role = unique_name("inspect_bundle_managed");
+        let extra_role = unique_name("inspect_bundle_extra");
+        let schema = unique_name("inspect_bundle_schema");
+        let _cleanup = TestDbCleanup::new(format!(
+            r#"
+            DROP SCHEMA IF EXISTS "{schema}" CASCADE;
+            DROP ROLE IF EXISTS "{managed_role}";
+            DROP ROLE IF EXISTS "{extra_role}";
+            "#
+        ));
+
+        execute_sql(&format!(
+            r#"
+            DROP SCHEMA IF EXISTS "{schema}" CASCADE;
+            DROP ROLE IF EXISTS "{managed_role}";
+            DROP ROLE IF EXISTS "{extra_role}";
+            CREATE ROLE "{managed_role}" NOLOGIN;
+            CREATE ROLE "{extra_role}" NOLOGIN;
+            CREATE SCHEMA "{schema}";
+            "#
+        ));
+
+        let (bundle_dir, bundle_path) = write_temp_bundle(
+            r#"
+sources:
+  - file: platform.yaml
+"#,
+            &[(
+                "platform.yaml",
+                &format!(
+                    r#"
+policy:
+  name: platform
+scope:
+  roles: [{managed_role}]
+  schemas:
+    - name: {schema}
+      facets: [owner]
+roles:
+  - name: {managed_role}
+    login: false
+schemas:
+  - name: {schema}
+    owner: {managed_role}
+"#
+                ),
+            )],
+        );
+        let _keep_dir = bundle_dir;
+
+        pgroles_cmd()
+            .args([
+                "inspect",
+                "--bundle",
+                bundle_path.to_str().expect("bundle path should be utf-8"),
+                "--database-url",
+                &database_url(),
+            ])
+            .assert()
+            .success()
+            .stdout(predicate::str::contains("Managed scope:"))
+            .stdout(predicate::str::contains("owner scope:"))
+            .stdout(predicate::str::contains(managed_role.as_str()))
+            .stdout(predicate::str::contains(extra_role.as_str()).not());
+    }
+
+    #[test]
+    #[ignore]
+    fn graph_current_managed_bundle_scopes_roles() {
+        let managed_role = unique_name("graph_bundle_managed");
+        let extra_role = unique_name("graph_bundle_extra");
+        let _cleanup = TestDbCleanup::new(format!(
+            r#"
+            DROP ROLE IF EXISTS "{managed_role}";
+            DROP ROLE IF EXISTS "{extra_role}";
+            "#
+        ));
+
+        execute_sql(&format!(
+            r#"
+            DROP ROLE IF EXISTS "{managed_role}";
+            DROP ROLE IF EXISTS "{extra_role}";
+            CREATE ROLE "{managed_role}" NOLOGIN;
+            CREATE ROLE "{extra_role}" NOLOGIN;
+            "#
+        ));
+
+        let (bundle_dir, bundle_path) = write_temp_bundle(
+            r#"
+sources:
+  - file: app.yaml
+"#,
+            &[(
+                "app.yaml",
+                &format!(
+                    r#"
+policy:
+  name: app
+scope:
+  roles: [{managed_role}]
+roles:
+  - name: {managed_role}
+    login: false
+"#
+                ),
+            )],
+        );
+        let _keep_dir = bundle_dir;
+
+        pgroles_cmd()
+            .args([
+                "graph",
+                "current",
+                "--bundle",
+                bundle_path.to_str().expect("bundle path should be utf-8"),
+                "--database-url",
+                &database_url(),
+                "--scope",
+                "managed",
+                "--format",
+                "json",
+            ])
+            .assert()
+            .success()
+            .stdout(predicate::str::contains(managed_role.as_str()))
+            .stdout(predicate::str::contains(extra_role.as_str()).not())
+            .stdout(predicate::str::contains("\"managed_scope\""));
+    }
+
+    #[test]
+    #[ignore]
+    fn diff_bundle_format_json_includes_ownership_annotations() {
+        let managed_role = unique_name("bundle_json_role");
+        let _cleanup = TestDbCleanup::new(format!(r#"DROP ROLE IF EXISTS "{managed_role}";"#));
+
+        execute_sql(&format!(r#"DROP ROLE IF EXISTS "{managed_role}";"#));
+
+        let (bundle_dir, bundle_path) = write_temp_bundle(
+            r#"
+sources:
+  - file: app.yaml
+"#,
+            &[(
+                "app.yaml",
+                &format!(
+                    r#"
+policy:
+  name: app
+scope:
+  roles: [{managed_role}]
+roles:
+  - name: {managed_role}
+    login: false
+"#
+                ),
+            )],
+        );
+        let _keep_dir = bundle_dir;
+
+        let output = pgroles_cmd()
+            .args([
+                "diff",
+                "--bundle",
+                bundle_path.to_str().expect("bundle path should be utf-8"),
+                "--database-url",
+                &database_url(),
+                "--format",
+                "json",
+                "--no-exit-code",
+            ])
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone();
+
+        let parsed: serde_json::Value =
+            serde_json::from_slice(&output).expect("diff json should parse");
+        assert_eq!(parsed["schema_version"], "pgroles.bundle_plan.v1");
+        assert_eq!(parsed["managed_scope"]["roles"][0], managed_role);
+        assert_eq!(parsed["changes"][0]["owner"]["document"], "app");
+        assert_eq!(parsed["changes"][0]["owner"]["managed_key"]["kind"], "role");
+        assert_eq!(
+            parsed["changes"][0]["owner"]["managed_key"]["name"],
+            managed_role
+        );
     }
 
     #[test]

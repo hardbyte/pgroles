@@ -1,7 +1,10 @@
+pub mod composition;
 pub mod diff;
 pub mod export;
 pub mod manifest;
 pub mod model;
+pub mod ownership;
+pub mod report;
 pub mod scram;
 pub mod sql;
 pub mod visual;

@@ -250,6 +250,7 @@ pub struct ProfileObjectTarget {
 pub struct SchemaBinding {
     pub name: String,
 
+    #[serde(default)]
     pub profiles: Vec<String>,
 
     /// Role naming pattern. Supports `{schema}` and `{profile}` placeholders.
@@ -262,7 +263,25 @@ pub struct SchemaBinding {
     pub owner: Option<String>,
 }
 
-fn default_role_pattern() -> String {
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, JsonSchema,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum SchemaBindingFacet {
+    Owner,
+    Bindings,
+}
+
+impl std::fmt::Display for SchemaBindingFacet {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SchemaBindingFacet::Owner => write!(f, "owner"),
+            SchemaBindingFacet::Bindings => write!(f, "bindings"),
+        }
+    }
+}
+
+pub(crate) fn default_role_pattern() -> String {
     "{schema}-{profile}".to_string()
 }
 

@@ -5,7 +5,7 @@ use k8s_openapi::api::core::v1::Secret;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference;
 use kube::ResourceExt;
 use kube::api::{Api, ObjectMeta, PostParams};
-use rand::Rng;
+use rand::RngExt;
 use std::collections::BTreeMap;
 
 use crate::crd::{GeneratePasswordSpec, PostgresPolicy};

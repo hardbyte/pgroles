@@ -98,6 +98,18 @@ pub fn render_statements_with_context(change: &Change, ctx: &SqlContext) -> Vec<
         Change::CreateRole { name, state } => render_create_role(name, state),
         Change::CreateSchema { name, owner } => render_create_schema(name, owner.as_deref()),
         Change::AlterSchemaOwner { name, owner } => render_alter_schema_owner(name, owner),
+        Change::EnsureSchemaOwnerPrivileges {
+            name,
+            owner,
+            privileges,
+        } => render_grant(
+            owner,
+            privileges,
+            ObjectType::Schema,
+            None,
+            Some(name.as_str()),
+            ctx,
+        ),
         Change::AlterRole { name, attributes } => render_alter_role(name, attributes),
         Change::SetComment { name, comment } => render_set_comment(name, comment),
         Change::Grant {
@@ -764,6 +776,19 @@ mod tests {
         assert_eq!(
             render(&change),
             "ALTER SCHEMA \"inventory\" OWNER TO \"inventory_owner\";"
+        );
+    }
+
+    #[test]
+    fn render_ensure_schema_owner_privileges() {
+        let change = Change::EnsureSchemaOwnerPrivileges {
+            name: "inventory".to_string(),
+            owner: "inventory_owner".to_string(),
+            privileges: BTreeSet::from([Privilege::Create, Privilege::Usage]),
+        };
+        assert_eq!(
+            render(&change),
+            "GRANT CREATE, USAGE ON SCHEMA \"inventory\" TO \"inventory_owner\";"
         );
     }
 

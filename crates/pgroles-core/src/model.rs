@@ -130,6 +130,12 @@ pub struct SchemaState {
     /// Desired owner for the schema. `None` means ensure existence only.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub owner: Option<String>,
+    /// The schema owner's ordinary privileges on the schema itself.
+    ///
+    /// PostgreSQL lets owners revoke their own CREATE/USAGE privileges, so we
+    /// track the effective state separately from grant rows.
+    #[serde(skip_serializing_if = "BTreeSet::is_empty", default)]
+    pub owner_privileges: BTreeSet<Privilege>,
 }
 
 // ---------------------------------------------------------------------------
@@ -238,10 +244,15 @@ impl RoleGraph {
 
         // --- Schemas ---
         for schema in &expanded.schemas {
+            let owner = schema.owner.clone();
             graph.schemas.insert(
                 schema.name.clone(),
                 SchemaState {
-                    owner: schema.owner.clone(),
+                    owner_privileges: owner
+                        .as_deref()
+                        .map(default_schema_owner_privileges)
+                        .unwrap_or_default(),
+                    owner,
                 },
             );
         }
@@ -320,6 +331,10 @@ fn grant_key_from_manifest(grant: &Grant) -> GrantKey {
         schema: grant.object.schema.clone(),
         name: grant.object.name.clone(),
     }
+}
+
+pub fn default_schema_owner_privileges(_owner: &str) -> BTreeSet<Privilege> {
+    [Privilege::Create, Privilege::Usage].into_iter().collect()
 }
 
 // ---------------------------------------------------------------------------

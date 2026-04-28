@@ -261,6 +261,7 @@ roles:
             "cdc".to_string(),
             crate::model::SchemaState {
                 owner: Some("cdc_owner".to_string()),
+                owner_privileges: crate::model::default_schema_owner_privileges("cdc_owner"),
             },
         );
 

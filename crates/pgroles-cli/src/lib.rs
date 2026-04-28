@@ -8,9 +8,12 @@ use std::path::Path;
 
 use anyhow::{Context, Result};
 
+use pgroles_core::composition::{self, ComposedPolicy, PolicyBundle, PolicyDocument};
 use pgroles_core::diff::{self, Change};
 use pgroles_core::manifest::{self, ExpandedManifest, PolicyManifest, RoleRetirement};
 use pgroles_core::model::RoleGraph;
+use pgroles_core::ownership::ManagedScope;
+use pgroles_core::report::{self, PlanOutputMode};
 use pgroles_core::sql;
 
 // ---------------------------------------------------------------------------
@@ -74,6 +77,52 @@ pub struct ValidatedManifest {
     pub desired: RoleGraph,
 }
 
+/// Load, validate, and compose a policy bundle from disk.
+pub fn validate_bundle_file(path: &Path) -> Result<ValidatedBundle> {
+    let yaml = read_manifest_file(path)?;
+    let bundle = composition::parse_policy_bundle(&yaml).map_err(|err| anyhow::anyhow!("{err}"))?;
+    let documents = load_policy_documents(path, &bundle)?;
+    let composed =
+        composition::compose_bundle(&bundle, &documents).map_err(|err| anyhow::anyhow!("{err}"))?;
+
+    Ok(ValidatedBundle {
+        bundle,
+        documents,
+        composed,
+    })
+}
+
+fn load_policy_documents(path: &Path, bundle: &PolicyBundle) -> Result<Vec<PolicyDocument>> {
+    let base_dir = path
+        .parent()
+        .with_context(|| format!("bundle path has no parent directory: {}", path.display()))?;
+
+    bundle
+        .sources
+        .iter()
+        .map(|source| {
+            let source_path = base_dir.join(&source.file);
+            let yaml = read_manifest_file(&source_path)?;
+            let fragment = composition::parse_policy_fragment(&yaml)
+                .map_err(|err| anyhow::anyhow!("{err}"))
+                .with_context(|| {
+                    format!("failed to parse policy document: {}", source_path.display())
+                })?;
+            Ok(PolicyDocument {
+                source: source.file.clone(),
+                fragment,
+            })
+        })
+        .collect()
+}
+
+/// The result of successfully validating a composed policy bundle.
+pub struct ValidatedBundle {
+    pub bundle: PolicyBundle,
+    pub documents: Vec<PolicyDocument>,
+    pub composed: ComposedPolicy,
+}
+
 // ---------------------------------------------------------------------------
 // Plan computation (pure — given both role graphs)
 // ---------------------------------------------------------------------------
@@ -125,25 +174,26 @@ pub fn format_plan_sql(changes: &[Change]) -> String {
 
 /// Format a plan as SQL statements using an explicit SQL context.
 pub fn format_plan_sql_with_context(changes: &[Change], ctx: &sql::SqlContext) -> String {
-    sql::render_all_with_context(&redacted_changes(changes), ctx)
+    sql::render_all_with_context(
+        &report::shape_plan_changes(changes, PlanOutputMode::Redacted),
+        ctx,
+    )
 }
 
 /// Format a plan as JSON for machine consumption.
 pub fn format_plan_json(changes: &[Change]) -> Result<String> {
-    serde_json::to_string_pretty(&redacted_changes(changes)).map_err(|err| anyhow::anyhow!("{err}"))
+    report::render_plan_json(changes, PlanOutputMode::Redacted)
+        .map_err(|err| anyhow::anyhow!("{err}"))
 }
 
-fn redacted_changes(changes: &[Change]) -> Vec<Change> {
-    changes
-        .iter()
-        .map(|change| match change {
-            Change::SetPassword { name, .. } => Change::SetPassword {
-                name: name.clone(),
-                password: "[REDACTED]".to_string(),
-            },
-            other => other.clone(),
-        })
-        .collect()
+/// Format a bundle plan as JSON with ownership annotations for each change.
+pub fn format_bundle_plan_json(changes: &[Change], composed: &ComposedPolicy) -> Result<String> {
+    report::render_bundle_plan_json(
+        changes,
+        &composed.report_context(),
+        PlanOutputMode::Redacted,
+    )
+    .map_err(|err| anyhow::anyhow!("{err}"))
 }
 
 /// Summary statistics for a plan.
@@ -182,7 +232,9 @@ impl PlanSummary {
                 Change::TerminateSessions { .. } => summary.sessions_terminated += 1,
                 Change::ReassignOwned { .. } => summary.ownerships_reassigned += 1,
                 Change::DropOwned { .. } => summary.owned_objects_dropped += 1,
-                Change::Grant { .. } => summary.grants += 1,
+                Change::Grant { .. } | Change::EnsureSchemaOwnerPrivileges { .. } => {
+                    summary.grants += 1
+                }
                 Change::Revoke { .. } => summary.revokes += 1,
                 Change::SetDefaultPrivilege { .. } => summary.default_privileges_set += 1,
                 Change::RevokeDefaultPrivilege { .. } => summary.default_privileges_revoked += 1,
@@ -309,6 +361,81 @@ pub fn format_validation_result(validated: &ValidatedManifest) -> String {
     output
 }
 
+/// Format bundle validation results for human-readable output.
+pub fn format_bundle_validation_result(validated: &ValidatedBundle) -> String {
+    let mut output = String::new();
+    output.push_str("Policy bundle is valid.\n");
+    output.push_str(&format!(
+        "  {} source document(s) loaded\n",
+        validated.documents.len()
+    ));
+    output.push_str(&format!(
+        "  {} shared profile(s) defined\n",
+        validated.bundle.shared.profiles.len()
+    ));
+    output.push_str(&format!(
+        "  {} schema(s) defined\n",
+        validated.composed.expanded.schemas.len()
+    ));
+    output.push_str(&format!(
+        "  {} role(s) defined\n",
+        validated.composed.expanded.roles.len()
+    ));
+    output.push_str(&format!(
+        "  {} grant(s) defined\n",
+        validated.composed.expanded.grants.len()
+    ));
+    output.push_str(&format!(
+        "  {} default privilege(s) defined\n",
+        validated.composed.expanded.default_privileges.len()
+    ));
+    output.push_str(&format!(
+        "  {} membership(s) defined\n",
+        validated.composed.expanded.memberships.len()
+    ));
+    output
+}
+
+/// Format a composed managed scope for human-readable debug output.
+pub fn format_managed_scope_summary(scope: &ManagedScope) -> String {
+    let mut output = String::new();
+    output.push_str("Managed scope:\n");
+    output.push_str(&format!("  {} role(s)\n", scope.roles.len()));
+    output.push_str(&format!("  {} schema(s)\n", scope.schemas.len()));
+
+    let owner_schemas: Vec<&str> = scope
+        .schemas
+        .iter()
+        .filter_map(|(schema, managed)| managed.owner.then_some(schema.as_str()))
+        .collect();
+    let binding_schemas: Vec<&str> = scope
+        .schemas
+        .iter()
+        .filter_map(|(schema, managed)| managed.bindings.then_some(schema.as_str()))
+        .collect();
+
+    output.push_str(&format!(
+        "  owner-managed schema(s): {}\n",
+        owner_schemas.len()
+    ));
+    if !owner_schemas.is_empty() {
+        output.push_str(&format!("  owner scope: {}\n", owner_schemas.join(", ")));
+    }
+
+    output.push_str(&format!(
+        "  binding-managed schema(s): {}\n",
+        binding_schemas.len()
+    ));
+    if !binding_schemas.is_empty() {
+        output.push_str(&format!(
+            "  binding scope: {}\n",
+            binding_schemas.join(", ")
+        ));
+    }
+
+    output
+}
+
 // ---------------------------------------------------------------------------
 // Inspect output formatting
 // ---------------------------------------------------------------------------
@@ -347,6 +474,7 @@ pub fn format_role_graph_summary(graph: &RoleGraph) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use pgroles_core::ownership::ManagedSchemaScope;
 
     const MINIMAL_MANIFEST: &str = r#"
 default_owner: app_owner
@@ -636,6 +764,44 @@ schemas:
         assert!(output.contains("4 role(s)"), "got: {output}");
     }
 
+    #[test]
+    fn managed_scope_summary_lists_owner_and_binding_facets() {
+        let scope = ManagedScope {
+            roles: ["app".to_string(), "app_owner".to_string()]
+                .into_iter()
+                .collect(),
+            schemas: [
+                (
+                    "inventory".to_string(),
+                    ManagedSchemaScope {
+                        owner: true,
+                        bindings: true,
+                    },
+                ),
+                (
+                    "audit".to_string(),
+                    ManagedSchemaScope {
+                        owner: true,
+                        bindings: false,
+                    },
+                ),
+            ]
+            .into_iter()
+            .collect(),
+        };
+
+        let output = format_managed_scope_summary(&scope);
+
+        assert!(output.contains("Managed scope:"), "got: {output}");
+        assert!(output.contains("2 role(s)"), "got: {output}");
+        assert!(output.contains("2 schema(s)"), "got: {output}");
+        assert!(
+            output.contains("owner scope: audit, inventory"),
+            "got: {output}"
+        );
+        assert!(output.contains("binding scope: inventory"), "got: {output}");
+    }
+
     // -----------------------------------------------------------------------
     // read_manifest_file
     // -----------------------------------------------------------------------
@@ -824,6 +990,44 @@ schemas:
         let json = format_plan_json(&changes).expect("json formatting should succeed");
         assert!(json.contains("[REDACTED]"), "got: {json}");
         assert!(!json.contains("super-secret"), "got: {json}");
+    }
+
+    #[test]
+    fn bundle_plan_json_includes_scope_and_ownership_annotations() {
+        let bundle = composition::parse_policy_bundle(
+            r#"
+sources:
+  - file: app.yaml
+"#,
+        )
+        .unwrap();
+        let documents = vec![composition::PolicyDocument {
+            source: "app.yaml".to_string(),
+            fragment: composition::parse_policy_fragment(
+                r#"
+policy:
+  name: app
+scope:
+  roles: [app]
+roles:
+  - name: app
+    login: false
+"#,
+            )
+            .unwrap(),
+        }];
+        let composed = composition::compose_bundle(&bundle, &documents).unwrap();
+        let changes = compute_plan(&RoleGraph::default(), &composed.desired);
+
+        let json_output = format_bundle_plan_json(&changes, &composed).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json_output).unwrap();
+
+        assert!(parsed.is_object());
+        assert_eq!(parsed["schema_version"], "pgroles.bundle_plan.v1");
+        assert_eq!(parsed["managed_scope"]["roles"][0], "app");
+        assert_eq!(parsed["changes"][0]["owner"]["document"], "app");
+        assert_eq!(parsed["changes"][0]["owner"]["managed_key"]["kind"], "role");
+        assert_eq!(parsed["changes"][0]["owner"]["managed_key"]["name"], "app");
     }
 
     #[test]

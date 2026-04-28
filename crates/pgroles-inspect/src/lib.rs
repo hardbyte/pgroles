@@ -19,7 +19,9 @@ use sqlx::PgPool;
 use thiserror::Error;
 use tracing::debug;
 
+use pgroles_core::manifest::Privilege;
 use pgroles_core::model::RoleGraph;
+use pgroles_core::ownership::ManagedScope;
 
 // Re-export the sub-modules' public items for testing / advanced use.
 pub use cloud::{CloudProvider, PrivilegeLevel, detect_privilege_level};
@@ -68,9 +70,11 @@ pub struct InspectConfig {
     /// Privileges and memberships are filtered to only include these roles.
     pub managed_roles: Vec<String>,
 
-    /// The schema names that the manifest manages.
-    /// Privileges and default privileges are scoped to these schemas.
+    /// The schema names that the manifest manages for schema-owner inspection.
     pub managed_schemas: Vec<String>,
+
+    /// The schema names whose grants/default privileges are managed.
+    pub privilege_schemas: Vec<String>,
 
     /// Whether to also inspect database-level privileges (CONNECT, CREATE, TEMPORARY).
     /// Usually only needed if the manifest includes database-level grants.
@@ -137,7 +141,8 @@ impl InspectConfig {
 
         Self {
             managed_roles: managed_roles.into_iter().collect(),
-            managed_schemas: managed_schemas.into_iter().collect(),
+            managed_schemas: managed_schemas.clone().into_iter().collect(),
+            privilege_schemas: managed_schemas.into_iter().collect(),
             include_database_privileges,
             wildcard_grants: wildcard_map
                 .into_iter()
@@ -149,6 +154,38 @@ impl InspectConfig {
                         privileges,
                     },
                 )
+                .collect(),
+        }
+    }
+
+    /// Create an `InspectConfig` from a managed scope plus an expanded desired
+    /// manifest so current-state inspection can be restricted to composed policy
+    /// boundaries.
+    pub fn from_managed_scope(
+        scope: &ManagedScope,
+        expanded: &pgroles_core::manifest::ExpandedManifest,
+        include_database_privileges: bool,
+    ) -> Self {
+        let base = Self::from_expanded(expanded, include_database_privileges);
+
+        Self {
+            managed_roles: scope.roles.iter().cloned().collect(),
+            managed_schemas: scope.schemas.keys().cloned().collect(),
+            privilege_schemas: scope
+                .schemas
+                .iter()
+                .filter_map(|(schema, managed)| managed.bindings.then_some(schema.clone()))
+                .collect(),
+            include_database_privileges,
+            wildcard_grants: base
+                .wildcard_grants
+                .into_iter()
+                .filter(|pattern| {
+                    scope
+                        .schemas
+                        .get(&pattern.schema)
+                        .is_some_and(|managed| managed.bindings)
+                })
                 .collect(),
         }
     }
@@ -227,6 +264,7 @@ pub async fn inspect_all(
             row.schema_name.clone(),
             pgroles_core::model::SchemaState {
                 owner: Some(row.owner_name.clone()),
+                owner_privileges: row.owner_privileges(),
             },
         );
     }
@@ -277,6 +315,11 @@ pub async fn inspect(pool: &PgPool, config: &InspectConfig) -> Result<RoleGraph,
     // Build &str slices for the query functions
     let role_refs: Vec<&str> = config.managed_roles.iter().map(|s| s.as_str()).collect();
     let schema_refs: Vec<&str> = config.managed_schemas.iter().map(|s| s.as_str()).collect();
+    let privilege_schema_refs: Vec<&str> = config
+        .privilege_schemas
+        .iter()
+        .map(|s| s.as_str())
+        .collect();
 
     // --- Roles ---
     debug!(
@@ -310,6 +353,7 @@ pub async fn inspect(pool: &PgPool, config: &InspectConfig) -> Result<RoleGraph,
                 row.schema_name.clone(),
                 pgroles_core::model::SchemaState {
                     owner: Some(row.owner_name.clone()),
+                    owner_privileges: row.owner_privileges(),
                 },
             );
         }
@@ -317,14 +361,14 @@ pub async fn inspect(pool: &PgPool, config: &InspectConfig) -> Result<RoleGraph,
     }
 
     // --- Object privileges ---
-    if !schema_refs.is_empty() {
+    if !privilege_schema_refs.is_empty() {
         debug!(
-            schemas = ?schema_refs,
+            schemas = ?privilege_schema_refs,
             "inspecting object privileges via aclexplode"
         );
         let privilege_grants = privileges::fetch_privileges_with_wildcards(
             pool,
-            &schema_refs,
+            &privilege_schema_refs,
             &role_refs,
             &config.wildcard_grants,
         )
@@ -350,9 +394,10 @@ pub async fn inspect(pool: &PgPool, config: &InspectConfig) -> Result<RoleGraph,
     }
 
     // --- Default privileges ---
-    if !schema_refs.is_empty() {
+    if !privilege_schema_refs.is_empty() {
         debug!("inspecting default privileges from pg_default_acl");
-        let default_privs = fetch_default_privileges(pool, &schema_refs, &role_refs).await?;
+        let default_privs =
+            fetch_default_privileges(pool, &privilege_schema_refs, &role_refs).await?;
         for (key, state) in default_privs {
             graph.default_privileges.insert(key, state);
         }
@@ -392,6 +437,21 @@ pub async fn fetch_existing_schemas(
 pub struct SchemaRow {
     pub schema_name: String,
     pub owner_name: String,
+    pub owner_has_create: bool,
+    pub owner_has_usage: bool,
+}
+
+impl SchemaRow {
+    fn owner_privileges(&self) -> BTreeSet<Privilege> {
+        let mut privileges = BTreeSet::new();
+        if self.owner_has_create {
+            privileges.insert(Privilege::Create);
+        }
+        if self.owner_has_usage {
+            privileges.insert(Privilege::Usage);
+        }
+        privileges
+    }
 }
 
 pub async fn fetch_schemas(
@@ -400,7 +460,11 @@ pub async fn fetch_schemas(
 ) -> Result<Vec<SchemaRow>, InspectError> {
     let rows = sqlx::query_as::<_, SchemaRow>(
         r#"
-        SELECT n.nspname AS schema_name, owner_role.rolname AS owner_name
+        SELECT
+            n.nspname AS schema_name,
+            owner_role.rolname AS owner_name,
+            has_schema_privilege(owner_role.rolname, n.nspname, 'CREATE') AS owner_has_create,
+            has_schema_privilege(owner_role.rolname, n.nspname, 'USAGE') AS owner_has_usage
         FROM pg_namespace n
         JOIN pg_roles owner_role ON owner_role.oid = n.nspowner
         WHERE n.nspname = ANY($1)
@@ -414,10 +478,9 @@ pub async fn fetch_schemas(
 }
 
 fn remove_redundant_schema_owner_grants(graph: &mut RoleGraph) {
-    // PostgreSQL records the schema owner's inherent CREATE/USAGE privileges in
-    // the schema ACL. Those are part of ownership, not user-declared grants.
-    // Filtering them here keeps `diff` from trying to revoke owner self-grants
-    // after a schema is created or its ownership changes.
+    // Keep ordinary owner CREATE/USAGE management in SchemaState instead of the
+    // grants map. This avoids noisy self-grants while still preserving drift
+    // when the owner's ordinary privileges have been revoked.
     graph.grants.retain(|key, _| {
         if key.object_type != pgroles_core::manifest::ObjectType::Schema {
             return true;
@@ -443,6 +506,7 @@ fn remove_redundant_schema_owner_grants(graph: &mut RoleGraph) {
 mod tests {
     use super::*;
     use pgroles_core::manifest::{expand_manifest, parse_manifest};
+    use pgroles_core::ownership::ManagedSchemaScope;
 
     #[test]
     fn inspect_config_from_expanded_manifest() {
@@ -495,6 +559,7 @@ grants:
         assert!(config.managed_schemas.contains(&"catalog".to_string()));
 
         assert!(config.include_database_privileges);
+        assert_eq!(config.privilege_schemas.len(), 2);
         assert_eq!(config.wildcard_grants.len(), 2);
     }
 
@@ -515,12 +580,55 @@ roles:
     }
 
     #[test]
+    fn inspect_config_from_managed_scope_limits_privileges_to_binding_schemas() {
+        let yaml = r#"
+default_owner: app_owner
+
+profiles:
+  editor:
+    grants:
+      - privileges: [USAGE]
+        object: { type: schema }
+
+schemas:
+  - name: inventory
+    owner: app_owner
+    profiles: [editor]
+
+roles:
+  - name: app_owner
+    login: false
+"#;
+        let manifest = parse_manifest(yaml).unwrap();
+        let expanded = expand_manifest(&manifest).unwrap();
+        let scope = ManagedScope {
+            roles: BTreeSet::from(["app_owner".to_string(), "inventory-editor".to_string()]),
+            schemas: BTreeMap::from([(
+                "inventory".to_string(),
+                ManagedSchemaScope {
+                    owner: true,
+                    bindings: false,
+                },
+            )]),
+        };
+
+        let config = InspectConfig::from_managed_scope(&scope, &expanded, false);
+
+        assert_eq!(config.managed_schemas, vec!["inventory".to_string()]);
+        assert!(config.privilege_schemas.is_empty());
+        assert!(config.wildcard_grants.is_empty());
+    }
+
+    #[test]
     fn remove_redundant_schema_owner_grants_keeps_only_non_owner_schema_grants() {
         let mut graph = RoleGraph::default();
         graph.schemas.insert(
             "inventory".to_string(),
             pgroles_core::model::SchemaState {
                 owner: Some("inventory_owner".to_string()),
+                owner_privileges: [pgroles_core::manifest::Privilege::Create]
+                    .into_iter()
+                    .collect(),
             },
         );
         graph.grants.insert(
