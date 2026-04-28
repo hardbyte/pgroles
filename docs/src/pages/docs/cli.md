@@ -3,34 +3,41 @@ title: CLI commands
 description: Reference for all pgroles CLI commands and options.
 ---
 
-The `pgroles` CLI provides five commands for managing PostgreSQL role policies. {% .lead %}
+The `pgroles` CLI provides six commands for managing PostgreSQL role policies. {% .lead %}
 
 ---
 
 ## Global options
 
-All commands accept `-f` / `--file` to specify the manifest path. If omitted, it defaults to `pgroles.yaml` in the current directory.
+Commands that operate on desired state accept either:
+
+- `-f` / `--file` for a single manifest file
+- `--bundle` for a composed bundle root file
+
+If omitted, manifest-based commands default to `pgroles.yaml` in the current directory.
 
 Commands that connect to a database accept `--database-url` or read from the `DATABASE_URL` environment variable.
 
 ## validate
 
-Parse and validate a manifest file without connecting to a database.
+Parse and validate a manifest file or composed bundle without connecting to a database.
 
 ```shell
 pgroles validate
 pgroles validate -f path/to/policy.yaml
+pgroles validate --bundle path/to/pgroles.bundle.yaml
 ```
 
 Reports the number of roles, grants, default privileges, and memberships after profile expansion.
 
 ## diff / plan
 
-Show the SQL changes needed to converge the database to the manifest. `plan` is an alias for `diff`.
+Show the SQL changes needed to converge the database to the manifest or bundle. `plan` is an alias for `diff`.
 
 ```shell
 pgroles diff --database-url postgres://localhost/mydb
 pgroles plan --database-url postgres://localhost/mydb
+pgroles diff --bundle path/to/pgroles.bundle.yaml --database-url postgres://localhost/mydb
 ```
 
 ### Options
@@ -38,12 +45,19 @@ pgroles plan --database-url postgres://localhost/mydb
 | Flag | Description |
 |---|---|
 | `-f`, `--file` | Manifest file path (default: `pgroles.yaml`) |
+| `--bundle` | Bundle root file path |
 | `--database-url` | PostgreSQL connection string (or `DATABASE_URL` env) |
 | `--format` | Output format: `sql` (default), `summary`, or `json` |
 | `--mode` | Reconciliation mode: `authoritative` (default), `additive`, or `adopt` |
 | `--exit-code` | Exit with code 2 when drift is detected (default: `true`) |
 
-The `sql` format prints the full SQL script. The `summary` format shows counts of each change type. The `json` format outputs the change list as a JSON array, suitable for CI/CD pipelines and programmatic consumption.
+The `sql` format prints the full SQL script. The `summary` format shows counts of each change type.
+
+For single-manifest mode, the `json` format outputs the change list as a JSON array. For bundle mode, the `json` format returns a typed object with:
+
+- `schema_version`
+- `managed_scope`
+- per-change ownership annotations (`document` plus managed key details)
 
 ### CI drift detection
 
@@ -86,11 +100,12 @@ That causes the generated plan to insert session termination, `REASSIGN OWNED BY
 
 ## apply
 
-Apply changes to bring the database in sync with the manifest.
+Apply changes to bring the database in sync with the manifest or bundle.
 
 ```shell
 pgroles apply --database-url postgres://localhost/mydb
 pgroles apply --database-url postgres://localhost/mydb --dry-run
+pgroles apply --bundle path/to/pgroles.bundle.yaml --database-url postgres://localhost/mydb
 ```
 
 ### Options
@@ -98,6 +113,7 @@ pgroles apply --database-url postgres://localhost/mydb --dry-run
 | Flag | Description |
 |---|---|
 | `-f`, `--file` | Manifest file path (default: `pgroles.yaml`) |
+| `--bundle` | Bundle root file path |
 | `--database-url` | PostgreSQL connection string (or `DATABASE_URL` env) |
 | `--mode` | Reconciliation mode: `authoritative` (default), `additive`, or `adopt` |
 | `--dry-run` | Print the SQL without executing it |
@@ -144,13 +160,15 @@ If pgroles still sees unhandled role-drop hazards after accounting for the decla
 
 ## inspect
 
-Show the current database state for roles and privileges managed by the manifest.
+Show the current database state for roles and privileges.
 
 ```shell
 pgroles inspect --database-url postgres://localhost/mydb
+pgroles inspect -f pgroles.yaml --database-url postgres://localhost/mydb
+pgroles inspect --bundle path/to/pgroles.bundle.yaml --database-url postgres://localhost/mydb
 ```
 
-This connects to the database, inspects the current roles/grants/memberships that are relevant to the manifest, and prints a summary.
+Without `-f` or `--bundle`, `inspect` shows all non-system roles and visible privileges. With `-f`, it scopes inspection to the manifest's managed roles and referenced schemas. With `--bundle`, it scopes inspection to the composed managed ownership boundary and prints a managed-scope summary before the role graph summary.
 
 ## generate
 
@@ -179,6 +197,49 @@ The generated manifest is a flat snapshot of the current state. After generating
 `generate` is best used as a starting point for brownfield adoption. Before applying the generated manifest in production, review it like any other infrastructure policy because once committed it becomes the desired state.
 {% /callout %}
 
+## graph
+
+Render the role graph as a terminal tree or machine-readable graph.
+
+```shell
+pgroles graph desired -f pgroles.yaml --format tree
+pgroles graph desired --bundle path/to/pgroles.bundle.yaml --format json
+pgroles graph current --database-url postgres://localhost/mydb --scope all --format tree
+pgroles graph current --bundle path/to/pgroles.bundle.yaml --database-url postgres://localhost/mydb --scope managed --format json
+```
+
+### desired
+
+Build the graph from a manifest or bundle.
+
+| Flag | Description |
+|---|---|
+| `-f`, `--file` | Manifest file path |
+| `--bundle` | Bundle root file path |
+| `--format` | `tree` (default), `json`, `dot`, or `mermaid` |
+| `-o`, `--output` | Write the rendered graph to a file |
+
+### current
+
+Build the graph from a live database.
+
+| Flag | Description |
+|---|---|
+| `-f`, `--file` | Manifest file path |
+| `--bundle` | Bundle root file path |
+| `--database-url` | PostgreSQL connection string |
+| `--scope` | `managed` (default) or `all` |
+| `--format` | `tree` (default), `json`, `dot`, or `mermaid` |
+| `-o`, `--output` | Write the rendered graph to a file |
+
+`graph current --scope managed` requires either `-f` or `--bundle` so pgroles knows which roles or bundle scope are considered managed.
+
+Bundle-aware graph JSON includes:
+
+- top-level `schema_version`
+- the normal graph payload
+- `meta.managed_scope` describing bundle-managed roles and schema facets
+
 ## Reconciliation modes
 
 The `--mode` flag controls how aggressively pgroles converges the database. Both `diff` and `apply` accept this flag.
@@ -200,6 +261,8 @@ pgroles apply --database-url postgres://localhost/mydb --mode additive
 ```
 
 Additive mode filters out: `REVOKE`, `REVOKE DEFAULT PRIVILEGE`, `REMOVE MEMBER`, `DROP ROLE`, `DROP OWNED`, `REASSIGN OWNED`, and `TERMINATE SESSIONS`.
+
+If additive mode skips a schema ownership transfer, pgroles also defers owner-bound follow-up steps such as schema-owner privilege repair and `ALTER DEFAULT PRIVILEGES FOR ROLE ...` for that owner context.
 
 ### adopt
 

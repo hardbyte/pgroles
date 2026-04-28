@@ -22,6 +22,89 @@ memberships: []                   # Role membership edges
 
 All fields are optional. A minimal manifest might only define `roles` and `grants`.
 
+## Bundle mode
+
+The CLI can also compose a **bundle** from one root file plus multiple scoped policy documents:
+
+```yaml
+# pgroles.bundle.yaml
+shared:
+  default_owner: app_owner
+  profiles:
+    editor:
+      grants:
+        - privileges: [USAGE]
+          object: { type: schema }
+sources:
+  - file: platform.yaml
+  - file: app.yaml
+```
+
+Each source file is a `PolicyFragment`:
+
+```yaml
+# platform.yaml
+policy:
+  name: platform
+scope:
+  roles: [app_owner]
+  schemas:
+    - name: inventory
+      facets: [owner]
+
+roles:
+  - name: app_owner
+
+schemas:
+  - name: inventory
+    owner: app_owner
+```
+
+```yaml
+# app.yaml
+policy:
+  name: app
+scope:
+  schemas:
+    - name: inventory
+      facets: [bindings]
+
+schemas:
+  - name: inventory
+    profiles: [editor]
+```
+
+Bundle composition is currently a CLI/core feature. The Kubernetes operator still reconciles a single `PostgresPolicy` resource.
+
+### Shared bundle fields
+
+| Field | Description |
+|---|---|
+| `shared.default_owner` | Default owner context shared across source documents |
+| `shared.auth_providers` | Shared auth provider metadata |
+| `shared.profiles` | Shared profile registry used by source documents |
+| `sources` | Relative file paths to policy documents that will be composed together |
+
+### Policy fragment fields
+
+Each source document adds two fields on top of the normal manifest content:
+
+| Field | Description |
+|---|---|
+| `policy.name` | Human-readable source label used in conflict and plan output |
+| `scope` | The ownership boundary this document is allowed to manage |
+
+### Scoped schema facets
+
+Schema scope is split into explicit facets:
+
+| Facet | Description |
+|---|---|
+| `owner` | Manage schema creation and ownership convergence |
+| `bindings` | Manage profile expansion, grants, and default privileges tied to the schema |
+
+Two source documents may reference the same schema only when they manage disjoint facets. If two documents claim the same role, grant, default-privilege rule, membership selector, or schema facet, composition fails before any database inspection begins.
+
 ## auth_providers
 
 Declare cloud authentication providers to document how IAM-mapped roles connect to the database. This is currently informational metadata used for validation and documentation purposes.

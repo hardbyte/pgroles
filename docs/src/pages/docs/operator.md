@@ -18,6 +18,10 @@ The operator brings the same convergent model as the CLI into Kubernetes. Instea
 - Status conditions and change summaries on the custom resource
 - Finalizer-based cleanup on resource deletion
 
+{% callout type="note" title="Bundle composition is CLI-only today" %}
+The CLI can compose a multi-file bundle with scoped ownership boundaries before diff or apply. The operator does **not** yet reconcile bundle fragments directly — each `PostgresPolicy` is still a single policy document.
+{% /callout %}
+
 {% callout title="Maturity" %}
 The operator provides serialized reconciliation with conflict detection, failure-aware retry, and observable status reporting. The API is `v1alpha1` — controller semantics are stable but the CRD contract has no documented upgrade path. Review the [production status](#production-status) section before deploying.
 {% /callout %}

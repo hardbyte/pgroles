@@ -61,6 +61,17 @@ spec:
 
 Once the manifest covers all roles and grants you want managed, switch to `reconciliation_mode: authoritative` to enable full convergence. Review the planned revocations carefully before switching — in a typical brownfield database, this may include thousands of existing grants to roles not yet in the manifest.
 
+## Multi-team adoption with bundles
+
+If platform and application teams need separate ownership boundaries, use CLI bundle mode instead of forcing everyone into one large manifest.
+
+- put shared profiles and `default_owner` in the bundle root
+- let one source document manage schema `owner` facets
+- let another source document manage schema `bindings` facets
+- run `validate`, `diff`, and `apply` against the bundle so pgroles rejects overlapping ownership before any database work begins
+
+This split is especially useful when platform owns schema creation/ownership, while application teams own the profile bindings and memberships that sit on top of those schemas.
+
 ## App-owned schemas
 
 Applications that create their own schemas via migrations (e.g. `awa`, `analytics`) now have two viable patterns:

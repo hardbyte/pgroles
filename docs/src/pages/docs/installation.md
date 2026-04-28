@@ -56,11 +56,11 @@ inside the Docker publish jobs.
 To reproduce the live CLI tests against a local PostgreSQL:
 
 ```shell
-docker run --rm --name pgroles-pg16 \
+docker run --rm --name pgroles-pg18 \
   -e POSTGRES_PASSWORD=testpassword \
   -e POSTGRES_DB=pgroles_test \
   -p 5432:5432 \
-  postgres:16
+  postgres:18
 ```
 
 In another shell:
@@ -71,7 +71,7 @@ cargo test -p pgroles-cli --test cli live_db::diff_against_live_db -- --ignored 
 cargo test -p pgroles-cli --test cli live_db::diff_summary_format -- --ignored --exact
 ```
 
-Use `postgres:17` or `postgres:18` to mirror the CI matrix.
+Use `postgres:16` or `postgres:17` if you want to reproduce the full CI matrix locally.
 
 ## Contributor notes
 
