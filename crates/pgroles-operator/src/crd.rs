@@ -744,6 +744,7 @@ pub struct PlanReference {
 
 /// Summary of changes applied during reconciliation.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(default)]
 pub struct ChangeSummary {
     #[serde(default)]
     pub roles_created: i32,
