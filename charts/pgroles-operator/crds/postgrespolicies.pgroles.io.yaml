@@ -762,6 +762,7 @@
                           "type": "string"
                         },
                         "profiles": {
+                          "default": [],
                           "items": {
                             "type": "string"
                           },
@@ -774,8 +775,7 @@
                         }
                       },
                       "required": [
-                        "name",
-                        "profiles"
+                        "name"
                       ],
                       "type": "object"
                     },
