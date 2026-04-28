@@ -182,6 +182,13 @@ jobs:
           wait_for_ready_true disjoint-policy
           assert_role_exists analytics
 
+          pg_query 'DROP SCHEMA IF EXISTS operator_owned_schema CASCADE; DROP ROLE IF EXISTS operator_schema_owner;'
+          kubectl apply -f k8s/samples/schema-owner-policy.yaml
+          wait_for_ready_true schema-owner-policy
+          assert_role_exists operator_schema_owner
+          assert_schema_exists operator_owned_schema
+          assert_schema_owner operator_owned_schema operator_schema_owner
+
           kubectl apply -f k8s/samples/second-disjoint-policy.yaml
           wait_for_ready_true second-disjoint-policy
           assert_role_exists reporting

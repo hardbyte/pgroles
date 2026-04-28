@@ -12,8 +12,8 @@
 
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64;
-use hmac::{Hmac, Mac};
-use rand::Rng;
+use hmac::{Hmac, KeyInit, Mac};
+use rand::RngExt;
 use sha2::{Digest, Sha256};
 use zeroize::Zeroize;
 

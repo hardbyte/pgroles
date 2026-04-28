@@ -135,6 +135,16 @@ assert_role_absent() {
   fi
 }
 
+assert_schema_exists() {
+  pg_query "SELECT nspname FROM pg_namespace WHERE nspname = '$1'" | grep -qx "$1"
+}
+
+assert_schema_owner() {
+  local schema="$1"
+  local expected_owner="$2"
+  pg_query "SELECT pg_get_userbyid(nspowner) FROM pg_namespace WHERE nspname = '$schema'" | grep -qx "$expected_owner"
+}
+
 get_password_hash() {
   pg_query "SELECT rolpassword FROM pg_authid WHERE rolname = '$1'"
 }

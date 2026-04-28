@@ -450,7 +450,11 @@ fn slow_retry_delay(resource: &PostgresPolicy) -> Duration {
 fn referenced_schema_names(
     expanded: &pgroles_core::manifest::ExpandedManifest,
 ) -> std::collections::BTreeSet<String> {
-    let mut names = std::collections::BTreeSet::new();
+    let mut names: std::collections::BTreeSet<String> = expanded
+        .schemas
+        .iter()
+        .map(|schema| schema.name.clone())
+        .collect();
     for grant in &expanded.grants {
         if grant.object.object_type == pgroles_core::manifest::ObjectType::Schema
             && let Some(name) = &grant.object.name
@@ -465,6 +469,16 @@ fn referenced_schema_names(
         names.insert(dp.schema.clone());
     }
     names
+}
+
+fn declared_schema_names(
+    expanded: &pgroles_core::manifest::ExpandedManifest,
+) -> std::collections::BTreeSet<String> {
+    expanded
+        .schemas
+        .iter()
+        .map(|schema| schema.name.clone())
+        .collect()
 }
 
 /// Pre-flight check: ensure every schema referenced by the policy exists in
@@ -486,10 +500,7 @@ async fn validate_referenced_schemas_exist(
     pool: &sqlx::PgPool,
     expanded: &pgroles_core::manifest::ExpandedManifest,
 ) -> Result<(), ReconcileError> {
-    let referenced: std::collections::BTreeSet<String> = referenced_schema_names(expanded)
-        .into_iter()
-        .filter(|name| !is_system_schema(name))
-        .collect();
+    let referenced = externally_required_schema_names(expanded);
     if referenced.is_empty() {
         return Ok(());
     }
@@ -508,6 +519,16 @@ async fn validate_referenced_schemas_exist(
             .join(", ");
         Err(ReconcileError::MissingDatabaseObjects(formatted))
     }
+}
+
+fn externally_required_schema_names(
+    expanded: &pgroles_core::manifest::ExpandedManifest,
+) -> std::collections::BTreeSet<String> {
+    let declared = declared_schema_names(expanded);
+    referenced_schema_names(expanded)
+        .into_iter()
+        .filter(|name| !is_system_schema(name) && !declared.contains(name))
+        .collect()
 }
 
 /// Apply reconciliation — the main "ensure desired state" logic.
@@ -1749,13 +1770,17 @@ fn accumulate_summary(summary: &mut ChangeSummary, change: &pgroles_core::diff::
     use pgroles_core::diff::Change;
     match change {
         Change::CreateRole { .. } => summary.roles_created += 1,
+        Change::CreateSchema { .. } => summary.schemas_created += 1,
+        Change::AlterSchemaOwner { .. } => summary.schema_owners_altered += 1,
         Change::AlterRole { .. } => summary.roles_altered += 1,
         Change::SetComment { .. } => summary.roles_altered += 1,
         Change::DropRole { .. } => summary.roles_dropped += 1,
         Change::TerminateSessions { .. } => summary.sessions_terminated += 1,
         Change::ReassignOwned { .. } => {}
         Change::DropOwned { .. } => {}
-        Change::Grant { .. } => summary.grants_added += 1,
+        Change::Grant { .. } | Change::EnsureSchemaOwnerPrivileges { .. } => {
+            summary.grants_added += 1
+        }
         Change::Revoke { .. } => summary.grants_revoked += 1,
         Change::SetDefaultPrivilege { .. } => summary.default_privileges_set += 1,
         Change::RevokeDefaultPrivilege { .. } => summary.default_privileges_revoked += 1,
@@ -1772,6 +1797,8 @@ fn summarize_changes(changes: &[pgroles_core::diff::Change]) -> ChangeSummary {
     }
     summary.total = summary.roles_created
         + summary.roles_altered
+        + summary.schemas_created
+        + summary.schema_owners_altered
         + summary.roles_dropped
         + summary.sessions_terminated
         + summary.grants_added
@@ -1820,13 +1847,13 @@ async fn detect_sql_context(
     inspect_config: &pgroles_inspect::InspectConfig,
 ) -> Result<pgroles_core::sql::SqlContext, ReconcileError> {
     let pg_version = pgroles_inspect::detect_pg_version(pool).await?;
-    let managed_schemas: Vec<&str> = inspect_config
-        .managed_schemas
+    let privilege_schemas: Vec<&str> = inspect_config
+        .privilege_schemas
         .iter()
         .map(|schema| schema.as_str())
         .collect();
     let relation_inventory =
-        pgroles_inspect::fetch_relation_inventory(pool, &managed_schemas).await?;
+        pgroles_inspect::fetch_relation_inventory(pool, &privilege_schemas).await?;
     Ok(
         pgroles_core::sql::SqlContext::from_version_num(pg_version.version_num)
             .with_relation_inventory(relation_inventory),
@@ -2447,6 +2474,32 @@ mod tests {
     }
 
     #[test]
+    fn accumulate_summary_counts_schema_changes_separately() {
+        use pgroles_core::diff::Change;
+
+        let mut summary = ChangeSummary::default();
+
+        accumulate_summary(
+            &mut summary,
+            &Change::CreateSchema {
+                name: "inventory".to_string(),
+                owner: Some("inventory_owner".to_string()),
+            },
+        );
+        accumulate_summary(
+            &mut summary,
+            &Change::AlterSchemaOwner {
+                name: "catalog".to_string(),
+                owner: "catalog_owner".to_string(),
+            },
+        );
+
+        assert_eq!(summary.schemas_created, 1);
+        assert_eq!(summary.schema_owners_altered, 1);
+        assert_eq!(summary.grants_added, 0);
+    }
+
+    #[test]
     fn summarize_changes_sets_total() {
         use pgroles_core::diff::Change;
         use pgroles_core::model::RoleState;
@@ -2455,6 +2508,10 @@ mod tests {
             Change::CreateRole {
                 name: "test".to_string(),
                 state: RoleState::default(),
+            },
+            Change::CreateSchema {
+                name: "inventory".to_string(),
+                owner: Some("inventory_owner".to_string()),
             },
             Change::Grant {
                 role: "test".to_string(),
@@ -2469,8 +2526,9 @@ mod tests {
 
         let summary = summarize_changes(&changes);
         assert_eq!(summary.roles_created, 1);
+        assert_eq!(summary.schemas_created, 1);
         assert_eq!(summary.grants_added, 1);
-        assert_eq!(summary.total, 2);
+        assert_eq!(summary.total, 3);
     }
 
     #[test]
@@ -2501,6 +2559,20 @@ mod tests {
             &Change::AlterRole {
                 name: "r1".to_string(),
                 attributes: vec![pgroles_core::model::RoleAttribute::Login(true)],
+            },
+        );
+        accumulate_summary(
+            &mut summary,
+            &Change::CreateSchema {
+                name: "schema1".to_string(),
+                owner: Some("owner1".to_string()),
+            },
+        );
+        accumulate_summary(
+            &mut summary,
+            &Change::AlterSchemaOwner {
+                name: "schema2".to_string(),
+                owner: "owner2".to_string(),
             },
         );
         accumulate_summary(
@@ -2603,6 +2675,8 @@ mod tests {
         assert_eq!(summary.roles_created, 1);
         // AlterRole + SetComment both increment roles_altered
         assert_eq!(summary.roles_altered, 2);
+        assert_eq!(summary.schemas_created, 1);
+        assert_eq!(summary.schema_owners_altered, 1);
         assert_eq!(summary.roles_dropped, 1);
         assert_eq!(summary.sessions_terminated, 1);
         assert_eq!(summary.grants_added, 1);
@@ -2657,6 +2731,7 @@ mod tests {
             ExpandedManifest, Grant, ObjectTarget, ObjectType, Privilege,
         };
         let expanded = ExpandedManifest {
+            schemas: Vec::new(),
             roles: Vec::new(),
             grants: vec![Grant {
                 role: "app".into(),
@@ -2680,6 +2755,7 @@ mod tests {
             ExpandedManifest, Grant, ObjectTarget, ObjectType, Privilege,
         };
         let expanded = ExpandedManifest {
+            schemas: Vec::new(),
             roles: Vec::new(),
             grants: vec![Grant {
                 role: "app".into(),
@@ -2703,6 +2779,7 @@ mod tests {
             DefaultPrivilege, DefaultPrivilegeGrant, ExpandedManifest, ObjectType, Privilege,
         };
         let expanded = ExpandedManifest {
+            schemas: Vec::new(),
             roles: Vec::new(),
             grants: Vec::new(),
             default_privileges: vec![DefaultPrivilege {
@@ -2727,6 +2804,7 @@ mod tests {
             ObjectType, Privilege,
         };
         let expanded = ExpandedManifest {
+            schemas: Vec::new(),
             roles: Vec::new(),
             grants: vec![
                 Grant {
@@ -2771,6 +2849,7 @@ mod tests {
             ExpandedManifest, Grant, ObjectTarget, ObjectType, Privilege,
         };
         let expanded = ExpandedManifest {
+            schemas: Vec::new(),
             roles: Vec::new(),
             grants: vec![Grant {
                 role: "app".into(),
@@ -2800,6 +2879,87 @@ mod tests {
         assert!(!is_system_schema("public"));
         assert!(!is_system_schema("etl"));
         assert!(!is_system_schema("analytics"));
+    }
+
+    #[test]
+    fn referenced_schema_names_include_declared_schemas() {
+        use pgroles_core::manifest::{ExpandedManifest, ExpandedSchema};
+
+        let expanded = ExpandedManifest {
+            schemas: vec![ExpandedSchema {
+                name: "cdc".into(),
+                owner: Some("cdc_owner".into()),
+            }],
+            roles: Vec::new(),
+            grants: Vec::new(),
+            default_privileges: Vec::new(),
+            memberships: Vec::new(),
+        };
+
+        let names = referenced_schema_names(&expanded);
+        assert!(names.contains("cdc"));
+    }
+
+    #[test]
+    fn declared_schema_names_returns_declared_only() {
+        use pgroles_core::manifest::{ExpandedManifest, ExpandedSchema};
+
+        let expanded = ExpandedManifest {
+            schemas: vec![ExpandedSchema {
+                name: "cdc".into(),
+                owner: Some("cdc_owner".into()),
+            }],
+            roles: Vec::new(),
+            grants: Vec::new(),
+            default_privileges: Vec::new(),
+            memberships: Vec::new(),
+        };
+
+        let names = declared_schema_names(&expanded);
+        assert_eq!(names.len(), 1);
+        assert!(names.contains("cdc"));
+    }
+
+    #[test]
+    fn externally_required_schema_names_excludes_declared_schemas() {
+        use pgroles_core::manifest::{
+            ExpandedManifest, ExpandedSchema, Grant, ObjectTarget, ObjectType, Privilege,
+        };
+
+        let expanded = ExpandedManifest {
+            schemas: vec![ExpandedSchema {
+                name: "managed".into(),
+                owner: Some("managed_owner".into()),
+            }],
+            roles: Vec::new(),
+            grants: vec![
+                Grant {
+                    role: "app".into(),
+                    privileges: vec![Privilege::Usage],
+                    object: ObjectTarget {
+                        object_type: ObjectType::Schema,
+                        schema: None,
+                        name: Some("managed".into()),
+                    },
+                },
+                Grant {
+                    role: "app".into(),
+                    privileges: vec![Privilege::Select],
+                    object: ObjectTarget {
+                        object_type: ObjectType::Table,
+                        schema: Some("external".into()),
+                        name: Some("*".into()),
+                    },
+                },
+            ],
+            default_privileges: Vec::new(),
+            memberships: Vec::new(),
+        };
+
+        let names = externally_required_schema_names(&expanded);
+        assert_eq!(names.len(), 1);
+        assert!(names.contains("external"));
+        assert!(!names.contains("managed"));
     }
 
     #[test]

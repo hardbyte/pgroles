@@ -162,3 +162,28 @@ async fn fetch_memberships_legacy(
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn membership_row_maps_to_membership_edge() {
+        let row = MembershipRow {
+            role_name: "editors".to_string(),
+            member_name: "alice@example.com".to_string(),
+            admin_option: true,
+            inherit_option: false,
+        };
+
+        let edge = row.to_membership_edge();
+        assert_eq!(edge.role, "editors");
+        assert_eq!(edge.member, "alice@example.com");
+        assert!(!edge.inherit);
+        assert!(edge.admin);
+    }
+}

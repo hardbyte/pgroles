@@ -96,6 +96,20 @@ pub fn render_statements(change: &Change) -> Vec<String> {
 pub fn render_statements_with_context(change: &Change, ctx: &SqlContext) -> Vec<String> {
     match change {
         Change::CreateRole { name, state } => render_create_role(name, state),
+        Change::CreateSchema { name, owner } => render_create_schema(name, owner.as_deref()),
+        Change::AlterSchemaOwner { name, owner } => render_alter_schema_owner(name, owner),
+        Change::EnsureSchemaOwnerPrivileges {
+            name,
+            owner,
+            privileges,
+        } => render_grant(
+            owner,
+            privileges,
+            ObjectType::Schema,
+            None,
+            Some(name.as_str()),
+            ctx,
+        ),
         Change::AlterRole { name, attributes } => render_alter_role(name, attributes),
         Change::SetComment { name, comment } => render_set_comment(name, comment),
         Change::Grant {
@@ -167,6 +181,30 @@ pub fn render_all_with_context(changes: &[Change], ctx: &SqlContext) -> String {
         .flat_map(|c| render_statements_with_context(c, ctx))
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+// ---------------------------------------------------------------------------
+// CREATE / ALTER SCHEMA
+// ---------------------------------------------------------------------------
+
+fn render_create_schema(name: &str, owner: Option<&str>) -> Vec<String> {
+    let sql = match owner {
+        Some(owner) => format!(
+            "CREATE SCHEMA {} AUTHORIZATION {};",
+            quote_ident(name),
+            quote_ident(owner)
+        ),
+        None => format!("CREATE SCHEMA {};", quote_ident(name)),
+    };
+    vec![sql]
+}
+
+fn render_alter_schema_owner(name: &str, owner: &str) -> Vec<String> {
+    vec![format!(
+        "ALTER SCHEMA {} OWNER TO {};",
+        quote_ident(name),
+        quote_ident(owner)
+    )]
 }
 
 // ---------------------------------------------------------------------------
@@ -709,6 +747,52 @@ mod tests {
     }
 
     #[test]
+    fn render_create_schema_with_owner() {
+        let change = Change::CreateSchema {
+            name: "inventory".to_string(),
+            owner: Some("inventory_owner".to_string()),
+        };
+        assert_eq!(
+            render(&change),
+            "CREATE SCHEMA \"inventory\" AUTHORIZATION \"inventory_owner\";"
+        );
+    }
+
+    #[test]
+    fn render_create_schema_without_owner() {
+        let change = Change::CreateSchema {
+            name: "inventory".to_string(),
+            owner: None,
+        };
+        assert_eq!(render(&change), "CREATE SCHEMA \"inventory\";");
+    }
+
+    #[test]
+    fn render_alter_schema_owner() {
+        let change = Change::AlterSchemaOwner {
+            name: "inventory".to_string(),
+            owner: "inventory_owner".to_string(),
+        };
+        assert_eq!(
+            render(&change),
+            "ALTER SCHEMA \"inventory\" OWNER TO \"inventory_owner\";"
+        );
+    }
+
+    #[test]
+    fn render_ensure_schema_owner_privileges() {
+        let change = Change::EnsureSchemaOwnerPrivileges {
+            name: "inventory".to_string(),
+            owner: "inventory_owner".to_string(),
+            privileges: BTreeSet::from([Privilege::Create, Privilege::Usage]),
+        };
+        assert_eq!(
+            render(&change),
+            "GRANT CREATE, USAGE ON SCHEMA \"inventory\" TO \"inventory_owner\";"
+        );
+    }
+
+    #[test]
     fn render_create_role_with_login_and_comment() {
         let change = Change::CreateRole {
             name: "analytics".to_string(),
@@ -1102,6 +1186,7 @@ profiles:
 
 schemas:
   - name: inventory
+    owner: inventory_owner
     profiles: [editor]
 
 memberships:
@@ -1120,6 +1205,7 @@ memberships:
 
         // Smoke test: the output should contain key SQL statements
         assert!(sql.contains("CREATE ROLE \"inventory-editor\""));
+        assert!(sql.contains("CREATE SCHEMA \"inventory\" AUTHORIZATION \"inventory_owner\";"));
         assert!(sql.contains("GRANT USAGE ON SCHEMA \"inventory\" TO \"inventory-editor\""));
         assert!(sql.contains("GRANT DELETE, INSERT, SELECT, UPDATE ON TABLE"));
         assert!(sql.contains("ALTER DEFAULT PRIVILEGES"));

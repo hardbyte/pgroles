@@ -117,3 +117,157 @@ pub async fn fetch_roles(
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn role_row_maps_to_role_state() {
+        let row = RoleRow {
+            rolname: "analytics".to_string(),
+            rolsuper: false,
+            rolinherit: false,
+            rolcreaterole: true,
+            rolcreatedb: false,
+            rolcanlogin: true,
+            rolreplication: false,
+            rolbypassrls: true,
+            rolconnlimit: 12,
+            comment: Some("analytics login".to_string()),
+            rolvaliduntil: Some("2026-12-31T00:00:00Z".to_string()),
+        };
+
+        let state = row.to_role_state();
+        assert!(state.login);
+        assert!(!state.superuser);
+        assert!(!state.inherit);
+        assert!(state.createrole);
+        assert!(!state.createdb);
+        assert!(!state.replication);
+        assert!(state.bypassrls);
+        assert_eq!(state.connection_limit, 12);
+        assert_eq!(state.comment.as_deref(), Some("analytics login"));
+        assert_eq!(
+            state.password_valid_until.as_deref(),
+            Some("2026-12-31T00:00:00Z")
+        );
+    }
+
+    fn with_runtime<T>(future: impl std::future::Future<Output = T>) -> T {
+        tokio::runtime::Runtime::new()
+            .expect("failed to create tokio runtime")
+            .block_on(future)
+    }
+
+    fn database_url() -> String {
+        std::env::var("DATABASE_URL").expect("DATABASE_URL must be set for live DB tests")
+    }
+
+    fn unique_name(prefix: &str) -> String {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock before unix epoch")
+            .as_nanos();
+        format!("{prefix}_{nanos}")
+    }
+
+    fn execute_sql(sql: &str) {
+        use sqlx::Executor;
+
+        with_runtime(async {
+            let pool = PgPool::connect(&database_url())
+                .await
+                .expect("failed to connect to live test database");
+            pool.execute(sql)
+                .await
+                .expect("failed to execute setup SQL");
+        });
+    }
+
+    struct TestDbCleanup {
+        sql: String,
+    }
+
+    impl TestDbCleanup {
+        fn new(sql: String) -> Self {
+            Self { sql }
+        }
+    }
+
+    impl Drop for TestDbCleanup {
+        fn drop(&mut self) {
+            execute_sql(&self.sql);
+        }
+    }
+
+    #[test]
+    #[ignore]
+    fn fetch_roles_scopes_to_managed_names() {
+        let managed = unique_name("managed_role");
+        let extra = unique_name("extra_role");
+        let _cleanup = TestDbCleanup::new(format!(
+            r#"
+            DROP ROLE IF EXISTS "{managed}";
+            DROP ROLE IF EXISTS "{extra}";
+            "#
+        ));
+
+        execute_sql(&format!(
+            r#"
+            DROP ROLE IF EXISTS "{managed}";
+            DROP ROLE IF EXISTS "{extra}";
+            CREATE ROLE "{managed}" LOGIN;
+            CREATE ROLE "{extra}" NOLOGIN;
+            "#
+        ));
+
+        let roles = with_runtime(async {
+            let pool = PgPool::connect(&database_url())
+                .await
+                .expect("failed to connect to live test database");
+            fetch_roles(&pool, Some(&[managed.as_str()]))
+                .await
+                .expect("failed to fetch scoped roles")
+        });
+
+        assert_eq!(roles.len(), 1);
+        assert_eq!(roles[0].rolname, managed);
+    }
+
+    #[test]
+    #[ignore]
+    fn fetch_roles_unscoped_excludes_postgres_but_includes_user_roles() {
+        let user_role = unique_name("role_inventory");
+        let _cleanup = TestDbCleanup::new(format!(r#"DROP ROLE IF EXISTS "{user_role}";"#));
+
+        execute_sql(&format!(
+            r#"
+            DROP ROLE IF EXISTS "{user_role}";
+            CREATE ROLE "{user_role}" LOGIN;
+            "#
+        ));
+
+        let roles = with_runtime(async {
+            let pool = PgPool::connect(&database_url())
+                .await
+                .expect("failed to connect to live test database");
+            fetch_roles(&pool, None)
+                .await
+                .expect("failed to fetch unscoped roles")
+        });
+
+        assert!(
+            roles.iter().any(|row| row.rolname == user_role),
+            "expected unscoped fetch to include the test user role"
+        );
+        assert!(
+            roles.iter().all(|row| row.rolname != "postgres"),
+            "expected unscoped fetch to exclude postgres"
+        );
+    }
+}

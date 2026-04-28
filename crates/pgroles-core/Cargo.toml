@@ -19,9 +19,9 @@ schemars = { workspace = true }
 thiserror = { workspace = true }
 
 # SCRAM-SHA-256 verifier computation
-sha2 = "0.10"
-hmac = "0.12"
-pbkdf2 = "0.12"
-base64 = "0.22"
-rand = "0.9"
+sha2 = "0.11"
+hmac = "0.13"
+pbkdf2 = "0.13.0"
+base64 = "0.22.1"
+rand = "0.10.1"
 zeroize = "1"

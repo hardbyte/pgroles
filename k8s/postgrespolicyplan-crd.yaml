@@ -152,68 +152,76 @@
                     "nullable": true,
                     "properties": {
                       "default_privileges_revoked": {
+                        "default": 0,
                         "format": "int32",
                         "type": "integer"
                       },
                       "default_privileges_set": {
+                        "default": 0,
                         "format": "int32",
                         "type": "integer"
                       },
                       "grants_added": {
+                        "default": 0,
                         "format": "int32",
                         "type": "integer"
                       },
                       "grants_revoked": {
+                        "default": 0,
                         "format": "int32",
                         "type": "integer"
                       },
                       "members_added": {
+                        "default": 0,
                         "format": "int32",
                         "type": "integer"
                       },
                       "members_removed": {
+                        "default": 0,
                         "format": "int32",
                         "type": "integer"
                       },
                       "passwords_set": {
+                        "default": 0,
                         "format": "int32",
                         "type": "integer"
                       },
                       "roles_altered": {
+                        "default": 0,
                         "format": "int32",
                         "type": "integer"
                       },
                       "roles_created": {
+                        "default": 0,
                         "format": "int32",
                         "type": "integer"
                       },
                       "roles_dropped": {
+                        "default": 0,
+                        "format": "int32",
+                        "type": "integer"
+                      },
+                      "schema_owners_altered": {
+                        "default": 0,
+                        "format": "int32",
+                        "type": "integer"
+                      },
+                      "schemas_created": {
+                        "default": 0,
                         "format": "int32",
                         "type": "integer"
                       },
                       "sessions_terminated": {
+                        "default": 0,
                         "format": "int32",
                         "type": "integer"
                       },
                       "total": {
+                        "default": 0,
                         "format": "int32",
                         "type": "integer"
                       }
                     },
-                    "required": [
-                      "default_privileges_revoked",
-                      "default_privileges_set",
-                      "grants_added",
-                      "grants_revoked",
-                      "members_added",
-                      "members_removed",
-                      "passwords_set",
-                      "roles_altered",
-                      "roles_created",
-                      "roles_dropped",
-                      "sessions_terminated",
-                      "total"
-                    ],
                     "type": "object"
                   },
                   "computedAt": {

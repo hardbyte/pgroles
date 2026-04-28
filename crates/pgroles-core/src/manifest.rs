@@ -15,6 +15,9 @@ pub enum ManifestError {
     #[error("duplicate role name: \"{0}\"")]
     DuplicateRole(String),
 
+    #[error("duplicate schema name: \"{0}\"")]
+    DuplicateSchema(String),
+
     #[error("profile \"{0}\" referenced by schema \"{1}\" is not defined")]
     UndefinedProfile(String, String),
 
@@ -247,6 +250,7 @@ pub struct ProfileObjectTarget {
 pub struct SchemaBinding {
     pub name: String,
 
+    #[serde(default)]
     pub profiles: Vec<String>,
 
     /// Role naming pattern. Supports `{schema}` and `{profile}` placeholders.
@@ -259,7 +263,25 @@ pub struct SchemaBinding {
     pub owner: Option<String>,
 }
 
-fn default_role_pattern() -> String {
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, JsonSchema,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum SchemaBindingFacet {
+    Owner,
+    Bindings,
+}
+
+impl std::fmt::Display for SchemaBindingFacet {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SchemaBindingFacet::Owner => write!(f, "owner"),
+            SchemaBindingFacet::Bindings => write!(f, "bindings"),
+        }
+    }
+}
+
+pub(crate) fn default_role_pattern() -> String {
     "{schema}-{profile}".to_string()
 }
 
@@ -430,10 +452,17 @@ pub struct RoleRetirement {
 /// default privileges, and memberships. Ready to be converted into a `RoleGraph`.
 #[derive(Debug, Clone)]
 pub struct ExpandedManifest {
+    pub schemas: Vec<ExpandedSchema>,
     pub roles: Vec<RoleDefinition>,
     pub grants: Vec<Grant>,
     pub default_privileges: Vec<DefaultPrivilege>,
     pub memberships: Vec<Membership>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExpandedSchema {
+    pub name: String,
+    pub owner: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -467,6 +496,24 @@ pub fn parse_manifest(yaml: &str) -> Result<PolicyManifest, ManifestError> {
 /// roles, grants, and default privileges. Merges with one-off definitions.
 /// Validates no duplicate role names.
 pub fn expand_manifest(manifest: &PolicyManifest) -> Result<ExpandedManifest, ManifestError> {
+    let mut seen_schemas: HashSet<String> = HashSet::new();
+    for schema_binding in &manifest.schemas {
+        if !seen_schemas.insert(schema_binding.name.clone()) {
+            return Err(ManifestError::DuplicateSchema(schema_binding.name.clone()));
+        }
+    }
+
+    let schemas: Vec<ExpandedSchema> = manifest
+        .schemas
+        .iter()
+        .map(|schema_binding| ExpandedSchema {
+            name: schema_binding.name.clone(),
+            owner: schema_binding
+                .owner
+                .clone()
+                .or(manifest.default_owner.clone()),
+        })
+        .collect();
     let mut roles: Vec<RoleDefinition> = Vec::new();
     let mut grants: Vec<Grant> = Vec::new();
     let mut default_privileges: Vec<DefaultPrivilege> = Vec::new();
@@ -627,6 +674,7 @@ pub fn expand_manifest(manifest: &PolicyManifest) -> Result<ExpandedManifest, Ma
     }
 
     Ok(ExpandedManifest {
+        schemas,
         roles,
         grants,
         default_privileges,
@@ -852,6 +900,63 @@ schemas:
     }
 
     #[test]
+    fn expand_schema_owner_overrides_default_owner() {
+        let yaml = r#"
+default_owner: app_owner
+
+profiles:
+  editor:
+    default_privileges:
+      - privileges: [SELECT]
+        on_type: table
+
+schemas:
+  - name: inventory
+    owner: inventory_owner
+    profiles: [editor]
+  - name: catalog
+    profiles: [editor]
+"#;
+
+        let manifest = parse_manifest(yaml).unwrap();
+        let expanded = expand_manifest(&manifest).unwrap();
+
+        assert_eq!(
+            expanded.schemas,
+            vec![
+                ExpandedSchema {
+                    name: "inventory".to_string(),
+                    owner: Some("inventory_owner".to_string()),
+                },
+                ExpandedSchema {
+                    name: "catalog".to_string(),
+                    owner: Some("app_owner".to_string()),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn expand_declared_schema_with_no_profiles() {
+        let yaml = r#"
+schemas:
+  - name: cdc
+    owner: cdc_owner
+    profiles: []
+"#;
+
+        let manifest = parse_manifest(yaml).unwrap();
+        let expanded = expand_manifest(&manifest).unwrap();
+
+        assert_eq!(expanded.schemas.len(), 1);
+        assert_eq!(expanded.schemas[0].name, "cdc");
+        assert_eq!(expanded.schemas[0].owner.as_deref(), Some("cdc_owner"));
+        assert!(expanded.roles.is_empty());
+        assert!(expanded.grants.is_empty());
+        assert!(expanded.default_privileges.is_empty());
+    }
+
+    #[test]
     fn expand_profiles_multi_schema() {
         let yaml = r#"
 profiles:
@@ -929,6 +1034,22 @@ roles:
                 .to_string()
                 .contains("duplicate role name")
         );
+    }
+
+    #[test]
+    fn expand_rejects_duplicate_schema_name() {
+        let yaml = r#"
+schemas:
+  - name: inventory
+    profiles: []
+  - name: inventory
+    owner: inventory_owner
+    profiles: []
+"#;
+
+        let manifest = parse_manifest(yaml).unwrap();
+        let error = expand_manifest(&manifest).unwrap_err();
+        assert!(error.to_string().contains("duplicate schema name"));
     }
 
     #[test]

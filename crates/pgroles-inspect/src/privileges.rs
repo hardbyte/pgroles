@@ -1,8 +1,13 @@
 //! Query object privileges from PostgreSQL catalog tables.
 //!
-//! Uses `aclexplode()` to decompose ACL arrays from `pg_class`, `pg_namespace`,
-//! `pg_proc`, `pg_type`, and `pg_database`. NULL ACLs (meaning system defaults)
-//! are handled via `COALESCE(acl_col, acldefault(type_char, owner_oid))`.
+//! Uses `aclexplode()` to decompose explicit ACL arrays from `pg_class`,
+//! `pg_namespace`, `pg_proc`, `pg_type`, and `pg_database`.
+//!
+//! Managed-state inspection intentionally does not synthesize owner/default ACLs
+//! from `acldefault(...)`. Doing so would make implicit owner privileges appear
+//! as explicit managed grants, causing drift where the manifest never declared
+//! those self-grants. PUBLIC/default visibility is handled separately by the
+//! `public_grants` module for informational output.
 //!
 //! The privilege character mapping:
 //!   r = SELECT, a = INSERT, w = UPDATE, d = DELETE, D = TRUNCATE,
@@ -81,8 +86,8 @@ pub async fn fetch_privileges(
     fetch_privileges_with_wildcards(pool, managed_schemas, managed_roles, &[]).await
 }
 
-/// Fetch schema-scoped relation names grouped by object type.
-pub async fn fetch_relation_inventory(
+/// Fetch schema-scoped object names grouped by object type.
+pub async fn fetch_object_inventory(
     pool: &PgPool,
     managed_schemas: &[&str],
 ) -> Result<BTreeMap<(ObjectType, String), Vec<String>>, sqlx::Error> {
@@ -103,7 +108,47 @@ pub async fn fetch_relation_inventory(
         JOIN pg_namespace n ON n.oid = c.relnamespace
         WHERE n.nspname = ANY($1)
           AND c.relkind IN ('r', 'p', 'v', 'm')
-        ORDER BY n.nspname, c.relkind, c.relname
+
+        UNION ALL
+
+        SELECT
+            NULL::text AS grantee,
+            '' AS privilege_type,
+            n.nspname AS schema_name,
+            c.relname AS object_name,
+            'sequence' AS obj_type
+        FROM pg_class c
+        JOIN pg_namespace n ON n.oid = c.relnamespace
+        WHERE n.nspname = ANY($1)
+          AND c.relkind = 'S'
+
+        UNION ALL
+
+        SELECT
+            NULL::text AS grantee,
+            '' AS privilege_type,
+            n.nspname AS schema_name,
+            p.proname || '(' || pg_catalog.pg_get_function_identity_arguments(p.oid) || ')' AS object_name,
+            'function' AS obj_type
+        FROM pg_proc p
+        JOIN pg_namespace n ON n.oid = p.pronamespace
+        WHERE n.nspname = ANY($1)
+
+        UNION ALL
+
+        SELECT
+            NULL::text AS grantee,
+            '' AS privilege_type,
+            n.nspname AS schema_name,
+            t.typname AS object_name,
+            'type' AS obj_type
+        FROM pg_type t
+        JOIN pg_namespace n ON n.oid = t.typnamespace
+        WHERE n.nspname = ANY($1)
+          AND t.typname NOT LIKE '\_%'
+          AND t.typtype <> 'p'
+
+        ORDER BY schema_name, obj_type, object_name
         "#,
     )
     .bind(managed_schemas)
@@ -127,6 +172,24 @@ pub async fn fetch_relation_inventory(
     Ok(inventory)
 }
 
+/// Fetch only relation names (tables, views, materialized views) for callers
+/// that specifically need relation inventory.
+pub async fn fetch_relation_inventory(
+    pool: &PgPool,
+    managed_schemas: &[&str],
+) -> Result<BTreeMap<(ObjectType, String), Vec<String>>, sqlx::Error> {
+    Ok(fetch_object_inventory(pool, managed_schemas)
+        .await?
+        .into_iter()
+        .filter(|((object_type, _), _)| {
+            matches!(
+                object_type,
+                ObjectType::Table | ObjectType::View | ObjectType::MaterializedView
+            )
+        })
+        .collect())
+}
+
 pub(crate) async fn fetch_privileges_with_wildcards(
     pool: &PgPool,
     managed_schemas: &[&str],
@@ -135,6 +198,15 @@ pub(crate) async fn fetch_privileges_with_wildcards(
 ) -> Result<BTreeMap<GrantKey, GrantState>, sqlx::Error> {
     let mut grants: BTreeMap<GrantKey, GrantState> = BTreeMap::new();
     let mut inventory: BTreeMap<(ObjectType, String), BTreeSet<String>> = BTreeMap::new();
+
+    for ((object_type, schema_name), object_names) in
+        fetch_object_inventory(pool, managed_schemas).await?
+    {
+        inventory.insert(
+            (object_type, schema_name),
+            object_names.into_iter().collect(),
+        );
+    }
 
     // Run all the independent queries and collect results.
     // We use separate queries per object type rather than one giant UNION
@@ -344,8 +416,7 @@ fn all_privileges() -> BTreeSet<Privilege> {
 /// the object type:
 ///   'r' = table, 'v' = view, 'm' = materialized view, 'S' = sequence, 'p' = partitioned table
 ///
-/// NULL ACLs are handled with `acldefault('r', c.relowner)` for relations and
-/// `acldefault('S', c.relowner)` for sequences.
+/// Only explicit ACLs are inspected. NULL ACLs produce no rows.
 async fn fetch_relation_privileges(
     pool: &PgPool,
     managed_schemas: &[&str],
@@ -366,15 +437,7 @@ async fn fetch_relation_privileges(
             END AS obj_type
         FROM pg_class c
         JOIN pg_namespace n ON n.oid = c.relnamespace
-        CROSS JOIN LATERAL aclexplode(
-            COALESCE(
-                c.relacl,
-                acldefault(
-                    CASE WHEN c.relkind = 'S' THEN 'S'::"char" ELSE 'r'::"char" END,
-                    c.relowner
-                )
-            )
-        ) AS acl
+        CROSS JOIN LATERAL aclexplode(c.relacl) AS acl
         LEFT JOIN pg_roles grantee ON grantee.oid = acl.grantee
         WHERE n.nspname = ANY($1)
           AND c.relkind IN ('r', 'p', 'v', 'm', 'S')
@@ -388,8 +451,8 @@ async fn fetch_relation_privileges(
 
 /// Fetch privileges on schemas.
 ///
-/// Uses `pg_namespace`. The ACL default type is 'n' (namespace).
-/// For schema grants, the object_name is the schema name itself.
+/// Uses `pg_namespace`. For schema grants, the object_name is the schema name itself.
+/// Only explicit ACLs are inspected. NULL ACLs produce no rows.
 async fn fetch_schema_privileges(
     pool: &PgPool,
     managed_schemas: &[&str],
@@ -403,12 +466,7 @@ async fn fetch_schema_privileges(
             n.nspname AS object_name,
             'schema' AS obj_type
         FROM pg_namespace n
-        CROSS JOIN LATERAL aclexplode(
-            COALESCE(
-                n.nspacl,
-                acldefault('n'::"char", n.nspowner)
-            )
-        ) AS acl
+        CROSS JOIN LATERAL aclexplode(n.nspacl) AS acl
         LEFT JOIN pg_roles grantee ON grantee.oid = acl.grantee
         WHERE n.nspname = ANY($1)
         ORDER BY n.nspname
@@ -421,9 +479,10 @@ async fn fetch_schema_privileges(
 
 /// Fetch privileges on functions/procedures.
 ///
-/// Uses `pg_proc` joined with `pg_namespace`. The ACL default type is 'f'.
+/// Uses `pg_proc` joined with `pg_namespace`.
 /// Function names can be overloaded, so we include the OID-derived
 /// identity signature via `pg_catalog.pg_get_function_identity_arguments()`.
+/// Only explicit ACLs are inspected. NULL ACLs produce no rows.
 async fn fetch_function_privileges(
     pool: &PgPool,
     managed_schemas: &[&str],
@@ -438,12 +497,7 @@ async fn fetch_function_privileges(
             'function' AS obj_type
         FROM pg_proc p
         JOIN pg_namespace n ON n.oid = p.pronamespace
-        CROSS JOIN LATERAL aclexplode(
-            COALESCE(
-                p.proacl,
-                acldefault('f'::"char", p.proowner)
-            )
-        ) AS acl
+        CROSS JOIN LATERAL aclexplode(p.proacl) AS acl
         LEFT JOIN pg_roles grantee ON grantee.oid = acl.grantee
         WHERE n.nspname = ANY($1)
         ORDER BY n.nspname, p.proname
@@ -456,9 +510,10 @@ async fn fetch_function_privileges(
 
 /// Fetch privileges on types/domains.
 ///
-/// Uses `pg_type` joined with `pg_namespace`. The ACL default type is 'T'.
+/// Uses `pg_type` joined with `pg_namespace`.
 /// We filter out internal/array types (typname not starting with '_',
 /// typtype not 'p' for pseudo-types).
+/// Only explicit ACLs are inspected. NULL ACLs produce no rows.
 async fn fetch_type_privileges(
     pool: &PgPool,
     managed_schemas: &[&str],
@@ -473,12 +528,7 @@ async fn fetch_type_privileges(
             'type' AS obj_type
         FROM pg_type t
         JOIN pg_namespace n ON n.oid = t.typnamespace
-        CROSS JOIN LATERAL aclexplode(
-            COALESCE(
-                t.typacl,
-                acldefault('T'::"char", t.typowner)
-            )
-        ) AS acl
+        CROSS JOIN LATERAL aclexplode(t.typacl) AS acl
         LEFT JOIN pg_roles grantee ON grantee.oid = acl.grantee
         WHERE n.nspname = ANY($1)
           AND t.typname NOT LIKE '\_%'
@@ -493,9 +543,8 @@ async fn fetch_type_privileges(
 
 /// Fetch database-level privileges on the current database.
 ///
-/// Uses `pg_database`. The ACL default type is 'd'.
-/// This is separate because it's not schema-scoped; we always query the
-/// current database.
+/// Uses `pg_database`. This is separate because it's not schema-scoped; we
+/// always query the current database. Only explicit ACLs are inspected.
 pub async fn fetch_database_privileges(
     pool: &PgPool,
     managed_roles: &[&str],
@@ -509,12 +558,7 @@ pub async fn fetch_database_privileges(
             db.datname AS object_name,
             'database' AS obj_type
         FROM pg_database db
-        CROSS JOIN LATERAL aclexplode(
-            COALESCE(
-                db.datacl,
-                acldefault('d'::"char", db.datdba)
-            )
-        ) AS acl
+        CROSS JOIN LATERAL aclexplode(db.datacl) AS acl
         LEFT JOIN pg_roles grantee ON grantee.oid = acl.grantee
         WHERE db.datname = current_database()
         ORDER BY db.datname
@@ -812,6 +856,74 @@ mod tests {
         assert!(
             !entry.privileges.contains(&Privilege::Update),
             "Update is not shared across all sequences"
+        );
+    }
+
+    #[test]
+    fn object_inventory_supports_non_relation_wildcards() {
+        let mut inventory: BTreeMap<(ObjectType, String), BTreeSet<String>> = BTreeMap::new();
+        inventory.insert(
+            (ObjectType::Function, "public".to_string()),
+            BTreeSet::from(["refresh_widgets()".to_string()]),
+        );
+        inventory.insert(
+            (ObjectType::Type, "public".to_string()),
+            BTreeSet::from(["widget_status".to_string()]),
+        );
+        inventory.insert(
+            (ObjectType::Sequence, "public".to_string()),
+            BTreeSet::from(["widgets_id_seq".to_string()]),
+        );
+
+        let wildcards = vec![
+            WildcardGrantPattern {
+                role: "app".to_string(),
+                object_type: ObjectType::Function,
+                schema: "public".to_string(),
+                privileges: BTreeSet::from([Privilege::Execute]),
+            },
+            WildcardGrantPattern {
+                role: "app".to_string(),
+                object_type: ObjectType::Type,
+                schema: "public".to_string(),
+                privileges: BTreeSet::from([Privilege::Usage]),
+            },
+            WildcardGrantPattern {
+                role: "app".to_string(),
+                object_type: ObjectType::Sequence,
+                schema: "public".to_string(),
+                privileges: BTreeSet::from([Privilege::Usage]),
+            },
+        ];
+
+        let result = normalize_wildcard_grants(BTreeMap::new(), &inventory, &wildcards);
+
+        assert!(
+            !result.contains_key(&GrantKey {
+                role: "app".to_string(),
+                object_type: ObjectType::Function,
+                schema: Some("public".to_string()),
+                name: Some("*".to_string()),
+            }),
+            "existing function inventory should prevent vacuous wildcard synthesis"
+        );
+        assert!(
+            !result.contains_key(&GrantKey {
+                role: "app".to_string(),
+                object_type: ObjectType::Type,
+                schema: Some("public".to_string()),
+                name: Some("*".to_string()),
+            }),
+            "existing type inventory should prevent vacuous wildcard synthesis"
+        );
+        assert!(
+            !result.contains_key(&GrantKey {
+                role: "app".to_string(),
+                object_type: ObjectType::Sequence,
+                schema: Some("public".to_string()),
+                name: Some("*".to_string()),
+            }),
+            "existing sequence inventory should prevent vacuous wildcard synthesis"
         );
     }
 }

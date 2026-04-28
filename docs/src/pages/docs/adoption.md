@@ -49,7 +49,7 @@ If the output is `-- No changes needed`, the manifest matches the database and a
 
 ### 4. Enable additive apply
 
-Switch to `mode: apply` with `reconciliation_mode: additive`. This applies all non-destructive changes — creating roles, adding grants and memberships, setting default privileges — but never revokes existing privileges, removes memberships, or drops roles.
+Switch to `mode: apply` with `reconciliation_mode: additive`. This applies all non-destructive changes — creating roles and declared schemas, adding grants and memberships, and setting default privileges when their owner context is already valid — but never revokes existing privileges, transfers schema ownership, removes memberships, or drops roles. If a schema's desired `owner` differs from the current owner, pgroles defers owner-bound follow-up steps such as `ALTER DEFAULT PRIVILEGES FOR ROLE <owner> ...` until a mode that allows the ownership transfer.
 
 ```yaml
 spec:
@@ -61,14 +61,23 @@ spec:
 
 Once the manifest covers all roles and grants you want managed, switch to `reconciliation_mode: authoritative` to enable full convergence. Review the planned revocations carefully before switching — in a typical brownfield database, this may include thousands of existing grants to roles not yet in the manifest.
 
+## Multi-team adoption with bundles
+
+If platform and application teams need separate ownership boundaries, use CLI bundle mode instead of forcing everyone into one large manifest.
+
+- put shared profiles and `default_owner` in the bundle root
+- let one source document manage schema `owner` facets
+- let another source document manage schema `bindings` facets
+- run `validate`, `diff`, and `apply` against the bundle so pgroles rejects overlapping ownership before any database work begins
+
+This split is especially useful when platform owns schema creation/ownership, while application teams own the profile bindings and memberships that sit on top of those schemas.
+
 ## App-owned schemas
 
-Applications that create their own schemas via migrations (e.g. `awa`, `analytics`) require a **two-stage** manifest:
+Applications that create their own schemas via migrations (e.g. `awa`, `analytics`) now have two viable patterns:
 
-1. **Bootstrap** — create login roles and database-level grants *before* migrations run
-2. **Full** — add schema-level grants, object grants, and default privileges *after* migrations have created the schema
-
-This is necessary because `GRANT USAGE ON SCHEMA foo` fails if `foo` does not exist yet.
+1. **Let pgroles manage the schema** — declare it under `schemas:` with an optional `owner`, and pgroles can create it before grants/default privileges are applied.
+2. **Let the application manage the schema** — keep using a two-stage manifest where migrations create the schema first, then pgroles applies schema/object grants afterward.
 
 ```yaml
 # Stage 1: bootstrap (pre-migration)
@@ -84,14 +93,15 @@ grants:
 ```
 
 ```yaml
-# Stage 2: full (post-migration)
+# Stage 2: full (pgroles manages schema)
 schemas:
   - name: app_schema
+    owner: app_owner
     profiles: [editor, viewer]
 ```
 
-{% callout type="note" title="Schema existence" %}
-pgroles does not create schemas. If a schema referenced in grants or profiles does not exist, the apply will fail. Ensure your application migrations run before applying schema-level grants.
+{% callout type="note" title="Declared vs referenced schemas" %}
+pgroles can create schemas that are explicitly declared under `schemas:`. Schemas that are only referenced from top-level `grants:` or `default_privileges:` must still exist before apply.
 {% /callout %}
 
 ## PUBLIC privilege caveats

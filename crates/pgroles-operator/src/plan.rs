@@ -595,9 +595,16 @@ fn render_redacted_sql(
 
 /// Compute SHA-256 hash of the SQL string as a hex digest.
 pub(crate) fn compute_sql_hash(sql: &str) -> String {
+    use std::fmt::Write as _;
+
     let mut hasher = Sha256::new();
     hasher.update(sql.as_bytes());
-    format!("{:x}", hasher.finalize())
+    let digest = hasher.finalize();
+    let mut hex = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        write!(&mut hex, "{byte:02x}").expect("writing to a string should succeed");
+    }
+    hex
 }
 
 /// Generate a plan name from policy name and current timestamp.

@@ -9,13 +9,15 @@ use sqlx::PgPool;
 use tracing::info;
 
 use pgroles_cli::{
-    PlanSummary, apply_role_retirements, compute_plan, format_plan_json,
+    PlanSummary, apply_role_retirements, compute_plan, format_bundle_plan_json,
+    format_bundle_validation_result, format_managed_scope_summary, format_plan_json,
     format_plan_sql_with_context, format_role_graph_summary, format_validation_result,
     inject_password_changes, planned_role_drops, read_manifest_file, resolve_passwords,
-    validate_manifest,
+    validate_bundle_file, validate_manifest,
 };
 use pgroles_core::diff::{ReconciliationMode, filter_changes};
-use pgroles_core::visual::{self, VisualSource};
+use pgroles_core::ownership::validate_changes_against_managed_surface;
+use pgroles_core::visual::{self, VisualManagedScope, VisualSource};
 use pgroles_inspect::{InspectConfig, inspect_drop_role_safety};
 
 // ---------------------------------------------------------------------------
@@ -35,11 +37,15 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Validate a manifest file (parse + expand). No database connection required.
+    /// Validate a manifest or bundle file. No database connection required.
     Validate {
         /// Path to the policy manifest YAML file.
-        #[arg(short, long, default_value = "pgroles.yaml")]
-        file: PathBuf,
+        #[arg(short, long, conflicts_with = "bundle")]
+        file: Option<PathBuf>,
+
+        /// Path to the policy bundle YAML file.
+        #[arg(long, conflicts_with = "file")]
+        bundle: Option<PathBuf>,
     },
 
     /// Show the SQL changes needed to converge the database to the manifest.
@@ -47,8 +53,12 @@ enum Commands {
     #[command(alias = "plan")]
     Diff {
         /// Path to the policy manifest YAML file.
-        #[arg(short, long, default_value = "pgroles.yaml")]
-        file: PathBuf,
+        #[arg(short, long, conflicts_with = "bundle")]
+        file: Option<PathBuf>,
+
+        /// Path to the policy bundle YAML file.
+        #[arg(long, conflicts_with = "file")]
+        bundle: Option<PathBuf>,
 
         /// PostgreSQL connection string (or set DATABASE_URL).
         #[arg(long, env = "DATABASE_URL")]
@@ -78,8 +88,12 @@ enum Commands {
     /// Apply the changes to bring the database in sync with the manifest.
     Apply {
         /// Path to the policy manifest YAML file.
-        #[arg(short, long, default_value = "pgroles.yaml")]
-        file: PathBuf,
+        #[arg(short, long, conflicts_with = "bundle")]
+        file: Option<PathBuf>,
+
+        /// Path to the policy bundle YAML file.
+        #[arg(long, conflicts_with = "file")]
+        bundle: Option<PathBuf>,
 
         /// PostgreSQL connection string (or set DATABASE_URL).
         #[arg(long, env = "DATABASE_URL")]
@@ -103,8 +117,13 @@ enum Commands {
         /// Path to policy manifest YAML. When provided, scopes output to roles
         /// and schemas declared in the manifest. When omitted, shows all
         /// non-system database roles and privileges.
-        #[arg(short, long)]
+        #[arg(short, long, conflicts_with = "bundle")]
         file: Option<PathBuf>,
+
+        /// Path to the policy bundle YAML file. When provided, scopes output to
+        /// the composed bundle ownership boundaries.
+        #[arg(long, conflicts_with = "file")]
+        bundle: Option<PathBuf>,
 
         /// PostgreSQL connection string (or set DATABASE_URL).
         #[arg(long, env = "DATABASE_URL")]
@@ -140,8 +159,12 @@ enum GraphSource {
     /// Build the graph from a manifest file (desired state).
     Desired {
         /// Path to the policy manifest YAML file.
-        #[arg(short, long, default_value = "pgroles.yaml")]
-        file: PathBuf,
+        #[arg(short, long, conflicts_with = "bundle")]
+        file: Option<PathBuf>,
+
+        /// Path to the policy bundle YAML file.
+        #[arg(long, conflicts_with = "file")]
+        bundle: Option<PathBuf>,
 
         /// Output format.
         #[arg(long, default_value = "tree")]
@@ -154,9 +177,13 @@ enum GraphSource {
 
     /// Build the graph from a live database (current state).
     Current {
-        /// Path to the policy manifest YAML file (required when --scope=managed).
-        #[arg(short, long)]
+        /// Path to the policy manifest YAML file (required when --scope=managed unless --bundle is used).
+        #[arg(short, long, conflicts_with = "bundle")]
         file: Option<PathBuf>,
+
+        /// Path to the policy bundle YAML file (required when --scope=managed unless --file is used).
+        #[arg(long, conflicts_with = "file")]
+        bundle: Option<PathBuf>,
 
         /// PostgreSQL connection string (or set DATABASE_URL).
         #[arg(long, env = "DATABASE_URL")]
@@ -246,12 +273,13 @@ const EXIT_DRIFT: u8 = 2;
 
 async fn run(cli: Cli) -> Result<ExitCode> {
     match cli.command {
-        Commands::Validate { file } => {
-            cmd_validate(&file)?;
+        Commands::Validate { file, bundle } => {
+            cmd_validate(file.as_deref(), bundle.as_deref())?;
             Ok(ExitCode::SUCCESS)
         }
         Commands::Diff {
             file,
+            bundle,
             database_url,
             format,
             mode,
@@ -259,7 +287,8 @@ async fn run(cli: Cli) -> Result<ExitCode> {
             no_exit_code,
         } => {
             cmd_diff(
-                &file,
+                file.as_deref(),
+                bundle.as_deref(),
                 &database_url,
                 &format,
                 mode.into(),
@@ -269,15 +298,27 @@ async fn run(cli: Cli) -> Result<ExitCode> {
         }
         Commands::Apply {
             file,
+            bundle,
             database_url,
             dry_run,
             mode,
         } => {
-            cmd_apply(&file, &database_url, dry_run, mode.into()).await?;
+            cmd_apply(
+                file.as_deref(),
+                bundle.as_deref(),
+                &database_url,
+                dry_run,
+                mode.into(),
+            )
+            .await?;
             Ok(ExitCode::SUCCESS)
         }
-        Commands::Inspect { file, database_url } => {
-            cmd_inspect(file.as_deref(), &database_url).await?;
+        Commands::Inspect {
+            file,
+            bundle,
+            database_url,
+        } => {
+            cmd_inspect(file.as_deref(), bundle.as_deref(), &database_url).await?;
             Ok(ExitCode::SUCCESS)
         }
         Commands::Generate {
@@ -290,14 +331,21 @@ async fn run(cli: Cli) -> Result<ExitCode> {
         Commands::Graph { source } => match source {
             GraphSource::Desired {
                 file,
+                bundle,
                 format,
                 output,
             } => {
-                cmd_graph_desired(&file, &format, output.as_deref())?;
+                cmd_graph_desired(
+                    file.as_deref(),
+                    bundle.as_deref(),
+                    &format,
+                    output.as_deref(),
+                )?;
                 Ok(ExitCode::SUCCESS)
             }
             GraphSource::Current {
                 file,
+                bundle,
                 database_url,
                 scope,
                 format,
@@ -305,6 +353,7 @@ async fn run(cli: Cli) -> Result<ExitCode> {
             } => {
                 cmd_graph_current(
                     file.as_deref(),
+                    bundle.as_deref(),
                     &database_url,
                     &scope,
                     &format,
@@ -321,21 +370,90 @@ async fn run(cli: Cli) -> Result<ExitCode> {
 // Subcommand implementations
 // ---------------------------------------------------------------------------
 
-fn cmd_validate(file: &Path) -> Result<()> {
-    let yaml = read_manifest_file(file)?;
+fn cmd_validate(file: Option<&Path>, bundle: Option<&Path>) -> Result<()> {
+    if let Some(bundle_path) = bundle {
+        let validated = validate_bundle_file(bundle_path)?;
+        print!("{}", format_bundle_validation_result(&validated));
+        return Ok(());
+    }
+
+    let file_path = file.unwrap_or_else(|| Path::new("pgroles.yaml"));
+    let yaml = read_manifest_file(file_path)?;
     let validated = validate_manifest(&yaml)?;
     print!("{}", format_validation_result(&validated));
     Ok(())
 }
 
 async fn cmd_diff(
-    file: &Path,
+    file: Option<&Path>,
+    bundle: Option<&Path>,
     database_url: &str,
     format: &OutputFormat,
     mode: ReconciliationMode,
     use_exit_code: bool,
 ) -> Result<ExitCode> {
-    let yaml = read_manifest_file(file)?;
+    if let Some(bundle_path) = bundle {
+        let validated = validate_bundle_file(bundle_path)?;
+        let pool = connect_db(database_url).await?;
+        let inspect_config = inspect_config_for_bundle(&validated);
+        let current = inspect_current_with_config(&pool, &inspect_config).await?;
+        let resolved_passwords = resolve_passwords(&validated.composed.expanded)
+            .context("failed to resolve role passwords")?;
+        info!(%mode, "reconciliation mode");
+        let changes = inject_password_changes(
+            filter_changes(
+                apply_role_retirements(
+                    compute_plan(&current, &validated.composed.desired),
+                    &validated.composed.manifest.retirements,
+                ),
+                mode,
+            ),
+            &resolved_passwords,
+        );
+        validate_changes_against_managed_surface(
+            &changes,
+            &validated.composed.managed_change_surface,
+        )?;
+        let drop_safety =
+            inspect_drop_safety(&pool, &changes, &validated.composed.manifest.retirements).await?;
+        let summary = PlanSummary::from_changes(&changes);
+
+        match format {
+            OutputFormat::Sql => {
+                let sql_ctx = detect_sql_context_with_config(&pool, &inspect_config).await?;
+                if summary.is_empty() {
+                    println!("-- No changes needed. Database is in sync with manifest.");
+                } else {
+                    print!("{}", format_plan_sql_with_context(&changes, &sql_ctx));
+                    eprintln!("\n{summary}");
+                    if !drop_safety.is_empty() {
+                        eprintln!("\n{drop_safety}");
+                    }
+                }
+            }
+            OutputFormat::Summary => {
+                print!("{summary}");
+                if !drop_safety.is_empty() {
+                    eprintln!("\n{drop_safety}");
+                }
+            }
+            OutputFormat::Json => {
+                println!(
+                    "{}",
+                    format_bundle_plan_json(&changes, &validated.composed)?
+                );
+            }
+        }
+
+        return if use_exit_code && summary.has_structural_changes() {
+            Ok(ExitCode::from(EXIT_DRIFT))
+        } else {
+            Ok(ExitCode::SUCCESS)
+        };
+    }
+
+    let file_path = file.unwrap_or_else(|| Path::new("pgroles.yaml"));
+    let yaml = read_manifest_file(file_path)?;
     let validated = validate_manifest(&yaml)?;
 
     let pool = connect_db(database_url).await?;
@@ -391,12 +509,123 @@ async fn cmd_diff(
 }
 
 async fn cmd_apply(
-    file: &Path,
+    file: Option<&Path>,
+    bundle: Option<&Path>,
     database_url: &str,
     dry_run: bool,
     mode: ReconciliationMode,
 ) -> Result<()> {
-    let yaml = read_manifest_file(file)?;
+    if let Some(bundle_path) = bundle {
+        let validated = validate_bundle_file(bundle_path)?;
+        let pool = connect_db(database_url).await?;
+        let inspect_config = inspect_config_for_bundle(&validated);
+        let sql_ctx = detect_sql_context_with_config(&pool, &inspect_config).await?;
+
+        // Detect cloud provider privilege level and warn about unsupported operations.
+        let privilege_level = pgroles_inspect::detect_privilege_level(&pool)
+            .await
+            .context("failed to detect privilege level")?;
+        info!(level = %privilege_level, "detected privilege level");
+
+        let current = inspect_current_with_config(&pool, &inspect_config).await?;
+
+        let resolved_passwords = resolve_passwords(&validated.composed.expanded)
+            .context("failed to resolve role passwords")?;
+        info!(%mode, "reconciliation mode");
+        let changes = inject_password_changes(
+            filter_changes(
+                apply_role_retirements(
+                    compute_plan(&current, &validated.composed.desired),
+                    &validated.composed.manifest.retirements,
+                ),
+                mode,
+            ),
+            &resolved_passwords,
+        );
+        validate_changes_against_managed_surface(
+            &changes,
+            &validated.composed.managed_change_surface,
+        )?;
+
+        // Validate changes against privilege level.
+        let priv_warnings = pgroles_inspect::cloud::validate_changes_for_privilege_level(
+            &changes,
+            &privilege_level,
+        );
+        if !priv_warnings.is_empty() {
+            for warning in &priv_warnings {
+                eprintln!("Warning: {warning}");
+            }
+        }
+
+        let drop_safety =
+            inspect_drop_safety(&pool, &changes, &validated.composed.manifest.retirements).await?;
+        let summary = PlanSummary::from_changes(&changes);
+
+        if summary.is_empty() {
+            println!("No changes needed. Database is in sync with manifest.");
+            return Ok(());
+        }
+
+        let sql_output = format_plan_sql_with_context(&changes, &sql_ctx);
+
+        if dry_run {
+            println!("-- DRY RUN: the following SQL would be executed:\n");
+            print!("{sql_output}");
+            eprintln!("\n{}", summary.format_plan());
+            if !drop_safety.is_empty() {
+                eprintln!("\n{drop_safety}");
+            }
+            return Ok(());
+        }
+
+        if drop_safety.has_blockers() {
+            anyhow::bail!("{}", drop_safety.blockers);
+        }
+
+        if !drop_safety.warnings.is_empty() {
+            eprintln!("\n{warnings}", warnings = drop_safety.warnings);
+        }
+
+        // Execute the entire plan in one transaction to avoid partial convergence.
+        info!(changes = summary.total(), "applying changes");
+        let mut transaction = pool.begin().await.context("failed to start transaction")?;
+        for change in &changes {
+            let is_sensitive = matches!(change, pgroles_core::diff::Change::SetPassword { .. });
+            for statement in pgroles_core::sql::render_statements_with_context(change, &sql_ctx) {
+                if is_sensitive {
+                    info!("executing: ALTER ROLE ... PASSWORD [REDACTED]");
+                } else {
+                    info!(sql = %statement, "executing");
+                }
+                sqlx::query(&statement)
+                    .execute(transaction.as_mut())
+                    .await
+                    .with_context(|| {
+                        if is_sensitive {
+                            "failed to execute: ALTER ROLE ... PASSWORD [REDACTED]".to_string()
+                        } else {
+                            format!("failed to execute: {statement}")
+                        }
+                    })?;
+            }
+        }
+        transaction
+            .commit()
+            .await
+            .context("failed to commit transaction")?;
+
+        println!(
+            "Applied {total} change(s) successfully.",
+            total = summary.total()
+        );
+        print!("{}", summary.format_applied());
+
+        return Ok(());
+    }
+
+    let file_path = file.unwrap_or_else(|| Path::new("pgroles.yaml"));
+    let yaml = read_manifest_file(file_path)?;
     let validated = validate_manifest(&yaml)?;
 
     let pool = connect_db(database_url).await?;
@@ -498,31 +727,46 @@ async fn cmd_apply(
     Ok(())
 }
 
-async fn cmd_inspect(file: Option<&Path>, database_url: &str) -> Result<()> {
-    // Validate manifest before connecting so YAML errors fail fast.
-    let validated = match file {
-        Some(path) => {
+async fn cmd_inspect(file: Option<&Path>, bundle: Option<&Path>, database_url: &str) -> Result<()> {
+    // Validate manifest or bundle before connecting so YAML errors fail fast.
+    let validated_manifest = match (file, bundle) {
+        (Some(path), None) => {
             let yaml = read_manifest_file(path)?;
             Some(validate_manifest(&yaml)?)
         }
-        None => None,
+        (None, Some(_)) | (None, None) => None,
+        (Some(_), Some(_)) => unreachable!("clap enforces conflicts"),
+    };
+    let validated_bundle = match (file, bundle) {
+        (None, Some(path)) => Some(validate_bundle_file(path)?),
+        (Some(_), None) | (None, None) => None,
+        (Some(_), Some(_)) => unreachable!("clap enforces conflicts"),
     };
 
     let pool = connect_db(database_url).await?;
 
-    let current = match validated {
-        Some(ref v) => inspect_current(&pool, v).await?,
-        None => {
-            info!("no manifest provided, inspecting all non-system roles");
-            pgroles_inspect::inspect_all(
-                &pool,
-                &pgroles_inspect::InspectAllConfig {
-                    exclude_system_roles: true,
-                },
-            )
-            .await
-            .context("failed to introspect database")?
-        }
+    let current = if let Some(ref validated) = validated_manifest {
+        inspect_current(&pool, validated).await?
+    } else if let Some(ref validated) = validated_bundle {
+        let inspect_config = inspect_config_for_bundle(validated);
+        inspect_current_with_config(&pool, &inspect_config).await?
+    } else {
+        info!("no manifest provided, inspecting all non-system roles");
+        pgroles_inspect::inspect_all(
+            &pool,
+            &pgroles_inspect::InspectAllConfig {
+                exclude_system_roles: true,
+            },
+        )
+        .await
+        .context("failed to introspect database")?
+    };
+
+    if let Some(ref validated) = validated_bundle {
+        print!(
+            "{}",
+            format_managed_scope_summary(&validated.composed.managed_scope)
+        );
     };
 
     print!("{}", format_role_graph_summary(&current));
@@ -568,26 +812,44 @@ async fn cmd_generate(database_url: &str, output: Option<&Path>) -> Result<()> {
     Ok(())
 }
 
-fn cmd_graph_desired(file: &Path, format: &GraphFormat, output: Option<&Path>) -> Result<()> {
-    let yaml = read_manifest_file(file)?;
-    let validated = validate_manifest(&yaml)?;
+fn cmd_graph_desired(
+    file: Option<&Path>,
+    bundle: Option<&Path>,
+    format: &GraphFormat,
+    output: Option<&Path>,
+) -> Result<()> {
+    let visual = if let Some(bundle_path) = bundle {
+        let validated = validate_bundle_file(bundle_path)?;
+        let mut visual =
+            visual::build_visual_graph(&validated.composed.desired, VisualSource::Desired);
+        if matches!(format, GraphFormat::Json) {
+            visual.meta.managed_scope =
+                Some(VisualManagedScope::from(&validated.composed.managed_scope));
+        }
+        visual
+    } else {
+        let file_path = file.unwrap_or_else(|| Path::new("pgroles.yaml"));
+        let yaml = read_manifest_file(file_path)?;
+        let validated = validate_manifest(&yaml)?;
+        visual::build_visual_graph(&validated.desired, VisualSource::Desired)
+    };
 
-    let visual = visual::build_visual_graph(&validated.desired, VisualSource::Desired);
     let rendered = render_graph(&visual, format);
     write_output(&rendered, output)
 }
 
 async fn cmd_graph_current(
     file: Option<&Path>,
+    bundle: Option<&Path>,
     database_url: &str,
     scope: &GraphScope,
     format: &GraphFormat,
     output: Option<&Path>,
 ) -> Result<()> {
     // Validate file requirement before connecting to the database.
-    if matches!(scope, GraphScope::Managed) && file.is_none() {
+    if matches!(scope, GraphScope::Managed) && file.is_none() && bundle.is_none() {
         anyhow::bail!(
-            "--file is required when --scope=managed (to determine which roles are managed)"
+            "--file or --bundle is required when --scope=managed (to determine which roles are managed)"
         );
     }
 
@@ -595,10 +857,23 @@ async fn cmd_graph_current(
 
     let graph = match scope {
         GraphScope::Managed => {
-            let file = file.expect("validated above");
-            let yaml = read_manifest_file(file)?;
-            let validated = validate_manifest(&yaml)?;
-            inspect_current(&pool, &validated).await?
+            if let Some(bundle_path) = bundle {
+                let validated = validate_bundle_file(bundle_path)?;
+                let inspect_config = inspect_config_for_bundle(&validated);
+                let graph = inspect_current_with_config(&pool, &inspect_config).await?;
+                let mut visual = visual::build_visual_graph(&graph, VisualSource::Current);
+                if matches!(format, GraphFormat::Json) {
+                    visual.meta.managed_scope =
+                        Some(VisualManagedScope::from(&validated.composed.managed_scope));
+                }
+                let rendered = render_graph(&visual, format);
+                return write_output(&rendered, output);
+            } else {
+                let file = file.expect("validated above");
+                let yaml = read_manifest_file(file)?;
+                let validated = validate_manifest(&yaml)?;
+                inspect_current(&pool, &validated).await?
+            }
         }
         GraphScope::All => {
             info!("introspecting all non-system roles");
@@ -654,16 +929,23 @@ async fn detect_sql_context(
     pool: &PgPool,
     expanded: &pgroles_core::manifest::ExpandedManifest,
 ) -> Result<pgroles_core::sql::SqlContext> {
+    let inspect_config = InspectConfig::from_expanded(expanded, false);
+    detect_sql_context_with_config(pool, &inspect_config).await
+}
+
+async fn detect_sql_context_with_config(
+    pool: &PgPool,
+    inspect_config: &InspectConfig,
+) -> Result<pgroles_core::sql::SqlContext> {
     let pg_version = pgroles_inspect::detect_pg_version(pool)
         .await
         .context("failed to detect PostgreSQL version")?;
-    let inspect_config = InspectConfig::from_expanded(expanded, false);
-    let managed_schemas: Vec<&str> = inspect_config
-        .managed_schemas
+    let privilege_schemas: Vec<&str> = inspect_config
+        .privilege_schemas
         .iter()
         .map(|schema| schema.as_str())
         .collect();
-    let relation_inventory = pgroles_inspect::fetch_relation_inventory(pool, &managed_schemas)
+    let relation_inventory = pgroles_inspect::fetch_relation_inventory(pool, &privilege_schemas)
         .await
         .context("failed to inspect relation inventory")?;
     info!(
@@ -696,13 +978,40 @@ async fn inspect_current(
                 .map(|retirement| retirement.role.clone()),
         );
 
+    inspect_current_with_config(pool, &config).await
+}
+
+fn inspect_config_for_bundle(validated: &pgroles_cli::ValidatedBundle) -> InspectConfig {
+    InspectConfig::from_managed_scope(
+        &validated.composed.managed_scope,
+        &validated.composed.expanded,
+        validated
+            .composed
+            .managed_change_surface
+            .needs_database_privilege_inspection(),
+    )
+    .with_additional_roles(
+        validated
+            .composed
+            .manifest
+            .retirements
+            .iter()
+            .map(|retirement| retirement.role.clone()),
+    )
+}
+
+async fn inspect_current_with_config(
+    pool: &PgPool,
+    config: &InspectConfig,
+) -> Result<pgroles_core::model::RoleGraph> {
     info!(
         managed_roles = config.managed_roles.len(),
         managed_schemas = config.managed_schemas.len(),
+        privilege_schemas = config.privilege_schemas.len(),
         "inspecting current database state"
     );
 
-    pgroles_inspect::inspect(pool, &config)
+    pgroles_inspect::inspect(pool, config)
         .await
         .context("failed to inspect database state")
 }
@@ -717,4 +1026,77 @@ async fn inspect_drop_safety(
         .await
         .context("failed to inspect role-drop safety")?;
     Ok(report.assess(retirements))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use pgroles_core::model::{RoleGraph, RoleState};
+
+    fn sample_visual_graph() -> pgroles_core::visual::VisualGraph {
+        let mut graph = RoleGraph::default();
+        graph.roles.insert(
+            "analytics".to_string(),
+            RoleState {
+                login: true,
+                ..RoleState::default()
+            },
+        );
+        visual::build_visual_graph(&graph, VisualSource::Desired)
+    }
+
+    #[test]
+    fn render_graph_delegates_to_requested_format() {
+        let visual = sample_visual_graph();
+
+        assert_eq!(
+            render_graph(&visual, &GraphFormat::Tree),
+            visual::render_tree(&visual)
+        );
+        assert_eq!(
+            render_graph(&visual, &GraphFormat::Json),
+            visual::render_json(&visual)
+        );
+        assert_eq!(
+            render_graph(&visual, &GraphFormat::Dot),
+            visual::render_dot(&visual)
+        );
+        assert_eq!(
+            render_graph(&visual, &GraphFormat::Mermaid),
+            visual::render_mermaid(&visual)
+        );
+    }
+
+    #[test]
+    fn write_output_writes_file_when_path_provided() {
+        let dir = tempfile::tempdir().expect("failed to create tempdir");
+        let path = dir.path().join("graph.txt");
+
+        write_output("graph output", Some(&path)).expect("write_output should succeed");
+
+        let written = std::fs::read_to_string(&path).expect("failed to read output file");
+        assert_eq!(written, "graph output");
+    }
+
+    #[test]
+    fn graph_current_managed_requires_file_before_connecting() {
+        let runtime = tokio::runtime::Runtime::new().expect("failed to create runtime");
+        let error = runtime
+            .block_on(cmd_graph_current(
+                None,
+                None,
+                "postgres://unused",
+                &GraphScope::Managed,
+                &GraphFormat::Tree,
+                None,
+            ))
+            .expect_err("managed graph without --file/--bundle should fail");
+
+        assert!(
+            error
+                .to_string()
+                .contains("--file or --bundle is required when --scope=managed"),
+            "unexpected error: {error:#}"
+        );
+    }
 }

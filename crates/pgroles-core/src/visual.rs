@@ -10,6 +10,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::manifest::{ObjectType, Privilege};
 use crate::model::{DefaultPrivKey, GrantKey, RoleGraph};
+use crate::ownership::ManagedScope;
+
+pub const VISUAL_GRAPH_SCHEMA_VERSION: &str = "pgroles.visual_graph.v1";
 
 // ---------------------------------------------------------------------------
 // DTO types
@@ -18,6 +21,7 @@ use crate::model::{DefaultPrivKey, GrantKey, RoleGraph};
 /// Top-level visualization graph.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VisualGraph {
+    pub schema_version: String,
     pub meta: VisualMeta,
     pub nodes: Vec<VisualNode>,
     pub edges: Vec<VisualEdge>,
@@ -32,6 +36,40 @@ pub struct VisualMeta {
     pub default_privilege_count: usize,
     pub membership_count: usize,
     pub collapsed: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub managed_scope: Option<VisualManagedScope>,
+}
+
+/// Optional managed-scope metadata for bundle-aware graph output.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VisualManagedScope {
+    pub roles: Vec<String>,
+    pub schemas: Vec<VisualManagedSchema>,
+}
+
+/// A schema plus the managed facets owned within that schema.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VisualManagedSchema {
+    pub name: String,
+    pub owner: bool,
+    pub bindings: bool,
+}
+
+impl From<&ManagedScope> for VisualManagedScope {
+    fn from(scope: &ManagedScope) -> Self {
+        Self {
+            roles: scope.roles.iter().cloned().collect(),
+            schemas: scope
+                .schemas
+                .iter()
+                .map(|(name, managed)| VisualManagedSchema {
+                    name: name.clone(),
+                    owner: managed.owner,
+                    bindings: managed.bindings,
+                })
+                .collect(),
+        }
+    }
 }
 
 /// Where the graph data came from.
@@ -229,6 +267,7 @@ pub fn build_visual_graph(graph: &RoleGraph, source: VisualSource) -> VisualGrap
     edges.sort_by(|a, b| (&a.source, &a.target, &a.kind).cmp(&(&b.source, &b.target, &b.kind)));
 
     VisualGraph {
+        schema_version: VISUAL_GRAPH_SCHEMA_VERSION.to_string(),
         meta: VisualMeta {
             source,
             role_count: graph.roles.len(),
@@ -236,6 +275,7 @@ pub fn build_visual_graph(graph: &RoleGraph, source: VisualSource) -> VisualGrap
             default_privilege_count: graph.default_privileges.len(),
             membership_count: graph.memberships.len(),
             collapsed: true,
+            managed_scope: None,
         },
         nodes,
         edges,
@@ -694,6 +734,7 @@ mod tests {
     use super::*;
     use crate::manifest::{expand_manifest, parse_manifest};
     use crate::model::RoleGraph;
+    use crate::ownership::{ManagedSchemaScope, ManagedScope};
 
     fn build_test_graph() -> RoleGraph {
         let yaml = r#"
@@ -840,6 +881,39 @@ memberships:
         let deserialized: VisualGraph = serde_json::from_str(&json).unwrap();
         assert_eq!(deserialized.nodes.len(), visual.nodes.len());
         assert_eq!(deserialized.edges.len(), visual.edges.len());
+    }
+
+    #[test]
+    fn json_contract_includes_schema_version_and_managed_scope() {
+        let graph = build_test_graph();
+        let mut visual = build_visual_graph(&graph, VisualSource::Desired);
+        visual.meta.managed_scope = Some(VisualManagedScope::from(&ManagedScope {
+            roles: ["analytics".to_string()].into_iter().collect(),
+            schemas: [(
+                "orders".to_string(),
+                ManagedSchemaScope {
+                    owner: true,
+                    bindings: true,
+                },
+            )]
+            .into_iter()
+            .collect(),
+        }));
+
+        let parsed: serde_json::Value =
+            serde_json::from_str(&render_json(&visual)).expect("json should parse");
+
+        assert_eq!(parsed["schema_version"], VISUAL_GRAPH_SCHEMA_VERSION);
+        assert_eq!(parsed["meta"]["managed_scope"]["roles"][0], "analytics");
+        assert_eq!(
+            parsed["meta"]["managed_scope"]["schemas"][0]["name"],
+            "orders"
+        );
+        assert_eq!(parsed["meta"]["managed_scope"]["schemas"][0]["owner"], true);
+        assert_eq!(
+            parsed["meta"]["managed_scope"]["schemas"][0]["bindings"],
+            true
+        );
     }
 
     #[test]
