@@ -418,6 +418,9 @@ fn classify_sqlx_error(error: &sqlx::Error) -> SqlErrorKind {
         .as_ref()
         .map(|database_error| database_error.message().to_ascii_lowercase());
 
+    // Some providers have been observed to surface role-alter permission
+    // failures with a misleading SQLSTATE 42704. Fall back to English message
+    // text here to avoid misclassifying them as missing objects.
     if message.as_deref().is_some_and(|message| {
         message.contains("permission denied") || message.contains("must be superuser")
     }) {
