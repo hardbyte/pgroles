@@ -410,24 +410,11 @@ enum SqlErrorKind {
 }
 
 fn classify_sqlx_error(error: &sqlx::Error) -> SqlErrorKind {
-    let database_error = error.as_database_error();
-    let code = database_error
-        .as_ref()
-        .and_then(|database_error| database_error.code());
-    let message = database_error
-        .as_ref()
-        .map(|database_error| database_error.message().to_ascii_lowercase());
-
-    // Some providers have been observed to surface role-alter permission
-    // failures with a misleading SQLSTATE 42704. Fall back to English message
-    // text here to avoid misclassifying them as missing objects.
-    if message.as_deref().is_some_and(|message| {
-        message.contains("permission denied") || message.contains("must be superuser")
-    }) {
-        return SqlErrorKind::InsufficientPrivileges;
-    }
-
-    match code.as_deref() {
+    match error
+        .as_database_error()
+        .and_then(|database_error| database_error.code())
+        .as_deref()
+    {
         Some(SQLSTATE_INSUFFICIENT_PRIVILEGE) => SqlErrorKind::InsufficientPrivileges,
         Some(SQLSTATE_INVALID_SCHEMA_NAME)
         | Some(SQLSTATE_UNDEFINED_TABLE)
@@ -2190,13 +2177,6 @@ mod tests {
         }))
     }
 
-    fn permission_denied_alter_role_sqlx_error_with_wrong_code() -> sqlx::Error {
-        sqlx::Error::Database(Box::new(TestDatabaseError {
-            message: "permission denied to alter role".to_string(),
-            code: Some(SQLSTATE_UNDEFINED_OBJECT),
-        }))
-    }
-
     fn transient_sqlx_error() -> sqlx::Error {
         sqlx::Error::Database(Box::new(TestDatabaseError {
             message: "connection timed out".to_string(),
@@ -3255,10 +3235,6 @@ mod tests {
             SqlErrorKind::MissingDatabaseObject
         );
         assert_eq!(
-            classify_sqlx_error(&permission_denied_alter_role_sqlx_error_with_wrong_code()),
-            SqlErrorKind::InsufficientPrivileges
-        );
-        assert_eq!(
             classify_sqlx_error(&transient_sqlx_error()),
             SqlErrorKind::Transient
         );
@@ -3290,13 +3266,6 @@ mod tests {
     fn error_reason_sql_exec_missing_database_object() {
         let err = ReconcileError::SqlExec(missing_schema_sqlx_error());
         assert_eq!(err.reason(), "MissingDatabaseObject");
-    }
-
-    #[test]
-    fn error_reason_sql_exec_permission_denied_role_change_is_insufficient_privileges() {
-        let err =
-            ReconcileError::SqlExec(permission_denied_alter_role_sqlx_error_with_wrong_code());
-        assert_eq!(err.reason(), "InsufficientPrivileges");
     }
 
     #[test]
