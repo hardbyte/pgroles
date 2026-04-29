@@ -1056,6 +1056,26 @@ mod live_db {
         std::env::var("DATABASE_URL").expect("DATABASE_URL must be set for live DB tests")
     }
 
+    fn database_url_for_role(role: &str, password: &str) -> String {
+        let base = database_url();
+        let scheme_end = base
+            .find("://")
+            .map(|index| index + 3)
+            .expect("DATABASE_URL should include a scheme");
+        let auth_end = base[scheme_end..]
+            .find('@')
+            .map(|index| scheme_end + index)
+            .expect("DATABASE_URL should include credentials");
+
+        format!(
+            "{}{}:{}{}",
+            &base[..scheme_end],
+            role,
+            password,
+            &base[auth_end..]
+        )
+    }
+
     fn unique_name(prefix: &str) -> String {
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -1152,6 +1172,21 @@ mod live_db {
                     .await
                     .expect("failed to query role existence");
             row.get("present")
+        })
+    }
+
+    fn query_role_login_and_inherit(role: &str) -> Option<(bool, bool)> {
+        with_runtime(async {
+            let pool = PgPool::connect(&database_url())
+                .await
+                .expect("failed to connect to live test database");
+            let row =
+                sqlx::query("SELECT rolcanlogin, rolinherit FROM pg_roles WHERE rolname = $1")
+                    .bind(role)
+                    .fetch_optional(&pool)
+                    .await
+                    .expect("failed to query role attributes");
+            row.map(|row| (row.get("rolcanlogin"), row.get("rolinherit")))
         })
     }
 
@@ -3637,6 +3672,130 @@ grants:
             DROP ROLE IF EXISTS "{role}";
             "#
         ));
+    }
+
+    /// Additive mode: does not rewrite brownfield role attributes for a
+    /// pre-existing role, which lets a limited CREATEROLE manager converge
+    /// grants without needing ADMIN on every existing role.
+    #[test]
+    #[ignore]
+    fn additive_mode_does_not_rewrite_preexisting_role_attributes() {
+        let managed_role = unique_name("addattrs_role");
+        let manager_role = unique_name("addattrs_manager");
+        let manager_password = unique_name("pw");
+        let manager_url = database_url_for_role(&manager_role, &manager_password);
+
+        execute_sql(&format!(
+            r#"
+            DROP ROLE IF EXISTS "{managed_role}";
+            DROP ROLE IF EXISTS "{manager_role}";
+            CREATE ROLE "{managed_role}" LOGIN NOINHERIT;
+            CREATE ROLE "{manager_role}" LOGIN CREATEROLE PASSWORD '{manager_password}';
+            "#
+        ));
+        let _cleanup = TestDbCleanup::new(format!(
+            r#"
+            DROP ROLE IF EXISTS "{managed_role}";
+            DROP ROLE IF EXISTS "{manager_role}";
+            "#
+        ));
+
+        let manifest_file = write_temp_manifest(&format!(
+            r#"
+roles:
+  - name: {managed_role}
+"#
+        ));
+
+        pgroles_cmd()
+            .args([
+                "apply",
+                "--file",
+                manifest_file.path().to_str().unwrap(),
+                "--database-url",
+                &manager_url,
+                "--mode",
+                "additive",
+            ])
+            .assert()
+            .success();
+
+        assert_eq!(
+            query_role_login_and_inherit(&managed_role),
+            Some((true, false)),
+            "additive mode should leave existing role attributes unchanged"
+        );
+
+        pgroles_cmd()
+            .args([
+                "diff",
+                "--file",
+                manifest_file.path().to_str().unwrap(),
+                "--database-url",
+                &manager_url,
+                "--mode",
+                "additive",
+                "--format",
+                "summary",
+            ])
+            .assert()
+            .success()
+            .stdout(predicate::str::contains("No changes needed"));
+    }
+
+    /// Generated roles inherit profile-level inherit/login attributes.
+    #[test]
+    #[ignore]
+    fn apply_profile_generated_role_preserves_inherit_attribute() {
+        let schema = unique_name("profile_inherit_schema");
+        let generated_role = format!("{schema}-editor");
+
+        execute_sql(&format!(
+            r#"
+            DROP SCHEMA IF EXISTS "{schema}" CASCADE;
+            DROP ROLE IF EXISTS "{generated_role}";
+            CREATE SCHEMA "{schema}";
+            "#
+        ));
+        let _cleanup = TestDbCleanup::new(format!(
+            r#"
+            DROP SCHEMA IF EXISTS "{schema}" CASCADE;
+            DROP ROLE IF EXISTS "{generated_role}";
+            "#
+        ));
+
+        let manifest_file = write_temp_manifest(&format!(
+            r#"
+profiles:
+  editor:
+    login: false
+    inherit: false
+    grants:
+      - privileges: [USAGE]
+        object: {{ type: schema }}
+
+schemas:
+  - name: {schema}
+    profiles: [editor]
+"#
+        ));
+
+        pgroles_cmd()
+            .args([
+                "apply",
+                "--file",
+                manifest_file.path().to_str().unwrap(),
+                "--database-url",
+                &database_url(),
+            ])
+            .assert()
+            .success();
+
+        assert_eq!(
+            query_role_login_and_inherit(&generated_role),
+            Some((false, false)),
+            "generated role should preserve profile login/inherit flags"
+        );
     }
 
     /// Adopt mode: revokes extra grants within managed scope but does

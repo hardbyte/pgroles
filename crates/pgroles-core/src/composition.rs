@@ -711,6 +711,7 @@ roles:
                     "viewer".to_string(),
                     Profile {
                         login: None,
+                        inherit: None,
                         grants: vec![],
                         default_privileges: vec![],
                     },

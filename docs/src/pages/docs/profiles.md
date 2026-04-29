@@ -106,20 +106,23 @@ This produces `legacy-viewer` instead of `legacy_data-viewer`.
 
 The pattern **must** contain `{profile}`. The `{schema}` placeholder is optional.
 
-## Profile login attribute
+## Generated role attributes
 
-Profiles can specify a `login` attribute that applies to generated roles:
+Profiles can specify `login` and `inherit` attributes that apply to generated roles:
 
 ```yaml
 profiles:
   service:
     login: true
+    inherit: false
     grants:
       - privileges: [USAGE]
         object: { type: schema }
 ```
 
-By default, profile-generated roles have `login: false` (NOLOGIN).
+By default, profile-generated roles have `login: false` (NOLOGIN) and `inherit: true` (INHERIT).
+
+This is especially useful for IAM-style patterns where a generated role should not be directly usable as a login role, or where you want generated roles to stay `NOINHERIT` until explicitly assumed.
 
 ## Owner overrides
 

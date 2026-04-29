@@ -190,8 +190,8 @@ impl std::fmt::Display for ReconciliationMode {
 /// Filter a list of changes according to the reconciliation mode.
 ///
 /// - **Authoritative**: returns all changes unmodified.
-/// - **Additive**: strips revokes, membership removals, role drops, and
-///   retirement cleanup steps.
+/// - **Additive**: strips revokes, membership removals, owner transfers,
+///   role rewrites, role drops, and retirement cleanup steps.
 /// - **Adopt**: strips role drops and retirement cleanup steps, but keeps
 ///   revokes and membership removals.
 pub fn filter_changes(changes: Vec<Change>, mode: ReconciliationMode) -> Vec<Change> {
@@ -223,6 +223,7 @@ fn filter_additive_changes(changes: Vec<Change>) -> Vec<Change> {
             Change::SetDefaultPrivilege { schema, owner, .. } => {
                 !skipped_owner_transfers.contains(&(schema.clone(), owner.clone()))
             }
+            Change::AlterRole { .. } | Change::SetComment { .. } => false,
             _ => !is_destructive(change),
         })
         .collect()
@@ -1395,8 +1396,8 @@ memberships:
     fn filter_additive_keeps_only_constructive_changes() {
         let filtered = filter_changes(all_change_variants(), ReconciliationMode::Additive);
 
-        // Should keep: CreateRole, CreateSchema, AlterRole, SetComment, Grant, SetDefaultPrivilege, AddMember
-        assert_eq!(filtered.len(), 7);
+        // Should keep: CreateRole, CreateSchema, Grant, SetDefaultPrivilege, AddMember
+        assert_eq!(filtered.len(), 5);
 
         // Verify no destructive changes remain
         for change in &filtered {
@@ -1405,6 +1406,8 @@ memberships:
                     change,
                     Change::AlterSchemaOwner { .. }
                         | Change::EnsureSchemaOwnerPrivileges { .. }
+                        | Change::AlterRole { .. }
+                        | Change::SetComment { .. }
                         | Change::Revoke { .. }
                         | Change::RevokeDefaultPrivilege { .. }
                         | Change::RemoveMember { .. }
@@ -1431,12 +1434,7 @@ memberships:
         assert!(
             filtered
                 .iter()
-                .any(|c| matches!(c, Change::AlterRole { .. }))
-        );
-        assert!(
-            filtered
-                .iter()
-                .any(|c| matches!(c, Change::SetComment { .. }))
+                .all(|c| !matches!(c, Change::AlterRole { .. } | Change::SetComment { .. }))
         );
         assert!(filtered.iter().any(|c| matches!(c, Change::Grant { .. })));
         assert!(

@@ -433,6 +433,9 @@ pub struct ProfileSpec {
     pub login: Option<bool>,
 
     #[serde(default)]
+    pub inherit: Option<bool>,
+
+    #[serde(default)]
     pub grants: Vec<ProfileGrantSpec>,
 
     #[serde(default)]
@@ -1193,6 +1196,7 @@ impl PostgresPolicySpec {
             .map(|(name, spec)| {
                 let profile = Profile {
                     login: spec.login,
+                    inherit: spec.inherit,
                     grants: spec
                         .grants
                         .iter()
@@ -1543,6 +1547,44 @@ mod tests {
     }
 
     #[test]
+    fn spec_to_policy_manifest_preserves_profile_inherit() {
+        let spec = PostgresPolicySpec {
+            connection: ConnectionSpec {
+                secret_ref: Some(SecretReference {
+                    name: "pg-secret".to_string(),
+                }),
+                secret_key: Some("DATABASE_URL".to_string()),
+                params: None,
+            },
+            interval: "5m".to_string(),
+            suspend: false,
+            mode: PolicyMode::Apply,
+            reconciliation_mode: CrdReconciliationMode::default(),
+            default_owner: None,
+            profiles: std::collections::HashMap::from([(
+                "editor".to_string(),
+                ProfileSpec {
+                    login: Some(false),
+                    inherit: Some(false),
+                    grants: vec![],
+                    default_privileges: vec![],
+                },
+            )]),
+            schemas: vec![],
+            roles: vec![],
+            grants: vec![],
+            default_privileges: vec![],
+            memberships: vec![],
+            retirements: vec![],
+            approval: None,
+        };
+
+        let manifest = spec.to_policy_manifest();
+        assert_eq!(manifest.profiles["editor"].login, Some(false));
+        assert_eq!(manifest.profiles["editor"].inherit, Some(false));
+    }
+
+    #[test]
     fn status_set_condition_replaces_existing() {
         let mut status = PostgresPolicyStatus::default();
 
@@ -1581,6 +1623,7 @@ mod tests {
             "editor".to_string(),
             ProfileSpec {
                 login: Some(false),
+                inherit: None,
                 grants: vec![],
                 default_privileges: vec![],
             },

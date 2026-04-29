@@ -17,7 +17,7 @@ Declarative PostgreSQL access control. Define roles, schema ownership, grants, a
 
 For simple setups, use a single manifest. For larger teams, the CLI also supports bundle composition: shared profiles plus multiple scoped policy fragments merged into one desired plan with conflict checks before any database diff or apply.
 
-By default, anything not in the manifest gets revoked or dropped. Same model as Terraform, applied to PostgreSQL. For incremental adoption, use `--mode additive` to only grant and never revoke, or `--mode adopt` to manage declared roles fully without dropping undeclared ones.
+By default, anything not in the manifest gets revoked or dropped. Same model as Terraform, applied to PostgreSQL. For incremental adoption, use `--mode additive` to only grant and never revoke, or `--mode adopt` to manage declared roles fully without dropping undeclared ones. In additive mode, pgroles also leaves attributes and comments unchanged on pre-existing roles.
 
 ## How it works
 
@@ -144,7 +144,7 @@ docker run --rm ghcr.io/hardbyte/pgroles --help
 
 - **Convergent** — the manifest is the desired state. Missing roles get created, extra roles get dropped, drifted grants get fixed.
 - **Reconciliation modes** — `--mode authoritative` (default) for full convergence, `--mode additive` to only grant and never revoke, `--mode adopt` to manage declared roles without dropping undeclared ones. Additive mode is the safest way to start using pgroles on an existing database.
-- **Profiles** — define privilege templates once, apply them across schemas. Each `schema x profile` pair becomes a role.
+- **Profiles** — define privilege templates once, apply them across schemas. Each `schema x profile` pair becomes a role, and profiles can set generated-role `login` and `inherit` attributes.
 - **Bundle composition** — compose shared profiles plus multiple scoped policy fragments in the CLI, with duplicate/conflict detection and managed-scope enforcement before diff or apply.
 - **Schema management** — declared schemas can be created and have ownership converged, while undeclared referenced schemas must already exist.
 - **Safer privilege bundles** — common application profiles can pair table, sequence, and function privileges so identity columns and trigger-driven routines are covered together.

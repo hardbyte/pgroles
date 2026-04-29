@@ -260,9 +260,11 @@ Only grant, never revoke. New roles, grants, memberships, and default privileges
 pgroles apply --database-url postgres://localhost/mydb --mode additive
 ```
 
-Additive mode filters out: `REVOKE`, `REVOKE DEFAULT PRIVILEGE`, `REMOVE MEMBER`, `DROP ROLE`, `DROP OWNED`, `REASSIGN OWNED`, and `TERMINATE SESSIONS`.
+Additive mode filters out: `ALTER ROLE`, `COMMENT ON ROLE`, `REVOKE`, `REVOKE DEFAULT PRIVILEGE`, `REMOVE MEMBER`, `ALTER SCHEMA ... OWNER TO ...`, `DROP ROLE`, `DROP OWNED`, `REASSIGN OWNED`, and `TERMINATE SESSIONS`.
 
 If additive mode skips a schema ownership transfer, pgroles also defers owner-bound follow-up steps such as schema-owner privilege repair and `ALTER DEFAULT PRIVILEGES FOR ROLE ...` for that owner context.
+
+For brownfield roles that already exist, additive mode intentionally leaves role attributes and comments unchanged. That means a pre-existing `LOGIN NOINHERIT` role can stay that way during adoption even if a minimal manifest would otherwise imply `NOLOGIN INHERIT`.
 
 ### adopt
 
