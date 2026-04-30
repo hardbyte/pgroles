@@ -5,7 +5,8 @@ use std::process::ExitCode;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
-use sqlx::PgPool;
+use sqlx::postgres::PgPoolOptions;
+use sqlx::{PgPool, Row};
 use tracing::info;
 
 use pgroles_cli::{
@@ -589,31 +590,7 @@ async fn cmd_apply(
 
         // Execute the entire plan in one transaction to avoid partial convergence.
         info!(changes = summary.total(), "applying changes");
-        let mut transaction = pool.begin().await.context("failed to start transaction")?;
-        for change in &changes {
-            let is_sensitive = matches!(change, pgroles_core::diff::Change::SetPassword { .. });
-            for statement in pgroles_core::sql::render_statements_with_context(change, &sql_ctx) {
-                if is_sensitive {
-                    info!("executing: ALTER ROLE ... PASSWORD [REDACTED]");
-                } else {
-                    info!(sql = %statement, "executing");
-                }
-                sqlx::query(&statement)
-                    .execute(transaction.as_mut())
-                    .await
-                    .with_context(|| {
-                        if is_sensitive {
-                            "failed to execute: ALTER ROLE ... PASSWORD [REDACTED]".to_string()
-                        } else {
-                            format!("failed to execute: {statement}")
-                        }
-                    })?;
-            }
-        }
-        transaction
-            .commit()
-            .await
-            .context("failed to commit transaction")?;
+        execute_changes(&pool, &changes, &sql_ctx).await?;
 
         println!(
             "Applied {total} change(s) successfully.",
@@ -692,31 +669,7 @@ async fn cmd_apply(
 
     // Execute the entire plan in one transaction to avoid partial convergence.
     info!(changes = summary.total(), "applying changes");
-    let mut transaction = pool.begin().await.context("failed to start transaction")?;
-    for change in &changes {
-        let is_sensitive = matches!(change, pgroles_core::diff::Change::SetPassword { .. });
-        for statement in pgroles_core::sql::render_statements_with_context(change, &sql_ctx) {
-            if is_sensitive {
-                info!("executing: ALTER ROLE ... PASSWORD [REDACTED]");
-            } else {
-                info!(sql = %statement, "executing");
-            }
-            sqlx::query(&statement)
-                .execute(transaction.as_mut())
-                .await
-                .with_context(|| {
-                    if is_sensitive {
-                        "failed to execute: ALTER ROLE ... PASSWORD [REDACTED]".to_string()
-                    } else {
-                        format!("failed to execute: {statement}")
-                    }
-                })?;
-        }
-    }
-    transaction
-        .commit()
-        .await
-        .context("failed to commit transaction")?;
+    execute_changes(&pool, &changes, &sql_ctx).await?;
 
     println!(
         "Applied {total} change(s) successfully.",
@@ -920,9 +873,140 @@ fn write_output(content: &str, output: Option<&Path>) -> Result<()> {
 
 async fn connect_db(database_url: &str) -> Result<PgPool> {
     info!("connecting to database");
-    PgPool::connect(database_url)
+    // The CLI is a one-shot tool, so prefer a single pooled connection. This
+    // avoids hopping across different backends when a hostname resolves to
+    // multiple PostgreSQL servers.
+    PgPoolOptions::new()
+        .max_connections(1)
+        .connect(database_url)
         .await
         .context("failed to connect to database")
+}
+
+#[derive(Debug, Clone)]
+struct ExecutionBackendInfo {
+    server_addr: String,
+    server_port: String,
+    backend_pid: i32,
+    database_name: String,
+    user_name: String,
+    in_recovery: bool,
+}
+
+impl std::fmt::Display for ExecutionBackendInfo {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "server={} port={} pid={} db={} user={} recovery={}",
+            self.server_addr,
+            self.server_port,
+            self.backend_pid,
+            self.database_name,
+            self.user_name,
+            self.in_recovery
+        )
+    }
+}
+
+async fn fetch_execution_backend_info<'e, E>(
+    executor: E,
+) -> Result<ExecutionBackendInfo, sqlx::Error>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Postgres>,
+{
+    let row = sqlx::query(
+        r#"
+        SELECT
+            COALESCE(inet_server_addr()::text, 'local') AS server_addr,
+            COALESCE(inet_server_port()::text, 'local') AS server_port,
+            pg_backend_pid() AS backend_pid,
+            current_database() AS database_name,
+            current_user AS user_name,
+            pg_is_in_recovery() AS in_recovery
+        "#,
+    )
+    .fetch_one(executor)
+    .await?;
+
+    Ok(ExecutionBackendInfo {
+        server_addr: row.get("server_addr"),
+        server_port: row.get("server_port"),
+        backend_pid: row.get("backend_pid"),
+        database_name: row.get("database_name"),
+        user_name: row.get("user_name"),
+        in_recovery: row.get("in_recovery"),
+    })
+}
+
+fn render_execution_failure(
+    statement: &str,
+    backend: Option<&ExecutionBackendInfo>,
+    error: &sqlx::Error,
+) -> String {
+    let backend_suffix = backend
+        .map(|backend| format!(" on backend [{backend}]"))
+        .unwrap_or_default();
+
+    if let Some(database_error) = error.as_database_error() {
+        let code = database_error
+            .code()
+            .map(|code| code.to_string())
+            .unwrap_or_else(|| "unknown".to_string());
+        let message = database_error.message();
+        format!("failed to execute: {statement}{backend_suffix}: SQLSTATE {code}: {message}")
+    } else {
+        format!("failed to execute: {statement}{backend_suffix}: {error}")
+    }
+}
+
+async fn execute_changes(
+    pool: &PgPool,
+    changes: &[pgroles_core::diff::Change],
+    sql_ctx: &pgroles_core::sql::SqlContext,
+) -> Result<()> {
+    let mut transaction = pool.begin().await.context("failed to start transaction")?;
+    let execution_backend = match fetch_execution_backend_info(transaction.as_mut()).await {
+        Ok(backend) => {
+            info!(backend = %backend, "using execution backend");
+            Some(backend)
+        }
+        Err(error) => {
+            tracing::warn!(%error, "failed to query execution backend details");
+            None
+        }
+    };
+
+    for change in changes {
+        let is_sensitive = matches!(change, pgroles_core::diff::Change::SetPassword { .. });
+        for statement in pgroles_core::sql::render_statements_with_context(change, sql_ctx) {
+            let statement_for_error = if is_sensitive {
+                "ALTER ROLE ... PASSWORD [REDACTED]".to_string()
+            } else {
+                statement.clone()
+            };
+            if is_sensitive {
+                info!("executing: ALTER ROLE ... PASSWORD [REDACTED]");
+            } else {
+                info!(sql = %statement, "executing");
+            }
+            if let Err(error) = sqlx::query(&statement).execute(transaction.as_mut()).await {
+                anyhow::bail!(
+                    "{}",
+                    render_execution_failure(
+                        &statement_for_error,
+                        execution_backend.as_ref(),
+                        &error
+                    )
+                );
+            }
+        }
+    }
+    transaction
+        .commit()
+        .await
+        .context("failed to commit transaction")?;
+
+    Ok(())
 }
 
 async fn detect_sql_context(
@@ -1032,6 +1116,47 @@ async fn inspect_drop_safety(
 mod tests {
     use super::*;
     use pgroles_core::model::{RoleGraph, RoleState};
+    use sqlx::error::{DatabaseError, ErrorKind};
+
+    #[derive(Debug)]
+    struct TestDatabaseError {
+        message: String,
+        code: Option<&'static str>,
+    }
+
+    impl std::fmt::Display for TestDatabaseError {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "{}", self.message)
+        }
+    }
+
+    impl std::error::Error for TestDatabaseError {}
+
+    impl DatabaseError for TestDatabaseError {
+        fn message(&self) -> &str {
+            &self.message
+        }
+
+        fn code(&self) -> Option<std::borrow::Cow<'_, str>> {
+            self.code.map(std::borrow::Cow::Borrowed)
+        }
+
+        fn as_error(&self) -> &(dyn std::error::Error + Send + Sync + 'static) {
+            self
+        }
+
+        fn as_error_mut(&mut self) -> &mut (dyn std::error::Error + Send + Sync + 'static) {
+            self
+        }
+
+        fn into_error(self: Box<Self>) -> Box<dyn std::error::Error + Send + Sync + 'static> {
+            self
+        }
+
+        fn kind(&self) -> ErrorKind {
+            ErrorKind::Other
+        }
+    }
 
     fn sample_visual_graph() -> pgroles_core::visual::VisualGraph {
         let mut graph = RoleGraph::default();
@@ -1098,5 +1223,40 @@ mod tests {
                 .contains("--file or --bundle is required when --scope=managed"),
             "unexpected error: {error:#}"
         );
+    }
+
+    #[test]
+    fn render_execution_failure_includes_backend_and_sqlstate() {
+        let backend = ExecutionBackendInfo {
+            server_addr: "10.0.0.5".to_string(),
+            server_port: "5432".to_string(),
+            backend_pid: 4242,
+            database_name: "pgroles_test".to_string(),
+            user_name: "postgres".to_string(),
+            in_recovery: false,
+        };
+        let error = sqlx::Error::Database(Box::new(TestDatabaseError {
+            message: "role \"accounts-editor\" does not exist".to_string(),
+            code: Some("42704"),
+        }));
+
+        let rendered = render_execution_failure(
+            r#"ALTER ROLE "accounts-editor" NOLOGIN INHERIT;"#,
+            Some(&backend),
+            &error,
+        );
+
+        assert!(rendered.contains("SQLSTATE 42704"));
+        assert!(rendered.contains("server=10.0.0.5"));
+        assert!(rendered.contains("role \"accounts-editor\" does not exist"));
+    }
+
+    #[test]
+    fn render_execution_failure_without_database_error_falls_back_to_display() {
+        let error = sqlx::Error::Io(std::io::Error::from(std::io::ErrorKind::TimedOut));
+        let rendered = render_execution_failure("SELECT 1;", None, &error);
+
+        assert!(rendered.contains("failed to execute: SELECT 1;"));
+        assert!(rendered.contains("timed out"));
     }
 }

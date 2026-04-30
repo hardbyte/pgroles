@@ -9,7 +9,7 @@ Guide to rolling out pgroles against existing databases without disruption. {% .
 
 ## Brownfield vs greenfield
 
-If your database already has roles, grants, and schemas, you are in a **brownfield** scenario. pgroles is designed for this — use `additive` mode to layer managed roles on top of existing state without revoking anything.
+If your database already has roles, grants, and schemas, you are in a **brownfield** scenario. pgroles is designed for this — use `additive` mode to layer managed roles on top of existing state without revoking anything or rewriting pre-existing role attributes during the first rollout.
 
 For new databases where pgroles owns everything from the start, `authoritative` mode is appropriate.
 
@@ -49,7 +49,7 @@ If the output is `-- No changes needed`, the manifest matches the database and a
 
 ### 4. Enable additive apply
 
-Switch to `mode: apply` with `reconciliation_mode: additive`. This applies all non-destructive changes — creating roles and declared schemas, adding grants and memberships, and setting default privileges when their owner context is already valid — but never revokes existing privileges, transfers schema ownership, removes memberships, or drops roles. If a schema's desired `owner` differs from the current owner, pgroles defers owner-bound follow-up steps such as `ALTER DEFAULT PRIVILEGES FOR ROLE <owner> ...` until a mode that allows the ownership transfer.
+Switch to `mode: apply` with `reconciliation_mode: additive`. This applies all non-destructive changes — creating roles and declared schemas, adding grants and memberships, and setting default privileges when their owner context is already valid — but never revokes existing privileges, rewrites attributes/comments on pre-existing roles, transfers schema ownership, removes memberships, or drops roles. If a schema's desired `owner` differs from the current owner, pgroles defers owner-bound follow-up steps such as `ALTER DEFAULT PRIVILEGES FOR ROLE <owner> ...` until a mode that allows the ownership transfer.
 
 ```yaml
 spec:
@@ -112,7 +112,7 @@ This means:
 
 - A role may have effective privileges not visible in `pgroles inspect` output
 - A manifest that omits `TEMPORARY` does not guarantee the role lacks `TEMPORARY` — it may still inherit it from `PUBLIC`
-- `additive` mode showing "no changes needed" does not mean effective privileges match the manifest exactly
+- `additive` mode showing "no changes needed" does not mean effective privileges or existing role attributes match the manifest exactly
 
 If least-privilege enforcement is important, you may need to manually revoke unwanted `PUBLIC` grants:
 

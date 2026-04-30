@@ -184,6 +184,8 @@ spec:
 
   profiles:
     editor:
+      login: false
+      inherit: false
       grants:
         - privileges: [USAGE]
           object: { type: schema }
@@ -227,7 +229,7 @@ spec:
       drop_owned: true
 ```
 
-Declared schemas can be created and have ownership converged by the operator. Schemas that are only referenced from top-level grants or default privileges must already exist in the database.
+Declared schemas can be created and have ownership converged by the operator. Schemas that are only referenced from top-level grants or default privileges must already exist in the database. Profile-generated roles also inherit the profile-level `login` and `inherit` attributes shown above.
 
 ### Database connection
 
@@ -456,7 +458,7 @@ spec:
 | Value | Behavior |
 | --- | --- |
 | `authoritative` (default) | Full convergence — anything not in the manifest is revoked or dropped |
-| `additive` | Only grant, never revoke — safe for incremental adoption |
+| `additive` | Only grant, never revoke — safe for incremental adoption, and it leaves pre-existing role attributes/comments unchanged |
 | `adopt` | Manage declared roles fully, but never drop undeclared roles |
 
 This is the same behavior as the CLI `--mode` flag. See the [CLI reconciliation modes](/docs/cli#reconciliation-modes) section for detailed semantics.

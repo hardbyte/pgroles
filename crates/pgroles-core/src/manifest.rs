@@ -221,6 +221,9 @@ pub struct Profile {
     pub login: Option<bool>,
 
     #[serde(default)]
+    pub inherit: Option<bool>,
+
+    #[serde(default)]
     pub grants: Vec<ProfileGrant>,
 
     #[serde(default)]
@@ -545,7 +548,7 @@ pub fn expand_manifest(manifest: &PolicyManifest) -> Result<ExpandedManifest, Ma
                 superuser: None,
                 createdb: None,
                 createrole: None,
-                inherit: None,
+                inherit: profile.inherit,
                 replication: None,
                 bypassrls: None,
                 connection_limit: None,
@@ -884,6 +887,7 @@ schemas:
         assert_eq!(expanded.roles.len(), 1);
         assert_eq!(expanded.roles[0].name, "myschema-editor");
         assert_eq!(expanded.roles[0].login, Some(false));
+        assert_eq!(expanded.roles[0].inherit, None);
 
         // Schema usage grant + table grant
         assert_eq!(expanded.grants.len(), 2);
@@ -934,6 +938,31 @@ schemas:
                 },
             ]
         );
+    }
+
+    #[test]
+    fn expand_profiles_preserves_generated_role_inherit() {
+        let yaml = r#"
+profiles:
+  editor:
+    login: false
+    inherit: false
+    grants:
+      - privileges: [USAGE]
+        object: { type: schema }
+
+schemas:
+  - name: myschema
+    profiles: [editor]
+"#;
+
+        let manifest = parse_manifest(yaml).unwrap();
+        let expanded = expand_manifest(&manifest).unwrap();
+
+        assert_eq!(expanded.roles.len(), 1);
+        assert_eq!(expanded.roles[0].name, "myschema-editor");
+        assert_eq!(expanded.roles[0].login, Some(false));
+        assert_eq!(expanded.roles[0].inherit, Some(false));
     }
 
     #[test]

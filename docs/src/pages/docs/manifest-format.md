@@ -151,6 +151,36 @@ default_owner: pgloader_pg
 
 Individual schemas can override this with their own `owner` field.
 
+## profiles
+
+Profiles are reusable templates that expand into concrete roles, grants, and default privileges when bound to schemas.
+
+```yaml
+profiles:
+  editor:
+    login: false
+    inherit: false
+    grants:
+      - privileges: [USAGE]
+        object: { type: schema }
+      - privileges: [SELECT, INSERT, UPDATE, DELETE]
+        object: { type: table, name: "*" }
+    default_privileges:
+      - privileges: [SELECT, INSERT, UPDATE, DELETE]
+        on_type: table
+```
+
+### Profile fields
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `login` | bool | `false` | Login attribute for generated roles |
+| `inherit` | bool | `true` | Inherit attribute for generated roles |
+| `grants` | list[grant template] | `[]` | Grants expanded into each bound schema |
+| `default_privileges` | list[default privilege template] | `[]` | Default privileges expanded into each bound schema |
+
+The generated role attributes apply only to roles created from `schema x profile` expansion. One-off roles under `roles:` still declare their own attributes directly.
+
 ## schemas
 
 The `schemas` section serves two related purposes:
@@ -188,6 +218,10 @@ When a schema is declared under `schemas:`:
 - pgroles does not reassign ownership of objects inside the schema
 
 If a schema is only referenced from top-level `grants:` or `default_privileges:` and is not declared under `schemas:`, it must already exist.
+
+{% callout type="note" title="Additive mode and schema bindings" %}
+In `additive` mode, pgroles still creates missing generated roles and grants, but it does not rewrite attributes or comments on pre-existing roles. If a generated role already exists with different attributes, additive mode leaves it unchanged until you switch to a mode that allows full convergence.
+{% /callout %}
 
 ### Declared vs referenced example
 

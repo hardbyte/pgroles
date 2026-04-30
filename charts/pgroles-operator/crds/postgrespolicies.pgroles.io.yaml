@@ -584,6 +584,10 @@
                           },
                           "type": "array"
                         },
+                        "inherit": {
+                          "nullable": true,
+                          "type": "boolean"
+                        },
                         "login": {
                           "nullable": true,
                           "type": "boolean"
