@@ -8,7 +8,7 @@ members = [
 resolver = "2"
 
 [workspace.package]
-version = "0.6.0-beta.2"
+version = "0.6.0"
 edition = "2024"
 authors = ["Brian Thorne <brian@thorne.link>"]
 license = "MIT"
@@ -54,8 +54,8 @@ k8s-openapi = { version = "0.27.1", features = ["latest", "schemars"] }
 schemars = "1"
 
 # Internal crates
-pgroles-core = { path = "crates/pgroles-core", version = "0.6.0-beta.2" }
-pgroles-inspect = { path = "crates/pgroles-inspect", version = "0.6.0-beta.2" }
+pgroles-core = { path = "crates/pgroles-core", version = "0.6.0" }
+pgroles-inspect = { path = "crates/pgroles-inspect", version = "0.6.0" }
 
 [profile.release]
 strip = "symbols"
