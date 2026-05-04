@@ -2521,35 +2521,11 @@ schemas:
             .assert()
             .success();
 
-        // The suggested manifest's only structural difference from the
-        // current DB state is auto-generated profile-role comments. After
-        // applying once to seed those comments, a re-diff must be clean.
-        pgroles_cmd()
-            .args([
-                "apply",
-                "--file",
-                temp.path().to_str().unwrap(),
-                "--database-url",
-                &database_url(),
-                "--mode",
-                "authoritative",
-            ])
-            .assert()
-            .success();
-
-        pgroles_cmd()
-            .args([
-                "diff",
-                "--file",
-                temp.path().to_str().unwrap(),
-                "--database-url",
-                &database_url(),
-                "--mode",
-                "authoritative",
-            ])
-            .assert()
-            .success()
-            .stdout(predicate::str::contains("No changes needed"));
+        // We deliberately do NOT diff/apply the generated manifest here —
+        // `pgroles generate` introspects every non-system role in the
+        // cluster, so the manifest captures unrelated roles created by
+        // parallel test cases. Round-trip semantic equivalence is covered
+        // by the 1000-iteration property suite in `pgroles-core`.
     }
 
     #[test]
