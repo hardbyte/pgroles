@@ -112,6 +112,11 @@ pub enum SkipReason {
     },
     /// The candidate manifest didn't round-trip cleanly; we abandoned it.
     RoundTripFailure { reason: String },
+    /// The provided `full_inventory` was missing object names that already
+    /// appear in the input's flat grants — a sure sign the inventory wasn't
+    /// sourced from a complete introspection. Wildcard collapse was
+    /// disabled for safety.
+    IncompleteFullInventory { reason: String },
 }
 
 /// What [`suggest_profiles`] returns: the new manifest, the profiles it built,
@@ -156,7 +161,21 @@ pub fn suggest_profiles(input: &PolicyManifest, opts: &SuggestOptions) -> Sugges
     //     candidate's wildcard expression matches the original's per-name
     //     entries, regardless of whether collapse ran.
     let grant_inventory = build_inventory(input);
-    let collapse_inventory = opts.full_inventory.as_ref();
+    // Defense-in-depth: if a caller hands us a `full_inventory` that's
+    // demonstrably incomplete (missing object names that already appear in
+    // the input's per-name grants), we can't trust it for collapse. Disable
+    // collapse and surface the issue. This catches accidental misuse like
+    // passing `inventory_from_manifest_grants(manifest)` as `full_inventory`.
+    let collapse_inventory: Option<&Inventory> = match opts.full_inventory.as_ref() {
+        None => None,
+        Some(full) => match validate_full_inventory(&grant_inventory, full) {
+            Ok(()) => Some(full),
+            Err(reason) => {
+                skipped.push(SkipReason::IncompleteFullInventory { reason });
+                None
+            }
+        },
+    };
 
     // --- Bucket grants and default privileges by grantee role ---------------
 
@@ -618,11 +637,25 @@ pub fn suggest_profiles(input: &PolicyManifest, opts: &SuggestOptions) -> Sugges
 /// field; the inventory stores no entries for `Schema` (those are 1:1).
 pub type Inventory = BTreeMap<(String, ObjectType), BTreeSet<String>>;
 
-/// Build the per-`(schema, object_type)` name inventory from a flat manifest.
-/// Wildcards (`name: "*"`) and schema/database-typed grants are excluded.
+/// Build a `(schema, object_type) → set of names` map from the flat grants
+/// in a manifest. Wildcards (`name: "*"`) and schema/database-typed grants
+/// are excluded.
 ///
-/// Exposed so callers (e.g. tests, custom round-trip checks) can replicate
-/// the wildcard-aware comparison the suggester uses internally.
+/// **Do not pass this to [`SuggestOptions::full_inventory`].** A grant-only
+/// view treats ungranted objects as nonexistent, and would let
+/// `collapse_full_coverage_grants` silently broaden privileges. This
+/// function exists for the wildcard-aware round-trip comparison the
+/// suggester uses internally — re-exported so test code can perform the
+/// same comparison. Production callers should source `full_inventory` from
+/// [`pgroles_inspect::fetch_object_inventory`].
+pub fn inventory_from_manifest_grants(m: &PolicyManifest) -> Inventory {
+    build_inventory(m)
+}
+
+/// Deprecated alias for [`inventory_from_manifest_grants`].
+#[deprecated(
+    note = "renamed to `inventory_from_manifest_grants` — must NOT be used as full_inventory"
+)]
 pub fn build_inventory_pub(m: &PolicyManifest) -> Inventory {
     build_inventory(m)
 }
@@ -632,6 +665,34 @@ pub fn build_inventory_pub(m: &PolicyManifest) -> Inventory {
 /// database-typed grants are passed through. Mutates `grants` in place.
 pub fn expand_wildcard_grants(grants: &mut Vec<Grant>, inventory: &Inventory) {
     expand_wildcards_in_place(grants, inventory)
+}
+
+/// Verify that every object name appearing in `grant_inventory` (i.e. every
+/// per-name grant referenced in the flat manifest) is also present in
+/// `full_inventory`. If a granted object is missing from the supposedly
+/// "full" inventory, the inventory is provably incomplete — likely the
+/// caller passed a grant-derived view by mistake.
+fn validate_full_inventory(
+    grant_inventory: &Inventory,
+    full_inventory: &Inventory,
+) -> Result<(), String> {
+    for (key, granted_names) in grant_inventory {
+        let Some(full_names) = full_inventory.get(key) else {
+            return Err(format!(
+                "full_inventory missing entry for (schema={}, type={:?}) — but {} object name(s) are referenced in input grants",
+                key.0,
+                key.1,
+                granted_names.len()
+            ));
+        };
+        if let Some(missing) = granted_names.iter().find(|n| !full_names.contains(*n)) {
+            return Err(format!(
+                "full_inventory[(schema={}, type={:?})] does not contain {missing:?} but it appears in input grants",
+                key.0, key.1
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn build_inventory(m: &PolicyManifest) -> Inventory {
@@ -1674,7 +1735,7 @@ grants:
 
         // With a full inventory provided, full-coverage names become
         // wildcards.
-        let inv = build_inventory_pub(&m);
+        let inv = inventory_from_manifest_grants(&m);
         let report = suggest_profiles(
             &m,
             &SuggestOptions {
@@ -1735,7 +1796,7 @@ grants:
         );
         // With a full inventory provided, the per-name grants get collapsed
         // and the two roles cluster on a wildcard signature.
-        let inv = build_inventory_pub(&m);
+        let inv = inventory_from_manifest_grants(&m);
         let report = suggest_profiles(
             &m,
             &SuggestOptions {
@@ -1817,7 +1878,7 @@ grants:
         // {only_one}. a-ro covers only t1 (partial) → no collapse for a-ro.
         // b-ro covers all of {only_one} (full) → collapses to wildcard.
         // Different signatures → no cluster.
-        let inv = build_inventory_pub(&m);
+        let inv = inventory_from_manifest_grants(&m);
         let report = suggest_profiles(
             &m,
             &SuggestOptions {
@@ -1826,6 +1887,59 @@ grants:
             },
         );
         assert!(report.profiles.is_empty());
+    }
+
+    #[test]
+    fn incomplete_full_inventory_disables_collapse_with_skip_reason() {
+        // Hand the suggester a `full_inventory` that's *missing* an object
+        // that already appears in the manifest's flat grants. This is
+        // exactly the failure mode of passing `inventory_from_manifest_grants`
+        // (or any partial view) — the suggester must detect it and refuse
+        // to collapse, surfacing an `IncompleteFullInventory` skip.
+        let m = parse(
+            r#"
+schemas:
+  - name: a
+    owner: o
+  - name: b
+    owner: o
+roles:
+  - name: a-rw
+  - name: b-rw
+grants:
+  - role: a-rw
+    privileges: [SELECT]
+    object: { type: table, schema: a, name: products }
+  - role: b-rw
+    privileges: [SELECT]
+    object: { type: table, schema: b, name: orders }
+"#,
+        );
+        // Provide an inventory that omits `products` — pretend the caller
+        // missed it.
+        let mut bad: Inventory = BTreeMap::new();
+        bad.entry(("a".to_string(), ObjectType::Table)).or_default(); // empty set
+        bad.entry(("b".to_string(), ObjectType::Table))
+            .or_default()
+            .insert("orders".to_string());
+        let report = suggest_profiles(
+            &m,
+            &SuggestOptions {
+                full_inventory: Some(bad),
+                ..Default::default()
+            },
+        );
+        // Collapse must have been disabled; literal names differ across
+        // schemas → no cluster.
+        assert!(report.profiles.is_empty());
+        assert!(
+            report
+                .skipped
+                .iter()
+                .any(|s| matches!(s, SkipReason::IncompleteFullInventory { .. })),
+            "expected IncompleteFullInventory skip; got: {:?}",
+            report.skipped
+        );
     }
 
     #[test]
@@ -1856,7 +1970,7 @@ grants:
 "#,
         );
         // Inventory reports schema `a` actually has *two* tables.
-        let mut inv = build_inventory_pub(&m);
+        let mut inv = inventory_from_manifest_grants(&m);
         inv.entry(("a".to_string(), ObjectType::Table))
             .or_default()
             .insert("t2_ungranted".to_string());

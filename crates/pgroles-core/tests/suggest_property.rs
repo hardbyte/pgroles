@@ -16,7 +16,7 @@ use pgroles_core::manifest::{
 };
 use pgroles_core::model::RoleGraph;
 use pgroles_core::suggest::{
-    SuggestOptions, build_inventory_pub, expand_wildcard_grants, suggest_profiles,
+    SuggestOptions, expand_wildcard_grants, inventory_from_manifest_grants, suggest_profiles,
 };
 
 // ---------------------------------------------------------------------------
@@ -254,7 +254,7 @@ fn check_round_trip_invariant_with_opts(
     // the manifest's existing grants AND any inventory the suggester used to
     // collapse — otherwise the candidate's freshly-emitted wildcards would
     // expand against fewer objects than the original's per-name grants.
-    let mut inventory = build_inventory_pub(manifest);
+    let mut inventory = inventory_from_manifest_grants(manifest);
     if let Some(full) = &opts.full_inventory {
         for (key, names) in full {
             inventory
@@ -313,7 +313,7 @@ fn check_round_trip_invariant(manifest: &PolicyManifest, seed: u64) {
     );
     // Path 2: simulate full inventory by treating the manifest's grants as
     // exhaustive. This exercises the collapse path on the same input.
-    let inv = build_inventory_pub(manifest);
+    let inv = inventory_from_manifest_grants(manifest);
     let opts_with_inv = SuggestOptions {
         full_inventory: Some(inv),
         ..Default::default()

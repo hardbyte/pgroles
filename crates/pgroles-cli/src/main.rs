@@ -889,6 +889,12 @@ fn log_suggest_report(report: &pgroles_core::suggest::SuggestReport) {
             SkipReason::RoundTripFailure { reason } => {
                 warn!(reason, "skipped: round-trip failure");
             }
+            SkipReason::IncompleteFullInventory { reason } => {
+                warn!(
+                    reason,
+                    "full_inventory looked incomplete; wildcard collapse disabled for safety"
+                );
+            }
         }
     }
 }
