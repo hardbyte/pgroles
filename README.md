@@ -148,7 +148,7 @@ docker run --rm ghcr.io/hardbyte/pgroles --help
 - **Bundle composition** — compose shared profiles plus multiple scoped policy fragments in the CLI, with duplicate/conflict detection and managed-scope enforcement before diff or apply.
 - **Schema management** — declared schemas can be created and have ownership converged, while undeclared referenced schemas must already exist.
 - **Safer privilege bundles** — common application profiles can pair table, sequence, and function privileges so identity columns and trigger-driven routines are covered together.
-- **Brownfield adoption** — `pgroles generate` introspects an existing database and produces a manifest you can refine.
+- **Brownfield adoption** — `pgroles generate` introspects an existing database and produces a manifest you can refine. Add `--suggest-profiles` to deterministically refactor roles that share a privilege shape across schemas into reusable profiles, with a built-in round-trip check that guarantees the suggested manifest doesn't widen privileges.
 - **Reproducible export** — `pgroles generate --output` writes the current database state directly to a manifest file.
 - **Drift detection** — `pgroles diff --exit-code` returns exit code 2 on drift, designed for CI gates.
 - **Password management** — login roles can set passwords from environment variables (CLI) or Kubernetes Secrets (operator), with `VALID UNTIL` expiration and redacted output.
