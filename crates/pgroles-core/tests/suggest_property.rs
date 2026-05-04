@@ -385,13 +385,9 @@ fn produces_at_least_some_profiles_on_uniform_input() {
 
 #[test]
 fn determinism_random_inputs() {
-    use std::collections::BTreeSet;
-
-    // For a handful of seeds, run the suggester twice; the *structural*
-    // output must match. (Whole-YAML comparison is unreliable because
-    // PolicyManifest.profiles is a HashMap with non-deterministic key order
-    // in serde_yaml output — this is a pre-existing pgroles trait, not a
-    // suggester property.)
+    // PolicyManifest.profiles is a BTreeMap, so the entire serialized YAML
+    // is deterministic — two runs on the same input must produce
+    // byte-identical output.
     for seed in [1u64, 2, 3, 100, 1234] {
         let mut rng1 = Rng::new(seed);
         let mut rng2 = Rng::new(seed);
@@ -401,47 +397,10 @@ fn determinism_random_inputs() {
         let r1 = suggest_profiles(&m1, &SuggestOptions::default());
         let r2 = suggest_profiles(&m2, &SuggestOptions::default());
 
-        let names1: BTreeSet<_> = r1.manifest.profiles.keys().cloned().collect();
-        let names2: BTreeSet<_> = r2.manifest.profiles.keys().cloned().collect();
         assert_eq!(
-            names1, names2,
-            "seed {seed}: suggester profile names non-deterministic"
+            serde_yaml::to_string(&r1.manifest).unwrap(),
+            serde_yaml::to_string(&r2.manifest).unwrap(),
+            "seed {seed}: suggester output non-deterministic"
         );
-        for name in &names1 {
-            assert_eq!(
-                serde_yaml::to_string(&r1.manifest.profiles[name]).unwrap(),
-                serde_yaml::to_string(&r2.manifest.profiles[name]).unwrap(),
-                "seed {seed}: profile `{name}` body non-deterministic"
-            );
-        }
-        // Vec-typed sections must serialize identically.
-        for (name, a, b) in [
-            (
-                "schemas",
-                serde_yaml::to_string(&r1.manifest.schemas),
-                serde_yaml::to_string(&r2.manifest.schemas),
-            ),
-            (
-                "roles",
-                serde_yaml::to_string(&r1.manifest.roles),
-                serde_yaml::to_string(&r2.manifest.roles),
-            ),
-            (
-                "grants",
-                serde_yaml::to_string(&r1.manifest.grants),
-                serde_yaml::to_string(&r2.manifest.grants),
-            ),
-            (
-                "default_privileges",
-                serde_yaml::to_string(&r1.manifest.default_privileges),
-                serde_yaml::to_string(&r2.manifest.default_privileges),
-            ),
-        ] {
-            assert_eq!(
-                a.unwrap(),
-                b.unwrap(),
-                "seed {seed}: {name} non-deterministic"
-            );
-        }
     }
 }

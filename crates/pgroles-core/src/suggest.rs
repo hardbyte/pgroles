@@ -243,8 +243,6 @@ pub fn suggest_profiles(input: &PolicyManifest, opts: &SuggestOptions) -> Sugges
 
     let mut eligible: Vec<Eligible> = Vec::new();
     let mut clustered_role_names: BTreeSet<String> = BTreeSet::new();
-    // Roles excluded for any reason — never clustered, kept in flat output.
-    let mut excluded_roles: BTreeSet<String> = BTreeSet::new();
 
     for role_def in &input.roles {
         let role_name = &role_def.name;
@@ -270,7 +268,6 @@ pub fn suggest_profiles(input: &PolicyManifest, opts: &SuggestOptions) -> Sugges
             || role_def.password_valid_until.is_some()
             || has_user_comment
         {
-            excluded_roles.insert(role_name.clone());
             skipped.push(SkipReason::UniqueAttributes {
                 role: role_name.clone(),
             });
@@ -302,7 +299,6 @@ pub fn suggest_profiles(input: &PolicyManifest, opts: &SuggestOptions) -> Sugges
             }
         }
         if has_unrepresentable_grant {
-            excluded_roles.insert(role_name.clone());
             skipped.push(SkipReason::UnrepresentableGrant {
                 role: role_name.clone(),
             });
@@ -315,12 +311,10 @@ pub fn suggest_profiles(input: &PolicyManifest, opts: &SuggestOptions) -> Sugges
 
         // No grants, no default privileges → can't promote, keep flat.
         if schemas_seen.is_empty() {
-            excluded_roles.insert(role_name.clone());
             continue;
         }
 
         if schemas_seen.len() > 1 {
-            excluded_roles.insert(role_name.clone());
             skipped.push(SkipReason::MultiSchema {
                 role: role_name.clone(),
                 schemas: schemas_seen.into_iter().collect(),
@@ -333,7 +327,6 @@ pub fn suggest_profiles(input: &PolicyManifest, opts: &SuggestOptions) -> Sugges
         // The schema must be declared in the manifest (otherwise we can't bind
         // a profile to it).
         let Some(owner_for_schema) = schema_owner.get(&schema) else {
-            excluded_roles.insert(role_name.clone());
             skipped.push(SkipReason::SchemaNotDeclared {
                 role: role_name.clone(),
                 schema,
@@ -350,7 +343,6 @@ pub fn suggest_profiles(input: &PolicyManifest, opts: &SuggestOptions) -> Sugges
             }
         }
         if owner_mismatch {
-            excluded_roles.insert(role_name.clone());
             skipped.push(SkipReason::OwnerMismatch {
                 role: role_name.clone(),
                 schema,
@@ -411,7 +403,6 @@ pub fn suggest_profiles(input: &PolicyManifest, opts: &SuggestOptions) -> Sugges
         let distinct_schemas: BTreeSet<&str> = members.iter().map(|m| m.schema.as_str()).collect();
         if distinct_schemas.len() < opts.min_schemas {
             for m in &members {
-                excluded_roles.insert(m.role_name.clone());
                 skipped.push(SkipReason::SoleSchema {
                     role: m.role_name.clone(),
                     schema: m.schema.clone(),
@@ -432,52 +423,78 @@ pub fn suggest_profiles(input: &PolicyManifest, opts: &SuggestOptions) -> Sugges
 
         // Find a (pattern, profile_name) that all members agree on AND that
         // doesn't conflict with already-committed schema patterns.
+        //
+        // For diagnostics: when no viable pattern can be chosen, surface
+        // `SchemaPatternConflict` if some pattern *would* have succeeded
+        // except for an already-locked schema; otherwise the failure is a
+        // role-name disagreement / collision and we report `NoUniformPattern`.
         let mut chosen: Option<(String, String)> = None;
+        // Records the schema/locked-pattern of the first pattern that was
+        // viable in every other respect but blocked by a schema lock.
+        let mut schema_conflict_blocking: Option<(String, String)> = None;
         for pat in pattern_priority {
-            // Schema-pattern conflict?
-            let conflict = unique_members.iter().any(|m| {
+            // Pattern viability ignoring schema lock: do role names match
+            // uniformly, is the resulting profile name a valid identifier,
+            // and is it free?
+            let viable_name: Option<String> = {
+                let mut names: BTreeSet<String> = BTreeSet::new();
+                let mut ok = true;
+                for m in &unique_members {
+                    if let Some(prof) = match_pattern(pat, &m.role_name, &m.schema) {
+                        names.insert(prof);
+                    } else {
+                        ok = false;
+                        break;
+                    }
+                }
+                if !ok || names.len() != 1 {
+                    None
+                } else {
+                    let n = names.into_iter().next().unwrap();
+                    if !is_valid_identifier(&n)
+                        || taken_profile_names.contains(&n)
+                        || input.profiles.contains_key(&n)
+                    {
+                        None
+                    } else {
+                        Some(n)
+                    }
+                }
+            };
+
+            // Is any of this cluster's schemas already locked to a different
+            // pattern?
+            let blocked_by_schema = unique_members.iter().find_map(|m| {
                 schema_pattern
                     .get(&m.schema)
-                    .map(|p| p != pat)
-                    .unwrap_or(false)
+                    .filter(|committed| *committed != pat)
+                    .map(|committed| (m.schema.clone(), committed.clone()))
             });
-            if conflict {
-                continue;
-            }
-            let mut names: BTreeSet<String> = BTreeSet::new();
-            let mut ok = true;
-            for m in &unique_members {
-                if let Some(prof) = match_pattern(pat, &m.role_name, &m.schema) {
-                    names.insert(prof);
-                } else {
-                    ok = false;
+
+            match (viable_name, blocked_by_schema) {
+                (Some(name), None) => {
+                    chosen = Some((pat.to_string(), name));
                     break;
                 }
-            }
-            if ok && names.len() == 1 {
-                let name = names.into_iter().next().unwrap();
-                if !is_valid_identifier(&name) {
-                    continue;
+                (Some(_), Some(conflict)) if schema_conflict_blocking.is_none() => {
+                    schema_conflict_blocking = Some(conflict);
                 }
-                // Two clusters can't share a profile name. The profile name is
-                // determined by the role-name pattern, so renaming would break
-                // the role-name invariant. Skip this candidate; the loop will
-                // try the next pattern.
-                if taken_profile_names.contains(&name) || input.profiles.contains_key(&name) {
-                    continue;
-                }
-                chosen = Some((pat.to_string(), name));
-                break;
+                _ => {}
             }
         }
 
         let Some((pattern, profile_name)) = chosen else {
-            for m in &unique_members {
-                excluded_roles.insert(m.role_name.clone());
+            if let Some((schema, winning_pattern)) = schema_conflict_blocking {
+                skipped.push(SkipReason::SchemaPatternConflict {
+                    schema,
+                    winning_pattern,
+                    dropped_roles: unique_members.iter().map(|m| m.role_name.clone()).collect(),
+                });
+            } else {
+                skipped.push(SkipReason::NoUniformPattern {
+                    roles: unique_members.iter().map(|m| m.role_name.clone()).collect(),
+                });
             }
-            skipped.push(SkipReason::NoUniformPattern {
-                roles: unique_members.iter().map(|m| m.role_name.clone()).collect(),
-            });
             continue;
         };
 
@@ -1577,6 +1594,34 @@ grants:
             "exactly one profile should win: {:?}",
             report.profiles
         );
+        // The losing cluster must surface a SchemaPatternConflict skip
+        // pointing at the schema whose pattern was already locked.
+        let conflicts: Vec<_> = report
+            .skipped
+            .iter()
+            .filter_map(|s| match s {
+                SkipReason::SchemaPatternConflict {
+                    schema,
+                    winning_pattern,
+                    dropped_roles,
+                } => Some((schema, winning_pattern, dropped_roles)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            conflicts.len(),
+            1,
+            "expected one SchemaPatternConflict skip, got: {:?}",
+            report.skipped
+        );
+        let (_, winning, dropped) = conflicts[0];
+        // Either pattern can win (depends on signature ordering); the
+        // important thing is that the *other* one is reported as conflicting.
+        assert!(
+            winning == "{schema}-{profile}" || winning == "{schema}_{profile}",
+            "unexpected winning_pattern: {winning}"
+        );
+        assert_eq!(dropped.len(), 2);
     }
 
     #[test]
@@ -2238,31 +2283,13 @@ grants:
         let r1 = suggest_profiles(&m1, &SuggestOptions::default());
         let r2 = suggest_profiles(&m2, &SuggestOptions::default());
 
-        // Note: PolicyManifest.profiles is a HashMap whose YAML serialization
-        // order is non-deterministic. Compare structurally instead.
-        assert_eq!(r1.profiles.len(), r2.profiles.len());
+        // PolicyManifest.profiles is a BTreeMap, so the entire manifest
+        // serializes deterministically — compare YAML directly.
         assert_eq!(r1.profiles.len(), 2);
-        let names1: BTreeSet<_> = r1.manifest.profiles.keys().cloned().collect();
-        let names2: BTreeSet<_> = r2.manifest.profiles.keys().cloned().collect();
-        assert_eq!(names1, names2);
-        for name in &names1 {
-            assert_eq!(
-                serde_yaml::to_string(&r1.manifest.profiles[name]).unwrap(),
-                serde_yaml::to_string(&r2.manifest.profiles[name]).unwrap()
-            );
-        }
-        // Schemas, roles, grants — these are Vec — must serialize identically.
+        assert_eq!(r2.profiles.len(), 2);
         assert_eq!(
-            serde_yaml::to_string(&r1.manifest.schemas).unwrap(),
-            serde_yaml::to_string(&r2.manifest.schemas).unwrap()
-        );
-        assert_eq!(
-            serde_yaml::to_string(&r1.manifest.roles).unwrap(),
-            serde_yaml::to_string(&r2.manifest.roles).unwrap()
-        );
-        assert_eq!(
-            serde_yaml::to_string(&r1.manifest.grants).unwrap(),
-            serde_yaml::to_string(&r2.manifest.grants).unwrap()
+            serde_yaml::to_string(&r1.manifest).unwrap(),
+            serde_yaml::to_string(&r2.manifest).unwrap()
         );
     }
 
