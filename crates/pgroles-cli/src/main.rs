@@ -7,7 +7,7 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use sqlx::postgres::PgPoolOptions;
 use sqlx::{PgPool, Row};
-use tracing::info;
+use tracing::{info, warn};
 
 use pgroles_cli::{
     PlanSummary, apply_role_retirements, compute_plan, format_bundle_plan_json,
@@ -143,6 +143,20 @@ enum Commands {
         /// Write output to this file instead of stdout.
         #[arg(short, long)]
         output: Option<PathBuf>,
+
+        /// Refactor the generated manifest into reusable profiles where roles
+        /// share an identical schema-relative privilege shape across multiple
+        /// schemas. The transformation is deterministic and round-trips: the
+        /// produced manifest expands to the exact same role state as the flat
+        /// version.
+        #[arg(long)]
+        suggest_profiles: bool,
+
+        /// Minimum number of distinct schemas a candidate cluster must span
+        /// before it becomes a profile. Only meaningful with
+        /// `--suggest-profiles`. Default: 2.
+        #[arg(long, default_value_t = 2, requires = "suggest_profiles")]
+        suggest_min_schemas: usize,
     },
 
     /// Visualize the role graph structure.
@@ -325,8 +339,16 @@ async fn run(cli: Cli) -> Result<ExitCode> {
         Commands::Generate {
             database_url,
             output,
+            suggest_profiles,
+            suggest_min_schemas,
         } => {
-            cmd_generate(&database_url, output.as_deref()).await?;
+            cmd_generate(
+                &database_url,
+                output.as_deref(),
+                suggest_profiles,
+                suggest_min_schemas,
+            )
+            .await?;
             Ok(ExitCode::SUCCESS)
         }
         Commands::Graph { source } => match source {
@@ -736,7 +758,12 @@ async fn cmd_inspect(file: Option<&Path>, bundle: Option<&Path>, database_url: &
     Ok(())
 }
 
-async fn cmd_generate(database_url: &str, output: Option<&Path>) -> Result<()> {
+async fn cmd_generate(
+    database_url: &str,
+    output: Option<&Path>,
+    suggest_profiles: bool,
+    suggest_min_schemas: usize,
+) -> Result<()> {
     let pool = connect_db(database_url).await?;
 
     // Introspect all non-system roles by using an unscoped inspect config.
@@ -750,7 +777,18 @@ async fn cmd_generate(database_url: &str, output: Option<&Path>) -> Result<()> {
     .await
     .context("failed to introspect database for generation")?;
 
-    let manifest = pgroles_core::export::role_graph_to_manifest(&graph);
+    let mut manifest = pgroles_core::export::role_graph_to_manifest(&graph);
+
+    if suggest_profiles {
+        let opts = pgroles_core::suggest::SuggestOptions {
+            min_schemas: suggest_min_schemas,
+            ..Default::default()
+        };
+        let report = pgroles_core::suggest::suggest_profiles(&manifest, &opts);
+        log_suggest_report(&report);
+        manifest = report.manifest;
+    }
+
     let yaml = serde_yaml::to_string(&manifest).context("failed to serialize manifest to YAML")?;
 
     match output {
@@ -763,6 +801,75 @@ async fn cmd_generate(database_url: &str, output: Option<&Path>) -> Result<()> {
     }
 
     Ok(())
+}
+
+fn log_suggest_report(report: &pgroles_core::suggest::SuggestReport) {
+    use pgroles_core::suggest::SkipReason;
+
+    if !report.round_trip_ok {
+        warn!("profile suggestion round-trip check failed; emitting flat manifest");
+    }
+    info!(
+        profiles_extracted = report.profiles.len(),
+        roles_skipped = report.skipped.len(),
+        "profile suggestion complete"
+    );
+    for p in &report.profiles {
+        let schemas: Vec<&str> = p.schema_to_role.keys().map(String::as_str).collect();
+        info!(
+            profile = %p.profile_name,
+            pattern = %p.role_pattern,
+            schemas = ?schemas,
+            replaced_roles = ?p.schema_to_role.values().collect::<Vec<_>>(),
+            "extracted profile"
+        );
+    }
+    for skip in &report.skipped {
+        match skip {
+            SkipReason::MultiSchema { role, schemas } => {
+                info!(role, ?schemas, "skipped: role spans multiple schemas");
+            }
+            SkipReason::SchemaNotDeclared { role, schema } => {
+                info!(role, schema, "skipped: schema not declared in manifest");
+            }
+            SkipReason::OwnerMismatch { role, schema } => {
+                info!(
+                    role,
+                    schema, "skipped: default privilege owner != schema owner"
+                );
+            }
+            SkipReason::UniqueAttributes { role } => {
+                info!(role, "skipped: role has attributes profiles can't express");
+            }
+            SkipReason::UnrepresentableGrant { role } => {
+                info!(role, "skipped: role has grants profiles can't express");
+            }
+            SkipReason::SoleSchema { role, schema } => {
+                info!(role, schema, "skipped: cluster spans only one schema");
+            }
+            SkipReason::NoUniformPattern { roles } => {
+                info!(
+                    ?roles,
+                    "skipped: no uniform role-name pattern across cluster"
+                );
+            }
+            SkipReason::SchemaPatternConflict {
+                schema,
+                winning_pattern,
+                dropped_roles,
+            } => {
+                info!(
+                    schema,
+                    winning_pattern,
+                    ?dropped_roles,
+                    "skipped: schema pattern conflict"
+                );
+            }
+            SkipReason::RoundTripFailure { reason } => {
+                warn!(reason, "skipped: round-trip failure");
+            }
+        }
+    }
 }
 
 fn cmd_graph_desired(

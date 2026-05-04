@@ -7,4 +7,5 @@ pub mod ownership;
 pub mod report;
 pub mod scram;
 pub mod sql;
+pub mod suggest;
 pub mod visual;
