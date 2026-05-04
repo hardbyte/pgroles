@@ -1,6 +1,6 @@
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashSet};
 use thiserror::Error;
 
 // ---------------------------------------------------------------------------
@@ -133,9 +133,11 @@ pub struct PolicyManifest {
     #[serde(default)]
     pub auth_providers: Vec<AuthProvider>,
 
-    /// Reusable privilege profiles.
+    /// Reusable privilege profiles. Stored as a `BTreeMap` so YAML
+    /// serialization is deterministic — two `pgroles generate` runs against
+    /// the same database produce byte-identical output.
     #[serde(default)]
-    pub profiles: HashMap<String, Profile>,
+    pub profiles: BTreeMap<String, Profile>,
 
     /// Schema bindings that expand profiles into concrete roles/grants.
     #[serde(default)]

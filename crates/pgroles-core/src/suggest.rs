@@ -27,7 +27,7 @@
 //! output. No LLM, no heuristics that depend on iteration order of unstable
 //! collections.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet};
 
 use crate::diff::{Change, diff};
 use crate::manifest::{
@@ -45,27 +45,33 @@ pub struct SuggestOptions {
     /// Default `2` — a profile with one schema is just an indirection.
     pub min_schemas: usize,
 
-    /// When `true` (default), collapse per-name grants into wildcards
-    /// (`name: "*"`) when a role's grants cover every object of a given
-    /// `(schema, object_type)` with identical privileges. This is what
-    /// generate-from-DB output normally needs: Postgres expands
-    /// `GRANT … ON ALL TABLES` into per-relation rows, so the suggester
-    /// has to re-collapse them to make profiles useful.
+    /// Complete object inventory `(schema, object_type) → set of names`,
+    /// **as observed in the live database** (i.e. from
+    /// [`pgroles_inspect::fetch_object_inventory`]). When provided, the
+    /// suggester collapses per-name grants into wildcards (`name: "*"`) for
+    /// `(schema, object_type)` buckets where a role covers every object,
+    /// which is what makes profile clustering across schemas useful for
+    /// `pgroles generate` output (Postgres expands `GRANT … ON ALL TABLES`
+    /// into per-relation rows).
     ///
-    /// The round-trip check still verifies semantic equivalence: each
-    /// wildcard is expanded against the *current* set of objects (taken
-    /// from the input manifest's grants) before comparison.
+    /// **Why required**: a grant-derived inventory would treat ungranted
+    /// objects as nonexistent. A role granted on every *currently-granted*
+    /// table would collapse to `name: "*"`, and applying the suggested
+    /// manifest would silently grant on previously-ungranted tables —
+    /// broadening privileges beyond the original manifest's intent. With a
+    /// real introspected inventory we know what *exists* vs what's
+    /// *granted*, so the collapse is sound.
     ///
-    /// Set to `false` for the strictest behavior — only cluster roles
-    /// whose grants reference identical literal names.
-    pub collapse_full_coverage: bool,
+    /// `None` (default) disables wildcard collapse entirely. Roles only
+    /// cluster when their grants reference identical literal names.
+    pub full_inventory: Option<Inventory>,
 }
 
 impl Default for SuggestOptions {
     fn default() -> Self {
         Self {
             min_schemas: 2,
-            collapse_full_coverage: true,
+            full_inventory: None,
         }
     }
 }
@@ -136,10 +142,21 @@ pub fn suggest_profiles(input: &PolicyManifest, opts: &SuggestOptions) -> Sugges
 
     let mut skipped: Vec<SkipReason> = Vec::new();
 
-    // --- Inventory: every (schema, object_type) → set of object names that
-    //     appear in any grant. Used both for collapse detection and for the
-    //     wildcard-aware round-trip check.
-    let inventory = build_inventory(input);
+    // --- Inventory ---------------------------------------------------------
+    //
+    // Two distinct inventories are involved:
+    //   * `full_inventory` (caller-provided, from live DB introspection):
+    //     authoritative list of every object that *exists*. Required to
+    //     safely collapse per-name grants into a wildcard, because we need
+    //     to know whether a role covers *every* object — not just every
+    //     object that happens to appear in some grant.
+    //   * `grant_inventory` (always built from the input's grants): the
+    //     domain over which wildcard grants in the candidate manifest must
+    //     be expanded for the round-trip diff. This is what guarantees the
+    //     candidate's wildcard expression matches the original's per-name
+    //     entries, regardless of whether collapse ran.
+    let grant_inventory = build_inventory(input);
+    let collapse_inventory = opts.full_inventory.as_ref();
 
     // --- Bucket grants and default privileges by grantee role ---------------
 
@@ -151,12 +168,12 @@ pub fn suggest_profiles(input: &PolicyManifest, opts: &SuggestOptions) -> Sugges
             .push(grant.clone());
     }
 
-    // If collapse is on, replace per-role per-name grants that fully cover
-    // their (schema, object_type) bucket with a single wildcard grant. This
-    // is what enables clustering across schemas with different table names.
-    if opts.collapse_full_coverage {
+    // Collapse per-role per-name grants that fully cover their (schema,
+    // object_type) bucket — only when a real introspected inventory is
+    // available. Without it, "full coverage" can't be soundly determined.
+    if let Some(inv) = collapse_inventory {
         for grants in role_grants.values_mut() {
-            collapse_full_coverage_grants(grants, &inventory);
+            collapse_full_coverage_grants(grants, inv);
         }
     }
 
@@ -215,6 +232,15 @@ pub fn suggest_profiles(input: &PolicyManifest, opts: &SuggestOptions) -> Sugges
 
         // Profiles can only express `login` and `inherit`. Any other
         // explicitly-set attribute disqualifies the role.
+        //
+        // Comments are treated as user-set documentation *unless* they match
+        // pgroles' own auto-generated annotation pattern (which `pgroles
+        // apply` writes when expanding a profile). Ignoring auto-comments
+        // makes `--suggest-profiles` idempotent across runs.
+        let has_user_comment = role_def
+            .comment
+            .as_deref()
+            .is_some_and(|c| !is_auto_profile_comment(c));
         if role_def.superuser.is_some()
             || role_def.createdb.is_some()
             || role_def.createrole.is_some()
@@ -223,7 +249,7 @@ pub fn suggest_profiles(input: &PolicyManifest, opts: &SuggestOptions) -> Sugges
             || role_def.connection_limit.is_some()
             || role_def.password.is_some()
             || role_def.password_valid_until.is_some()
-            || role_def.comment.is_some()
+            || has_user_comment
         {
             excluded_roles.insert(role_name.clone());
             skipped.push(SkipReason::UniqueAttributes {
@@ -355,7 +381,7 @@ pub fn suggest_profiles(input: &PolicyManifest, opts: &SuggestOptions) -> Sugges
     // schema → list of profile names already attached.
     let mut schema_profiles: BTreeMap<String, Vec<String>> = BTreeMap::new();
     // profile name → built Profile object.
-    let mut profiles_out: HashMap<String, Profile> = HashMap::new();
+    let mut profiles_out: BTreeMap<String, Profile> = BTreeMap::new();
     // profile name → sources (schema, original role name) for the report.
     let mut suggested: Vec<SuggestedProfile> = Vec::new();
     // Profile names already taken (avoid collisions).
@@ -554,7 +580,12 @@ pub fn suggest_profiles(input: &PolicyManifest, opts: &SuggestOptions) -> Sugges
 
     // --- Round-trip safety check -------------------------------------------
 
-    let round_trip_ok = match check_round_trip(input, &candidate, &inventory) {
+    // Round-trip wildcard expansion uses the most authoritative inventory
+    // available. With a full introspected inventory we expand against the
+    // *real* set of objects in each schema; otherwise we fall back to the
+    // grant-derived view (sufficient when collapse didn't run).
+    let round_trip_inventory = collapse_inventory.cloned().unwrap_or(grant_inventory);
+    let round_trip_ok = match check_round_trip(input, &candidate, &round_trip_inventory) {
         Ok(()) => true,
         Err(reason) => {
             skipped.push(SkipReason::RoundTripFailure {
@@ -844,6 +875,13 @@ fn match_pattern(pattern: &str, role_name: &str, schema: &str) -> Option<String>
             .map(|p| p.to_string()),
         _ => None,
     }
+}
+
+/// Recognise the auto-generated role comment that `expand_manifest` writes
+/// when materializing a `profile × schema` role. Format:
+/// `"Generated from profile 'X' for schema 'Y'"`.
+fn is_auto_profile_comment(c: &str) -> bool {
+    c.starts_with("Generated from profile '") && c.contains("' for schema '") && c.ends_with('\'')
 }
 
 fn is_valid_identifier(s: &str) -> bool {
@@ -1621,14 +1659,9 @@ grants:
 "#,
         );
 
-        // With collapse OFF, the literal sequence name is preserved.
-        let report = suggest_profiles(
-            &m,
-            &SuggestOptions {
-                collapse_full_coverage: false,
-                ..Default::default()
-            },
-        );
+        // Default options (no full_inventory) → no collapse → literal names
+        // are preserved.
+        let report = suggest_profiles(&m, &SuggestOptions::default());
         assert!(report.round_trip_ok);
         assert_eq!(report.profiles.len(), 1);
         let prof = report.manifest.profiles.get("rw").unwrap();
@@ -1639,8 +1672,16 @@ grants:
             .unwrap();
         assert_eq!(seq_grant.object.name.as_deref(), Some("orders_id_seq"));
 
-        // With collapse ON (default), full-coverage names become wildcards.
-        let report = suggest_profiles(&m, &SuggestOptions::default());
+        // With a full inventory provided, full-coverage names become
+        // wildcards.
+        let inv = build_inventory_pub(&m);
+        let report = suggest_profiles(
+            &m,
+            &SuggestOptions {
+                full_inventory: Some(inv),
+                ..Default::default()
+            },
+        );
         assert!(report.round_trip_ok);
         let prof = report.manifest.profiles.get("rw").unwrap();
         let seq_grant = prof
@@ -1692,7 +1733,16 @@ grants:
     object: { type: table, schema: checkout, name: order_items }
 "#,
         );
-        let report = suggest_profiles(&m, &SuggestOptions::default());
+        // With a full inventory provided, the per-name grants get collapsed
+        // and the two roles cluster on a wildcard signature.
+        let inv = build_inventory_pub(&m);
+        let report = suggest_profiles(
+            &m,
+            &SuggestOptions {
+                full_inventory: Some(inv),
+                ..Default::default()
+            },
+        );
         assert!(report.round_trip_ok, "skipped: {:?}", report.skipped);
         assert_eq!(report.profiles.len(), 1);
         let prof = report.manifest.profiles.get("reader").unwrap();
@@ -1706,10 +1756,10 @@ grants:
     }
 
     #[test]
-    fn collapse_off_prevents_clustering_across_different_names() {
+    fn no_full_inventory_prevents_clustering_across_different_names() {
         // Same input as `collapse_clusters_roles_with_different_object_names`
-        // but with collapse disabled — should NOT cluster, since literal names
-        // differ.
+        // but without a full_inventory — should NOT cluster, since literal
+        // names differ and we can't safely collapse without DB introspection.
         let m = parse(
             r#"
 schemas:
@@ -1729,13 +1779,9 @@ grants:
     object: { type: table, schema: checkout, name: orders }
 "#,
         );
-        let report = suggest_profiles(
-            &m,
-            &SuggestOptions {
-                collapse_full_coverage: false,
-                ..Default::default()
-            },
-        );
+        // Default (no full_inventory) → no collapse → different literal names
+        // produce different signatures → no cluster.
+        let report = suggest_profiles(&m, &SuggestOptions::default());
         assert!(report.profiles.is_empty());
     }
 
@@ -1767,11 +1813,143 @@ grants:
     object: { type: table, schema: b, name: only_one }
 "#,
         );
-        let report = suggest_profiles(&m, &SuggestOptions::default());
-        // a-ro has partial coverage of schema `a`, b-ro has full coverage of
-        // schema `b`. Their signatures differ (per-name `t1` vs wildcard).
-        // No cluster.
+        // Full inventory says schema `a` has {t1, t2}, schema `b` has
+        // {only_one}. a-ro covers only t1 (partial) → no collapse for a-ro.
+        // b-ro covers all of {only_one} (full) → collapses to wildcard.
+        // Different signatures → no cluster.
+        let inv = build_inventory_pub(&m);
+        let report = suggest_profiles(
+            &m,
+            &SuggestOptions {
+                full_inventory: Some(inv),
+                ..Default::default()
+            },
+        );
         assert!(report.profiles.is_empty());
+    }
+
+    #[test]
+    fn full_inventory_with_ungranted_objects_blocks_unsafe_collapse() {
+        // Schema `a` has 2 tables; role `a-ro` has SELECT on only one. With a
+        // grant-derived view of the world we'd think coverage was full and
+        // collapse to wildcard — which would silently grant on `t2` after
+        // applying. With a real introspected inventory (containing both
+        // tables), the suggester correctly sees partial coverage and refuses
+        // to collapse.
+        let m = parse(
+            r#"
+schemas:
+  - name: a
+    owner: o
+  - name: b
+    owner: o
+roles:
+  - name: a-ro
+  - name: b-ro
+grants:
+  - role: a-ro
+    privileges: [SELECT]
+    object: { type: table, schema: a, name: t1 }
+  - role: b-ro
+    privileges: [SELECT]
+    object: { type: table, schema: b, name: only_one }
+"#,
+        );
+        // Inventory reports schema `a` actually has *two* tables.
+        let mut inv = build_inventory_pub(&m);
+        inv.entry(("a".to_string(), ObjectType::Table))
+            .or_default()
+            .insert("t2_ungranted".to_string());
+        let report = suggest_profiles(
+            &m,
+            &SuggestOptions {
+                full_inventory: Some(inv),
+                ..Default::default()
+            },
+        );
+        // a-ro has partial coverage now → no collapse → no cluster.
+        assert!(report.profiles.is_empty());
+    }
+
+    #[test]
+    fn auto_generated_profile_comments_dont_block_resuggestion() {
+        // When `pgroles apply` materializes a profile, it sets a comment on
+        // each generated role. Re-running `--suggest-profiles` later must not
+        // treat those auto-comments as user-set documentation that
+        // disqualifies the role.
+        let m = parse(
+            r#"
+schemas:
+  - name: inventory
+    owner: o
+  - name: checkout
+    owner: o
+roles:
+  - name: inventory-reader
+    comment: "Generated from profile 'reader' for schema 'inventory'"
+  - name: checkout-reader
+    comment: "Generated from profile 'reader' for schema 'checkout'"
+grants:
+  - role: inventory-reader
+    privileges: [SELECT]
+    object: { type: table, schema: inventory, name: "*" }
+  - role: checkout-reader
+    privileges: [SELECT]
+    object: { type: table, schema: checkout, name: "*" }
+"#,
+        );
+        let report = suggest_profiles(&m, &SuggestOptions::default());
+        assert!(report.round_trip_ok);
+        assert_eq!(report.profiles.len(), 1);
+        assert_eq!(report.profiles[0].profile_name, "reader");
+    }
+
+    #[test]
+    fn user_set_comments_still_block_clustering() {
+        // A real user-set comment (not the auto-generated pattern) keeps the
+        // role flat — profiles can't carry per-role comments.
+        let m = parse(
+            r#"
+schemas:
+  - name: inventory
+    owner: o
+  - name: checkout
+    owner: o
+roles:
+  - name: inventory-reader
+    comment: "Owned by data team — Q3 access only"
+  - name: checkout-reader
+grants:
+  - role: inventory-reader
+    privileges: [SELECT]
+    object: { type: table, schema: inventory, name: "*" }
+  - role: checkout-reader
+    privileges: [SELECT]
+    object: { type: table, schema: checkout, name: "*" }
+"#,
+        );
+        let report = suggest_profiles(&m, &SuggestOptions::default());
+        // inventory-reader excluded for user comment → checkout-reader is
+        // now sole-schema → no cluster.
+        assert!(report.profiles.is_empty());
+        assert!(report.skipped.iter().any(
+            |s| matches!(s, SkipReason::UniqueAttributes { role } if role == "inventory-reader")
+        ));
+    }
+
+    #[test]
+    fn is_auto_profile_comment_basic() {
+        assert!(is_auto_profile_comment(
+            "Generated from profile 'reader' for schema 'inventory'"
+        ));
+        assert!(is_auto_profile_comment(
+            "Generated from profile 'app-rw' for schema 'app_v2'"
+        ));
+        assert!(!is_auto_profile_comment("Random user note"));
+        assert!(!is_auto_profile_comment(
+            "Generated from profile 'reader' for schema 'inventory"
+        )); // missing trailing quote
+        assert!(!is_auto_profile_comment("Generated from profile 'reader'")); // missing schema part
     }
 
     #[test]

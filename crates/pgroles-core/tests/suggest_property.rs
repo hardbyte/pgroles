@@ -242,27 +242,41 @@ fn random_manifest(rng: &mut Rng) -> PolicyManifest {
     }
 }
 
-fn check_round_trip_invariant(manifest: &PolicyManifest, seed: u64) {
-    let report = suggest_profiles(manifest, &SuggestOptions::default());
+fn check_round_trip_invariant_with_opts(
+    manifest: &PolicyManifest,
+    seed: u64,
+    opts: &SuggestOptions,
+    label: &str,
+) {
+    let report = suggest_profiles(manifest, opts);
 
-    // Build the same wildcard-expansion inventory the suggester uses, so we
-    // can perform a semantic comparison: per-name and `name: "*"` grants are
-    // equivalent when the wildcard would expand to the same set of objects.
-    let inventory = build_inventory_pub(manifest);
+    // For wildcard-aware comparison the round-trip inventory must cover both
+    // the manifest's existing grants AND any inventory the suggester used to
+    // collapse — otherwise the candidate's freshly-emitted wildcards would
+    // expand against fewer objects than the original's per-name grants.
+    let mut inventory = build_inventory_pub(manifest);
+    if let Some(full) = &opts.full_inventory {
+        for (key, names) in full {
+            inventory
+                .entry(key.clone())
+                .or_default()
+                .extend(names.iter().cloned());
+        }
+    }
 
     let mut original_expanded = expand_manifest(manifest)
-        .unwrap_or_else(|e| panic!("seed {seed}: original expand failed: {e}"));
+        .unwrap_or_else(|e| panic!("seed {seed} [{label}]: original expand failed: {e}"));
     expand_wildcard_grants(&mut original_expanded.grants, &inventory);
     let original_graph =
         RoleGraph::from_expanded(&original_expanded, manifest.default_owner.as_deref())
-            .unwrap_or_else(|e| panic!("seed {seed}: original graph failed: {e}"));
+            .unwrap_or_else(|e| panic!("seed {seed} [{label}]: original graph failed: {e}"));
 
     let mut new_expanded = expand_manifest(&report.manifest)
-        .unwrap_or_else(|e| panic!("seed {seed}: candidate expand failed: {e}"));
+        .unwrap_or_else(|e| panic!("seed {seed} [{label}]: candidate expand failed: {e}"));
     expand_wildcard_grants(&mut new_expanded.grants, &inventory);
     let new_graph =
         RoleGraph::from_expanded(&new_expanded, report.manifest.default_owner.as_deref())
-            .unwrap_or_else(|e| panic!("seed {seed}: candidate graph failed: {e}"));
+            .unwrap_or_else(|e| panic!("seed {seed} [{label}]: candidate graph failed: {e}"));
 
     let changes = diff(&original_graph, &new_graph);
     let bad: Vec<_> = changes
@@ -274,7 +288,7 @@ fn check_round_trip_invariant(manifest: &PolicyManifest, seed: u64) {
         let original_yaml = serde_yaml::to_string(manifest).unwrap();
         let candidate_yaml = serde_yaml::to_string(&report.manifest).unwrap();
         panic!(
-            "seed {seed}: round-trip violated.\n  bad changes ({}): {:#?}\n  round_trip_ok={}\n  profiles: {:?}\n\n--- ORIGINAL ---\n{}\n--- CANDIDATE ---\n{}",
+            "seed {seed} [{label}]: round-trip violated.\n  bad changes ({}): {:#?}\n  round_trip_ok={}\n  profiles: {:?}\n\n--- ORIGINAL ---\n{}\n--- CANDIDATE ---\n{}",
             bad.len(),
             bad,
             report.round_trip_ok,
@@ -287,6 +301,24 @@ fn check_round_trip_invariant(manifest: &PolicyManifest, seed: u64) {
             candidate_yaml,
         );
     }
+}
+
+fn check_round_trip_invariant(manifest: &PolicyManifest, seed: u64) {
+    // Path 1: no full_inventory → no collapse path.
+    check_round_trip_invariant_with_opts(
+        manifest,
+        seed,
+        &SuggestOptions::default(),
+        "no_inventory",
+    );
+    // Path 2: simulate full inventory by treating the manifest's grants as
+    // exhaustive. This exercises the collapse path on the same input.
+    let inv = build_inventory_pub(manifest);
+    let opts_with_inv = SuggestOptions {
+        full_inventory: Some(inv),
+        ..Default::default()
+    };
+    check_round_trip_invariant_with_opts(manifest, seed, &opts_with_inv, "with_inventory");
 }
 
 // ---------------------------------------------------------------------------

@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -104,7 +104,7 @@ pub struct SharedPolicy {
     pub auth_providers: Vec<AuthProvider>,
 
     #[serde(default)]
-    pub profiles: HashMap<String, Profile>,
+    pub profiles: BTreeMap<String, Profile>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -707,7 +707,7 @@ roles:
     fn compose_bundle_rejects_duplicate_generated_roles() {
         let bundle = PolicyBundle {
             shared: SharedPolicy {
-                profiles: HashMap::from([(
+                profiles: BTreeMap::from([(
                     "viewer".to_string(),
                     Profile {
                         login: None,

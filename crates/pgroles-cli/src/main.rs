@@ -780,9 +780,30 @@ async fn cmd_generate(
     let mut manifest = pgroles_core::export::role_graph_to_manifest(&graph);
 
     if suggest_profiles {
+        // Fetch the *complete* per-schema object inventory from the live DB.
+        // The suggester needs this to safely collapse per-name grants into
+        // wildcards: a grant-derived inventory would treat ungranted objects
+        // as nonexistent and could broaden privileges when the suggested
+        // manifest is applied.
+        let schemas: Vec<String> = manifest.schemas.iter().map(|s| s.name.clone()).collect();
+        let schema_refs: Vec<&str> = schemas.iter().map(String::as_str).collect();
+        let raw_inventory = pgroles_inspect::fetch_object_inventory(&pool, &schema_refs)
+            .await
+            .context("failed to fetch object inventory for profile suggestion")?;
+        // Translate `(ObjectType, schema) → Vec<name>` into the suggester's
+        // `(schema, ObjectType) → BTreeSet<name>` shape.
+        let mut full_inventory: pgroles_core::suggest::Inventory =
+            std::collections::BTreeMap::new();
+        for ((object_type, schema), names) in raw_inventory {
+            full_inventory
+                .entry((schema, object_type))
+                .or_default()
+                .extend(names);
+        }
+
         let opts = pgroles_core::suggest::SuggestOptions {
             min_schemas: suggest_min_schemas,
-            ..Default::default()
+            full_inventory: Some(full_inventory),
         };
         let report = pgroles_core::suggest::suggest_profiles(&manifest, &opts);
         log_suggest_report(&report);
