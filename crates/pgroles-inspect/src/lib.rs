@@ -27,7 +27,9 @@ use pgroles_core::ownership::ManagedScope;
 pub use cloud::{CloudProvider, PrivilegeLevel, detect_privilege_level};
 pub use defaults::fetch_default_privileges;
 pub use memberships::fetch_memberships;
-pub use privileges::{fetch_database_privileges, fetch_privileges, fetch_relation_inventory};
+pub use privileges::{
+    fetch_database_privileges, fetch_object_inventory, fetch_privileges, fetch_relation_inventory,
+};
 pub use public_grants::{PublicGrants, fetch_public_grants, format_public_grants};
 pub use roles::fetch_roles;
 pub use safety::{

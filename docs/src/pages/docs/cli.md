@@ -188,9 +188,43 @@ The generated manifest uses no profiles — all roles, grants, default privilege
 |---|---|
 | `--database-url` | PostgreSQL connection string (or `DATABASE_URL` env) |
 | `-o`, `--output` | Write the generated manifest to a file instead of stdout |
+| `--suggest-profiles` | Refactor the flat output into reusable [profiles](/docs/profiles) where roles share the same schema-relative privilege shape across multiple schemas |
+| `--suggest-min-schemas N` | Minimum schemas a candidate cluster must span before it becomes a profile (default `2`). Only meaningful with `--suggest-profiles` |
+
+### Refining with `--suggest-profiles`
+
+The flat output of `generate` faithfully reproduces the database state but is repetitive — every reader/editor role enumerates its grants per schema. `--suggest-profiles` extracts reusable [profiles](/docs/profiles) automatically, deterministically, and round-trip-safely:
+
+```shell
+pgroles generate --database-url $DATABASE_URL --suggest-profiles > pgroles.yaml
+```
+
+When run, the suggester:
+
+- Buckets each role's grants by schema and computes a *schema-relative signature* — the grants and default privileges with the schema replaced by a placeholder.
+- Clusters roles with identical signatures across `>= min_schemas` schemas into a single profile.
+- Picks a uniform role-name pattern (`{schema}-{profile}`, `{schema}_{profile}`, `{profile}-{schema}`, or `{profile}_{schema}`) so the resulting expansion produces the same role names as the input.
+- Verifies that re-expanding the suggested manifest produces the same role state as the flat one (modulo auto-generated role comments). If anything would change semantically, the suggestion is dropped and the flat manifest is returned.
+
+To safely collapse per-name grants into wildcards (e.g. turning per-table `GRANT SELECT ON each_table` into a `name: "*"` profile grant), the suggester uses a complete object inventory introspected from the live database — so it cannot accidentally widen privileges to objects that exist but had no grants.
+
+The log output documents what was extracted and why each remaining role stayed flat:
+
+```
+profile suggestion complete profiles_extracted=2 roles_skipped=3
+extracted profile profile=reader pattern={schema}_{profile} schemas=["analytics","billing","checkout","inventory"]
+extracted profile profile=editor pattern={schema}_{profile} schemas=["billing","checkout","inventory"]
+skipped: role spans multiple schemas role="app_owner" schemas=["billing","checkout","inventory"]
+skipped: role has attributes profiles can't express role="platform_admin"
+skipped: cluster spans only one schema role="analytics_owner" schema="analytics"
+```
+
+{% callout type="note" title="Idempotent across re-runs" %}
+Re-running `--suggest-profiles` on a database where you've already applied a suggested manifest works as expected. The auto-generated profile comments (`Generated from profile 'X' for schema 'Y'`) are recognised and ignored; user-set role comments still keep a role flat.
+{% /callout %}
 
 {% callout type="note" title="Starting point for refinement" %}
-The generated manifest is a flat snapshot of the current state. After generating it, you can reorganize roles into profiles and schemas to take advantage of pgroles' template system.
+The generated manifest — flat or with suggested profiles — is a snapshot of the current state. After generating it, you can reorganize roles into profiles and schemas to take advantage of pgroles' template system.
 {% /callout %}
 
 {% callout type="warning" title="Treat generated manifests as authoritative input" %}

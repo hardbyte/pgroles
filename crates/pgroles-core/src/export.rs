@@ -4,7 +4,7 @@
 //! It produces a flat manifest (no profiles) that faithfully represents the
 //! current database state. When applied back, it should produce zero diff.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 
 use crate::manifest::{
     DefaultPrivilege, DefaultPrivilegeGrant, Grant, MemberSpec, Membership, ObjectTarget,
@@ -143,7 +143,7 @@ pub fn role_graph_to_manifest(graph: &RoleGraph) -> PolicyManifest {
     PolicyManifest {
         default_owner: None,
         auth_providers: Vec::new(),
-        profiles: HashMap::new(),
+        profiles: BTreeMap::new(),
         schemas,
         roles,
         grants,

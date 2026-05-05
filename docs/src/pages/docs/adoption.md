@@ -25,6 +25,14 @@ pgroles generate --database-url $DATABASE_URL > pgroles.yaml
 
 This produces a flat manifest you can refine into profiles and schema bindings.
 
+For databases where multiple schemas share the same access pattern (a `*_reader`, `*_editor`, `*_app` role per schema), add `--suggest-profiles` to skip the manual refactoring step:
+
+```shell
+pgroles generate --database-url $DATABASE_URL --suggest-profiles > pgroles.yaml
+```
+
+The suggester extracts reusable [profiles](/docs/profiles) deterministically and only commits to them when round-trip equivalence with the flat manifest is verified. Roles that don't fit a uniform pattern stay flat. See the [CLI reference](/docs/cli#refining-with---suggest-profiles) for details.
+
 ### 2. Plan mode first
 
 Deploy with `mode: plan` to see what pgroles *would* do without executing any SQL:

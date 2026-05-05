@@ -787,7 +787,26 @@ fn generate_help() {
         .assert()
         .success()
         .stdout(predicate::str::contains("--database-url"))
-        .stdout(predicate::str::contains("--output"));
+        .stdout(predicate::str::contains("--output"))
+        .stdout(predicate::str::contains("--suggest-profiles"))
+        .stdout(predicate::str::contains("--suggest-min-schemas"));
+}
+
+#[test]
+fn generate_suggest_min_schemas_requires_suggest_profiles() {
+    // The flag is gated by clap's `requires`. Passing it alone must fail.
+    pgroles_cmd()
+        .env_remove("DATABASE_URL")
+        .args([
+            "generate",
+            "--suggest-min-schemas",
+            "1",
+            "--database-url",
+            "postgres://nowhere/",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("suggest"));
 }
 
 #[test]
@@ -2380,6 +2399,133 @@ schemas:
             yaml.contains("owner: postgres"),
             "expected generated manifest to include postgres schema owner: {yaml}"
         );
+    }
+
+    #[test]
+    #[ignore]
+    fn generate_with_suggest_profiles_extracts_clusters() {
+        // Seed a small brownfield with three schemas that each have a
+        // matching `*-reader` role. After --suggest-profiles, the manifest
+        // should contain a single `reader` profile.
+        let prefix = unique_name("sug").replace('-', "_");
+        let s1 = format!("{prefix}_a");
+        let s2 = format!("{prefix}_b");
+        let s3 = format!("{prefix}_c");
+        let r1 = format!("{s1}-reader");
+        let r2 = format!("{s2}-reader");
+        let r3 = format!("{s3}-reader");
+
+        let cleanup_sql = format!(
+            r#"
+            DROP OWNED BY "{r1}" CASCADE;
+            DROP OWNED BY "{r2}" CASCADE;
+            DROP OWNED BY "{r3}" CASCADE;
+            DROP ROLE IF EXISTS "{r1}";
+            DROP ROLE IF EXISTS "{r2}";
+            DROP ROLE IF EXISTS "{r3}";
+            DROP SCHEMA IF EXISTS "{s1}" CASCADE;
+            DROP SCHEMA IF EXISTS "{s2}" CASCADE;
+            DROP SCHEMA IF EXISTS "{s3}" CASCADE;
+            "#
+        );
+        let _cleanup = TestDbCleanup::new(cleanup_sql);
+
+        execute_sql(&format!(
+            r#"
+            DROP ROLE IF EXISTS "{r1}";
+            DROP ROLE IF EXISTS "{r2}";
+            DROP ROLE IF EXISTS "{r3}";
+            DROP SCHEMA IF EXISTS "{s1}" CASCADE;
+            DROP SCHEMA IF EXISTS "{s2}" CASCADE;
+            DROP SCHEMA IF EXISTS "{s3}" CASCADE;
+            CREATE SCHEMA "{s1}" AUTHORIZATION postgres;
+            CREATE SCHEMA "{s2}" AUTHORIZATION postgres;
+            CREATE SCHEMA "{s3}" AUTHORIZATION postgres;
+            CREATE TABLE "{s1}".t (id int);
+            CREATE TABLE "{s2}".t (id int);
+            CREATE TABLE "{s3}".t (id int);
+            CREATE ROLE "{r1}" NOLOGIN;
+            CREATE ROLE "{r2}" NOLOGIN;
+            CREATE ROLE "{r3}" NOLOGIN;
+            GRANT USAGE ON SCHEMA "{s1}" TO "{r1}";
+            GRANT USAGE ON SCHEMA "{s2}" TO "{r2}";
+            GRANT USAGE ON SCHEMA "{s3}" TO "{r3}";
+            GRANT SELECT ON "{s1}".t TO "{r1}";
+            GRANT SELECT ON "{s2}".t TO "{r2}";
+            GRANT SELECT ON "{s3}".t TO "{r3}";
+            "#
+        ));
+
+        // Without --suggest-profiles: flat manifest, no profiles section
+        // (or an empty one).
+        let flat_yaml = String::from_utf8(
+            pgroles_cmd()
+                .args(["generate", "--database-url", &database_url()])
+                .assert()
+                .success()
+                .get_output()
+                .stdout
+                .clone(),
+        )
+        .expect("flat output utf8");
+        assert!(flat_yaml.contains(&format!("- name: {r1}")));
+        assert!(flat_yaml.contains(&format!("- name: {r2}")));
+        assert!(flat_yaml.contains(&format!("- name: {r3}")));
+        // Either no profiles key or "profiles: {}".
+        assert!(
+            flat_yaml.contains("profiles: {}") || !flat_yaml.contains("\nprofiles:"),
+            "flat manifest unexpectedly has profiles: {flat_yaml}"
+        );
+
+        // With --suggest-profiles: a single `reader` profile should appear,
+        // and the three reader roles should be replaced by schema bindings.
+        let suggested_yaml = String::from_utf8(
+            pgroles_cmd()
+                .args([
+                    "generate",
+                    "--database-url",
+                    &database_url(),
+                    "--suggest-profiles",
+                ])
+                .assert()
+                .success()
+                .get_output()
+                .stdout
+                .clone(),
+        )
+        .expect("suggested output utf8");
+
+        assert!(
+            suggested_yaml.contains("reader:"),
+            "expected `reader` profile section: {suggested_yaml}"
+        );
+        for s in [&s1, &s2, &s3] {
+            // Each schema should now bind the reader profile.
+            assert!(
+                suggested_yaml.contains(&format!("- name: {s}\n  profiles:\n  - reader")),
+                "schema {s} should bind reader profile in: {suggested_yaml}"
+            );
+        }
+        // The original reader role names should not appear as flat roles
+        // anymore (they're produced by expansion).
+        assert!(
+            !suggested_yaml.contains(&format!("- name: {r1}")),
+            "{r1} should be replaced by profile expansion: {suggested_yaml}"
+        );
+
+        // Sanity: the suggested manifest must validate.
+        let temp = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(temp.path(), &suggested_yaml).unwrap();
+        pgroles_cmd()
+            .args(["validate", "--file", temp.path().to_str().unwrap()])
+            .assert()
+            .success();
+
+        // We deliberately do NOT diff/apply the generated manifest here —
+        // `pgroles generate` introspects every non-system role in the
+        // cluster, so the manifest captures unrelated roles created by
+        // parallel test cases. Round-trip semantic equivalence is covered
+        // by the 1000-iteration property suite in `pgroles-core`.
     }
 
     #[test]
