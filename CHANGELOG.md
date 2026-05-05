@@ -5,6 +5,23 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.6.0] - 2026-04-30
+
+### Added
+
+- **Schema management** — declared schemas (`schemas[].owner`) are now first-class state. pgroles creates missing schemas, converges `OWNER TO`, and filters implicit owner ACLs from inspection/export so plan and apply round-trip cleanly. Plan/apply summaries report schema creations and owner alterations. Generated SQL includes `CREATE SCHEMA` and `ALTER SCHEMA … OWNER TO`. (#90)
+- **Profile-level `inherit`** — profiles can set `inherit` on generated roles (already existed for `login`); threaded through to the operator CRD as well. (#95)
+
+### Fixed
+
+- **Additive mode no longer rewrites brownfield role attributes or comments.** Previously a pre-existing role like `accounts_editor LOGIN NOINHERIT` could trigger `ALTER ROLE … NOLOGIN INHERIT` under additive mode, which contradicts incremental adoption semantics. Additive mode now leaves attributes and comments unchanged on pre-existing roles. (#95)
+- **CLI execution sticks to a single backend.** When a hostname resolves to multiple PostgreSQL servers, one-shot commands could inspect one backend and execute mutations against another. Connection identity is now pinned for the lifetime of a CLI invocation, and SQL execution failures include the backend identity. (#95)
+
+### Changed
+
+- **Documentation** — README and docs updated with schema-management semantics, examples, operator guidance, additive-brownfield behavior, and generated-role attributes. (#90, #95)
+- **Dependency bumps** — `next` 16.2.0 → 16.2.3 in `/docs` (#75); `rand` 0.9.2 → 0.9.3 (#82).
+
 ## [0.7.0-beta.1] - 2026-05-05
 
 ### Added
