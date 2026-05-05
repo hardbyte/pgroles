@@ -5,8 +5,8 @@ description: >-
   Define roles, memberships, grants, and default privileges in YAML
   and let the operator converge your database to the desired state.
 type: application
-version: 0.6.0
-appVersion: "0.6.0"
+version: 0.7.0-beta.1
+appVersion: "0.7.0-beta.1"
 icon: https://raw.githubusercontent.com/hardbyte/pgroles/main/docs/public/logo.svg
 sources:
   - https://github.com/hardbyte/pgroles
@@ -16,14 +16,13 @@ maintainers:
     url: https://hardbyte.nz
 annotations:
   artifacthub.io/changes: |
+    - kind: added
+      description: '`pgroles generate --suggest-profiles` deterministically refactors a flat brownfield manifest into reusable profiles, with a round-trip-safe inventory check that prevents privilege widening.'
     - kind: changed
-      description: Finishes operator-managed passwords, including idempotent generated and Secret-backed password reconciliation.
-    - kind: changed
-      description: Renames grant targets from `on` to `object` in chart examples and published CRD schema.
-    - kind: fixed
-      description: Adds release-time checks so chart publication fails if the chart version or bundled CRDs are stale.
+      description: '`PolicyManifest.profiles` is now a `BTreeMap` (was `HashMap`) so YAML output is deterministic — same input, same bytes.'
   artifacthub.io/category: database
   artifacthub.io/operator: "true"
+  artifacthub.io/prerelease: "true"
   artifacthub.io/operatorCapabilities: Basic Install
   artifacthub.io/license: MIT
   artifacthub.io/links: |

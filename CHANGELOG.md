@@ -5,6 +5,19 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.7.0-beta.1] - 2026-05-05
+
+### Added
+
+- **`pgroles generate --suggest-profiles`** — deterministically refactor a flat brownfield manifest into reusable profiles. The suggester clusters roles whose grants share an identical *schema-relative signature* across multiple schemas, picks a uniform role-name pattern (`{schema}-{profile}` / `{schema}_{profile}` / `{profile}-{schema}` / `{profile}_{schema}`) so role names are preserved verbatim, and verifies round-trip equivalence against the flat manifest before committing. Re-runs on databases where a suggested manifest has already been applied are idempotent (auto-generated profile-role comments are recognised and ignored). (#96)
+- **Live-DB inventory required for safe wildcard collapse** — the suggester only collapses per-name grants into wildcards (`name: "*"`) when given a complete object inventory from `pgroles_inspect::fetch_object_inventory`. The CLI fetches this automatically. A grant-only view would treat ungranted objects as nonexistent and could broaden privileges; the suggester now refuses to collapse if the provided inventory is missing any object that already appears in input grants. (#96)
+- **`pgroles_core::suggest` module** — new public API: `suggest_profiles`, `SuggestOptions`, `SuggestReport`, `SuggestedProfile`, `SkipReason` (with variants `MultiSchema`, `SchemaNotDeclared`, `OwnerMismatch`, `UniqueAttributes`, `UnrepresentableGrant`, `SoleSchema`, `NoUniformPattern`, `SchemaPatternConflict`, `RoundTripFailure`, `IncompleteFullInventory`), `Inventory`, `inventory_from_manifest_grants`, `expand_wildcard_grants`. (#96)
+- **`pgroles_inspect::fetch_object_inventory`** re-exported at the crate root for callers building their own suggester pipelines. (#96)
+
+### Changed
+
+- **BREAKING: `PolicyManifest.profiles` is now `BTreeMap<String, Profile>`** (was `HashMap<String, Profile>`). YAML serialization is now deterministic — two `pgroles generate` runs against the same database produce byte-identical output. Library consumers that construct `PolicyManifest` directly will need to update their map type. The CLI and operator are unaffected. (#96)
+
 ## [0.5.0] - 2026-04-15
 
 ### Added
