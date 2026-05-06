@@ -5,6 +5,23 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.7.0] - 2026-05-06
+
+### Added
+
+- **`pgroles generate --suggest-profiles`** — deterministically refactor flat brownfield manifests into reusable profiles, with live database inventory checks before wildcard collapse so generated profiles do not broaden privileges. (#96)
+- **`pgroles_core::suggest` public API** and `pgroles_inspect::fetch_object_inventory` for callers building their own brownfield profile-suggestion pipelines. (#96)
+
+### Fixed
+
+- **Large operator plan SQL previews no longer exceed Kubernetes ConfigMap limits.** Small redacted SQL previews remain inline, large previews are stored as gzip-compressed ConfigMap `binaryData`, and exceptionally large incompressible previews fall back to a truncated inline preview while apply continues to render executable SQL from the in-memory change set. (#98)
+- **Status-less `PostgresPolicyPlan` resources and orphaned plan SQL ConfigMaps are cleaned up defensively.** The operator persists SQL artifacts before making plans visible, cleans stale status-less plans and orphaned SQL ConfigMaps before and after reconcile, and also collects stale policy-labeled SQL ConfigMaps left behind by older versions. (#99)
+- **Plan storage correctness is modeled in TLA+.** The model covers persistence failure, the invariant that plans are not visible before their SQL artifact is ready, at-most-one actionable plan safety, and eventual cleanup of stale status-less plans and orphan SQL artifacts. (#98, #99)
+
+### Changed
+
+- **BREAKING: `PolicyManifest.profiles` is now `BTreeMap<String, Profile>`** (was `HashMap<String, Profile>`). YAML serialization is now deterministic — two `pgroles generate` runs against the same database produce byte-identical output. Library consumers that construct `PolicyManifest` directly will need to update their map type. The CLI and operator are unaffected. (#96)
+
 ## [0.7.0-beta.2] - 2026-05-06
 
 ### Fixed
