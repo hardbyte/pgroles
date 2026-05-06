@@ -770,6 +770,8 @@ async fn reconcile_apply_inner(
     // Release advisory lock (always, even on error).
     advisory_lock.release().await;
 
+    crate::plan::cleanup_old_plans_best_effort(&ctx.kube_client, resource, None).await;
+
     result
 }
 
@@ -980,8 +982,6 @@ async fn apply_under_lock(
         })
         .await?;
 
-        crate::plan::cleanup_old_plans_best_effort(&ctx.kube_client, resource, None).await;
-
         info!(
             name,
             namespace,
@@ -1100,8 +1100,6 @@ async fn apply_under_lock(
             })
             .await?;
 
-            crate::plan::cleanup_old_plans_best_effort(&ctx.kube_client, resource, None).await;
-
             Ok((
                 Action::requeue(requeue_interval),
                 ReconcileOutcome::Reconciled,
@@ -1207,13 +1205,6 @@ async fn apply_under_lock(
                             })
                             .await?;
 
-                            crate::plan::cleanup_old_plans_best_effort(
-                                &ctx.kube_client,
-                                resource,
-                                None,
-                            )
-                            .await;
-
                             return Ok((
                                 Action::requeue(requeue_interval),
                                 ReconcileOutcome::Planned,
@@ -1311,13 +1302,6 @@ async fn apply_under_lock(
                             status.transient_failure_count = 0;
                         })
                         .await?;
-
-                        crate::plan::cleanup_old_plans_best_effort(
-                            &ctx.kube_client,
-                            resource,
-                            None,
-                        )
-                        .await;
 
                         return Ok((
                             Action::requeue(requeue_interval),
@@ -1494,8 +1478,6 @@ async fn apply_under_lock(
                 });
             })
             .await?;
-
-            crate::plan::cleanup_old_plans_best_effort(&ctx.kube_client, resource, None).await;
 
             info!(
                 name,
@@ -3124,6 +3106,13 @@ mod tests {
     }
 
     #[test]
+    fn retry_classifies_plan_sql_storage_as_slow() {
+        let error =
+            finalizer::Error::ApplyFailed(ReconcileError::PlanSqlStorage("gzip failed".into()));
+        assert_eq!(retry_class(&error), RetryClass::Slow);
+    }
+
+    #[test]
     fn retry_classifies_secret_missing_as_slow() {
         let error = finalizer::Error::ApplyFailed(ReconcileError::Context(Box::new(
             crate::context::ContextError::SecretMissing {
@@ -3315,6 +3304,12 @@ mod tests {
     fn error_reason_sql_exec_transient_is_apply_failed() {
         let err = ReconcileError::SqlExec(transient_sqlx_error());
         assert_eq!(err.reason(), "ApplyFailed");
+    }
+
+    #[test]
+    fn error_reason_plan_sql_storage_failed() {
+        let err = ReconcileError::PlanSqlStorage("gzip failed".into());
+        assert_eq!(err.reason(), "PlanSqlStorageFailed");
     }
 
     #[test]

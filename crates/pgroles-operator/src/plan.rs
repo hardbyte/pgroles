@@ -344,6 +344,9 @@ pub async fn create_or_update_plan(
             Ok(plan) => (plan, true),
             Err(kube::Error::Api(api_err)) if api_err.code == 409 => {
                 let existing = plans_api.get(&plan_name).await?;
+                if !should_patch_existing_plan_status(&existing) {
+                    return Ok(PlanCreationResult::Deduplicated(existing.name_any()));
+                }
                 (existing, false)
             }
             Err(err) => {
@@ -686,7 +689,7 @@ fn build_plan_sql_configmap_object(
                 ),
                 (
                     LABEL_PLAN.to_string(),
-                    sanitize_label_value(configmap_plan_name(configmap_name)),
+                    plan_label_value(configmap_plan_name(configmap_name)),
                 ),
             ])),
             annotations: Some(BTreeMap::from([
@@ -718,6 +721,10 @@ fn configmap_plan_name(configmap_name: &str) -> &str {
     configmap_name
         .strip_suffix("-sql")
         .unwrap_or(configmap_name)
+}
+
+fn plan_label_value(plan_name: &str) -> String {
+    compute_sql_hash(plan_name)[..32].to_string()
 }
 
 fn validate_existing_sql_configmap(
@@ -913,11 +920,13 @@ async fn cleanup_orphan_sql_configmaps(
         .await?;
     let known_plan_labels: BTreeSet<String> = existing_plans
         .iter()
-        .map(|plan| sanitize_label_value(&plan.name_any()))
+        .map(|plan| plan_label_value(&plan.name_any()))
         .collect();
+    let known_plan_names: BTreeSet<String> =
+        existing_plans.iter().map(ResourceExt::name_any).collect();
 
     for configmap in configmaps {
-        if !is_orphan_sql_configmap(&configmap, &known_plan_labels, now_ts) {
+        if !is_orphan_sql_configmap(&configmap, &known_plan_names, &known_plan_labels, now_ts) {
             continue;
         }
 
@@ -944,6 +953,7 @@ async fn cleanup_orphan_sql_configmaps(
 
 fn is_orphan_sql_configmap(
     configmap: &ConfigMap,
+    known_plan_names: &BTreeSet<String>,
     known_plan_labels: &BTreeSet<String>,
     now_ts: i64,
 ) -> bool {
@@ -953,9 +963,19 @@ fn is_orphan_sql_configmap(
     if !labels.contains_key(LABEL_POLICY) || !is_stale_object(configmap, now_ts) {
         return false;
     }
+    if known_plan_names.contains(configmap_plan_name(&configmap.name_any())) {
+        return false;
+    }
     labels
         .get(LABEL_PLAN)
         .map(|plan_label| !known_plan_labels.contains(plan_label))
+        .unwrap_or(true)
+}
+
+fn should_patch_existing_plan_status(plan: &PostgresPolicyPlan) -> bool {
+    plan.status
+        .as_ref()
+        .map(|status| status.phase == PlanPhase::Pending)
         .unwrap_or(true)
 }
 
@@ -1554,6 +1574,36 @@ mod tests {
     }
 
     #[test]
+    fn plan_label_value_is_stable_and_label_safe_for_long_names() {
+        let plan_name = "very-long-policy-name-".repeat(20);
+        let label = plan_label_value(&plan_name);
+        assert_eq!(label, plan_label_value(&plan_name));
+        assert_eq!(label.len(), 32);
+        assert!(label.chars().all(|ch| ch.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn existing_non_pending_plan_status_is_not_repatched_on_create_conflict() {
+        let approved = test_plan("plan-1", PlanPhase::Approved, None);
+        let applying = test_plan("plan-1", PlanPhase::Applying, None);
+        let applied = test_plan("plan-1", PlanPhase::Applied, None);
+
+        assert!(!should_patch_existing_plan_status(&approved));
+        assert!(!should_patch_existing_plan_status(&applying));
+        assert!(!should_patch_existing_plan_status(&applied));
+    }
+
+    #[test]
+    fn existing_pending_or_statusless_plan_can_be_patched_on_create_conflict() {
+        let pending = test_plan("plan-1", PlanPhase::Pending, None);
+        let mut statusless = pending.clone();
+        statusless.status = None;
+
+        assert!(should_patch_existing_plan_status(&pending));
+        assert!(should_patch_existing_plan_status(&statusless));
+    }
+
+    #[test]
     fn prepare_plan_sql_keeps_small_sql_inline() {
         let prepared = prepare_plan_sql("plan-1", "CREATE ROLE app LOGIN;").unwrap();
 
@@ -1671,15 +1721,50 @@ mod tests {
         assert!(is_orphan_sql_configmap(
             &configmap,
             &BTreeSet::new(),
+            &BTreeSet::new(),
             ORPHAN_GRACE_SECS + 1
         ));
     }
 
     #[test]
-    fn stale_policy_sql_configmap_with_known_plan_label_is_not_orphan() {
-        let plan_label = sanitize_label_value("test-policy-plan-20260506-000000-abcdef012345");
+    fn stale_policy_sql_configmap_with_current_plan_name_is_not_orphan() {
+        let plan_name = "test-policy-plan-20260506-000000-abcdef012345";
         let configmap = ConfigMap {
             metadata: k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta {
+                name: Some(format!("{plan_name}-sql")),
+                labels: Some(BTreeMap::from([
+                    (
+                        LABEL_POLICY.to_string(),
+                        sanitize_label_value("test-policy"),
+                    ),
+                    (
+                        LABEL_PLAN.to_string(),
+                        sanitize_label_value("legacy-colliding-label"),
+                    ),
+                ])),
+                creation_timestamp: Some(k8s_openapi::apimachinery::pkg::apis::meta::v1::Time(
+                    jiff::Timestamp::from_second(0).unwrap(),
+                )),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        assert!(!is_orphan_sql_configmap(
+            &configmap,
+            &BTreeSet::from([plan_name.to_string()]),
+            &BTreeSet::new(),
+            ORPHAN_GRACE_SECS + 1
+        ));
+    }
+
+    #[test]
+    fn stale_policy_sql_configmap_with_known_hash_plan_label_is_not_orphan() {
+        let plan_name = "test-policy-plan-20260506-000000-abcdef012345";
+        let plan_label = plan_label_value(plan_name);
+        let configmap = ConfigMap {
+            metadata: k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta {
+                name: Some("different-plan-sql".to_string()),
                 labels: Some(BTreeMap::from([
                     (
                         LABEL_POLICY.to_string(),
@@ -1697,7 +1782,39 @@ mod tests {
 
         assert!(!is_orphan_sql_configmap(
             &configmap,
+            &BTreeSet::new(),
             &BTreeSet::from([plan_label]),
+            ORPHAN_GRACE_SECS + 1
+        ));
+    }
+
+    #[test]
+    fn stale_policy_sql_configmap_with_only_legacy_colliding_label_is_orphan() {
+        let plan_name =
+            "very-long-policy-name-that-would-have-collided-plan-20260506-000000-abcdef012345";
+        let legacy_label = sanitize_label_value(plan_name);
+        let configmap = ConfigMap {
+            metadata: k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta {
+                name: Some("deleted-historical-plan-sql".to_string()),
+                labels: Some(BTreeMap::from([
+                    (
+                        LABEL_POLICY.to_string(),
+                        sanitize_label_value("test-policy"),
+                    ),
+                    (LABEL_PLAN.to_string(), legacy_label.clone()),
+                ])),
+                creation_timestamp: Some(k8s_openapi::apimachinery::pkg::apis::meta::v1::Time(
+                    jiff::Timestamp::from_second(0).unwrap(),
+                )),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        assert!(is_orphan_sql_configmap(
+            &configmap,
+            &BTreeSet::new(),
+            &BTreeSet::new(),
             ORPHAN_GRACE_SECS + 1
         ));
     }
