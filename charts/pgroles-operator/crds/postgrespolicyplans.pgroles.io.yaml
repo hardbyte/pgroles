@@ -291,6 +291,11 @@
                     ],
                     "type": "string"
                   },
+                  "redactedSqlHash": {
+                    "description": "SHA-256 hash of the redacted SQL preview bytes. This is for storage\nintegrity only; approval and deduplication continue to use `sql_hash`.",
+                    "nullable": true,
+                    "type": "string"
+                  },
                   "sqlHash": {
                     "description": "SHA-256 hash of the planned SQL, used to detect duplicate plans.\nIf a newly computed plan has the same hash as the current pending plan,\nthe operator can skip creating a redundant plan.",
                     "nullable": true,
@@ -301,10 +306,25 @@
                     "nullable": true,
                     "type": "string"
                   },
+                  "sqlOriginalBytes": {
+                    "description": "Uncompressed byte length of the redacted SQL preview.",
+                    "format": "int64",
+                    "nullable": true,
+                    "type": "integer"
+                  },
                   "sqlRef": {
                     "description": "Reference to ConfigMap containing the full SQL (for large plans).",
                     "nullable": true,
                     "properties": {
+                      "compression": {
+                        "description": "Compression used for the referenced SQL content. Missing means older\nuncompressed ConfigMap data.",
+                        "enum": [
+                          "gzip",
+                          null
+                        ],
+                        "nullable": true,
+                        "type": "string"
+                      },
                       "key": {
                         "type": "string"
                       },
@@ -323,6 +343,17 @@
                     "format": "int64",
                     "nullable": true,
                     "type": "integer"
+                  },
+                  "sqlStoredBytes": {
+                    "description": "Stored byte length of the SQL preview after inline/truncation/compression.",
+                    "format": "int64",
+                    "nullable": true,
+                    "type": "integer"
+                  },
+                  "sqlTruncated": {
+                    "default": false,
+                    "description": "True when the SQL preview was truncated because the full redacted SQL\ncould not be persisted within Kubernetes object limits.",
+                    "type": "boolean"
                   }
                 },
                 "type": "object"

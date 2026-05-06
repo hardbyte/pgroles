@@ -145,6 +145,9 @@ pub enum ReconcileError {
 
     #[error("password generation error: {0}")]
     PasswordGeneration(#[from] Box<crate::password::PasswordError>),
+
+    #[error("plan SQL storage error: {0}")]
+    PlanSqlStorage(String),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -350,7 +353,8 @@ fn retry_class_for_reconcile_error(error: &ReconcileError) -> RetryClass {
         | ReconcileError::ConflictingPolicy(_)
         | ReconcileError::UnsafeRoleDrops(_)
         | ReconcileError::EmptyPasswordSecret { .. }
-        | ReconcileError::NoNamespace => RetryClass::Slow,
+        | ReconcileError::NoNamespace
+        | ReconcileError::PlanSqlStorage(_) => RetryClass::Slow,
         ReconcileError::PasswordGeneration(err) => {
             if err.is_transient() {
                 RetryClass::Transient
@@ -976,10 +980,7 @@ async fn apply_under_lock(
         })
         .await?;
 
-        // Clean up old plans.
-        if let Err(err) = crate::plan::cleanup_old_plans(&ctx.kube_client, resource, None).await {
-            tracing::warn!(%err, "failed to clean up old plans");
-        }
+        crate::plan::cleanup_old_plans_best_effort(&ctx.kube_client, resource, None).await;
 
         info!(
             name,
@@ -1099,11 +1100,7 @@ async fn apply_under_lock(
             })
             .await?;
 
-            // Clean up old plans.
-            if let Err(err) = crate::plan::cleanup_old_plans(&ctx.kube_client, resource, None).await
-            {
-                tracing::warn!(%err, "failed to clean up old plans");
-            }
+            crate::plan::cleanup_old_plans_best_effort(&ctx.kube_client, resource, None).await;
 
             Ok((
                 Action::requeue(requeue_interval),
@@ -1210,12 +1207,12 @@ async fn apply_under_lock(
                             })
                             .await?;
 
-                            if let Err(err) =
-                                crate::plan::cleanup_old_plans(&ctx.kube_client, resource, None)
-                                    .await
-                            {
-                                tracing::warn!(%err, "failed to clean up old plans");
-                            }
+                            crate::plan::cleanup_old_plans_best_effort(
+                                &ctx.kube_client,
+                                resource,
+                                None,
+                            )
+                            .await;
 
                             return Ok((
                                 Action::requeue(requeue_interval),
@@ -1315,11 +1312,12 @@ async fn apply_under_lock(
                         })
                         .await?;
 
-                        if let Err(err) =
-                            crate::plan::cleanup_old_plans(&ctx.kube_client, resource, None).await
-                        {
-                            tracing::warn!(%err, "failed to clean up old plans");
-                        }
+                        crate::plan::cleanup_old_plans_best_effort(
+                            &ctx.kube_client,
+                            resource,
+                            None,
+                        )
+                        .await;
 
                         return Ok((
                             Action::requeue(requeue_interval),
@@ -1497,10 +1495,7 @@ async fn apply_under_lock(
             })
             .await?;
 
-            if let Err(err) = crate::plan::cleanup_old_plans(&ctx.kube_client, resource, None).await
-            {
-                tracing::warn!(%err, "failed to clean up old plans");
-            }
+            crate::plan::cleanup_old_plans_best_effort(&ctx.kube_client, resource, None).await;
 
             info!(
                 name,
@@ -2076,6 +2071,7 @@ impl ReconcileError {
             ReconcileError::EmptyPasswordSecret { .. } => "InvalidSpec",
             ReconcileError::MissingDatabaseObjects(_) => "MissingDatabaseObject",
             ReconcileError::PasswordGeneration(_) => "SecretFetchFailed",
+            ReconcileError::PlanSqlStorage(_) => "PlanSqlStorageFailed",
             ReconcileError::Kube(_) => "KubernetesApiError",
             ReconcileError::NoNamespace => "InvalidResource",
         }

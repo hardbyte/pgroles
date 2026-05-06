@@ -181,6 +181,9 @@ pub const LABEL_POLICY: &str = "pgroles.io/policy";
 /// Label key for the managed database identity on plan resources.
 pub const LABEL_DATABASE_IDENTITY: &str = "pgroles.io/database-identity";
 
+/// Label key for the plan name on SQL storage resources.
+pub const LABEL_PLAN: &str = "pgroles.io/plan";
+
 impl From<CrdReconciliationMode> for pgroles_core::diff::ReconciliationMode {
     fn from(crd: CrdReconciliationMode) -> Self {
         match crd {
@@ -849,6 +852,10 @@ pub struct PostgresPolicyPlanStatus {
     /// Inline SQL for small plans (below a size threshold).
     #[serde(default)]
     pub sql_inline: Option<String>,
+    /// True when the SQL preview was truncated because the full redacted SQL
+    /// could not be persisted within Kubernetes object limits.
+    #[serde(default)]
+    pub sql_truncated: bool,
     /// Timestamp when the plan was computed.
     #[serde(default)]
     pub computed_at: Option<String>,
@@ -874,6 +881,16 @@ pub struct PostgresPolicyPlanStatus {
     /// grants expand to many per-object statements.
     #[serde(default)]
     pub sql_statements: Option<i64>,
+    /// SHA-256 hash of the redacted SQL preview bytes. This is for storage
+    /// integrity only; approval and deduplication continue to use `sql_hash`.
+    #[serde(default)]
+    pub redacted_sql_hash: Option<String>,
+    /// Uncompressed byte length of the redacted SQL preview.
+    #[serde(default)]
+    pub sql_original_bytes: Option<i64>,
+    /// Stored byte length of the SQL preview after inline/truncation/compression.
+    #[serde(default)]
+    pub sql_stored_bytes: Option<i64>,
 }
 
 /// Reference to a ConfigMap containing SQL for a plan.
@@ -881,6 +898,17 @@ pub struct PostgresPolicyPlanStatus {
 pub struct SqlRef {
     pub name: String,
     pub key: String,
+    /// Compression used for the referenced SQL content. Missing means older
+    /// uncompressed ConfigMap data.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compression: Option<SqlCompression>,
+}
+
+/// Compression format used for persisted plan SQL previews.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum SqlCompression {
+    Gzip,
 }
 
 /// Phase of a `PostgresPolicyPlan`.
@@ -3475,10 +3503,28 @@ retirements:
         assert!(status.sql_ref.is_none());
         assert!(status.sql_hash.is_none());
         assert!(status.sql_inline.is_none());
+        assert!(!status.sql_truncated);
+        assert!(status.redacted_sql_hash.is_none());
+        assert!(status.sql_original_bytes.is_none());
+        assert!(status.sql_stored_bytes.is_none());
         assert!(status.change_summary.is_none());
         assert!(status.computed_at.is_none());
         assert!(status.applied_at.is_none());
         assert!(status.last_error.is_none());
+    }
+
+    #[test]
+    fn sql_ref_missing_compression_deserializes_as_uncompressed_legacy_shape() {
+        let json = serde_json::json!({
+            "name": "legacy-plan-sql",
+            "key": "plan.sql"
+        });
+
+        let sql_ref: SqlRef = serde_json::from_value(json).expect("legacy SqlRef should decode");
+
+        assert_eq!(sql_ref.name, "legacy-plan-sql");
+        assert_eq!(sql_ref.key, "plan.sql");
+        assert_eq!(sql_ref.compression, None);
     }
 
     #[test]

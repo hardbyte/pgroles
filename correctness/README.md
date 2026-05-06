@@ -25,6 +25,16 @@ Races modeled:
 4. Database drift changes between plan creation and approval
 5. Hash dedup skips identical plans
 
+### `races/PlanStorage.tla`
+
+Verifies the Kubernetes persistence ordering around plan SQL previews:
+
+- A visible plan is never created before its SQL review artifact is ready
+- SQL persistence failure does not materialise a status-less plan
+- Stale status-less plans are eventually collected
+- Orphan SQL ConfigMaps are eventually collected
+- At most one actionable plan exists in the modeled lifecycle
+
 ## Running
 
 ```bash

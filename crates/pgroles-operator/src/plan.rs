@@ -4,20 +4,25 @@
 //! reconciliation plans. Plans represent computed SQL change sets that may
 //! require explicit approval before execution against a database.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
+use std::io::Write;
+use std::time::Duration;
 
+use flate2::Compression;
+use flate2::write::GzEncoder;
+use k8s_openapi::ByteString;
 use k8s_openapi::api::core::v1::ConfigMap;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference;
-use kube::api::{Api, ListParams, Patch, PatchParams, PostParams};
+use kube::api::{Api, DeleteParams, ListParams, Patch, PatchParams, PostParams};
 use kube::{Client, Resource, ResourceExt};
 use sha2::{Digest, Sha256};
 use tracing::info;
 
 use crate::crd::{
-    ChangeSummary, CrdReconciliationMode, LABEL_DATABASE_IDENTITY, LABEL_POLICY,
+    ChangeSummary, CrdReconciliationMode, LABEL_DATABASE_IDENTITY, LABEL_PLAN, LABEL_POLICY,
     PLAN_APPROVED_ANNOTATION, PLAN_REJECTED_ANNOTATION, PlanPhase, PlanReference, PolicyCondition,
     PolicyPlanRef, PostgresPolicy, PostgresPolicyPlan, PostgresPolicyPlanSpec,
-    PostgresPolicyPlanStatus, SqlRef,
+    PostgresPolicyPlanStatus, SqlCompression, SqlRef,
 };
 use crate::reconciler::ReconcileError;
 
@@ -48,8 +53,18 @@ impl PlanCreationResult {
 /// Maximum inline SQL size in plan status before spilling to a ConfigMap.
 const MAX_INLINE_SQL_BYTES: usize = 16 * 1024;
 
-/// ConfigMap data key for the SQL content.
-const SQL_CONFIGMAP_KEY: &str = "plan.sql";
+/// ConfigMap binaryData key for gzip-compressed SQL content.
+const SQL_CONFIGMAP_GZIP_KEY: &str = "plan.sql.gz";
+
+/// Conservative stored-byte ceiling for SQL ConfigMaps. Kubernetes caps
+/// ConfigMap data at 1 MiB; this leaves room for metadata and future labels.
+const MAX_CONFIGMAP_SQL_BYTES: usize = 900 * 1024;
+
+/// Stale status-less plan and orphan ConfigMap grace period.
+const ORPHAN_GRACE_SECS: i64 = 60;
+
+/// Best-effort cleanup should never block a fresh reconcile for long.
+const CLEANUP_TIMEOUT_SECS: u64 = 5;
 
 /// Default maximum number of historical plans to retain per policy.
 const DEFAULT_MAX_PLANS: usize = 10;
@@ -58,6 +73,55 @@ const DEFAULT_MAX_PLANS: usize = 10;
 /// dedup check to consider it a match. Plans older than this are ignored so
 /// that retries after the user fixes the environment are not blocked.
 const FAILED_PLAN_DEDUP_WINDOW_SECS: i64 = 120;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PlanSqlArtifact {
+    Inline(String),
+    CompressedConfigMap {
+        configmap_name: String,
+        key: String,
+        compressed_sql: Vec<u8>,
+    },
+    TruncatedInline(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PreparedPlanSql {
+    artifact: PlanSqlArtifact,
+    redacted_sql_hash: String,
+    original_bytes: usize,
+    stored_bytes: usize,
+}
+
+impl PreparedPlanSql {
+    fn sql_ref(&self) -> Option<SqlRef> {
+        match &self.artifact {
+            PlanSqlArtifact::CompressedConfigMap {
+                configmap_name,
+                key,
+                ..
+            } => Some(SqlRef {
+                name: configmap_name.clone(),
+                key: key.clone(),
+                compression: Some(SqlCompression::Gzip),
+            }),
+            PlanSqlArtifact::Inline(_) | PlanSqlArtifact::TruncatedInline(_) => None,
+        }
+    }
+
+    fn sql_inline(&self) -> Option<String> {
+        match &self.artifact {
+            PlanSqlArtifact::Inline(sql) | PlanSqlArtifact::TruncatedInline(sql) => {
+                Some(sql.clone())
+            }
+            PlanSqlArtifact::CompressedConfigMap { .. } => None,
+        }
+    }
+
+    fn is_truncated(&self) -> bool {
+        matches!(self.artifact, PlanSqlArtifact::TruncatedInline(_))
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Plan approval check
@@ -111,10 +175,10 @@ pub fn check_plan_approval(plan: &PostgresPolicyPlan) -> PlanApprovalState {
 /// 1. Renders the full executable SQL from the changes
 /// 2. Computes SHA-256 of the full SQL (before any redaction/truncation)
 /// 3. Checks for an existing Pending plan with the same hash (dedup)
-/// 4. Marks any existing Pending plan with a different hash as Superseded
+/// 4. Persists the SQL preview artifact, if needed
 /// 5. Creates the new plan resource with ownerReferences
-/// 6. Creates a ConfigMap for large SQL, or stores inline
-/// 7. Updates the plan status
+/// 6. Updates the plan status
+/// 7. Marks any older Pending plans with a different hash as Superseded
 #[allow(clippy::too_many_arguments)]
 pub async fn create_or_update_plan(
     client: &Client,
@@ -141,6 +205,8 @@ pub async fn create_or_update_plan(
 
     // 4. Render redacted SQL for display (passwords masked).
     let redacted_sql = render_redacted_sql(changes, sql_context);
+
+    cleanup_old_plans_best_effort(client, policy, None).await;
 
     let plans_api: Api<PostgresPolicyPlan> = Api::namespaced(client.clone(), &namespace);
 
@@ -198,34 +264,21 @@ pub async fn create_or_update_plan(
         }
     }
 
-    // 6. Mark any existing Pending plans as Superseded.
-    for plan in &existing_plans {
-        if let Some(ref status) = plan.status
-            && status.phase == PlanPhase::Pending
-        {
-            let plan_name = plan.name_any();
-            info!(
-                plan = %plan_name,
-                policy = %policy_name,
-                "marking existing pending plan as Superseded"
-            );
-            let superseded_status = PostgresPolicyPlanStatus {
-                phase: PlanPhase::Superseded,
-                ..status.clone()
-            };
-            let patch = serde_json::json!({ "status": superseded_status });
-            plans_api
-                .patch_status(
-                    &plan_name,
-                    &PatchParams::apply("pgroles-operator"),
-                    &Patch::Merge(&patch),
-                )
-                .await?;
-        }
-    }
+    // 6. Generate a plan name using timestamp plus SQL hash. The hash suffix
+    // makes same-second retries after content persistence failures idempotent.
+    let plan_name = generate_plan_name(&policy_name, &sql_hash);
+    let prepared_sql = prepare_plan_sql(&plan_name, &redacted_sql)?;
 
-    // 7. Generate a unique plan name using a timestamp.
-    let plan_name = generate_plan_name(&policy_name);
+    // 7. Persist SQL content before materialising the visible plan resource.
+    let sql_configmap_name = create_plan_sql_configmap(
+        client,
+        policy,
+        &namespace,
+        &policy_name,
+        database_identity,
+        &prepared_sql,
+    )
+    .await?;
 
     // 8. Build ownerReference pointing to the parent policy.
     let owner_ref = build_owner_reference(policy);
@@ -272,50 +325,45 @@ pub async fn create_or_update_plan(
             "pgroles.io/sql-hash".to_string(),
             sql_hash[..12].to_string(),
         ),
+        (
+            "pgroles.io/redacted-sql-hash".to_string(),
+            prepared_sql.redacted_sql_hash[..12].to_string(),
+        ),
+        (
+            "pgroles.io/sql-original-bytes".to_string(),
+            prepared_sql.original_bytes.to_string(),
+        ),
+        (
+            "pgroles.io/sql-stored-bytes".to_string(),
+            prepared_sql.stored_bytes.to_string(),
+        ),
     ]));
 
-    let created_plan = plans_api.create(&PostParams::default(), &plan).await?;
+    let (created_plan, created_new_plan) =
+        match plans_api.create(&PostParams::default(), &plan).await {
+            Ok(plan) => (plan, true),
+            Err(kube::Error::Api(api_err)) if api_err.code == 409 => {
+                let existing = plans_api.get(&plan_name).await?;
+                (existing, false)
+            }
+            Err(err) => {
+                if let Some(configmap_name) = sql_configmap_name.as_deref() {
+                    delete_configmap_best_effort(client, &namespace, configmap_name).await;
+                }
+                return Err(err.into());
+            }
+        };
     let plan_name = created_plan.name_any();
 
-    // 10. Handle SQL storage: inline or ConfigMap.
-    let (sql_inline, sql_ref) = if redacted_sql.len() <= MAX_INLINE_SQL_BYTES {
-        (Some(redacted_sql), None)
-    } else {
-        // Create a ConfigMap for the full redacted SQL.
-        let configmap_name = format!("{plan_name}-sql");
-        let configmap = ConfigMap {
-            metadata: k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta {
-                name: Some(configmap_name.clone()),
-                namespace: Some(namespace.clone()),
-                owner_references: Some(vec![build_plan_owner_reference(&created_plan)]),
-                labels: Some(BTreeMap::from([(
-                    LABEL_POLICY.to_string(),
-                    sanitize_label_value(&policy_name),
-                )])),
-                ..Default::default()
-            },
-            data: Some(BTreeMap::from([(
-                SQL_CONFIGMAP_KEY.to_string(),
-                redacted_sql,
-            )])),
-            ..Default::default()
-        };
-
-        let configmaps_api: Api<ConfigMap> = Api::namespaced(client.clone(), &namespace);
-        configmaps_api
-            .create(&PostParams::default(), &configmap)
-            .await?;
-
-        (
-            None,
-            Some(SqlRef {
-                name: configmap_name,
-                key: SQL_CONFIGMAP_KEY.to_string(),
-            }),
-        )
-    };
-
     // 11. Update plan status.
+    let computed_message = if prepared_sql.is_truncated() {
+        format!(
+            "Plan computed with {} change(s); SQL preview truncated because compressed SQL exceeded Kubernetes ConfigMap limits",
+            change_summary.total
+        )
+    } else {
+        format!("Plan computed with {} change(s)", change_summary.total)
+    };
     let plan_status = PostgresPolicyPlanStatus {
         phase: PlanPhase::Pending,
         conditions: vec![
@@ -323,10 +371,7 @@ pub async fn create_or_update_plan(
                 condition_type: "Computed".to_string(),
                 status: "True".to_string(),
                 reason: Some("PlanComputed".to_string()),
-                message: Some(format!(
-                    "Plan computed with {} change(s)",
-                    change_summary.total
-                )),
+                message: Some(computed_message),
                 last_transition_time: Some(crate::crd::now_rfc3339()),
             },
             PolicyCondition {
@@ -338,8 +383,9 @@ pub async fn create_or_update_plan(
             },
         ],
         change_summary: Some(change_summary.clone()),
-        sql_ref,
-        sql_inline,
+        sql_ref: prepared_sql.sql_ref(),
+        sql_inline: prepared_sql.sql_inline(),
+        sql_truncated: prepared_sql.is_truncated(),
         computed_at: Some(crate::crd::now_rfc3339()),
         applied_at: None,
         last_error: None,
@@ -347,16 +393,57 @@ pub async fn create_or_update_plan(
         applying_since: None,
         failed_at: None,
         sql_statements: Some(sql_statement_count),
+        redacted_sql_hash: Some(prepared_sql.redacted_sql_hash.clone()),
+        sql_original_bytes: Some(prepared_sql.original_bytes as i64),
+        sql_stored_bytes: Some(prepared_sql.stored_bytes as i64),
     };
 
     let status_patch = serde_json::json!({ "status": plan_status });
-    plans_api
+    if let Err(err) = plans_api
         .patch_status(
             &plan_name,
             &PatchParams::apply("pgroles-operator"),
             &Patch::Merge(&status_patch),
         )
-        .await?;
+        .await
+    {
+        if created_new_plan {
+            delete_plan_best_effort(&plans_api, &plan_name).await;
+        }
+        if let Some(configmap_name) = sql_configmap_name.as_deref() {
+            delete_configmap_best_effort(client, &namespace, configmap_name).await;
+        }
+        return Err(err.into());
+    }
+
+    // 12. Mark any existing Pending plans as Superseded after the new plan is
+    // fully visible. This avoids losing the current actionable plan if SQL
+    // persistence fails before the replacement is materialised.
+    for plan in &existing_plans {
+        if let Some(ref status) = plan.status
+            && status.phase == PlanPhase::Pending
+            && plan.name_any() != plan_name
+        {
+            let old_plan_name = plan.name_any();
+            info!(
+                plan = %old_plan_name,
+                policy = %policy_name,
+                "marking existing pending plan as Superseded"
+            );
+            let superseded_status = PostgresPolicyPlanStatus {
+                phase: PlanPhase::Superseded,
+                ..status.clone()
+            };
+            let patch = serde_json::json!({ "status": superseded_status });
+            plans_api
+                .patch_status(
+                    &old_plan_name,
+                    &PatchParams::apply("pgroles-operator"),
+                    &Patch::Merge(&patch),
+                )
+                .await?;
+        }
+    }
 
     info!(
         plan = %plan_name,
@@ -374,8 +461,10 @@ pub async fn create_or_update_plan(
 
 /// Execute an approved plan against the database.
 ///
-/// Reads SQL from inline status or the referenced ConfigMap, executes it in
-/// a transaction, and updates the plan status to Applied or Failed.
+/// Re-renders executable SQL from the reconciler's in-memory changes, executes
+/// it in a transaction, and updates the plan status to Applied or Failed.
+/// Persisted SQL on the plan is a redacted review artifact only; apply must not
+/// read it because large plans may store only a truncated preview.
 pub async fn execute_plan(
     client: &Client,
     plan: &PostgresPolicyPlan,
@@ -455,6 +544,206 @@ pub async fn execute_plan(
     }
 }
 
+fn prepare_plan_sql(
+    plan_name: &str,
+    redacted_sql: &str,
+) -> Result<PreparedPlanSql, ReconcileError> {
+    let original_bytes = redacted_sql.len();
+    let redacted_sql_hash = compute_sql_hash(redacted_sql);
+
+    if original_bytes <= MAX_INLINE_SQL_BYTES {
+        return Ok(PreparedPlanSql {
+            artifact: PlanSqlArtifact::Inline(redacted_sql.to_string()),
+            redacted_sql_hash,
+            original_bytes,
+            stored_bytes: original_bytes,
+        });
+    }
+
+    let compressed_sql = gzip_bytes(redacted_sql.as_bytes())?;
+    if compressed_sql.len() <= MAX_CONFIGMAP_SQL_BYTES {
+        let stored_bytes = compressed_sql.len();
+        return Ok(PreparedPlanSql {
+            artifact: PlanSqlArtifact::CompressedConfigMap {
+                configmap_name: format!("{plan_name}-sql"),
+                key: SQL_CONFIGMAP_GZIP_KEY.to_string(),
+                compressed_sql,
+            },
+            redacted_sql_hash,
+            original_bytes,
+            stored_bytes,
+        });
+    }
+
+    let truncated = truncate_utf8(
+        redacted_sql,
+        MAX_INLINE_SQL_BYTES,
+        "\n-- truncated: compressed SQL preview exceeded Kubernetes ConfigMap limits --",
+    );
+    let stored_bytes = truncated.len();
+    Ok(PreparedPlanSql {
+        artifact: PlanSqlArtifact::TruncatedInline(truncated),
+        redacted_sql_hash,
+        original_bytes,
+        stored_bytes,
+    })
+}
+
+fn gzip_bytes(bytes: &[u8]) -> Result<Vec<u8>, ReconcileError> {
+    let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+    encoder
+        .write_all(bytes)
+        .map_err(|err| ReconcileError::PlanSqlStorage(err.to_string()))?;
+    encoder
+        .finish()
+        .map_err(|err| ReconcileError::PlanSqlStorage(err.to_string()))
+}
+
+fn truncate_utf8(text: &str, max_bytes: usize, marker: &str) -> String {
+    if text.len() <= max_bytes {
+        return text.to_string();
+    }
+
+    let target_len = max_bytes.saturating_sub(marker.len());
+    let mut end = target_len.min(text.len());
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+
+    let mut truncated = text[..end].to_string();
+    truncated.push_str(marker);
+    truncated
+}
+
+async fn create_plan_sql_configmap(
+    client: &Client,
+    policy: &PostgresPolicy,
+    namespace: &str,
+    policy_name: &str,
+    database_identity: &str,
+    prepared_sql: &PreparedPlanSql,
+) -> Result<Option<String>, ReconcileError> {
+    let PlanSqlArtifact::CompressedConfigMap {
+        configmap_name,
+        key: _,
+        compressed_sql: _,
+    } = &prepared_sql.artifact
+    else {
+        return Ok(None);
+    };
+
+    let configmap = build_plan_sql_configmap_object(
+        policy,
+        namespace,
+        policy_name,
+        database_identity,
+        prepared_sql,
+    )?;
+
+    let configmaps_api: Api<ConfigMap> = Api::namespaced(client.clone(), namespace);
+    match configmaps_api
+        .create(&PostParams::default(), &configmap)
+        .await
+    {
+        Ok(_) => Ok(Some(configmap_name.clone())),
+        Err(kube::Error::Api(api_err)) if api_err.code == 409 => {
+            let existing = configmaps_api.get(configmap_name).await?;
+            validate_existing_sql_configmap(&existing, prepared_sql)?;
+            Ok(Some(configmap_name.clone()))
+        }
+        Err(err) => Err(err.into()),
+    }
+}
+
+fn build_plan_sql_configmap_object(
+    policy: &PostgresPolicy,
+    namespace: &str,
+    policy_name: &str,
+    database_identity: &str,
+    prepared_sql: &PreparedPlanSql,
+) -> Result<ConfigMap, ReconcileError> {
+    let PlanSqlArtifact::CompressedConfigMap {
+        configmap_name,
+        key,
+        compressed_sql,
+    } = &prepared_sql.artifact
+    else {
+        return Err(ReconcileError::PlanSqlStorage(
+            "cannot build ConfigMap for inline plan SQL".to_string(),
+        ));
+    };
+
+    Ok(ConfigMap {
+        metadata: k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta {
+            name: Some(configmap_name.clone()),
+            namespace: Some(namespace.to_string()),
+            owner_references: Some(vec![build_owner_reference(policy)]),
+            labels: Some(BTreeMap::from([
+                (LABEL_POLICY.to_string(), sanitize_label_value(policy_name)),
+                (
+                    LABEL_DATABASE_IDENTITY.to_string(),
+                    sanitize_label_value(database_identity),
+                ),
+                (
+                    LABEL_PLAN.to_string(),
+                    sanitize_label_value(configmap_plan_name(configmap_name)),
+                ),
+            ])),
+            annotations: Some(BTreeMap::from([
+                ("pgroles.io/sql-compression".to_string(), "gzip".to_string()),
+                (
+                    "pgroles.io/redacted-sql-hash".to_string(),
+                    prepared_sql.redacted_sql_hash.clone(),
+                ),
+                (
+                    "pgroles.io/sql-original-bytes".to_string(),
+                    prepared_sql.original_bytes.to_string(),
+                ),
+                (
+                    "pgroles.io/sql-stored-bytes".to_string(),
+                    prepared_sql.stored_bytes.to_string(),
+                ),
+            ])),
+            ..Default::default()
+        },
+        binary_data: Some(BTreeMap::from([(
+            key.clone(),
+            ByteString(compressed_sql.clone()),
+        )])),
+        ..Default::default()
+    })
+}
+
+fn configmap_plan_name(configmap_name: &str) -> &str {
+    configmap_name
+        .strip_suffix("-sql")
+        .unwrap_or(configmap_name)
+}
+
+fn validate_existing_sql_configmap(
+    configmap: &ConfigMap,
+    prepared_sql: &PreparedPlanSql,
+) -> Result<(), ReconcileError> {
+    let Some(annotations) = configmap.metadata.annotations.as_ref() else {
+        return Err(ReconcileError::PlanSqlStorage(format!(
+            "existing ConfigMap {} is missing SQL storage annotations",
+            configmap.name_any()
+        )));
+    };
+    let hash_matches = annotations
+        .get("pgroles.io/redacted-sql-hash")
+        .map(|hash| hash == &prepared_sql.redacted_sql_hash)
+        .unwrap_or(false);
+    if hash_matches {
+        Ok(())
+    } else {
+        Err(ReconcileError::PlanSqlStorage(format!(
+            "existing ConfigMap {} does not match computed SQL preview hash",
+            configmap.name_any()
+        )))
+    }
+}
+
 /// Execute SQL changes in a database transaction.
 ///
 /// Returns the number of statements executed on success.
@@ -487,10 +776,33 @@ async fn execute_changes_in_transaction(
 // Plan cleanup / retention
 // ---------------------------------------------------------------------------
 
+/// Best-effort cleanup wrapper used on hot reconciliation paths. Cleanup should
+/// reduce leaked resources, never block otherwise valid reconciliation.
+pub async fn cleanup_old_plans_best_effort(
+    client: &Client,
+    policy: &PostgresPolicy,
+    max_plans: Option<usize>,
+) {
+    match tokio::time::timeout(
+        Duration::from_secs(CLEANUP_TIMEOUT_SECS),
+        cleanup_old_plans(client, policy, max_plans),
+    )
+    .await
+    {
+        Ok(Ok(())) => {}
+        Ok(Err(err)) => tracing::warn!(%err, "failed to clean up old plans"),
+        Err(_) => tracing::warn!(
+            timeout_secs = CLEANUP_TIMEOUT_SECS,
+            "timed out cleaning up old plans"
+        ),
+    }
+}
+
 /// Clean up old plans for a policy, retaining at most `max_plans` terminal plans.
 ///
-/// Terminal plans are those in Applied, Failed, Superseded, or Rejected phase.
-/// Pending and Approved plans are never cleaned up by this function.
+/// Terminal plans are those in Applied, Failed, Superseded, or Rejected phase;
+/// Pending, Approved, and Applying plans are retained. Status-less plans and
+/// SQL ConfigMaps older than a short grace period are treated as stale orphans.
 pub async fn cleanup_old_plans(
     client: &Client,
     policy: &PostgresPolicy,
@@ -505,6 +817,26 @@ pub async fn cleanup_old_plans(
     let existing_plans = plans_api
         .list(&ListParams::default().labels(&label_selector))
         .await?;
+    let now_ts = now_epoch_secs();
+
+    for plan in existing_plans
+        .iter()
+        .filter(|plan| is_stale_statusless_plan(plan, now_ts))
+    {
+        let plan_name = plan.name_any();
+        info!(
+            plan = %plan_name,
+            policy = %policy_name,
+            "cleaning up stale status-less plan"
+        );
+        if let Err(err) = plans_api.delete(&plan_name, &DeleteParams::default()).await {
+            tracing::warn!(
+                plan = %plan_name,
+                %err,
+                "failed to delete stale status-less plan during cleanup"
+            );
+        }
+    }
 
     // Collect terminal plans sorted by creation timestamp (oldest first).
     let mut terminal_plans: Vec<&PostgresPolicyPlan> = existing_plans
@@ -525,33 +857,40 @@ pub async fn cleanup_old_plans(
         })
         .collect();
 
-    if terminal_plans.len() <= max_plans {
-        return Ok(());
-    }
+    if terminal_plans.len() > max_plans {
+        // Sort by creation timestamp ascending (oldest first).
+        terminal_plans.sort_by(|a, b| {
+            let a_time = a.metadata.creation_timestamp.as_ref();
+            let b_time = b.metadata.creation_timestamp.as_ref();
+            a_time.cmp(&b_time)
+        });
 
-    // Sort by creation timestamp ascending (oldest first).
-    terminal_plans.sort_by(|a, b| {
-        let a_time = a.metadata.creation_timestamp.as_ref();
-        let b_time = b.metadata.creation_timestamp.as_ref();
-        a_time.cmp(&b_time)
-    });
-
-    let plans_to_delete = terminal_plans.len() - max_plans;
-    for plan in terminal_plans.into_iter().take(plans_to_delete) {
-        let plan_name = plan.name_any();
-        info!(
-            plan = %plan_name,
-            policy = %policy_name,
-            "cleaning up old plan"
-        );
-        if let Err(err) = plans_api.delete(&plan_name, &Default::default()).await {
-            tracing::warn!(
+        let plans_to_delete = terminal_plans.len() - max_plans;
+        for plan in terminal_plans.into_iter().take(plans_to_delete) {
+            let plan_name = plan.name_any();
+            info!(
                 plan = %plan_name,
-                %err,
-                "failed to delete old plan during cleanup"
+                policy = %policy_name,
+                "cleaning up old plan"
             );
+            if let Err(err) = plans_api.delete(&plan_name, &DeleteParams::default()).await {
+                tracing::warn!(
+                    plan = %plan_name,
+                    %err,
+                    "failed to delete old plan during cleanup"
+                );
+            }
         }
     }
+
+    cleanup_orphan_sql_configmaps(
+        client,
+        &namespace,
+        &policy_name,
+        &existing_plans.items,
+        now_ts,
+    )
+    .await?;
 
     Ok(())
 }
@@ -559,6 +898,106 @@ pub async fn cleanup_old_plans(
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+async fn cleanup_orphan_sql_configmaps(
+    client: &Client,
+    namespace: &str,
+    policy_name: &str,
+    existing_plans: &[PostgresPolicyPlan],
+    now_ts: i64,
+) -> Result<(), ReconcileError> {
+    let configmaps_api: Api<ConfigMap> = Api::namespaced(client.clone(), namespace);
+    let label_selector = format!("{LABEL_POLICY}={}", sanitize_label_value(policy_name));
+    let configmaps = configmaps_api
+        .list(&ListParams::default().labels(&label_selector))
+        .await?;
+    let known_plan_labels: BTreeSet<String> = existing_plans
+        .iter()
+        .map(|plan| sanitize_label_value(&plan.name_any()))
+        .collect();
+
+    for configmap in configmaps {
+        if !is_orphan_sql_configmap(&configmap, &known_plan_labels, now_ts) {
+            continue;
+        }
+
+        let configmap_name = configmap.name_any();
+        info!(
+            configmap = %configmap_name,
+            policy = %policy_name,
+            "cleaning up orphan plan SQL ConfigMap"
+        );
+        if let Err(err) = configmaps_api
+            .delete(&configmap_name, &DeleteParams::default())
+            .await
+        {
+            tracing::warn!(
+                configmap = %configmap_name,
+                %err,
+                "failed to delete orphan plan SQL ConfigMap during cleanup"
+            );
+        }
+    }
+
+    Ok(())
+}
+
+fn is_orphan_sql_configmap(
+    configmap: &ConfigMap,
+    known_plan_labels: &BTreeSet<String>,
+    now_ts: i64,
+) -> bool {
+    let Some(labels) = configmap.metadata.labels.as_ref() else {
+        return false;
+    };
+    if !labels.contains_key(LABEL_POLICY) || !is_stale_object(configmap, now_ts) {
+        return false;
+    }
+    labels
+        .get(LABEL_PLAN)
+        .map(|plan_label| !known_plan_labels.contains(plan_label))
+        .unwrap_or(true)
+}
+
+fn is_stale_statusless_plan(plan: &PostgresPolicyPlan, now_ts: i64) -> bool {
+    plan.status.is_none() && is_stale_object(plan, now_ts)
+}
+
+fn is_stale_object<K>(resource: &K, now_ts: i64) -> bool
+where
+    K: Resource,
+{
+    resource
+        .meta()
+        .creation_timestamp
+        .as_ref()
+        .map(|timestamp| now_ts.saturating_sub(timestamp.0.as_second()) > ORPHAN_GRACE_SECS)
+        .unwrap_or(false)
+}
+
+async fn delete_plan_best_effort(plans_api: &Api<PostgresPolicyPlan>, plan_name: &str) {
+    if let Err(err) = plans_api.delete(plan_name, &DeleteParams::default()).await {
+        tracing::warn!(
+            plan = %plan_name,
+            %err,
+            "failed to roll back plan after status update failure"
+        );
+    }
+}
+
+async fn delete_configmap_best_effort(client: &Client, namespace: &str, configmap_name: &str) {
+    let configmaps_api: Api<ConfigMap> = Api::namespaced(client.clone(), namespace);
+    if let Err(err) = configmaps_api
+        .delete(configmap_name, &DeleteParams::default())
+        .await
+    {
+        tracing::warn!(
+            configmap = %configmap_name,
+            %err,
+            "failed to roll back plan SQL ConfigMap"
+        );
+    }
+}
 
 /// Render the full executable SQL from changes (including real passwords).
 pub(crate) fn render_full_sql(
@@ -607,28 +1046,27 @@ pub(crate) fn compute_sql_hash(sql: &str) -> String {
     hex
 }
 
-/// Generate a plan name from policy name and current timestamp.
+/// Generate a plan name from policy name, current timestamp, and SQL hash.
 ///
-/// Format: `{policy-name}-plan-{YYYYMMDD-HHMMSS}-{millis}{random}`
+/// Format: `{policy-name}-plan-{YYYYMMDD-HHMMSS}-{hash-prefix}`
 ///
-/// A millisecond and random suffix is appended to avoid collisions when the
-/// operator retries within the same second.
-fn generate_plan_name(policy_name: &str) -> String {
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default();
+/// The hash suffix makes retries within the same second idempotent if SQL
+/// content persistence succeeds but plan creation fails.
+fn generate_plan_name(policy_name: &str, sql_hash: &str) -> String {
     let timestamp = format_timestamp_compact();
-    let millis = now.subsec_millis();
-    let random_suffix: u32 = rand::random::<u32>() % 1000;
-    let suffix = format!("{millis:03}{random_suffix:03}");
+    let suffix = &sql_hash[..12.min(sql_hash.len())];
     // Kubernetes names must be <= 253 chars and DNS-compatible.
     // Reserve 4 chars for the potential "-sql" ConfigMap suffix.
     let max_name_len = 253 - 4; // 249
     let max_prefix_len = max_name_len - "-plan-".len() - timestamp.len() - "-".len() - suffix.len();
     let prefix = if policy_name.len() > max_prefix_len {
-        &policy_name[..max_prefix_len]
-    } else {
         policy_name
+            .char_indices()
+            .take_while(|(idx, ch)| idx + ch.len_utf8() <= max_prefix_len)
+            .map(|(_, ch)| ch)
+            .collect::<String>()
+    } else {
+        policy_name.to_string()
     };
     format!("{prefix}-plan-{timestamp}-{suffix}")
 }
@@ -691,18 +1129,6 @@ fn build_owner_reference(policy: &PostgresPolicy) -> OwnerReference {
         kind: PostgresPolicy::kind(&()).to_string(),
         name: policy.name_any(),
         uid: policy.metadata.uid.clone().unwrap_or_default(),
-        controller: Some(true),
-        block_owner_deletion: Some(true),
-    }
-}
-
-/// Build an OwnerReference pointing from a ConfigMap to its parent plan.
-fn build_plan_owner_reference(plan: &PostgresPolicyPlan) -> OwnerReference {
-    OwnerReference {
-        api_version: PostgresPolicyPlan::api_version(&()).to_string(),
-        kind: PostgresPolicyPlan::kind(&()).to_string(),
-        name: plan.name_any(),
-        uid: plan.metadata.uid.clone().unwrap_or_default(),
         controller: Some(true),
         block_owner_deletion: Some(true),
     }
@@ -1003,6 +1429,9 @@ pub async fn mark_plan_superseded(
 mod tests {
     use super::*;
     use crate::crd::CrdReconciliationMode;
+    use base64::Engine as _;
+    use flate2::read::GzDecoder;
+    use std::io::Read;
 
     fn test_plan(
         name: &str,
@@ -1088,24 +1517,125 @@ mod tests {
     }
 
     #[test]
+    fn compute_sql_hash_matches_pinned_fixture() {
+        assert_eq!(
+            compute_sql_hash("CREATE ROLE app LOGIN;"),
+            "12a9743285d98ce73cfa9c840e943fc627d1fcbce22c5206fda1b21c84c1ac9c"
+        );
+    }
+
+    #[test]
     fn generate_plan_name_has_expected_format() {
-        let name = generate_plan_name("my-policy");
+        let hash = "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789";
+        let name = generate_plan_name("my-policy", hash);
         assert!(name.starts_with("my-policy-plan-"));
-        // Should be "my-policy-plan-YYYYMMDD-HHMMSS-MMMRRR"
+        assert!(name.ends_with("-abcdef012345"));
         let suffix = name.strip_prefix("my-policy-plan-").unwrap();
-        // YYYYMMDD-HHMMSS-MMMRRR = 15 + 1 + 6 = 22 chars
-        assert_eq!(suffix.len(), 22);
+        // YYYYMMDD-HHMMSS-hashprefix = 15 + 1 + 12 = 28 chars
+        assert_eq!(suffix.len(), 28);
         assert_eq!(&suffix[8..9], "-");
         assert_eq!(&suffix[15..16], "-");
     }
 
     #[test]
-    fn generate_plan_name_is_unique_across_calls() {
-        let name1 = generate_plan_name("my-policy");
-        let name2 = generate_plan_name("my-policy");
-        // With millisecond + random suffix, collisions are extremely unlikely
-        // (this test may very rarely fail, but demonstrates the intent).
-        assert_ne!(name1, name2);
+    fn generate_plan_name_is_idempotent_for_same_hash_in_same_second() {
+        let hash = "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789";
+        let name1 = generate_plan_name("my-policy", hash);
+        let name2 = generate_plan_name("my-policy", hash);
+        assert_eq!(name1, name2);
+    }
+
+    #[test]
+    fn generate_plan_name_truncates_on_utf8_boundary() {
+        let hash = "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789";
+        let name = generate_plan_name(&"é".repeat(140), hash);
+        assert!(name.len() <= 249);
+        assert!(name.ends_with("-abcdef012345"));
+    }
+
+    #[test]
+    fn prepare_plan_sql_keeps_small_sql_inline() {
+        let prepared = prepare_plan_sql("plan-1", "CREATE ROLE app LOGIN;").unwrap();
+
+        assert!(matches!(prepared.artifact, PlanSqlArtifact::Inline(_)));
+        assert_eq!(
+            prepared.sql_inline(),
+            Some("CREATE ROLE app LOGIN;".to_string())
+        );
+        assert!(prepared.sql_ref().is_none());
+        assert!(!prepared.is_truncated());
+    }
+
+    #[test]
+    fn prepare_plan_sql_compresses_large_brownfield_sized_sql() {
+        let sql = brownfield_sized_sql();
+        assert!(sql.len() > 1_048_576);
+
+        let prepared = prepare_plan_sql("policy-plan-20260506-000000-abcdef012345", &sql).unwrap();
+
+        let PlanSqlArtifact::CompressedConfigMap {
+            key,
+            compressed_sql,
+            ..
+        } = &prepared.artifact
+        else {
+            panic!("expected compressed ConfigMap artifact");
+        };
+        assert_eq!(key, SQL_CONFIGMAP_GZIP_KEY);
+        assert!(compressed_sql.len() < MAX_CONFIGMAP_SQL_BYTES);
+        assert_eq!(gunzip(compressed_sql), sql);
+        assert_eq!(
+            prepared.sql_ref().unwrap().compression,
+            Some(SqlCompression::Gzip)
+        );
+        assert_eq!(prepared.original_bytes, sql.len());
+        assert_eq!(prepared.stored_bytes, compressed_sql.len());
+    }
+
+    #[test]
+    fn configmap_binary_data_serializes_with_one_base64_layer() {
+        let sql = brownfield_sized_sql();
+        let prepared = prepare_plan_sql("policy-plan-20260506-000000-abcdef012345", &sql).unwrap();
+        let PlanSqlArtifact::CompressedConfigMap {
+            key,
+            compressed_sql,
+            ..
+        } = &prepared.artifact
+        else {
+            panic!("expected compressed ConfigMap artifact");
+        };
+        let configmap = ConfigMap {
+            binary_data: Some(BTreeMap::from([(
+                key.clone(),
+                ByteString(compressed_sql.clone()),
+            )])),
+            ..Default::default()
+        };
+
+        let encoded = serde_json::to_value(&configmap).unwrap()["binaryData"][key]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let decoded = base64::engine::general_purpose::STANDARD
+            .decode(encoded)
+            .unwrap();
+
+        assert_eq!(decoded, *compressed_sql);
+        assert_eq!(gunzip(&decoded), sql);
+    }
+
+    #[test]
+    fn prepare_plan_sql_truncates_when_compressed_sql_is_still_too_large() {
+        let sql = deterministic_incompressible_sql(1_400_000);
+        let prepared = prepare_plan_sql("policy-plan-20260506-000000-abcdef012345", &sql).unwrap();
+
+        let PlanSqlArtifact::TruncatedInline(preview) = &prepared.artifact else {
+            panic!("expected truncated inline artifact");
+        };
+        assert!(preview.len() <= MAX_INLINE_SQL_BYTES);
+        assert!(preview.contains("truncated"));
+        assert!(prepared.sql_ref().is_none());
+        assert!(prepared.is_truncated());
     }
 
     #[test]
@@ -1120,6 +1650,56 @@ mod tests {
         let long_value = "a".repeat(100);
         let sanitized = sanitize_label_value(&long_value);
         assert!(sanitized.len() <= 63);
+    }
+
+    #[test]
+    fn stale_policy_sql_configmap_without_plan_label_is_orphan() {
+        let configmap = ConfigMap {
+            metadata: k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta {
+                labels: Some(BTreeMap::from([(
+                    LABEL_POLICY.to_string(),
+                    sanitize_label_value("test-policy"),
+                )])),
+                creation_timestamp: Some(k8s_openapi::apimachinery::pkg::apis::meta::v1::Time(
+                    jiff::Timestamp::from_second(0).unwrap(),
+                )),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        assert!(is_orphan_sql_configmap(
+            &configmap,
+            &BTreeSet::new(),
+            ORPHAN_GRACE_SECS + 1
+        ));
+    }
+
+    #[test]
+    fn stale_policy_sql_configmap_with_known_plan_label_is_not_orphan() {
+        let plan_label = sanitize_label_value("test-policy-plan-20260506-000000-abcdef012345");
+        let configmap = ConfigMap {
+            metadata: k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta {
+                labels: Some(BTreeMap::from([
+                    (
+                        LABEL_POLICY.to_string(),
+                        sanitize_label_value("test-policy"),
+                    ),
+                    (LABEL_PLAN.to_string(), plan_label.clone()),
+                ])),
+                creation_timestamp: Some(k8s_openapi::apimachinery::pkg::apis::meta::v1::Time(
+                    jiff::Timestamp::from_second(0).unwrap(),
+                )),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        assert!(!is_orphan_sql_configmap(
+            &configmap,
+            &BTreeSet::from([plan_label]),
+            ORPHAN_GRACE_SECS + 1
+        ));
     }
 
     #[test]
@@ -1167,5 +1747,65 @@ mod tests {
             now > y2025 && now < y2100,
             "epoch secs {now} should be between 2025 and 2100"
         );
+    }
+
+    fn brownfield_sized_sql() -> String {
+        let mut sql = String::new();
+        for schema in 0..33 {
+            for profile in ["reader", "writer", "owner", "cdc"] {
+                let role = format!("schema_{schema}_{profile}");
+                sql.push_str(&format!(
+                    "CREATE ROLE \"{role}\" LOGIN;\nCOMMENT ON ROLE \"{role}\" IS 'Generated from profile {profile} for brownfield migration schema {schema} with cdc ownership directives and review metadata';\n"
+                ));
+                for relkind in ["TABLES", "SEQUENCES", "FUNCTIONS"] {
+                    sql.push_str(&format!(
+                        "GRANT SELECT ON ALL {relkind} IN SCHEMA \"schema_{schema}\" TO \"{role}\";\n"
+                    ));
+                }
+                for owner in 0..20 {
+                    sql.push_str(&format!(
+                        "ALTER DEFAULT PRIVILEGES FOR ROLE \"owner_{owner}\" IN SCHEMA \"schema_{schema}\" GRANT SELECT ON TABLES TO \"{role}\";\n"
+                    ));
+                }
+            }
+        }
+        for member in 0..70 {
+            sql.push_str(&format!(
+                "GRANT \"group_{member}\" TO \"service_login_{}\";\n",
+                member % 20
+            ));
+        }
+        while sql.len() <= 1_100_000 {
+            sql.push_str("-- brownfield migration padding for large plan regression\n");
+        }
+        sql
+    }
+
+    fn deterministic_incompressible_sql(target_bytes: usize) -> String {
+        let mut state = 0x1234_5678_u64;
+        let mut sql = String::with_capacity(target_bytes);
+        while sql.len() < target_bytes {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            let value = (state % 62) as u8;
+            let ch = match value {
+                0..=9 => b'0' + value,
+                10..=35 => b'a' + (value - 10),
+                _ => b'A' + (value - 36),
+            };
+            sql.push(ch as char);
+            if sql.len().is_multiple_of(120) {
+                sql.push('\n');
+            }
+        }
+        sql
+    }
+
+    fn gunzip(bytes: &[u8]) -> String {
+        let mut decoder = GzDecoder::new(bytes);
+        let mut decoded = String::new();
+        decoder.read_to_string(&mut decoded).unwrap();
+        decoded
     }
 }
