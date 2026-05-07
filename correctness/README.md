@@ -35,6 +35,34 @@ Verifies the Kubernetes persistence ordering around plan SQL previews:
 - Orphan SQL ConfigMaps are eventually collected
 - At most one actionable plan exists in the modeled lifecycle
 
+### `races/Convergence.tla`
+
+Verifies that wildcard grants converge under external mutations to managed
+objects (added in v0.7.1 after the partly-dev15 reconcile-flap incident):
+
+- Eventually-permanently `currentGrants = Inventory` under fairness on the
+  reconcile action and a finite number of external `DROP+CREATE`s
+- The set of "objects with the per-role ACL" never moves further from the
+  desired wildcard across a single reconcile
+
+The model abstracts a single `(role, schema, object_type)` scope. Two diff
+semantics are switchable via the `UseFixedDiff` constant:
+
+- `UseFixedDiff = TRUE` — the v0.7.1 fix (per-name `REVOKE`s shadow-suppressed
+  by a desired wildcard for the same scope). `EventuallyConverged` holds.
+- `UseFixedDiff = FALSE` — the v0.7.0 behaviour. TLC produces a 4-state lasso
+  counterexample: a single external `DROP+CREATE` causes the reconcile to
+  invert the set of granted objects each cycle, exactly the
+  partly-dev15 oscillation between two stable plan hashes.
+
+```bash
+# Verify the fix converges
+./correctness/run-tlc.sh races/Convergence.tla races/Convergence.cfg
+
+# Reproduce the v0.7.0 flap as a TLC counterexample
+./correctness/run-tlc.sh races/Convergence.tla races/Convergence_buggy.cfg
+```
+
 ## Running
 
 ```bash
