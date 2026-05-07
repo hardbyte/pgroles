@@ -109,8 +109,15 @@ jobs:
       - name: Create kind cluster
         run: kind create cluster --name pgroles-fairness --wait 60s
 
-      - name: Install CRD
-        run: kubectl apply -f k8s/crd.yaml
+      - name: Install CRDs
+        run: |
+          # Both CRDs must be installed: the operator writes
+          # `PostgresPolicyPlan` resources alongside `PostgresPolicy`,
+          # and a missing plan CRD surfaces as a 404 on every reconcile.
+          # The shared composite action `.github/actions/setup-e2e` does
+          # the same thing for CI's E2E suites.
+          kubectl apply -f k8s/crd.yaml
+          kubectl apply -f k8s/postgrespolicyplan-crd.yaml
 
       - name: Deploy dev PostgreSQL
         run: |
