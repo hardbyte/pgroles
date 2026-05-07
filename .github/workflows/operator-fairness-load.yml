@@ -92,72 +92,30 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
-      - uses: dtolnay/rust-toolchain@stable
+      # Shared with CI's E2E suites — installs kind, both CRDs, deploys
+      # dev PostgreSQL, builds and deploys the operator, and verifies it
+      # by reconciling `basic-policy`. Keeping fairness on the same
+      # composite action prevents the inline copy from drifting again
+      # (as it did between #74 and #102).
+      - uses: ./.github/actions/setup-e2e
+        with:
+          cluster-name: pgroles-fairness
 
-      - uses: Swatinem/rust-cache@v2
-
-      - uses: docker/setup-buildx-action@v4
-
-      - name: Install kind
+      - name: Prepare fairness-specific state
         run: |
-          [ -f /usr/local/bin/kind ] || {
-            curl -Lo /usr/local/bin/kind https://kind.sigs.k8s.io/dl/v0.24.0/kind-linux-amd64
-            echo "b89aada5a39d620da3fcd16435b7f28d858927dd53f92cbac77686b0588b600d  /usr/local/bin/kind" | sha256sum -c -
-            chmod +x /usr/local/bin/kind
-          }
+          # Free up `basic-policy` (created by the composite for its
+          # health check) so it doesn't compete with fairness scenarios.
+          kubectl delete pgr basic-policy --wait=true
 
-      - name: Create kind cluster
-        run: kind create cluster --name pgroles-fairness --wait 60s
-
-      - name: Install CRDs
-        run: |
-          # Both CRDs must be installed: the operator writes
-          # `PostgresPolicyPlan` resources alongside `PostgresPolicy`,
-          # and a missing plan CRD surfaces as a 404 on every reconcile.
-          # The shared composite action `.github/actions/setup-e2e` does
-          # the same thing for CI's E2E suites.
-          kubectl apply -f k8s/crd.yaml
-          kubectl apply -f k8s/postgrespolicyplan-crd.yaml
-
-      - name: Deploy dev PostgreSQL
-        run: |
-          kubectl apply -f k8s/dev/postgres.yaml
-          kubectl rollout status statefulset/postgres --timeout=120s
-
-      - name: Wait for PostgreSQL readiness
-        run: kubectl wait --for=condition=ready pod/postgres-0 --timeout=90s
-
-      - name: Seed databases and secrets
-        run: |
+          # Add the second `churntest` database + secret. The composite
+          # already provisions `loadtest` + `loadtest-postgres-credentials`.
           kubectl exec -i postgres-0 -- psql -v ON_ERROR_STOP=1 -U postgres -d postgres <<'SQL'
-          CREATE DATABASE loadtest;
           CREATE DATABASE churntest;
           SQL
-
-          kubectl create secret generic loadtest-postgres-credentials \
-            --from-literal=DATABASE_URL='postgres://postgres:devpassword@postgres.default.svc.cluster.local:5432/loadtest' \
-            --dry-run=client -o yaml | kubectl apply -f -
 
           kubectl create secret generic churntest-postgres-credentials \
             --from-literal=DATABASE_URL='postgres://postgres:devpassword@postgres.default.svc.cluster.local:5432/churntest' \
             --dry-run=client -o yaml | kubectl apply -f -
-
-      - name: Build operator image and load into kind
-        run: |
-          docker build -f docker/Dockerfile --target operator -t pgroles-operator:fairness .
-          kind load docker-image pgroles-operator:fairness --name pgroles-fairness
-
-      - name: Deploy operator
-        run: |
-          kubectl apply -f k8s/deploy/namespace.yaml
-          kubectl apply -f k8s/deploy/rbac.yaml
-
-          sed 's|ghcr.io/hardbyte/pgroles-operator:latest|pgroles-operator:fairness|' \
-            k8s/deploy/deployment.yaml | \
-            sed 's|imagePullPolicy:.*|imagePullPolicy: Never|' | \
-            kubectl apply -f -
-
-          kubectl -n pgroles-system rollout status deployment/pgroles-operator --timeout=60s
 
       - name: Run fairness and load scenarios
         run: |
