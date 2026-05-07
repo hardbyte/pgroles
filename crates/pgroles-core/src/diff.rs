@@ -8,7 +8,7 @@
 //! from the desired state is revoked/dropped. This is the Terraform-style
 //! "manifest is the entire truth" approach.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use crate::manifest::{ObjectType, Privilege, RoleRetirement};
 use crate::model::{
@@ -555,6 +555,24 @@ fn diff_grants(
     grants_out: &mut Vec<Change>,
     revokes_out: &mut Vec<Change>,
 ) {
+    // Index desired wildcard grants for shadow-revoke filtering below. A
+    // desired wildcard `(role, schema, type, "*")` declares "every object of
+    // this type in this schema gets these privileges", so any per-name entry
+    // surviving in `current` for the same (role, schema, type) is implicitly
+    // covered by the wildcard. Revoking those privileges per-name would just
+    // be undone by the wildcard GRANT in the same plan — and because GRANTs
+    // are applied before REVOKEs, the net effect is to strip privileges from
+    // exactly the objects the inspector knew about, leaving the recently-
+    // recreated objects with grants. The next reconcile observes the inverted
+    // set, and the controller flaps forever.
+    let desired_wildcards: BTreeMap<(&str, &Option<String>, ObjectType), &BTreeSet<Privilege>> =
+        desired
+            .grants
+            .iter()
+            .filter(|(k, _)| k.name.as_deref() == Some("*") && k.schema.is_some())
+            .map(|(k, v)| ((k.role.as_str(), &k.schema, k.object_type), &v.privileges))
+            .collect();
+
     // Grants in desired but not in current → GRANT (full set)
     // Grants in both → diff the privilege sets
     for (key, desired_state) in &desired.grants {
@@ -586,10 +604,28 @@ fn diff_grants(
         }
     }
 
-    // Grant targets in current but not in desired → REVOKE all
+    // Grant targets in current but not in desired → REVOKE the privileges
+    // that aren't shadowed by a desired wildcard for the same scope.
     for (key, current_state) in &current.grants {
-        if !desired.grants.contains_key(key) {
-            revokes_out.push(change_revoke(key, &current_state.privileges));
+        if desired.grants.contains_key(key) {
+            continue;
+        }
+
+        let to_revoke: BTreeSet<Privilege> = if key.name.as_deref() != Some("*")
+            && let Some(wildcard_privileges) =
+                desired_wildcards.get(&(key.role.as_str(), &key.schema, key.object_type))
+        {
+            current_state
+                .privileges
+                .difference(wildcard_privileges)
+                .copied()
+                .collect()
+        } else {
+            current_state.privileges.clone()
+        };
+
+        if !to_revoke.is_empty() {
+            revokes_out.push(change_revoke(key, &to_revoke));
         }
     }
 }
@@ -1888,6 +1924,92 @@ memberships:
                 ))));
             }
             other => panic!("expected AlterRole, got: {other:?}"),
+        }
+    }
+
+    /// Reproduces the partly-dev15 reconcile flap (May 2026): when the desired
+    /// graph has a wildcard grant `(role, schema, type, "*")` and `current`
+    /// has only per-name entries (because the inspector's wildcard collapse
+    /// failed — typically because at least one inventory object lacks the
+    /// privilege, e.g. a function that was DROPped+CREATEd between reconciles
+    /// resetting its proacl to NULL), `diff()` must NOT emit per-name REVOKEs
+    /// for objects covered by the desired wildcard. Otherwise apply order
+    /// (GRANTs before REVOKEs) re-grants on ALL FUNCTIONS and then strips
+    /// privileges from the previously-granted set, producing a permanent
+    /// oscillation between two stable states.
+    #[test]
+    fn diff_does_not_revoke_per_name_grants_covered_by_desired_wildcard() {
+        let role = "cdc-editor".to_string();
+        let schema = "cdc".to_string();
+        let object_type = ObjectType::Function;
+
+        // current: per-name EXECUTE grants for f1 and f3 only — f2 was
+        // recreated externally (proacl=NULL) so the inspector did not produce
+        // a row for it, the wildcard collapse failed, and per-name entries
+        // remain in the graph.
+        let mut current = empty_graph();
+        for fn_name in ["f1()", "f3()"] {
+            current.grants.insert(
+                GrantKey {
+                    role: role.clone(),
+                    object_type,
+                    schema: Some(schema.clone()),
+                    name: Some(fn_name.to_string()),
+                },
+                GrantState {
+                    privileges: BTreeSet::from([Privilege::Execute]),
+                },
+            );
+        }
+
+        // desired: a single wildcard grant declaring EXECUTE on every function
+        // in the schema.
+        let mut desired = empty_graph();
+        desired.grants.insert(
+            GrantKey {
+                role: role.clone(),
+                object_type,
+                schema: Some(schema.clone()),
+                name: Some("*".to_string()),
+            },
+            GrantState {
+                privileges: BTreeSet::from([Privilege::Execute]),
+            },
+        );
+
+        let changes = diff(&current, &desired);
+
+        let revokes: Vec<_> = changes
+            .iter()
+            .filter(|c| matches!(c, Change::Revoke { .. }))
+            .collect();
+        assert!(
+            revokes.is_empty(),
+            "must not revoke per-name grants covered by desired wildcard \
+             (would cause apply-order flap); got: {revokes:#?}"
+        );
+
+        let grants: Vec<_> = changes
+            .iter()
+            .filter(|c| matches!(c, Change::Grant { .. }))
+            .collect();
+        assert_eq!(
+            grants.len(),
+            1,
+            "expected a single wildcard GRANT to materialise ACLs on all functions; got: {grants:#?}"
+        );
+        match grants[0] {
+            Change::Grant {
+                role: r,
+                name,
+                privileges,
+                ..
+            } => {
+                assert_eq!(r, &role);
+                assert_eq!(name.as_deref(), Some("*"));
+                assert!(privileges.contains(&Privilege::Execute));
+            }
+            other => panic!("expected wildcard Grant, got: {other:?}"),
         }
     }
 
