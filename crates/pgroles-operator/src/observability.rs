@@ -30,6 +30,10 @@ struct Metrics {
     reconcile_total: Counter<u64>,
     reconcile_duration_ms: Histogram<u64>,
     reconcile_inflight: UpDownCounter<i64>,
+    inspect_duration_ms: Histogram<u64>,
+    inspect_items_total: Counter<u64>,
+    wildcard_grantability_queries_total: Counter<u64>,
+    wildcard_unsatisfied_grants_total: Counter<u64>,
     plan_total: Counter<u64>,
     plan_changes_total: Counter<u64>,
     lock_contention_total: Counter<u64>,
@@ -114,6 +118,64 @@ impl OperatorObservability {
     pub fn record_invalid_spec(&self) {
         if let Some(metrics) = &self.metrics {
             metrics.invalid_spec_total.add(1, &[]);
+        }
+    }
+
+    pub fn record_inspection(&self, stats: &pgroles_inspect::InspectionStats) {
+        let Some(metrics) = &self.metrics else {
+            return;
+        };
+
+        for (phase, duration) in &stats.phase_durations {
+            metrics.inspect_duration_ms.record(
+                duration.as_millis() as u64,
+                &[KeyValue::new("phase", *phase)],
+            );
+        }
+
+        for (kind, count) in [
+            ("roles", stats.roles),
+            ("memberships", stats.memberships),
+            ("schemas", stats.schemas),
+            ("grants", stats.grants),
+            ("default_privileges", stats.default_privileges),
+            (
+                "wildcard_configured_grants",
+                stats.wildcard.configured_grants,
+            ),
+            (
+                "wildcard_configured_scopes",
+                stats.wildcard.configured_scopes,
+            ),
+            (
+                "wildcard_inventory_objects",
+                stats.wildcard.inventory_objects,
+            ),
+            (
+                "wildcard_unsatisfied_scopes",
+                stats.wildcard.unsatisfied_scopes,
+            ),
+            (
+                "wildcard_grantability_objects",
+                stats.wildcard.grantability_objects,
+            ),
+        ] {
+            if count > 0 {
+                metrics
+                    .inspect_items_total
+                    .add(count as u64, &[KeyValue::new("kind", kind)]);
+            }
+        }
+
+        if stats.wildcard.grantability_queries > 0 {
+            metrics
+                .wildcard_grantability_queries_total
+                .add(stats.wildcard.grantability_queries as u64, &[]);
+        }
+        if stats.wildcard.unsatisfied_grants > 0 {
+            metrics
+                .wildcard_unsatisfied_grants_total
+                .add(stats.wildcard.unsatisfied_grants as u64, &[]);
         }
     }
 
@@ -235,6 +297,23 @@ impl Metrics {
                 .i64_up_down_counter("pgroles.reconcile.inflight")
                 .with_description("In-flight reconciliations")
                 .build(),
+            inspect_duration_ms: meter
+                .u64_histogram("pgroles.inspect.duration")
+                .with_unit("ms")
+                .with_description("Database inspection phase duration in milliseconds")
+                .build(),
+            inspect_items_total: meter
+                .u64_counter("pgroles.inspect.items")
+                .with_description("Database inspection objects observed by kind")
+                .build(),
+            wildcard_grantability_queries_total: meter
+                .u64_counter("pgroles.wildcard.grantability_queries")
+                .with_description("Wildcard grantability catalog queries")
+                .build(),
+            wildcard_unsatisfied_grants_total: meter
+                .u64_counter("pgroles.wildcard.unsatisfied_grants")
+                .with_description("Wildcard grants missing privileges before grantability checks")
+                .build(),
             plan_total: meter
                 .u64_counter("pgroles.plan.total")
                 .with_description("Successful plan-mode reconciliations by result")
@@ -286,6 +365,7 @@ async fn readyz(State(observability): State<OperatorObservability>) -> impl Into
 #[cfg(test)]
 mod tests {
     use std::sync::{Arc, Mutex};
+    use std::time::Duration;
 
     use axum::extract::State;
     use axum::http::StatusCode;
@@ -329,18 +409,26 @@ mod tests {
     }
 
     fn u64_sum_value(metrics: &[ResourceMetrics], name: &str) -> Option<u64> {
-        metrics
+        let mut found = false;
+        let total = metrics
             .iter()
             .flat_map(|resource_metrics| resource_metrics.scope_metrics())
             .flat_map(|scope_metrics| scope_metrics.metrics())
-            .find(|metric| metric.name() == name)
-            .and_then(|metric| match metric.data() {
-                AggregatedMetrics::U64(MetricData::Sum(sum)) => sum
-                    .data_points()
-                    .next()
-                    .map(|data_point| data_point.value()),
+            .filter(|metric| metric.name() == name)
+            .filter_map(|metric| match metric.data() {
+                AggregatedMetrics::U64(MetricData::Sum(sum)) => {
+                    found = true;
+                    Some(
+                        sum.data_points()
+                            .map(|data_point| data_point.value())
+                            .sum::<u64>(),
+                    )
+                }
                 _ => None,
             })
+            .sum();
+
+        found.then_some(total)
     }
 
     fn i64_sum_value(metrics: &[ResourceMetrics], name: &str) -> Option<i64> {
@@ -406,6 +494,28 @@ mod tests {
         observability.record_policy_conflict();
         observability.record_invalid_spec();
         observability.record_database_connection_failure();
+        observability.record_inspection(&pgroles_inspect::InspectionStats {
+            roles: 3,
+            memberships: 2,
+            schemas: 1,
+            grants: 5,
+            default_privileges: 1,
+            phase_durations: [
+                ("roles", Duration::from_millis(4)),
+                ("object_privileges", Duration::from_millis(12)),
+            ]
+            .into_iter()
+            .collect(),
+            wildcard: pgroles_inspect::WildcardInspectionStats {
+                configured_grants: 2,
+                configured_scopes: 1,
+                inventory_objects: 100,
+                unsatisfied_grants: 1,
+                unsatisfied_scopes: 1,
+                grantability_queries: 1,
+                grantability_objects: 3,
+            },
+        });
         observability.record_plan_result("drift");
         observability.record_planned_changes(2);
         observability.record_apply_result("success");
@@ -420,6 +530,16 @@ mod tests {
 
         assert!(metric_exists(&metrics, "pgroles.reconcile.total"));
         assert!(metric_exists(&metrics, "pgroles.reconcile.duration"));
+        assert!(metric_exists(&metrics, "pgroles.inspect.duration"));
+        assert_eq!(u64_sum_value(&metrics, "pgroles.inspect.items"), Some(119));
+        assert_eq!(
+            u64_sum_value(&metrics, "pgroles.wildcard.grantability_queries"),
+            Some(1)
+        );
+        assert_eq!(
+            u64_sum_value(&metrics, "pgroles.wildcard.unsatisfied_grants"),
+            Some(1)
+        );
         assert_eq!(u64_sum_value(&metrics, "pgroles.plan.total"), Some(1));
         assert_eq!(u64_sum_value(&metrics, "pgroles.plan.changes"), Some(2));
         assert_eq!(

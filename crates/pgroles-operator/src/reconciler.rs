@@ -887,6 +887,7 @@ async fn apply_under_lock(
                     .map(|retirement| retirement.role.clone()),
             );
     let inspection = pgroles_inspect::inspect_with_diagnostics(pool, &inspect_config).await?;
+    ctx.observability.record_inspection(&inspection.stats);
     if !inspection.diagnostics.is_empty() {
         return Err(ReconcileError::UnsatisfiableWildcardGrant(
             inspection.diagnostics.to_string(),

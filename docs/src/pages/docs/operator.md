@@ -485,6 +485,15 @@ operator:
 
 The intended deployment model is operator -> OpenTelemetry Collector -> your metrics backend.
 
+The exported metrics include reconcile, plan, apply, lock-contention, conflict, and database-connection counters. They also include database inspection measurements for larger deployments:
+
+| Metric | Labels | Meaning |
+| --- | --- | --- |
+| `pgroles.inspect.duration` | `phase` | Duration for each inspection phase, such as roles, memberships, object privileges, database privileges, and default privileges |
+| `pgroles.inspect.items` | `kind` | Counts of inspected roles, memberships, schemas, grants, default privileges, configured wildcard scopes, unsatisfied wildcard scopes, wildcard inventory objects, and grantability objects |
+| `pgroles.wildcard.grantability_queries` | - | Number of wildcard grantability catalog queries issued |
+| `pgroles.wildcard.unsatisfied_grants` | - | Number of wildcard grants missing privileges before grantability checks |
+
 The operator also emits transition-based Kubernetes Events such as:
 
 - `ConflictDetected`

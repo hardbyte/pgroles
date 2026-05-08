@@ -14,6 +14,7 @@ mod safety;
 mod version;
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::time::{Duration, Instant};
 
 use sqlx::PgPool;
 use thiserror::Error;
@@ -136,6 +137,35 @@ impl std::fmt::Display for UnsatisfiableWildcardObject {
 pub struct InspectionResult {
     pub graph: RoleGraph,
     pub diagnostics: InspectionDiagnostics,
+    pub stats: InspectionStats,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct InspectionStats {
+    pub roles: usize,
+    pub memberships: usize,
+    pub schemas: usize,
+    pub grants: usize,
+    pub default_privileges: usize,
+    pub phase_durations: BTreeMap<&'static str, Duration>,
+    pub wildcard: WildcardInspectionStats,
+}
+
+impl InspectionStats {
+    fn record_phase(&mut self, phase: &'static str, duration: Duration) {
+        self.phase_durations.insert(phase, duration);
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct WildcardInspectionStats {
+    pub configured_grants: usize,
+    pub configured_scopes: usize,
+    pub inventory_objects: usize,
+    pub unsatisfied_grants: usize,
+    pub unsatisfied_scopes: usize,
+    pub grantability_queries: usize,
+    pub grantability_objects: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -415,6 +445,7 @@ pub async fn inspect_with_diagnostics(
 ) -> Result<InspectionResult, InspectError> {
     let mut graph = RoleGraph::default();
     let mut diagnostics = InspectionDiagnostics::default();
+    let mut stats = InspectionStats::default();
 
     // Build &str slices for the query functions
     let role_refs: Vec<&str> = config.managed_roles.iter().map(|s| s.as_str()).collect();
@@ -430,15 +461,20 @@ pub async fn inspect_with_diagnostics(
         count = role_refs.len(),
         "inspecting managed roles from pg_roles"
     );
+    let phase_started_at = Instant::now();
     let role_rows = fetch_roles(pool, Some(&role_refs)).await?;
+    stats.record_phase("roles", phase_started_at.elapsed());
     for row in &role_rows {
         graph.roles.insert(row.rolname.clone(), row.to_role_state());
     }
+    stats.roles = graph.roles.len();
     debug!(found = graph.roles.len(), "roles inspected");
 
     // --- Memberships ---
     debug!("inspecting memberships from pg_auth_members");
+    let phase_started_at = Instant::now();
     let membership_rows = fetch_memberships(pool, Some(&role_refs)).await?;
+    stats.record_phase("memberships", phase_started_at.elapsed());
     for row in &membership_rows {
         graph.memberships.insert(row.to_membership_edge());
     }
@@ -446,12 +482,15 @@ pub async fn inspect_with_diagnostics(
     // This captures cases like "user@example.com is a member of inventory-editor"
     // where inventory-editor is the group (managed) and user@example.com is the member.
     // The fetch above already handles this (filters on group role = managed).
+    stats.memberships = graph.memberships.len();
     debug!(found = graph.memberships.len(), "memberships inspected");
 
     // --- Schemas ---
     if !schema_refs.is_empty() {
         debug!(schemas = ?schema_refs, "inspecting schemas from pg_namespace");
+        let phase_started_at = Instant::now();
         let schema_rows = fetch_schemas(pool, &schema_refs).await?;
+        stats.record_phase("schemas", phase_started_at.elapsed());
         for row in &schema_rows {
             graph.schemas.insert(
                 row.schema_name.clone(),
@@ -461,6 +500,7 @@ pub async fn inspect_with_diagnostics(
                 },
             );
         }
+        stats.schemas = graph.schemas.len();
         debug!(found = graph.schemas.len(), "schemas inspected");
     }
 
@@ -470,6 +510,7 @@ pub async fn inspect_with_diagnostics(
             schemas = ?privilege_schema_refs,
             "inspecting object privileges via aclexplode"
         );
+        let phase_started_at = Instant::now();
         let privilege_result = privileges::fetch_privileges_with_wildcards(
             pool,
             &privilege_schema_refs,
@@ -477,6 +518,8 @@ pub async fn inspect_with_diagnostics(
             &config.wildcard_grants,
         )
         .await?;
+        stats.record_phase("object_privileges", phase_started_at.elapsed());
+        stats.wildcard = privilege_result.wildcard_stats;
         diagnostics
             .unsatisfiable_wildcard_grants
             .extend(privilege_result.diagnostics);
@@ -485,16 +528,20 @@ pub async fn inspect_with_diagnostics(
             graph.grants.insert(key, state);
         }
         remove_redundant_schema_owner_grants(&mut graph);
+        stats.grants = graph.grants.len();
         debug!(found = graph.grants.len(), "privilege grants inspected");
     }
 
     // --- Database-level privileges ---
     if config.include_database_privileges {
         debug!("inspecting database-level privileges");
+        let phase_started_at = Instant::now();
         let db_grants = fetch_database_privileges(pool, &role_refs).await?;
+        stats.record_phase("database_privileges", phase_started_at.elapsed());
         for (key, state) in db_grants {
             graph.grants.insert(key, state);
         }
+        stats.grants = graph.grants.len();
         debug!(
             total = graph.grants.len(),
             "grants after database privileges"
@@ -504,18 +551,25 @@ pub async fn inspect_with_diagnostics(
     // --- Default privileges ---
     if !privilege_schema_refs.is_empty() {
         debug!("inspecting default privileges from pg_default_acl");
+        let phase_started_at = Instant::now();
         let default_privs =
             fetch_default_privileges(pool, &privilege_schema_refs, &role_refs).await?;
+        stats.record_phase("default_privileges", phase_started_at.elapsed());
         for (key, state) in default_privs {
             graph.default_privileges.insert(key, state);
         }
+        stats.default_privileges = graph.default_privileges.len();
         debug!(
             found = graph.default_privileges.len(),
             "default privileges inspected"
         );
     }
 
-    Ok(InspectionResult { graph, diagnostics })
+    Ok(InspectionResult {
+        graph,
+        diagnostics,
+        stats,
+    })
 }
 
 /// Fetch the names of all non-system schemas in the target database.
