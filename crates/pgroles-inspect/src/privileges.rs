@@ -527,6 +527,7 @@ fn can_grant(row: &GrantabilityRow, privilege: Privilege) -> bool {
         Privilege::Trigger => row.can_trigger,
         Privilege::Execute => row.can_execute,
         Privilege::Usage => row.can_usage,
+        // Database and schema privileges are not object-wildcard grant targets.
         Privilege::Create | Privilege::Connect | Privilege::Temporary => false,
     }
 }

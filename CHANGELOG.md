@@ -5,6 +5,12 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.7.2] - 2026-05-08
+
+### Fixed
+
+- **Unsatisfiable wildcard grants now fail with a clear diagnostic instead of re-planning forever.** A wildcard such as `function name: "*"` remains strict desired state: every matching object must either already have the requested privilege or be grantable by the executor. When a matching object is missing the privilege and the executor lacks the corresponding `WITH GRANT OPTION`, CLI `diff`/`plan`/`apply` now stop with `UnsatisfiableWildcardGrant` instead of printing or applying repeated wildcard SQL. The operator reports `Ready=False` and `Degraded=True` with the same reason, leaves no new `PostgresPolicyPlan` or SQL ConfigMap for that reconcile, and retries at the normal policy interval. (#105, #106)
+
 ## [0.7.1] - 2026-05-08
 
 ### Fixed

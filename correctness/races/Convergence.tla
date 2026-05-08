@@ -18,6 +18,8 @@ EXTENDS FiniteSets, Naturals
     1. Manifest has a single wildcard grant: every object in `Inventory`
        must have the privilege for the role. (One role, one schema,
        one object type, one privilege — the smallest faithful slice.)
+       Each object also has per-object grantability from the executor's
+       point of view, modelling ownership / WITH GRANT OPTION.
     2. The operator inspects, computes a diff against the wildcard,
        and applies. Apply runs every GRANT before any REVOKE — matches
        diff() in pgroles-core/src/diff.rs.
@@ -25,7 +27,8 @@ EXTENDS FiniteSets, Naturals
        CREATEs an object, resetting its proacl to NULL. The inspector's
        per-name aclexplode then misses that object, and the
        wildcard-collapse in normalize_wildcard_grants fails for the
-       (role, schema, type) scope.
+       (role, schema, type) scope. The recreated object may be owned by
+       the executor (grantable) or by another role (not grantable).
     4. The operator reconciles again.
 
   Two diff semantics are modelled:
@@ -45,13 +48,21 @@ EXTENDS FiniteSets, Naturals
       emits the wildcard GRANT only; the next reconcile's collapse
       succeeds and the diff is empty.
 
+    - UseDiagnostics = TRUE — the v0.7.2 behaviour (PR #106). Before
+      planning/applying, inspection detects any object that is both
+      missing the wildcard privilege and not grantable by the executor.
+      Reconcile reports an UnsatisfiableWildcardGrant diagnostic and
+      does not mutate grants or create another plan.
+
   Property to verify:
 
-    EventuallyConverged ==
-        <>[](currentGrants = Inventory)
+    EventuallySettled ==
+        <>[](currentGrants = Inventory \/ diagnosed)
 
-  Holds under UseFixedDiff = TRUE; fails under UseFixedDiff = FALSE
-  with a TLC trace that exhibits the flap.
+  With all objects grantable, "settled" means converged. With a
+  non-grantable object missing the wildcard privilege, "settled" means
+  diagnosed and stable instead of repeatedly planning impossible SQL.
+  Under UseFixedDiff = FALSE, TLC still finds the v0.7.0 flap.
 
   Caveats / what is NOT modelled:
     - Multiple roles / schemas / object types — the bug is a per-scope
@@ -59,6 +70,9 @@ EXTENDS FiniteSets, Naturals
     - Privilege subsets — the bug surfaces with exactly one privilege
       (EXECUTE for functions). A multi-privilege model would add no
       new behaviour.
+    - PostgreSQL's detailed grantor chains — per-object grantability is
+      reduced to "executor can grant this object" vs "cannot grant this
+      object", which is the distinction used by diagnostics.
     - The plan lifecycle around the apply (Pending/Approved/Applying
       etc.) — covered by PlanLifecycle.tla. We collapse a reconcile
       into a single atomic state transition.
@@ -67,11 +81,13 @@ EXTENDS FiniteSets, Naturals
 CONSTANTS
     Inventory,        \* Set of object names in the managed schema, e.g. {f1,f2,f3}
     UseFixedDiff,     \* TRUE for v0.7.1 semantics, FALSE for v0.7.0 (buggy)
+    UseDiagnostics,   \* TRUE for v0.7.2 unsatisfiable-wildcard diagnostics
     MaxDrops          \* Bound the number of external drop+creates for model checking
 
 ASSUME
     /\ Inventory /= {}
     /\ UseFixedDiff \in BOOLEAN
+    /\ UseDiagnostics \in BOOLEAN
     /\ MaxDrops \in Nat
 
 VARIABLES
@@ -81,60 +97,99 @@ VARIABLES
     \* collapse succeeds and the system is converged.
     currentGrants,
 
+    \* Set of objects for which the executor can currently grant the
+    \* wildcard privilege. This abstracts ownership / WITH GRANT OPTION.
+    grantable,
+
     \* How many external drop+creates remain. Each one removes one object
     \* from currentGrants. Bounded so TLC explores a finite state space.
-    dropsRemaining
+    dropsRemaining,
 
-vars == <<currentGrants, dropsRemaining>>
+    \* Whether reconcile has surfaced UnsatisfiableWildcardGrant. A new
+    \* external mutation clears it because the environment changed.
+    diagnosed
+
+vars == <<currentGrants, grantable, dropsRemaining, diagnosed>>
 
 TypeOK ==
     /\ currentGrants \subseteq Inventory
+    /\ grantable \subseteq Inventory
     /\ dropsRemaining \in 0..MaxDrops
+    /\ diagnosed \in BOOLEAN
 
 Init ==
     \* Start in the steady state: every object has the per-role ACL,
-    \* the inspector's collapse holds, the diff is empty.
+    \* the inspector's collapse holds, and the diff is empty. Ownership
+    \* starts grantable, but external drop+create can change it per object.
     /\ currentGrants = Inventory
+    /\ grantable = Inventory
     /\ dropsRemaining = MaxDrops
+    /\ diagnosed = FALSE
+
+MissingNonGrantable ==
+    (Inventory \ currentGrants) \ grantable
 
 \* An external service (e.g. cdc-relay) DROPs and CREATEs an object.
 \* Its proacl resets to NULL, so the inspector no longer produces a row
-\* for it under managed_roles, and the wildcard collapse fails.
+\* for it under managed_roles, and the wildcard collapse fails. The
+\* recreated object may be grantable by the executor or owned by another
+\* role; all other object ownership is unchanged.
 ExternalDropCreate ==
     /\ dropsRemaining > 0
     /\ \E n \in currentGrants:
-        currentGrants' = currentGrants \ {n}
+        /\ currentGrants' = currentGrants \ {n}
+        /\ grantable' \in { grantable \ {n}, grantable \cup {n} }
     /\ dropsRemaining' = dropsRemaining - 1
+    /\ diagnosed' = FALSE
 
 \* No-op reconcile: already converged.
 ReconcileNoop ==
     /\ currentGrants = Inventory
-    /\ UNCHANGED vars
+    /\ diagnosed' = FALSE
+    /\ UNCHANGED <<currentGrants, grantable, dropsRemaining>>
+
+\* v0.7.2 diagnostic reconcile. If a wildcard target is missing the
+\* privilege and is not grantable by the executor, strict desired-state
+\* semantics stop before planning/applying repeated SQL.
+ReconcileDiagnostic ==
+    /\ UseDiagnostics
+    /\ currentGrants /= Inventory
+    /\ MissingNonGrantable /= {}
+    /\ diagnosed' = TRUE
+    /\ UNCHANGED <<currentGrants, grantable, dropsRemaining>>
 
 \* v0.7.0 (buggy) reconcile. When collapse fails, diff emits:
 \*   - GRANT wildcard                   (covers all of Inventory)
 \*   - REVOKE per-name FOR EACH n in currentGrants
 \* Apply order is GRANTs then REVOKEs, so:
-\*   after wildcard GRANT:    set = Inventory
-\*   after per-name REVOKEs:  set = Inventory \ currentGrants_before
+\*   after wildcard GRANT:    grantable objects have ACLs
+\*   after per-name REVOKEs:  previous currentGrants are stripped
 \* The set of "objects with an ACL" INVERTS each reconcile.
 ReconcileBuggy ==
     /\ ~UseFixedDiff
     /\ currentGrants /= Inventory
-    /\ currentGrants' = Inventory \ currentGrants
+    /\ ~(UseDiagnostics /\ MissingNonGrantable /= {})
+    /\ currentGrants' = (currentGrants \cup grantable) \ currentGrants
+    /\ diagnosed' = FALSE
     /\ UNCHANGED dropsRemaining
+    /\ UNCHANGED grantable
 
 \* v0.7.1 reconcile. Per-name REVOKEs are filtered when their privileges
 \* are shadowed by a desired wildcard for the same scope, so the diff
-\* emits only the wildcard GRANT and apply converges in one step.
+\* emits only the wildcard GRANT. It converges in one step when every
+\* missing object is grantable; otherwise v0.7.2 diagnostics preempt it.
 ReconcileFixed ==
     /\ UseFixedDiff
     /\ currentGrants /= Inventory
-    /\ currentGrants' = Inventory
+    /\ ~(UseDiagnostics /\ MissingNonGrantable /= {})
+    /\ currentGrants' = currentGrants \cup grantable
+    /\ diagnosed' = FALSE
     /\ UNCHANGED dropsRemaining
+    /\ UNCHANGED grantable
 
 Reconcile ==
     \/ ReconcileNoop
+    \/ ReconcileDiagnostic
     \/ ReconcileBuggy
     \/ ReconcileFixed
 
@@ -153,18 +208,29 @@ Spec ==
 
 \* --- Properties ---
 
-\* Eventually-permanently converged. Under fairness on Reconcile and a
-\* finite number of external drops, the database eventually matches the
-\* manifest and stays there. Holds under UseFixedDiff = TRUE; fails
-\* under UseFixedDiff = FALSE with a counterexample showing the flap.
+\* Eventually-permanently settled. Under fairness on Reconcile and a
+\* finite number of external drops, the database either matches the
+\* manifest or has surfaced a stable UnsatisfiableWildcardGrant
+\* diagnostic. With all missing objects grantable, this reduces to
+\* convergence; with a missing non-grantable object, strict semantics
+\* settle by diagnosing instead of churning.
+EventuallySettled ==
+    <>[]((currentGrants = Inventory) \/ diagnosed)
+
+\* Eventually-permanently converged. This remains useful in configs where
+\* all objects stay grantable, but is intentionally stronger than the
+\* v0.7.2 ownership-aware contract.
 EventuallyConverged ==
     <>[](currentGrants = Inventory)
 
 \* Bounded-step convergence: under the fixed semantics, the gap between
-\* desired and current shrinks monotonically across reconciles (a single
-\* reconcile closes it). Useful as a sanity check on the action shape.
+\* desired and current never grows across fixed/diagnostic reconciles.
+\* Useful as a sanity check on the action shape.
 NoStrictlyWorseReconcile ==
-    [][(currentGrants /= Inventory /\ Reconcile) =>
+    [][(currentGrants /= Inventory /\ (ReconcileFixed \/ ReconcileDiagnostic)) =>
         Cardinality(Inventory \ currentGrants') <= Cardinality(Inventory \ currentGrants)]_vars
+
+DiagnosticDoesNotMutateGrants ==
+    [][ReconcileDiagnostic => currentGrants' = currentGrants]_vars
 
 ====

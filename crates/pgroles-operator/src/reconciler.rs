@@ -581,6 +581,8 @@ async fn reconcile_apply(
             let error_reason = err.reason();
             let is_transient_failure =
                 retry_class_for_reconcile_error(&err) == RetryClass::Transient;
+            // Unsatisfiable wildcards would regenerate the same impossible plan.
+            // Other failures keep any plan ref so the same plan can be retried.
             let clear_current_plan_ref =
                 matches!(&err, ReconcileError::UnsatisfiableWildcardGrant(_));
             match error_reason {
