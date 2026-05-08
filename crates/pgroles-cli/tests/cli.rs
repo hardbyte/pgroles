@@ -3089,6 +3089,96 @@ grants:
 
     #[test]
     #[ignore]
+    fn wildcard_function_grant_fails_before_partial_apply_when_object_not_grantable() {
+        let schema = unique_name("wildfn_mixed_owner_schema");
+        let executor = unique_name("wildfn_executor");
+        let definer = unique_name("wildfn_definer");
+        let role = unique_name("wildfn_editor");
+        let password = "pgroles-test-password";
+        let executor_url = database_url_for_role(&executor, password);
+
+        let _cleanup = TestDbCleanup::new(format!(
+            r#"
+            DROP SCHEMA IF EXISTS "{schema}" CASCADE;
+            DROP ROLE IF EXISTS "{role}";
+            DROP ROLE IF EXISTS "{definer}";
+            DROP ROLE IF EXISTS "{executor}";
+            "#
+        ));
+
+        execute_sql(&format!(
+            r#"
+            DROP SCHEMA IF EXISTS "{schema}" CASCADE;
+            DROP ROLE IF EXISTS "{role}";
+            DROP ROLE IF EXISTS "{definer}";
+            DROP ROLE IF EXISTS "{executor}";
+            CREATE ROLE "{executor}" LOGIN PASSWORD '{password}';
+            CREATE ROLE "{definer}" NOLOGIN;
+            CREATE ROLE "{role}" NOLOGIN;
+            CREATE SCHEMA "{schema}" AUTHORIZATION "{executor}";
+            CREATE FUNCTION "{schema}".f1() RETURNS int LANGUAGE sql AS 'SELECT 1';
+            ALTER FUNCTION "{schema}".f1() OWNER TO "{executor}";
+            CREATE FUNCTION "{schema}".f2() RETURNS int LANGUAGE sql AS 'SELECT 2';
+            ALTER FUNCTION "{schema}".f2() OWNER TO "{definer}";
+            REVOKE EXECUTE ON FUNCTION "{schema}".f1() FROM PUBLIC;
+            REVOKE EXECUTE ON FUNCTION "{schema}".f2() FROM PUBLIC;
+            "#
+        ));
+
+        let manifest_file = write_temp_manifest(&format!(
+            r#"
+roles:
+  - name: {role}
+
+grants:
+  - role: {role}
+    privileges: [EXECUTE]
+    object: {{ type: function, schema: {schema}, name: "*" }}
+"#
+        ));
+
+        pgroles_cmd()
+            .args([
+                "diff",
+                "--file",
+                manifest_file.path().to_str().unwrap(),
+                "--database-url",
+                &executor_url,
+                "--format",
+                "sql",
+            ])
+            .assert()
+            .failure()
+            .stdout(predicate::str::is_empty())
+            .stderr(predicate::str::contains("UnsatisfiableWildcardGrant"))
+            .stderr(predicate::str::contains("f2()"))
+            .stderr(predicate::str::contains(&definer))
+            .stderr(predicate::str::contains("GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA").not());
+
+        pgroles_cmd()
+            .args([
+                "apply",
+                "--file",
+                manifest_file.path().to_str().unwrap(),
+                "--database-url",
+                &executor_url,
+            ])
+            .assert()
+            .failure()
+            .stderr(predicate::str::contains("UnsatisfiableWildcardGrant"));
+
+        assert!(
+            !query_has_function_privilege(&role, &format!(r#""{schema}"."f1"()"#)),
+            "apply should fail before partially granting the grantable function"
+        );
+        assert!(
+            !query_has_function_privilege(&role, &format!(r#""{schema}"."f2"()"#)),
+            "non-grantable function should remain ungranted"
+        );
+    }
+
+    #[test]
+    #[ignore]
     fn specific_function_grants_apply_and_converge() {
         let schema = unique_name("function_schema");
         let role = unique_name("function_role");

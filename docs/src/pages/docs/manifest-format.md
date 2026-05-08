@@ -348,6 +348,13 @@ Use `name: "*"` to grant on all current objects of a type in a schema. pgroles
 expands relation wildcards safely by object type, so `table`, `view`, and
 `materialized_view` privileges do not bleed across each other.
 
+Wildcard grants are strict: every matching current object must either already
+have the requested privilege or be grantable by the database user running
+pgroles. If a matching object is missing the privilege and the executor lacks
+the corresponding `WITH GRANT OPTION`, `diff`, `plan`, and `apply` stop with an
+`UnsatisfiableWildcardGrant` diagnostic instead of emitting a repeating wildcard
+`GRANT`.
+
 ## default_privileges
 
 Default privileges configure what happens when new objects are created:

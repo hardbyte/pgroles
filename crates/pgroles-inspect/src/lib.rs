@@ -19,7 +19,7 @@ use sqlx::PgPool;
 use thiserror::Error;
 use tracing::debug;
 
-use pgroles_core::manifest::Privilege;
+use pgroles_core::manifest::{ObjectType, Privilege};
 use pgroles_core::model::RoleGraph;
 use pgroles_core::ownership::ManagedScope;
 
@@ -45,6 +45,97 @@ pub use version::{PgVersion, detect_pg_version};
 pub enum InspectError {
     #[error("database query error: {0}")]
     Database(#[from] sqlx::Error),
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct InspectionDiagnostics {
+    pub unsatisfiable_wildcard_grants: Vec<UnsatisfiableWildcardGrant>,
+}
+
+impl InspectionDiagnostics {
+    pub fn is_empty(&self) -> bool {
+        self.unsatisfiable_wildcard_grants.is_empty()
+    }
+}
+
+impl std::fmt::Display for InspectionDiagnostics {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        for (index, diagnostic) in self.unsatisfiable_wildcard_grants.iter().enumerate() {
+            if index > 0 {
+                writeln!(f)?;
+            }
+            write!(f, "{diagnostic}")?;
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnsatisfiableWildcardGrant {
+    pub role: String,
+    pub object_type: ObjectType,
+    pub schema: String,
+    pub privileges: std::collections::BTreeSet<Privilege>,
+    pub executor: String,
+    pub skipped_count: usize,
+    pub examples: Vec<UnsatisfiableWildcardObject>,
+}
+
+impl std::fmt::Display for UnsatisfiableWildcardGrant {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let privileges = self
+            .privileges
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(", ");
+        let examples = self
+            .examples
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("; ");
+        write!(
+            f,
+            "UnsatisfiableWildcardGrant: cannot fully satisfy wildcard grant \
+             {privileges} ON {} * IN SCHEMA \"{}\" TO \"{}\" as executor \"{}\"; \
+             {} matching object(s) are missing the desired privilege and are not grantable",
+            self.object_type, self.schema, self.role, self.executor, self.skipped_count
+        )?;
+        if !examples.is_empty() {
+            write!(f, " (examples: {examples})")?;
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnsatisfiableWildcardObject {
+    pub name: String,
+    pub owner: String,
+    pub privileges: std::collections::BTreeSet<Privilege>,
+}
+
+impl std::fmt::Display for UnsatisfiableWildcardObject {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let privileges = self
+            .privileges
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(", ");
+        write!(
+            f,
+            "\"{}\" owned by \"{}\" missing [{}]",
+            self.name, self.owner, privileges
+        )
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct InspectionResult {
+    pub graph: RoleGraph,
+    pub diagnostics: InspectionDiagnostics,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -283,7 +374,8 @@ pub async fn inspect_all(
             &role_refs,
             &[], // no wildcard patterns
         )
-        .await?;
+        .await?
+        .grants;
         for (key, state) in privilege_grants {
             graph.grants.insert(key, state);
         }
@@ -312,7 +404,17 @@ pub async fn inspect_all(
 /// Queries roles, memberships, object privileges, and default privileges,
 /// scoped to the managed set defined by `config`.
 pub async fn inspect(pool: &PgPool, config: &InspectConfig) -> Result<RoleGraph, InspectError> {
+    Ok(inspect_with_diagnostics(pool, config).await?.graph)
+}
+
+/// Inspect the current database state and return diagnostics for desired-state
+/// intent that cannot be satisfied by the current executor.
+pub async fn inspect_with_diagnostics(
+    pool: &PgPool,
+    config: &InspectConfig,
+) -> Result<InspectionResult, InspectError> {
     let mut graph = RoleGraph::default();
+    let mut diagnostics = InspectionDiagnostics::default();
 
     // Build &str slices for the query functions
     let role_refs: Vec<&str> = config.managed_roles.iter().map(|s| s.as_str()).collect();
@@ -368,13 +470,17 @@ pub async fn inspect(pool: &PgPool, config: &InspectConfig) -> Result<RoleGraph,
             schemas = ?privilege_schema_refs,
             "inspecting object privileges via aclexplode"
         );
-        let privilege_grants = privileges::fetch_privileges_with_wildcards(
+        let privilege_result = privileges::fetch_privileges_with_wildcards(
             pool,
             &privilege_schema_refs,
             &role_refs,
             &config.wildcard_grants,
         )
         .await?;
+        diagnostics
+            .unsatisfiable_wildcard_grants
+            .extend(privilege_result.diagnostics);
+        let privilege_grants = privilege_result.grants;
         for (key, state) in privilege_grants {
             graph.grants.insert(key, state);
         }
@@ -409,7 +515,7 @@ pub async fn inspect(pool: &PgPool, config: &InspectConfig) -> Result<RoleGraph,
         );
     }
 
-    Ok(graph)
+    Ok(InspectionResult { graph, diagnostics })
 }
 
 /// Fetch the names of all non-system schemas in the target database.

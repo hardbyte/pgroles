@@ -82,6 +82,21 @@ touch the others.
 
 If a schema has no objects of the declared type (e.g. no sequences yet), the wildcard grant is treated as vacuously satisfied — pgroles will not re-issue the statement on subsequent reconciles. When objects are later added, the next reconcile detects the new objects and applies the appropriate grants.
 
+Wildcard grants are strict desired state. `name: "*"` means every matching
+current object in the schema, not only the objects the current executor happens
+to own. During `diff`, `plan`, and `apply`, pgroles checks whether each missing
+wildcard privilege is grantable by the connected database user. If a matching
+object is missing the requested privilege and the executor lacks the matching
+`WITH GRANT OPTION`, pgroles stops with `UnsatisfiableWildcardGrant` instead of
+printing or applying a wildcard `GRANT` that would churn on every reconcile.
+
+The diagnostic includes the role, object type, schema, requested privileges,
+executor, skipped object count, and example object names with owners. To resolve
+it, run pgroles as a role that can grant the requested privileges on every
+matching object, transfer ownership, grant the executor the needed grant option,
+or narrow the manifest to objects that are intentionally managed by that
+executor.
+
 ### Specific object
 
 ```yaml
