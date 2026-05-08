@@ -28,7 +28,8 @@ use pgroles_core::model::{GrantKey, GrantState};
 /// A raw ACL row returned by our `aclexplode()` queries.
 #[derive(Debug, sqlx::FromRow)]
 struct AclRow {
-    /// The grantee role name. NULL means PUBLIC — we skip those.
+    /// The grantee role name. Privilege queries filter to managed roles in SQL;
+    /// inventory queries synthesize NULL because they do not carry grantees.
     grantee: Option<String>,
     /// The privilege type as a single character (e.g. 'r' for SELECT).
     privilege_type: String,
@@ -547,16 +548,9 @@ pub(crate) async fn fetch_privileges_with_wildcards(
     wildcard_stats.inventory_objects = inventory.values().map(BTreeSet::len).sum();
 
     for row in all_rows {
-        // Skip PUBLIC grantee (NULL)
-        let grantee = match row.grantee {
-            Some(ref name) => name,
-            None => continue,
-        };
-
-        // Skip if the grantee isn't in the managed set
-        if !managed_roles.contains(&grantee.as_str()) {
+        let Some(grantee) = row.grantee.as_ref() else {
             continue;
-        }
+        };
 
         let privilege = match acl_char_to_privilege(&row.privilege_type) {
             Some(privilege) => privilege,
@@ -1264,14 +1258,9 @@ pub async fn fetch_database_privileges(
     let mut grants: BTreeMap<GrantKey, GrantState> = BTreeMap::new();
 
     for row in rows {
-        let grantee = match row.grantee {
-            Some(ref name) => name,
-            None => continue,
-        };
-
-        if !managed_roles.contains(&grantee.as_str()) {
+        let Some(grantee) = row.grantee.as_ref() else {
             continue;
-        }
+        };
 
         let privilege = match acl_char_to_privilege(&row.privilege_type) {
             Some(privilege) => privilege,
