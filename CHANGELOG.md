@@ -5,6 +5,14 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.7.1] - 2026-05-08
+
+### Fixed
+
+- **Wildcard grants no longer flap when an inventory object loses its ACL between reconciles.** When a desired manifest had a wildcard grant (e.g. `function name: "*"`) and an object in scope was `DROP`ped+`CREATE`d externally — for example by a service running its own migrations — the inspector's wildcard-collapse failed and `diff` emitted both a wildcard `GRANT ... ON ALL ... IN SCHEMA` and a per-name `REVOKE` for every previously-granted object. Apply order re-granted everywhere then stripped the previously-known set, the next reconcile observed the inversion, and the controller flapped indefinitely. `diff` now treats a desired wildcard as shadowing per-name revocations of the same privileges within the same `(role, schema, type)` scope; covers both wildcard-only and wildcard-plus-specific-extras manifest shapes. (#104)
+- **Status starvation removed for cache-invalidating connection failures.** `reconcile_apply` previously held the in-process per-database lock across the connection probe, so `PostgresPolicy` resources sharing one credentials Secret could serialize on the lock during a Secret rotation to a bad URL — each lock-holder paying the full `POOL_ACQUIRE_TIMEOUT_SECS`. Lock contention requeues silently without updating the policy status, so an unlucky sibling could spend tens of seconds bouncing on the lock before publishing its `Ready=False/DatabaseConnectionFailed` condition. The connection probe now runs *before* lock acquisition, so failures surfaced at pool creation time (first reconcile, or after a Secret-resourceVersion / params-fingerprint cache invalidation) update status independently of concurrent reconciles for the same database target. Connection failures encountered inside the locked DDL phase against an already-cached pool are unaffected. (#104)
+- **TLA+ model for wildcard-grant convergence** (`correctness/races/Convergence.tla`). Verifies eventually-permanent convergence under fairness and a finite number of external `DROP+CREATE`s, and produces the partly-dev15-shaped lasso counterexample under v0.7.0 semantics. (#104)
+
 ## [0.7.0] - 2026-05-06
 
 ### Added

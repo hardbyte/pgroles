@@ -5,8 +5,8 @@ description: >-
   Define roles, memberships, grants, and default privileges in YAML
   and let the operator converge your database to the desired state.
 type: application
-version: 0.7.0
-appVersion: "0.7.0"
+version: 0.7.1
+appVersion: "0.7.1"
 icon: https://raw.githubusercontent.com/hardbyte/pgroles/main/docs/public/logo.svg
 sources:
   - https://github.com/hardbyte/pgroles
@@ -17,11 +17,9 @@ maintainers:
 annotations:
   artifacthub.io/changes: |
     - kind: fixed
-      description: 'Large plan SQL previews are stored as gzip-compressed ConfigMap binaryData before the plan is made visible, avoiding ConfigMap size failures and retry loops.'
+      description: 'Wildcard grants no longer flap when an inventory object loses its ACL (e.g. externally DROP+CREATEd functions).'
     - kind: fixed
-      description: 'Stale status-less plans and orphaned plan SQL ConfigMaps are cleaned up defensively before and after reconcile.'
-    - kind: added
-      description: 'pgroles generate --suggest-profiles can refactor flat brownfield manifests into deterministic reusable profiles.'
+      description: 'Connection failures detected at pool-creation time (e.g. after a credential Secret rotation) no longer starve sibling policies on the in-process lock.'
   artifacthub.io/category: database
   artifacthub.io/operator: "true"
   artifacthub.io/prerelease: "false"
