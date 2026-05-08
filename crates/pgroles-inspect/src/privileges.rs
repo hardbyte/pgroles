@@ -223,15 +223,18 @@ pub(crate) async fn fetch_privileges_with_wildcards(
     wildcard_grants: &[WildcardGrantPattern],
 ) -> Result<PrivilegeInspectionResult, sqlx::Error> {
     let mut grants: BTreeMap<GrantKey, GrantState> = BTreeMap::new();
+    let has_wildcards = !wildcard_grants.is_empty();
     let mut inventory: BTreeMap<(ObjectType, String), BTreeSet<String>> = BTreeMap::new();
 
-    for ((object_type, schema_name), object_names) in
-        fetch_object_inventory(pool, managed_schemas).await?
-    {
-        inventory.insert(
-            (object_type, schema_name),
-            object_names.into_iter().collect(),
-        );
+    if has_wildcards {
+        for ((object_type, schema_name), object_names) in
+            fetch_object_inventory(pool, managed_schemas).await?
+        {
+            inventory.insert(
+                (object_type, schema_name),
+                object_names.into_iter().collect(),
+            );
+        }
     }
 
     // Run all the independent queries and collect results.
@@ -251,7 +254,8 @@ pub(crate) async fn fetch_privileges_with_wildcards(
         .collect();
 
     for row in &all_rows {
-        if let Some(object_type) = obj_type_str_to_object_type(&row.obj_type)
+        if has_wildcards
+            && let Some(object_type) = obj_type_str_to_object_type(&row.obj_type)
             && !matches!(object_type, ObjectType::Schema | ObjectType::Database)
             && let Some(schema_name) = &row.schema_name
         {
@@ -307,15 +311,20 @@ pub(crate) async fn fetch_privileges_with_wildcards(
         entry.privileges.insert(privilege);
     }
 
-    let diagnostics = if wildcard_grants.is_empty() {
-        Vec::new()
-    } else {
+    let diagnostics = if has_wildcards {
         let executor = fetch_current_user(pool).await?;
         let grantability = fetch_wildcard_grantability(pool, managed_schemas).await?;
         detect_unsatisfiable_wildcards(&grants, &grantability, wildcard_grants, &executor)
+    } else {
+        Vec::new()
     };
 
-    let grants = normalize_wildcard_grants(grants, &inventory, wildcard_grants);
+    let grants = if has_wildcards {
+        normalize_wildcard_grants(grants, &inventory, wildcard_grants)
+    } else {
+        grants
+    };
+
     Ok(PrivilegeInspectionResult {
         grants,
         diagnostics,

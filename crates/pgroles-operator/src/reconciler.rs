@@ -581,6 +581,8 @@ async fn reconcile_apply(
             let error_reason = err.reason();
             let is_transient_failure =
                 retry_class_for_reconcile_error(&err) == RetryClass::Transient;
+            let clear_current_plan_ref =
+                matches!(&err, ReconcileError::UnsatisfiableWildcardGrant(_));
             match error_reason {
                 "DatabaseConnectionFailed" => {
                     ctx.observability.record_database_connection_failure()
@@ -599,6 +601,7 @@ async fn reconcile_apply(
                     error_reason,
                     &error_message,
                     is_transient_failure,
+                    clear_current_plan_ref,
                 );
             })
             .await
@@ -615,6 +618,7 @@ fn mark_reconcile_failure_status(
     error_reason: &str,
     error_message: &str,
     is_transient_failure: bool,
+    clear_current_plan_ref: bool,
 ) {
     status.set_condition(ready_condition(false, error_reason, error_message));
     status.set_condition(degraded_condition(error_reason, error_message));
@@ -622,11 +626,14 @@ fn mark_reconcile_failure_status(
         c.condition_type != "Reconciling"
             && c.condition_type != "Paused"
             && c.condition_type != "Drifted"
+            && c.condition_type != "Conflict"
     });
     status.change_summary = None;
     status.planned_sql = None;
     status.planned_sql_truncated = false;
-    status.current_plan_ref = None;
+    if clear_current_plan_ref {
+        status.current_plan_ref = None;
+    }
     status.last_error = Some(error_message.to_string());
     if is_transient_failure {
         status.transient_failure_count += 1;
@@ -2752,6 +2759,7 @@ mod tests {
         let mut status = PostgresPolicyStatus {
             conditions: vec![
                 ready_condition(true, "Planned", "Plan computed"),
+                conflict_condition("ConflictingPolicy", "Policy overlaps another policy"),
                 reconciling_condition("Reconciliation in progress"),
                 drifted_condition(true, "DriftDetected", "1 planned change pending"),
             ],
@@ -2772,7 +2780,13 @@ mod tests {
             ..Default::default()
         };
 
-        mark_reconcile_failure_status(&mut status, "UnsatisfiableWildcardGrant", message, false);
+        mark_reconcile_failure_status(
+            &mut status,
+            "UnsatisfiableWildcardGrant",
+            message,
+            false,
+            true,
+        );
 
         let ready = status
             .conditions
@@ -2797,9 +2811,11 @@ mod tests {
 
         assert!(
             status.conditions.iter().all(|condition| {
-                condition.condition_type != "Reconciling" && condition.condition_type != "Drifted"
+                condition.condition_type != "Reconciling"
+                    && condition.condition_type != "Drifted"
+                    && condition.condition_type != "Conflict"
             }),
-            "transient planning conditions should be cleared on degraded status"
+            "transient planning and stale conflict conditions should be cleared on degraded status"
         );
         assert!(status.change_summary.is_none());
         assert!(status.planned_sql.is_none());
@@ -2807,6 +2823,42 @@ mod tests {
         assert!(status.current_plan_ref.is_none());
         assert_eq!(status.last_error.as_deref(), Some(message));
         assert_eq!(status.transient_failure_count, 0);
+    }
+
+    #[test]
+    fn reconcile_failure_status_preserves_plan_reference_when_requested() {
+        let mut status = PostgresPolicyStatus {
+            current_plan_ref: Some(crate::crd::PlanReference {
+                name: "approved-plan".into(),
+            }),
+            planned_sql: Some("ALTER ROLE \"app\" LOGIN;".into()),
+            planned_sql_truncated: true,
+            transient_failure_count: 2,
+            ..Default::default()
+        };
+
+        mark_reconcile_failure_status(
+            &mut status,
+            "ApplyFailed",
+            "SQL execution error: connection closed",
+            true,
+            false,
+        );
+
+        assert_eq!(
+            status
+                .current_plan_ref
+                .as_ref()
+                .map(|plan| plan.name.as_str()),
+            Some("approved-plan")
+        );
+        assert!(status.planned_sql.is_none());
+        assert!(!status.planned_sql_truncated);
+        assert_eq!(
+            status.last_error.as_deref(),
+            Some("SQL execution error: connection closed")
+        );
+        assert_eq!(status.transient_failure_count, 3);
     }
 
     #[test]

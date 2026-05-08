@@ -1180,44 +1180,31 @@ async fn inspect_current(
     pool: &PgPool,
     validated: &pgroles_cli::ValidatedManifest,
 ) -> Result<pgroles_core::model::RoleGraph> {
-    // Determine whether the manifest has database-level grants.
+    let config = inspect_config_for_manifest(validated);
+    inspect_current_with_config(pool, &config).await
+}
+
+fn inspect_config_for_manifest(validated: &pgroles_cli::ValidatedManifest) -> InspectConfig {
     let has_database_grants = validated
         .expanded
         .grants
         .iter()
         .any(|g| g.object.object_type == pgroles_core::manifest::ObjectType::Database);
 
-    let config = InspectConfig::from_expanded(&validated.expanded, has_database_grants)
-        .with_additional_roles(
-            validated
-                .manifest
-                .retirements
-                .iter()
-                .map(|retirement| retirement.role.clone()),
-        );
-
-    inspect_current_with_config(pool, &config).await
+    InspectConfig::from_expanded(&validated.expanded, has_database_grants).with_additional_roles(
+        validated
+            .manifest
+            .retirements
+            .iter()
+            .map(|retirement| retirement.role.clone()),
+    )
 }
 
 async fn inspect_current_for_plan(
     pool: &PgPool,
     validated: &pgroles_cli::ValidatedManifest,
 ) -> Result<pgroles_core::model::RoleGraph> {
-    let has_database_grants = validated
-        .expanded
-        .grants
-        .iter()
-        .any(|g| g.object.object_type == pgroles_core::manifest::ObjectType::Database);
-
-    let config = InspectConfig::from_expanded(&validated.expanded, has_database_grants)
-        .with_additional_roles(
-            validated
-                .manifest
-                .retirements
-                .iter()
-                .map(|retirement| retirement.role.clone()),
-        );
-
+    let config = inspect_config_for_manifest(validated);
     inspect_current_for_plan_with_config(pool, &config).await
 }
 
