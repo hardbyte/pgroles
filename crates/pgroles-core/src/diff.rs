@@ -557,14 +557,23 @@ fn diff_grants(
 ) {
     // Index desired wildcard grants for shadow-revoke filtering below. A
     // desired wildcard `(role, schema, type, "*")` declares "every object of
-    // this type in this schema gets these privileges", so any per-name entry
-    // surviving in `current` for the same (role, schema, type) is implicitly
-    // covered by the wildcard. Revoking those privileges per-name would just
-    // be undone by the wildcard GRANT in the same plan — and because GRANTs
-    // are applied before REVOKEs, the net effect is to strip privileges from
-    // exactly the objects the inspector knew about, leaving the recently-
-    // recreated objects with grants. The next reconcile observes the inverted
-    // set, and the controller flaps forever.
+    // this type in this schema gets these privileges", so for any per-name
+    // entry surviving in `current` for the same (role, schema, type), the
+    // wildcard's privileges are implicitly covered. Revoking those privileges
+    // per-name would just be undone by the wildcard GRANT in the same plan
+    // — and because GRANTs are applied before REVOKEs, the net effect is to
+    // strip privileges from exactly the objects the inspector knew about,
+    // leaving the recently-recreated objects with grants. The next reconcile
+    // observes the inverted set, and the controller flaps forever.
+    //
+    // The shadowing applies to BOTH branches that produce per-name REVOKEs:
+    //   - the matched-key branch (desired and current both have the per-name
+    //     entry, e.g. desired=`widgets:INSERT` plus wildcard `*:SELECT`,
+    //     current=`widgets:SELECT+INSERT` → without filtering, `to_remove`
+    //     for the matched key would be `{SELECT}` and apply would strip a
+    //     privilege the wildcard still declares).
+    //   - the absent-key branch (current has a per-name entry that desired
+    //     covers only via wildcard).
     let desired_wildcards: BTreeMap<(&str, &Option<String>, ObjectType), &BTreeSet<Privilege>> =
         desired
             .grants
@@ -572,6 +581,21 @@ fn diff_grants(
             .filter(|(k, _)| k.name.as_deref() == Some("*") && k.schema.is_some())
             .map(|(k, v)| ((k.role.as_str(), &k.schema, k.object_type), &v.privileges))
             .collect();
+
+    // Returns the subset of `candidate` not shadowed by a desired wildcard
+    // for the same (role, schema, type). The wildcard itself is never
+    // shadowed (it has name="*", not a specific object name).
+    let shadow_filter = |key: &GrantKey, candidate: BTreeSet<Privilege>| -> BTreeSet<Privilege> {
+        if key.name.as_deref() == Some("*") {
+            return candidate;
+        }
+        match desired_wildcards.get(&(key.role.as_str(), &key.schema, key.object_type)) {
+            Some(wildcard_privileges) => {
+                candidate.difference(wildcard_privileges).copied().collect()
+            }
+            None => candidate,
+        }
+    };
 
     // Grants in desired but not in current → GRANT (full set)
     // Grants in both → diff the privilege sets
@@ -593,6 +617,7 @@ fn diff_grants(
                     .difference(&desired_state.privileges)
                     .copied()
                     .collect();
+                let to_remove = shadow_filter(key, to_remove);
 
                 if !to_add.is_empty() {
                     grants_out.push(change_grant(key, &to_add));
@@ -611,19 +636,7 @@ fn diff_grants(
             continue;
         }
 
-        let to_revoke: BTreeSet<Privilege> = if key.name.as_deref() != Some("*")
-            && let Some(wildcard_privileges) =
-                desired_wildcards.get(&(key.role.as_str(), &key.schema, key.object_type))
-        {
-            current_state
-                .privileges
-                .difference(wildcard_privileges)
-                .copied()
-                .collect()
-        } else {
-            current_state.privileges.clone()
-        };
-
+        let to_revoke = shadow_filter(key, current_state.privileges.clone());
         if !to_revoke.is_empty() {
             revokes_out.push(change_revoke(key, &to_revoke));
         }
@@ -2011,6 +2024,97 @@ memberships:
             }
             other => panic!("expected wildcard Grant, got: {other:?}"),
         }
+    }
+
+    /// Companion to the absent-key flap test above: the matched-key branch
+    /// of `diff_grants` (where current and desired share a per-name entry)
+    /// must also subtract desired-wildcard privileges from the revoke set.
+    /// Concrete shape: a manifest combines `table * SELECT` (wildcard) with
+    /// `widgets INSERT` (per-object extra). If wildcard collapse fails and
+    /// `current` carries `widgets {SELECT, INSERT}`, the matched-key diff
+    /// computes `to_remove = {SELECT}` against desired `widgets {INSERT}`
+    /// — but SELECT is still declared by the wildcard, so revoking it here
+    /// produces the same apply-order hazard (GRANT * SELECT, then
+    /// REVOKE widgets SELECT → widgets ends up with INSERT only, the
+    /// wildcard is unsatisfied, the next reconcile inverts again).
+    #[test]
+    fn diff_does_not_revoke_extra_privileges_covered_by_desired_wildcard() {
+        let role = "viewer".to_string();
+        let schema = "myschema".to_string();
+        let object_type = ObjectType::Table;
+
+        // current: widgets has the wildcard's SELECT plus the extra INSERT.
+        // The wildcard's `(*)` key is absent from current (collapse failed).
+        let mut current = empty_graph();
+        current.grants.insert(
+            GrantKey {
+                role: role.clone(),
+                object_type,
+                schema: Some(schema.clone()),
+                name: Some("widgets".to_string()),
+            },
+            GrantState {
+                privileges: BTreeSet::from([Privilege::Select, Privilege::Insert]),
+            },
+        );
+
+        // desired: wildcard SELECT plus per-object widgets INSERT.
+        let mut desired = empty_graph();
+        desired.grants.insert(
+            GrantKey {
+                role: role.clone(),
+                object_type,
+                schema: Some(schema.clone()),
+                name: Some("*".to_string()),
+            },
+            GrantState {
+                privileges: BTreeSet::from([Privilege::Select]),
+            },
+        );
+        desired.grants.insert(
+            GrantKey {
+                role: role.clone(),
+                object_type,
+                schema: Some(schema.clone()),
+                name: Some("widgets".to_string()),
+            },
+            GrantState {
+                privileges: BTreeSet::from([Privilege::Insert]),
+            },
+        );
+
+        let changes = diff(&current, &desired);
+
+        let revokes: Vec<_> = changes
+            .iter()
+            .filter(|c| matches!(c, Change::Revoke { .. }))
+            .collect();
+        assert!(
+            revokes.is_empty(),
+            "must not revoke widgets SELECT — covered by desired wildcard; got: {revokes:#?}"
+        );
+
+        // Should still emit the wildcard GRANT to materialise SELECT on
+        // every table (the reason the wildcard is unsatisfied in current).
+        let grants: Vec<_> = changes
+            .iter()
+            .filter(|c| matches!(c, Change::Grant { .. }))
+            .collect();
+        let has_wildcard_select_grant = grants.iter().any(|c| {
+            matches!(
+                c,
+                Change::Grant {
+                    name,
+                    privileges,
+                    ..
+                } if name.as_deref() == Some("*")
+                    && privileges.contains(&Privilege::Select)
+            )
+        });
+        assert!(
+            has_wildcard_select_grant,
+            "expected wildcard GRANT for SELECT; got: {grants:#?}"
+        );
     }
 
     #[test]
