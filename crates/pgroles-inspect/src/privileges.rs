@@ -28,7 +28,8 @@ use pgroles_core::model::{GrantKey, GrantState};
 /// A raw ACL row returned by our `aclexplode()` queries.
 #[derive(Debug, sqlx::FromRow)]
 struct AclRow {
-    /// The grantee role name. NULL means PUBLIC — we skip those.
+    /// The grantee role name. Privilege queries filter to managed roles in SQL;
+    /// inventory queries synthesize NULL because they do not carry grantees.
     grantee: Option<String>,
     /// The privilege type as a single character (e.g. 'r' for SELECT).
     privilege_type: String,
@@ -152,6 +153,15 @@ impl WildcardScopeFilter {
 
     fn len(&self) -> usize {
         self.schema_names.len()
+    }
+
+    fn unique_schemas(&self) -> Vec<String> {
+        self.schema_names
+            .iter()
+            .cloned()
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect()
     }
 
     fn contains(&self, object_type: ObjectType, schema_name: &str) -> bool {
@@ -323,6 +333,7 @@ async fn fetch_object_inventory_for_wildcards(
     if filter.is_empty() {
         return Ok(BTreeMap::new());
     }
+    let wildcard_schemas = filter.unique_schemas();
 
     let rows = sqlx::query_as::<_, AclRow>(
         r#"
@@ -376,6 +387,7 @@ async fn fetch_object_inventory_for_wildcards(
                 WHEN 'm' THEN 'materialized_view'
              END
         WHERE c.relkind IN ('r', 'p', 'v', 'm')
+          AND n.nspname = ANY($12)
 
         UNION ALL
 
@@ -391,6 +403,7 @@ async fn fetch_object_inventory_for_wildcards(
           ON scope.schema_name = n.nspname
          AND scope.obj_type = 'sequence'
         WHERE c.relkind = 'S'
+          AND n.nspname = ANY($12)
 
         UNION ALL
 
@@ -405,6 +418,7 @@ async fn fetch_object_inventory_for_wildcards(
         JOIN wildcard_scope scope
           ON scope.schema_name = n.nspname
          AND scope.obj_type = 'function'
+        WHERE n.nspname = ANY($12)
 
         UNION ALL
 
@@ -421,6 +435,7 @@ async fn fetch_object_inventory_for_wildcards(
          AND scope.obj_type = 'type'
         WHERE t.typname NOT LIKE '\_%'
           AND t.typtype <> 'p'
+          AND n.nspname = ANY($12)
 
         ORDER BY schema_name, obj_type, object_name
         "#,
@@ -436,6 +451,7 @@ async fn fetch_object_inventory_for_wildcards(
     .bind(&filter.need_trigger)
     .bind(&filter.need_execute)
     .bind(&filter.need_usage)
+    .bind(&wildcard_schemas)
     .fetch_all(pool)
     .await?;
 
@@ -504,10 +520,10 @@ pub(crate) async fn fetch_privileges_with_wildcards(
     // We use separate queries per object type rather than one giant UNION
     // because the NULL-ACL handling (acldefault) differs per type.
 
-    let relation_rows = fetch_relation_privileges(pool, managed_schemas).await?;
-    let schema_rows = fetch_schema_privileges(pool, managed_schemas).await?;
-    let function_rows = fetch_function_privileges(pool, managed_schemas).await?;
-    let type_rows = fetch_type_privileges(pool, managed_schemas).await?;
+    let relation_rows = fetch_relation_privileges(pool, managed_schemas, managed_roles).await?;
+    let schema_rows = fetch_schema_privileges(pool, managed_schemas, managed_roles).await?;
+    let function_rows = fetch_function_privileges(pool, managed_schemas, managed_roles).await?;
+    let type_rows = fetch_type_privileges(pool, managed_schemas, managed_roles).await?;
 
     let all_rows: Vec<AclRow> = relation_rows
         .into_iter()
@@ -532,16 +548,9 @@ pub(crate) async fn fetch_privileges_with_wildcards(
     wildcard_stats.inventory_objects = inventory.values().map(BTreeSet::len).sum();
 
     for row in all_rows {
-        // Skip PUBLIC grantee (NULL)
-        let grantee = match row.grantee {
-            Some(ref name) => name,
-            None => continue,
-        };
-
-        // Skip if the grantee isn't in the managed set
-        if !managed_roles.contains(&grantee.as_str()) {
+        let Some(grantee) = row.grantee.as_ref() else {
             continue;
-        }
+        };
 
         let privilege = match acl_char_to_privilege(&row.privilege_type) {
             Some(privilege) => privilege,
@@ -669,6 +678,7 @@ async fn fetch_wildcard_grantability(
     if filter.is_empty() {
         return Ok(BTreeMap::new());
     }
+    let wildcard_schemas = filter.unique_schemas();
 
     let rows = sqlx::query_as::<_, GrantabilityRow>(
         r#"
@@ -747,6 +757,7 @@ async fn fetch_wildcard_grantability(
             SELECT pg_has_role(current_user, c.relowner, 'USAGE') AS can_grant_as_owner
         ) owner_grant
         WHERE c.relkind IN ('r', 'p', 'v', 'm')
+          AND n.nspname = ANY($12)
 
         UNION ALL
 
@@ -779,6 +790,7 @@ async fn fetch_wildcard_grantability(
             SELECT pg_has_role(current_user, c.relowner, 'USAGE') AS can_grant_as_owner
         ) owner_grant
         WHERE c.relkind = 'S'
+          AND n.nspname = ANY($12)
 
         UNION ALL
 
@@ -806,6 +818,7 @@ async fn fetch_wildcard_grantability(
         CROSS JOIN LATERAL (
             SELECT pg_has_role(current_user, p.proowner, 'USAGE') AS can_grant_as_owner
         ) owner_grant
+        WHERE n.nspname = ANY($12)
 
         UNION ALL
 
@@ -835,6 +848,7 @@ async fn fetch_wildcard_grantability(
         ) owner_grant
         WHERE t.typname NOT LIKE '\_%'
           AND t.typtype <> 'p'
+          AND n.nspname = ANY($12)
 
         ORDER BY schema_name, obj_type, object_name
         "#,
@@ -850,6 +864,7 @@ async fn fetch_wildcard_grantability(
     .bind(&filter.need_trigger)
     .bind(&filter.need_execute)
     .bind(&filter.need_usage)
+    .bind(&wildcard_schemas)
     .fetch_all(pool)
     .await?;
 
@@ -1079,6 +1094,7 @@ fn all_privileges() -> BTreeSet<Privilege> {
 async fn fetch_relation_privileges(
     pool: &PgPool,
     managed_schemas: &[&str],
+    managed_roles: &[&str],
 ) -> Result<Vec<AclRow>, sqlx::Error> {
     sqlx::query_as::<_, AclRow>(
         r#"
@@ -1097,13 +1113,15 @@ async fn fetch_relation_privileges(
         FROM pg_class c
         JOIN pg_namespace n ON n.oid = c.relnamespace
         CROSS JOIN LATERAL aclexplode(c.relacl) AS acl
-        LEFT JOIN pg_roles grantee ON grantee.oid = acl.grantee
+        JOIN pg_roles grantee ON grantee.oid = acl.grantee
         WHERE n.nspname = ANY($1)
           AND c.relkind IN ('r', 'p', 'v', 'm', 'S')
+          AND grantee.rolname = ANY($2)
         ORDER BY n.nspname, c.relname
         "#,
     )
     .bind(managed_schemas)
+    .bind(managed_roles)
     .fetch_all(pool)
     .await
 }
@@ -1115,6 +1133,7 @@ async fn fetch_relation_privileges(
 async fn fetch_schema_privileges(
     pool: &PgPool,
     managed_schemas: &[&str],
+    managed_roles: &[&str],
 ) -> Result<Vec<AclRow>, sqlx::Error> {
     sqlx::query_as::<_, AclRow>(
         r#"
@@ -1126,12 +1145,14 @@ async fn fetch_schema_privileges(
             'schema' AS obj_type
         FROM pg_namespace n
         CROSS JOIN LATERAL aclexplode(n.nspacl) AS acl
-        LEFT JOIN pg_roles grantee ON grantee.oid = acl.grantee
+        JOIN pg_roles grantee ON grantee.oid = acl.grantee
         WHERE n.nspname = ANY($1)
+          AND grantee.rolname = ANY($2)
         ORDER BY n.nspname
         "#,
     )
     .bind(managed_schemas)
+    .bind(managed_roles)
     .fetch_all(pool)
     .await
 }
@@ -1145,6 +1166,7 @@ async fn fetch_schema_privileges(
 async fn fetch_function_privileges(
     pool: &PgPool,
     managed_schemas: &[&str],
+    managed_roles: &[&str],
 ) -> Result<Vec<AclRow>, sqlx::Error> {
     sqlx::query_as::<_, AclRow>(
         r#"
@@ -1157,12 +1179,14 @@ async fn fetch_function_privileges(
         FROM pg_proc p
         JOIN pg_namespace n ON n.oid = p.pronamespace
         CROSS JOIN LATERAL aclexplode(p.proacl) AS acl
-        LEFT JOIN pg_roles grantee ON grantee.oid = acl.grantee
+        JOIN pg_roles grantee ON grantee.oid = acl.grantee
         WHERE n.nspname = ANY($1)
+          AND grantee.rolname = ANY($2)
         ORDER BY n.nspname, p.proname
         "#,
     )
     .bind(managed_schemas)
+    .bind(managed_roles)
     .fetch_all(pool)
     .await
 }
@@ -1176,6 +1200,7 @@ async fn fetch_function_privileges(
 async fn fetch_type_privileges(
     pool: &PgPool,
     managed_schemas: &[&str],
+    managed_roles: &[&str],
 ) -> Result<Vec<AclRow>, sqlx::Error> {
     sqlx::query_as::<_, AclRow>(
         r#"
@@ -1188,14 +1213,16 @@ async fn fetch_type_privileges(
         FROM pg_type t
         JOIN pg_namespace n ON n.oid = t.typnamespace
         CROSS JOIN LATERAL aclexplode(t.typacl) AS acl
-        LEFT JOIN pg_roles grantee ON grantee.oid = acl.grantee
+        JOIN pg_roles grantee ON grantee.oid = acl.grantee
         WHERE n.nspname = ANY($1)
           AND t.typname NOT LIKE '\_%'
           AND t.typtype <> 'p'
+          AND grantee.rolname = ANY($2)
         ORDER BY n.nspname, t.typname
         "#,
     )
     .bind(managed_schemas)
+    .bind(managed_roles)
     .fetch_all(pool)
     .await
 }
@@ -1218,25 +1245,22 @@ pub async fn fetch_database_privileges(
             'database' AS obj_type
         FROM pg_database db
         CROSS JOIN LATERAL aclexplode(db.datacl) AS acl
-        LEFT JOIN pg_roles grantee ON grantee.oid = acl.grantee
+        JOIN pg_roles grantee ON grantee.oid = acl.grantee
         WHERE db.datname = current_database()
+          AND grantee.rolname = ANY($1)
         ORDER BY db.datname
         "#,
     )
+    .bind(managed_roles)
     .fetch_all(pool)
     .await?;
 
     let mut grants: BTreeMap<GrantKey, GrantState> = BTreeMap::new();
 
     for row in rows {
-        let grantee = match row.grantee {
-            Some(ref name) => name,
-            None => continue,
-        };
-
-        if !managed_roles.contains(&grantee.as_str()) {
+        let Some(grantee) = row.grantee.as_ref() else {
             continue;
-        }
+        };
 
         let privilege = match acl_char_to_privilege(&row.privilege_type) {
             Some(privilege) => privilege,
@@ -1519,6 +1543,32 @@ mod tests {
         assert_eq!(filter.need_select, vec![true]);
         assert_eq!(filter.need_insert, vec![true]);
         assert_eq!(filter.need_update, vec![false]);
+    }
+
+    #[test]
+    fn wildcard_scope_filter_reports_unique_schemas() {
+        let filter = WildcardScopeFilter::from_wildcards(&[
+            WildcardGrantPattern {
+                role: "reader".to_string(),
+                object_type: ObjectType::Table,
+                schema: "app".to_string(),
+                privileges: BTreeSet::from([Privilege::Select]),
+            },
+            WildcardGrantPattern {
+                role: "reader".to_string(),
+                object_type: ObjectType::Function,
+                schema: "app".to_string(),
+                privileges: BTreeSet::from([Privilege::Execute]),
+            },
+            WildcardGrantPattern {
+                role: "reader".to_string(),
+                object_type: ObjectType::Table,
+                schema: "audit".to_string(),
+                privileges: BTreeSet::from([Privilege::Select]),
+            },
+        ]);
+
+        assert_eq!(filter.unique_schemas(), vec!["app", "audit"]);
     }
 
     #[test]
