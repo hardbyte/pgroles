@@ -419,7 +419,7 @@ async fn cmd_diff(
         let validated = validate_bundle_file(bundle_path)?;
         let pool = connect_db(database_url).await?;
         let inspect_config = inspect_config_for_bundle(&validated);
-        let current = inspect_current_with_config(&pool, &inspect_config).await?;
+        let current = inspect_current_for_plan_with_config(&pool, &inspect_config).await?;
         let resolved_passwords = resolve_passwords(&validated.composed.expanded)
             .context("failed to resolve role passwords")?;
         info!(%mode, "reconciliation mode");
@@ -480,7 +480,7 @@ async fn cmd_diff(
     let validated = validate_manifest(&yaml)?;
 
     let pool = connect_db(database_url).await?;
-    let current = inspect_current(&pool, &validated).await?;
+    let current = inspect_current_for_plan(&pool, &validated).await?;
 
     let resolved_passwords =
         resolve_passwords(&validated.expanded).context("failed to resolve role passwords")?;
@@ -550,7 +550,7 @@ async fn cmd_apply(
             .context("failed to detect privilege level")?;
         info!(level = %privilege_level, "detected privilege level");
 
-        let current = inspect_current_with_config(&pool, &inspect_config).await?;
+        let current = inspect_current_for_plan_with_config(&pool, &inspect_config).await?;
 
         let resolved_passwords = resolve_passwords(&validated.composed.expanded)
             .context("failed to resolve role passwords")?;
@@ -636,7 +636,7 @@ async fn cmd_apply(
         .context("failed to detect privilege level")?;
     info!(level = %privilege_level, "detected privilege level");
 
-    let current = inspect_current(&pool, &validated).await?;
+    let current = inspect_current_for_plan(&pool, &validated).await?;
 
     let resolved_passwords =
         resolve_passwords(&validated.expanded).context("failed to resolve role passwords")?;
@@ -1199,6 +1199,28 @@ async fn inspect_current(
     inspect_current_with_config(pool, &config).await
 }
 
+async fn inspect_current_for_plan(
+    pool: &PgPool,
+    validated: &pgroles_cli::ValidatedManifest,
+) -> Result<pgroles_core::model::RoleGraph> {
+    let has_database_grants = validated
+        .expanded
+        .grants
+        .iter()
+        .any(|g| g.object.object_type == pgroles_core::manifest::ObjectType::Database);
+
+    let config = InspectConfig::from_expanded(&validated.expanded, has_database_grants)
+        .with_additional_roles(
+            validated
+                .manifest
+                .retirements
+                .iter()
+                .map(|retirement| retirement.role.clone()),
+        );
+
+    inspect_current_for_plan_with_config(pool, &config).await
+}
+
 fn inspect_config_for_bundle(validated: &pgroles_cli::ValidatedBundle) -> InspectConfig {
     InspectConfig::from_managed_scope(
         &validated.composed.managed_scope,
@@ -1232,6 +1254,26 @@ async fn inspect_current_with_config(
     pgroles_inspect::inspect(pool, config)
         .await
         .context("failed to inspect database state")
+}
+
+async fn inspect_current_for_plan_with_config(
+    pool: &PgPool,
+    config: &InspectConfig,
+) -> Result<pgroles_core::model::RoleGraph> {
+    info!(
+        managed_roles = config.managed_roles.len(),
+        managed_schemas = config.managed_schemas.len(),
+        privilege_schemas = config.privilege_schemas.len(),
+        "inspecting current database state"
+    );
+
+    let inspection = pgroles_inspect::inspect_with_diagnostics(pool, config)
+        .await
+        .context("failed to inspect database state")?;
+    if !inspection.diagnostics.is_empty() {
+        anyhow::bail!("{}", inspection.diagnostics);
+    }
+    Ok(inspection.graph)
 }
 
 async fn inspect_drop_safety(

@@ -131,6 +131,9 @@ pub enum ReconcileError {
     MissingDatabaseObjects(String),
 
     #[error("{0}")]
+    UnsatisfiableWildcardGrant(String),
+
+    #[error("{0}")]
     ConflictingPolicy(String),
 
     #[error("lock contention on database \"{0}\": {1}")]
@@ -350,6 +353,7 @@ fn retry_class_for_reconcile_error(error: &ReconcileError) -> RetryClass {
         | ReconcileError::InvalidInterval(_, _)
         | ReconcileError::InvalidSpec(_)
         | ReconcileError::MissingDatabaseObjects(_)
+        | ReconcileError::UnsatisfiableWildcardGrant(_)
         | ReconcileError::ConflictingPolicy(_)
         | ReconcileError::UnsafeRoleDrops(_)
         | ReconcileError::EmptyPasswordSecret { .. }
@@ -583,29 +587,19 @@ async fn reconcile_apply(
                 }
                 "InvalidSpec" => ctx.observability.record_invalid_spec(),
                 "ConflictingPolicy" => ctx.observability.record_policy_conflict(),
-                "ApplyFailed" | "MissingDatabaseObject" => {
+                "ApplyFailed" | "MissingDatabaseObject" | "UnsatisfiableWildcardGrant" => {
                     ctx.observability.record_apply_result("error")
                 }
                 _ => {}
             }
             reconcile_guard.record_result("error", error_reason);
             if let Err(status_err) = update_status(ctx, resource, |status| {
-                status.set_condition(ready_condition(false, error_reason, &error_message));
-                status.set_condition(degraded_condition(error_reason, &error_message));
-                status.conditions.retain(|c| {
-                    c.condition_type != "Reconciling"
-                        && c.condition_type != "Paused"
-                        && c.condition_type != "Drifted"
-                });
-                status.change_summary = None;
-                status.planned_sql = None;
-                status.planned_sql_truncated = false;
-                status.last_error = Some(error_message.clone());
-                if is_transient_failure {
-                    status.transient_failure_count += 1;
-                } else {
-                    status.transient_failure_count = 0;
-                }
+                mark_reconcile_failure_status(
+                    status,
+                    error_reason,
+                    &error_message,
+                    is_transient_failure,
+                );
             })
             .await
             {
@@ -613,6 +607,31 @@ async fn reconcile_apply(
             }
             Err(err)
         }
+    }
+}
+
+fn mark_reconcile_failure_status(
+    status: &mut PostgresPolicyStatus,
+    error_reason: &str,
+    error_message: &str,
+    is_transient_failure: bool,
+) {
+    status.set_condition(ready_condition(false, error_reason, error_message));
+    status.set_condition(degraded_condition(error_reason, error_message));
+    status.conditions.retain(|c| {
+        c.condition_type != "Reconciling"
+            && c.condition_type != "Paused"
+            && c.condition_type != "Drifted"
+    });
+    status.change_summary = None;
+    status.planned_sql = None;
+    status.planned_sql_truncated = false;
+    status.current_plan_ref = None;
+    status.last_error = Some(error_message.to_string());
+    if is_transient_failure {
+        status.transient_failure_count += 1;
+    } else {
+        status.transient_failure_count = 0;
     }
 }
 
@@ -858,7 +877,13 @@ async fn apply_under_lock(
                     .iter()
                     .map(|retirement| retirement.role.clone()),
             );
-    let current = pgroles_inspect::inspect(pool, &inspect_config).await?;
+    let inspection = pgroles_inspect::inspect_with_diagnostics(pool, &inspect_config).await?;
+    if !inspection.diagnostics.is_empty() {
+        return Err(ReconcileError::UnsatisfiableWildcardGrant(
+            inspection.diagnostics.to_string(),
+        ));
+    }
+    let current = inspection.graph;
 
     // 6b. Pre-flight: validate that every schema referenced by the policy
     // exists in the target database. This turns a mid-transaction
@@ -2047,6 +2072,7 @@ impl ReconcileError {
             | ReconcileError::InvalidInterval(_, _)
             | ReconcileError::InvalidSpec(_) => "InvalidSpec",
             ReconcileError::ConflictingPolicy(_) => "ConflictingPolicy",
+            ReconcileError::UnsatisfiableWildcardGrant(_) => "UnsatisfiableWildcardGrant",
             ReconcileError::LockContention(_, _) => "LockContention",
             ReconcileError::Context(context) => match context.as_ref() {
                 ContextError::SecretFetch { .. } => "SecretFetchFailed",
@@ -2712,6 +2738,78 @@ mod tests {
     }
 
     #[test]
+    fn error_reason_unsatisfiable_wildcard_grant() {
+        let err = ReconcileError::UnsatisfiableWildcardGrant(
+            "UnsatisfiableWildcardGrant: function f2() is not grantable".into(),
+        );
+        assert_eq!(err.reason(), "UnsatisfiableWildcardGrant");
+        assert!(err.to_string().contains("UnsatisfiableWildcardGrant"));
+    }
+
+    #[test]
+    fn unsatisfiable_wildcard_status_is_degraded_without_plan_reference() {
+        let message = "UnsatisfiableWildcardGrant: cannot fully satisfy wildcard grant EXECUTE ON function * IN SCHEMA \"app\" TO \"reader\" as executor \"app_owner\"; 1 matching object(s) are missing the desired privilege and are not grantable (examples: \"f2()\" owned by \"definer\" missing [EXECUTE])";
+        let mut status = PostgresPolicyStatus {
+            conditions: vec![
+                ready_condition(true, "Planned", "Plan computed"),
+                reconciling_condition("Reconciliation in progress"),
+                drifted_condition(true, "DriftDetected", "1 planned change pending"),
+            ],
+            change_summary: Some(ChangeSummary {
+                grants_added: 1,
+                total: 1,
+                ..Default::default()
+            }),
+            planned_sql: Some(
+                "GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA \"app\" TO \"reader\";".into(),
+            ),
+            planned_sql_truncated: true,
+            last_error: None,
+            transient_failure_count: 3,
+            current_plan_ref: Some(crate::crd::PlanReference {
+                name: "example-plan".into(),
+            }),
+            ..Default::default()
+        };
+
+        mark_reconcile_failure_status(&mut status, "UnsatisfiableWildcardGrant", message, false);
+
+        let ready = status
+            .conditions
+            .iter()
+            .find(|condition| condition.condition_type == "Ready")
+            .expect("Ready condition should be present");
+        assert_eq!(ready.status, "False");
+        assert_eq!(ready.reason.as_deref(), Some("UnsatisfiableWildcardGrant"));
+        assert_eq!(ready.message.as_deref(), Some(message));
+
+        let degraded = status
+            .conditions
+            .iter()
+            .find(|condition| condition.condition_type == "Degraded")
+            .expect("Degraded condition should be present");
+        assert_eq!(degraded.status, "True");
+        assert_eq!(
+            degraded.reason.as_deref(),
+            Some("UnsatisfiableWildcardGrant")
+        );
+        assert_eq!(degraded.message.as_deref(), Some(message));
+
+        assert!(
+            status.conditions.iter().all(|condition| {
+                condition.condition_type != "Reconciling" && condition.condition_type != "Drifted"
+            }),
+            "transient planning conditions should be cleared on degraded status"
+        );
+        assert!(status.change_summary.is_none());
+        assert!(status.planned_sql.is_none());
+        assert!(!status.planned_sql_truncated);
+        assert!(status.current_plan_ref.is_none());
+        assert_eq!(status.last_error.as_deref(), Some(message));
+        assert_eq!(status.transient_failure_count, 0);
+    }
+
+    #[test]
     fn error_display_missing_database_objects_lists_schemas() {
         let err = ReconcileError::MissingDatabaseObjects("schema \"etl\", schema \"jobs\"".into());
         let msg = err.to_string();
@@ -3121,6 +3219,14 @@ mod tests {
     fn retry_classifies_missing_database_objects_as_slow() {
         let error = finalizer::Error::ApplyFailed(ReconcileError::MissingDatabaseObjects(
             "schema \"etl\"".into(),
+        ));
+        assert_eq!(retry_class(&error), RetryClass::Slow);
+    }
+
+    #[test]
+    fn retry_classifies_unsatisfiable_wildcard_grant_as_slow() {
+        let error = finalizer::Error::ApplyFailed(ReconcileError::UnsatisfiableWildcardGrant(
+            "UnsatisfiableWildcardGrant: function f2() is not grantable".into(),
         ));
         assert_eq!(retry_class(&error), RetryClass::Slow);
     }
