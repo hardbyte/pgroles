@@ -59,6 +59,103 @@ pub(crate) struct PrivilegeInspectionResult {
     pub diagnostics: Vec<UnsatisfiableWildcardGrant>,
 }
 
+struct WildcardScopeFilter {
+    schema_names: Vec<String>,
+    object_types: Vec<String>,
+    need_select: Vec<bool>,
+    need_insert: Vec<bool>,
+    need_update: Vec<bool>,
+    need_delete: Vec<bool>,
+    need_truncate: Vec<bool>,
+    need_references: Vec<bool>,
+    need_trigger: Vec<bool>,
+    need_execute: Vec<bool>,
+    need_usage: Vec<bool>,
+}
+
+impl WildcardScopeFilter {
+    fn from_wildcards(wildcard_grants: &[WildcardGrantPattern]) -> Self {
+        let mut scopes: BTreeMap<(ObjectType, String), BTreeSet<Privilege>> = BTreeMap::new();
+
+        for wildcard in wildcard_grants {
+            if matches!(
+                wildcard.object_type,
+                ObjectType::Schema | ObjectType::Database
+            ) {
+                continue;
+            }
+
+            scopes
+                .entry((wildcard.object_type, wildcard.schema.clone()))
+                .or_default()
+                .extend(wildcard.privileges.iter().copied());
+        }
+
+        let mut filter = Self {
+            schema_names: Vec::with_capacity(scopes.len()),
+            object_types: Vec::with_capacity(scopes.len()),
+            need_select: Vec::with_capacity(scopes.len()),
+            need_insert: Vec::with_capacity(scopes.len()),
+            need_update: Vec::with_capacity(scopes.len()),
+            need_delete: Vec::with_capacity(scopes.len()),
+            need_truncate: Vec::with_capacity(scopes.len()),
+            need_references: Vec::with_capacity(scopes.len()),
+            need_trigger: Vec::with_capacity(scopes.len()),
+            need_execute: Vec::with_capacity(scopes.len()),
+            need_usage: Vec::with_capacity(scopes.len()),
+        };
+
+        for ((object_type, schema), privileges) in scopes {
+            filter.schema_names.push(schema);
+            filter
+                .object_types
+                .push(object_type_label(object_type).to_string());
+            filter
+                .need_select
+                .push(privileges.contains(&Privilege::Select));
+            filter
+                .need_insert
+                .push(privileges.contains(&Privilege::Insert));
+            filter
+                .need_update
+                .push(privileges.contains(&Privilege::Update));
+            filter
+                .need_delete
+                .push(privileges.contains(&Privilege::Delete));
+            filter
+                .need_truncate
+                .push(privileges.contains(&Privilege::Truncate));
+            filter
+                .need_references
+                .push(privileges.contains(&Privilege::References));
+            filter
+                .need_trigger
+                .push(privileges.contains(&Privilege::Trigger));
+            filter
+                .need_execute
+                .push(privileges.contains(&Privilege::Execute));
+            filter
+                .need_usage
+                .push(privileges.contains(&Privilege::Usage));
+        }
+
+        filter
+    }
+
+    fn is_empty(&self) -> bool {
+        self.schema_names.is_empty()
+    }
+
+    fn contains(&self, object_type: ObjectType, schema_name: &str) -> bool {
+        self.schema_names
+            .iter()
+            .zip(&self.object_types)
+            .any(|(schema, obj_type)| {
+                schema == schema_name && obj_type == object_type_label(object_type)
+            })
+    }
+}
+
 /// Map a PostgreSQL ACL privilege character to our `Privilege` enum.
 fn acl_char_to_privilege(character: &str) -> Option<Privilege> {
     match character {
@@ -90,6 +187,19 @@ fn obj_type_str_to_object_type(obj_type: &str) -> Option<ObjectType> {
         "database" => Some(ObjectType::Database),
         "type" => Some(ObjectType::Type),
         _ => None,
+    }
+}
+
+fn object_type_label(object_type: ObjectType) -> &'static str {
+    match object_type {
+        ObjectType::Table => "table",
+        ObjectType::View => "view",
+        ObjectType::MaterializedView => "materialized_view",
+        ObjectType::Sequence => "sequence",
+        ObjectType::Function => "function",
+        ObjectType::Schema => "schema",
+        ObjectType::Database => "database",
+        ObjectType::Type => "type",
     }
 }
 
@@ -198,6 +308,146 @@ pub async fn fetch_object_inventory(
     Ok(inventory)
 }
 
+async fn fetch_object_inventory_for_wildcards(
+    pool: &PgPool,
+    filter: &WildcardScopeFilter,
+) -> Result<BTreeMap<(ObjectType, String), Vec<String>>, sqlx::Error> {
+    if filter.is_empty() {
+        return Ok(BTreeMap::new());
+    }
+
+    let rows = sqlx::query_as::<_, AclRow>(
+        r#"
+        WITH wildcard_scope(
+            schema_name,
+            obj_type,
+            need_select,
+            need_insert,
+            need_update,
+            need_delete,
+            need_truncate,
+            need_references,
+            need_trigger,
+            need_execute,
+            need_usage
+        ) AS (
+            SELECT *
+            FROM unnest(
+                $1::text[],
+                $2::text[],
+                $3::bool[],
+                $4::bool[],
+                $5::bool[],
+                $6::bool[],
+                $7::bool[],
+                $8::bool[],
+                $9::bool[],
+                $10::bool[],
+                $11::bool[]
+            )
+        )
+        SELECT
+            NULL::text AS grantee,
+            '' AS privilege_type,
+            n.nspname AS schema_name,
+            c.relname AS object_name,
+            CASE c.relkind
+                WHEN 'r' THEN 'table'
+                WHEN 'p' THEN 'table'
+                WHEN 'v' THEN 'view'
+                WHEN 'm' THEN 'materialized_view'
+            END AS obj_type
+        FROM pg_class c
+        JOIN pg_namespace n ON n.oid = c.relnamespace
+        JOIN wildcard_scope scope
+          ON scope.schema_name = n.nspname
+         AND scope.obj_type = CASE c.relkind
+                WHEN 'r' THEN 'table'
+                WHEN 'p' THEN 'table'
+                WHEN 'v' THEN 'view'
+                WHEN 'm' THEN 'materialized_view'
+             END
+        WHERE c.relkind IN ('r', 'p', 'v', 'm')
+
+        UNION ALL
+
+        SELECT
+            NULL::text AS grantee,
+            '' AS privilege_type,
+            n.nspname AS schema_name,
+            c.relname AS object_name,
+            'sequence' AS obj_type
+        FROM pg_class c
+        JOIN pg_namespace n ON n.oid = c.relnamespace
+        JOIN wildcard_scope scope
+          ON scope.schema_name = n.nspname
+         AND scope.obj_type = 'sequence'
+        WHERE c.relkind = 'S'
+
+        UNION ALL
+
+        SELECT
+            NULL::text AS grantee,
+            '' AS privilege_type,
+            n.nspname AS schema_name,
+            p.proname || '(' || pg_catalog.pg_get_function_identity_arguments(p.oid) || ')' AS object_name,
+            'function' AS obj_type
+        FROM pg_proc p
+        JOIN pg_namespace n ON n.oid = p.pronamespace
+        JOIN wildcard_scope scope
+          ON scope.schema_name = n.nspname
+         AND scope.obj_type = 'function'
+
+        UNION ALL
+
+        SELECT
+            NULL::text AS grantee,
+            '' AS privilege_type,
+            n.nspname AS schema_name,
+            t.typname AS object_name,
+            'type' AS obj_type
+        FROM pg_type t
+        JOIN pg_namespace n ON n.oid = t.typnamespace
+        JOIN wildcard_scope scope
+          ON scope.schema_name = n.nspname
+         AND scope.obj_type = 'type'
+        WHERE t.typname NOT LIKE '\_%'
+          AND t.typtype <> 'p'
+
+        ORDER BY schema_name, obj_type, object_name
+        "#,
+    )
+    .bind(&filter.schema_names)
+    .bind(&filter.object_types)
+    .bind(&filter.need_select)
+    .bind(&filter.need_insert)
+    .bind(&filter.need_update)
+    .bind(&filter.need_delete)
+    .bind(&filter.need_truncate)
+    .bind(&filter.need_references)
+    .bind(&filter.need_trigger)
+    .bind(&filter.need_execute)
+    .bind(&filter.need_usage)
+    .fetch_all(pool)
+    .await?;
+
+    let mut inventory = BTreeMap::new();
+    for row in rows {
+        let Some(object_type) = obj_type_str_to_object_type(&row.obj_type) else {
+            continue;
+        };
+        inventory
+            .entry((
+                object_type,
+                row.schema_name
+                    .expect("relation inventory rows always include schema"),
+            ))
+            .or_insert_with(Vec::new)
+            .push(row.object_name);
+    }
+    Ok(inventory)
+}
+
 /// Fetch only relation names (tables, views, materialized views) for callers
 /// that specifically need relation inventory.
 pub async fn fetch_relation_inventory(
@@ -224,11 +474,12 @@ pub(crate) async fn fetch_privileges_with_wildcards(
 ) -> Result<PrivilegeInspectionResult, sqlx::Error> {
     let mut grants: BTreeMap<GrantKey, GrantState> = BTreeMap::new();
     let has_wildcards = !wildcard_grants.is_empty();
+    let wildcard_scope_filter = WildcardScopeFilter::from_wildcards(wildcard_grants);
     let mut inventory: BTreeMap<(ObjectType, String), BTreeSet<String>> = BTreeMap::new();
 
     if has_wildcards {
         for ((object_type, schema_name), object_names) in
-            fetch_object_inventory(pool, managed_schemas).await?
+            fetch_object_inventory_for_wildcards(pool, &wildcard_scope_filter).await?
         {
             inventory.insert(
                 (object_type, schema_name),
@@ -258,6 +509,7 @@ pub(crate) async fn fetch_privileges_with_wildcards(
             && let Some(object_type) = obj_type_str_to_object_type(&row.obj_type)
             && !matches!(object_type, ObjectType::Schema | ObjectType::Database)
             && let Some(schema_name) = &row.schema_name
+            && wildcard_scope_filter.contains(object_type, schema_name)
         {
             inventory
                 .entry((object_type, schema_name.clone()))
@@ -311,12 +563,19 @@ pub(crate) async fn fetch_privileges_with_wildcards(
         entry.privileges.insert(privilege);
     }
 
-    let diagnostics = if has_wildcards {
-        let executor = fetch_current_user(pool).await?;
-        let grantability = fetch_wildcard_grantability(pool, managed_schemas).await?;
-        detect_unsatisfiable_wildcards(&grants, &grantability, wildcard_grants, &executor)
+    let unsatisfied_wildcards = if has_wildcards {
+        unsatisfied_wildcard_grants(&grants, &inventory, wildcard_grants)
     } else {
         Vec::new()
+    };
+
+    let diagnostics = if unsatisfied_wildcards.is_empty() {
+        Vec::new()
+    } else {
+        let executor = fetch_current_user(pool).await?;
+        let grantability_filter = WildcardScopeFilter::from_wildcards(&unsatisfied_wildcards);
+        let grantability = fetch_wildcard_grantability(pool, &grantability_filter).await?;
+        detect_unsatisfiable_wildcards(&grants, &grantability, &unsatisfied_wildcards, &executor)
     };
 
     let grants = if has_wildcards {
@@ -338,12 +597,91 @@ async fn fetch_current_user(pool: &PgPool) -> Result<String, sqlx::Error> {
     Ok(user)
 }
 
+fn unsatisfied_wildcard_grants(
+    grants: &BTreeMap<GrantKey, GrantState>,
+    inventory: &BTreeMap<(ObjectType, String), BTreeSet<String>>,
+    wildcard_grants: &[WildcardGrantPattern],
+) -> Vec<WildcardGrantPattern> {
+    let mut unsatisfied = Vec::new();
+
+    for wildcard in wildcard_grants {
+        let Some(object_names) = inventory.get(&(wildcard.object_type, wildcard.schema.clone()))
+        else {
+            continue;
+        };
+
+        if object_names.is_empty() {
+            continue;
+        }
+
+        let mut missing_privileges = BTreeSet::new();
+        for object_name in object_names {
+            let key = GrantKey {
+                role: wildcard.role.clone(),
+                object_type: wildcard.object_type,
+                schema: Some(wildcard.schema.clone()),
+                name: Some(object_name.clone()),
+            };
+
+            let existing = grants.get(&key);
+            for privilege in &wildcard.privileges {
+                if !existing.is_some_and(|state| state.privileges.contains(privilege)) {
+                    missing_privileges.insert(*privilege);
+                }
+            }
+        }
+
+        if !missing_privileges.is_empty() {
+            unsatisfied.push(WildcardGrantPattern {
+                role: wildcard.role.clone(),
+                object_type: wildcard.object_type,
+                schema: wildcard.schema.clone(),
+                privileges: missing_privileges,
+            });
+        }
+    }
+
+    unsatisfied
+}
+
 async fn fetch_wildcard_grantability(
     pool: &PgPool,
-    managed_schemas: &[&str],
+    filter: &WildcardScopeFilter,
 ) -> Result<BTreeMap<(ObjectType, String, String), GrantabilityRow>, sqlx::Error> {
+    if filter.is_empty() {
+        return Ok(BTreeMap::new());
+    }
+
     let rows = sqlx::query_as::<_, GrantabilityRow>(
         r#"
+        WITH wildcard_scope(
+            schema_name,
+            obj_type,
+            need_select,
+            need_insert,
+            need_update,
+            need_delete,
+            need_truncate,
+            need_references,
+            need_trigger,
+            need_execute,
+            need_usage
+        ) AS (
+            SELECT *
+            FROM unnest(
+                $1::text[],
+                $2::text[],
+                $3::bool[],
+                $4::bool[],
+                $5::bool[],
+                $6::bool[],
+                $7::bool[],
+                $8::bool[],
+                $9::bool[],
+                $10::bool[],
+                $11::bool[]
+            )
+        )
         SELECT
             n.nspname AS schema_name,
             c.relname AS object_name,
@@ -354,19 +692,43 @@ async fn fetch_wildcard_grantability(
                 WHEN 'v' THEN 'view'
                 WHEN 'm' THEN 'materialized_view'
             END AS obj_type,
-            has_table_privilege(current_user, c.oid, 'SELECT WITH GRANT OPTION') AS can_select,
-            has_table_privilege(current_user, c.oid, 'INSERT WITH GRANT OPTION') AS can_insert,
-            has_table_privilege(current_user, c.oid, 'UPDATE WITH GRANT OPTION') AS can_update,
-            has_table_privilege(current_user, c.oid, 'DELETE WITH GRANT OPTION') AS can_delete,
-            has_table_privilege(current_user, c.oid, 'TRUNCATE WITH GRANT OPTION') AS can_truncate,
-            has_table_privilege(current_user, c.oid, 'REFERENCES WITH GRANT OPTION') AS can_references,
-            has_table_privilege(current_user, c.oid, 'TRIGGER WITH GRANT OPTION') AS can_trigger,
+            CASE WHEN owner_grant.can_grant_as_owner THEN scope.need_select
+                 WHEN scope.need_select THEN has_table_privilege(current_user, c.oid, 'SELECT WITH GRANT OPTION')
+                 ELSE false END AS can_select,
+            CASE WHEN owner_grant.can_grant_as_owner THEN scope.need_insert
+                 WHEN scope.need_insert THEN has_table_privilege(current_user, c.oid, 'INSERT WITH GRANT OPTION')
+                 ELSE false END AS can_insert,
+            CASE WHEN owner_grant.can_grant_as_owner THEN scope.need_update
+                 WHEN scope.need_update THEN has_table_privilege(current_user, c.oid, 'UPDATE WITH GRANT OPTION')
+                 ELSE false END AS can_update,
+            CASE WHEN owner_grant.can_grant_as_owner THEN scope.need_delete
+                 WHEN scope.need_delete THEN has_table_privilege(current_user, c.oid, 'DELETE WITH GRANT OPTION')
+                 ELSE false END AS can_delete,
+            CASE WHEN owner_grant.can_grant_as_owner THEN scope.need_truncate
+                 WHEN scope.need_truncate THEN has_table_privilege(current_user, c.oid, 'TRUNCATE WITH GRANT OPTION')
+                 ELSE false END AS can_truncate,
+            CASE WHEN owner_grant.can_grant_as_owner THEN scope.need_references
+                 WHEN scope.need_references THEN has_table_privilege(current_user, c.oid, 'REFERENCES WITH GRANT OPTION')
+                 ELSE false END AS can_references,
+            CASE WHEN owner_grant.can_grant_as_owner THEN scope.need_trigger
+                 WHEN scope.need_trigger THEN has_table_privilege(current_user, c.oid, 'TRIGGER WITH GRANT OPTION')
+                 ELSE false END AS can_trigger,
             false AS can_execute,
             false AS can_usage
         FROM pg_class c
         JOIN pg_namespace n ON n.oid = c.relnamespace
-        WHERE n.nspname = ANY($1)
-          AND c.relkind IN ('r', 'p', 'v', 'm')
+        JOIN wildcard_scope scope
+          ON scope.schema_name = n.nspname
+         AND scope.obj_type = CASE c.relkind
+                WHEN 'r' THEN 'table'
+                WHEN 'p' THEN 'table'
+                WHEN 'v' THEN 'view'
+                WHEN 'm' THEN 'materialized_view'
+             END
+        CROSS JOIN LATERAL (
+            SELECT pg_has_role(current_user, c.relowner, 'USAGE') AS can_grant_as_owner
+        ) owner_grant
+        WHERE c.relkind IN ('r', 'p', 'v', 'm')
 
         UNION ALL
 
@@ -375,19 +737,30 @@ async fn fetch_wildcard_grantability(
             c.relname AS object_name,
             pg_get_userbyid(c.relowner) AS owner_name,
             'sequence' AS obj_type,
-            has_sequence_privilege(current_user, c.oid, 'SELECT WITH GRANT OPTION') AS can_select,
+            CASE WHEN owner_grant.can_grant_as_owner THEN scope.need_select
+                 WHEN scope.need_select THEN has_sequence_privilege(current_user, c.oid, 'SELECT WITH GRANT OPTION')
+                 ELSE false END AS can_select,
             false AS can_insert,
-            has_sequence_privilege(current_user, c.oid, 'UPDATE WITH GRANT OPTION') AS can_update,
+            CASE WHEN owner_grant.can_grant_as_owner THEN scope.need_update
+                 WHEN scope.need_update THEN has_sequence_privilege(current_user, c.oid, 'UPDATE WITH GRANT OPTION')
+                 ELSE false END AS can_update,
             false AS can_delete,
             false AS can_truncate,
             false AS can_references,
             false AS can_trigger,
             false AS can_execute,
-            has_sequence_privilege(current_user, c.oid, 'USAGE WITH GRANT OPTION') AS can_usage
+            CASE WHEN owner_grant.can_grant_as_owner THEN scope.need_usage
+                 WHEN scope.need_usage THEN has_sequence_privilege(current_user, c.oid, 'USAGE WITH GRANT OPTION')
+                 ELSE false END AS can_usage
         FROM pg_class c
         JOIN pg_namespace n ON n.oid = c.relnamespace
-        WHERE n.nspname = ANY($1)
-          AND c.relkind = 'S'
+        JOIN wildcard_scope scope
+          ON scope.schema_name = n.nspname
+         AND scope.obj_type = 'sequence'
+        CROSS JOIN LATERAL (
+            SELECT pg_has_role(current_user, c.relowner, 'USAGE') AS can_grant_as_owner
+        ) owner_grant
+        WHERE c.relkind = 'S'
 
         UNION ALL
 
@@ -403,11 +776,18 @@ async fn fetch_wildcard_grantability(
             false AS can_truncate,
             false AS can_references,
             false AS can_trigger,
-            has_function_privilege(current_user, p.oid, 'EXECUTE WITH GRANT OPTION') AS can_execute,
+            CASE WHEN owner_grant.can_grant_as_owner THEN scope.need_execute
+                 WHEN scope.need_execute THEN has_function_privilege(current_user, p.oid, 'EXECUTE WITH GRANT OPTION')
+                 ELSE false END AS can_execute,
             false AS can_usage
         FROM pg_proc p
         JOIN pg_namespace n ON n.oid = p.pronamespace
-        WHERE n.nspname = ANY($1)
+        JOIN wildcard_scope scope
+          ON scope.schema_name = n.nspname
+         AND scope.obj_type = 'function'
+        CROSS JOIN LATERAL (
+            SELECT pg_has_role(current_user, p.proowner, 'USAGE') AS can_grant_as_owner
+        ) owner_grant
 
         UNION ALL
 
@@ -424,17 +804,34 @@ async fn fetch_wildcard_grantability(
             false AS can_references,
             false AS can_trigger,
             false AS can_execute,
-            has_type_privilege(current_user, t.oid, 'USAGE WITH GRANT OPTION') AS can_usage
+            CASE WHEN owner_grant.can_grant_as_owner THEN scope.need_usage
+                 WHEN scope.need_usage THEN has_type_privilege(current_user, t.oid, 'USAGE WITH GRANT OPTION')
+                 ELSE false END AS can_usage
         FROM pg_type t
         JOIN pg_namespace n ON n.oid = t.typnamespace
-        WHERE n.nspname = ANY($1)
-          AND t.typname NOT LIKE '\_%'
+        JOIN wildcard_scope scope
+          ON scope.schema_name = n.nspname
+         AND scope.obj_type = 'type'
+        CROSS JOIN LATERAL (
+            SELECT pg_has_role(current_user, t.typowner, 'USAGE') AS can_grant_as_owner
+        ) owner_grant
+        WHERE t.typname NOT LIKE '\_%'
           AND t.typtype <> 'p'
 
         ORDER BY schema_name, obj_type, object_name
         "#,
     )
-    .bind(managed_schemas)
+    .bind(&filter.schema_names)
+    .bind(&filter.object_types)
+    .bind(&filter.need_select)
+    .bind(&filter.need_insert)
+    .bind(&filter.need_update)
+    .bind(&filter.need_delete)
+    .bind(&filter.need_truncate)
+    .bind(&filter.need_references)
+    .bind(&filter.need_trigger)
+    .bind(&filter.need_execute)
+    .bind(&filter.need_usage)
     .fetch_all(pool)
     .await?;
 
@@ -1011,6 +1408,99 @@ mod tests {
         );
 
         assert!(diagnostics.is_empty());
+    }
+
+    #[test]
+    fn unsatisfied_wildcards_are_empty_when_every_object_has_requested_privileges() {
+        let grants = BTreeMap::from([
+            (
+                GrantKey {
+                    role: "app-editor".to_string(),
+                    object_type: ObjectType::Function,
+                    schema: Some("app".to_string()),
+                    name: Some("f1()".to_string()),
+                },
+                GrantState {
+                    privileges: BTreeSet::from([Privilege::Execute]),
+                },
+            ),
+            (
+                GrantKey {
+                    role: "app-editor".to_string(),
+                    object_type: ObjectType::Function,
+                    schema: Some("app".to_string()),
+                    name: Some("f2()".to_string()),
+                },
+                GrantState {
+                    privileges: BTreeSet::from([Privilege::Execute]),
+                },
+            ),
+        ]);
+        let inventory = BTreeMap::from([(
+            (ObjectType::Function, "app".to_string()),
+            BTreeSet::from(["f1()".to_string(), "f2()".to_string()]),
+        )]);
+
+        let unsatisfied = unsatisfied_wildcard_grants(&grants, &inventory, &[execute_wildcard()]);
+
+        assert!(unsatisfied.is_empty());
+    }
+
+    #[test]
+    fn unsatisfied_wildcards_keep_only_missing_privileges() {
+        let wildcard = WildcardGrantPattern {
+            role: "app-editor".to_string(),
+            object_type: ObjectType::Table,
+            schema: "app".to_string(),
+            privileges: BTreeSet::from([Privilege::Select, Privilege::Insert]),
+        };
+        let grants = BTreeMap::from([(
+            GrantKey {
+                role: "app-editor".to_string(),
+                object_type: ObjectType::Table,
+                schema: Some("app".to_string()),
+                name: Some("widgets".to_string()),
+            },
+            GrantState {
+                privileges: BTreeSet::from([Privilege::Select]),
+            },
+        )]);
+        let inventory = BTreeMap::from([(
+            (ObjectType::Table, "app".to_string()),
+            BTreeSet::from(["widgets".to_string()]),
+        )]);
+
+        let unsatisfied = unsatisfied_wildcard_grants(&grants, &inventory, &[wildcard]);
+
+        assert_eq!(unsatisfied.len(), 1);
+        assert_eq!(
+            unsatisfied[0].privileges,
+            BTreeSet::from([Privilege::Insert])
+        );
+    }
+
+    #[test]
+    fn wildcard_scope_filter_deduplicates_scopes_and_unions_privileges() {
+        let filter = WildcardScopeFilter::from_wildcards(&[
+            WildcardGrantPattern {
+                role: "reader".to_string(),
+                object_type: ObjectType::Table,
+                schema: "app".to_string(),
+                privileges: BTreeSet::from([Privilege::Select]),
+            },
+            WildcardGrantPattern {
+                role: "writer".to_string(),
+                object_type: ObjectType::Table,
+                schema: "app".to_string(),
+                privileges: BTreeSet::from([Privilege::Insert]),
+            },
+        ]);
+
+        assert_eq!(filter.schema_names, vec!["app"]);
+        assert_eq!(filter.object_types, vec!["table"]);
+        assert_eq!(filter.need_select, vec![true]);
+        assert_eq!(filter.need_insert, vec![true]);
+        assert_eq!(filter.need_update, vec![false]);
     }
 
     #[test]
