@@ -537,33 +537,24 @@ fn externally_required_schema_names(
 
 /// Apply reconciliation — the main "ensure desired state" logic.
 ///
-/// Acquires the in-process per-database lock before doing any work. If the
-/// lock is already held, the reconciliation is requeued with jitter.
+/// The in-process per-database lock is acquired *inside* [`reconcile_apply_inner`],
+/// after the connection probe succeeds. That way a bad-credentials,
+/// secret-fetch, or spec-validation failure produces an ordinary error which
+/// flows through the status-updating path below, instead of competing for
+/// the lock with parallel reconciles for the same `database_identity`. With
+/// three policies sharing one secret, a Secret rotation to bad credentials
+/// would otherwise serialize them on the lock — each holding it for the full
+/// `POOL_ACQUIRE_TIMEOUT_SECS` worth of pool-timeout — and an unlucky policy
+/// could spend tens of seconds in lock-contention requeues without ever
+/// updating its status condition (lock contention is silent by design).
 async fn reconcile_apply(
     resource: &PostgresPolicy,
     ctx: &OperatorContext,
 ) -> Result<Action, ReconcileError> {
     let reconcile_guard = ctx.observability.start_reconcile();
 
-    // Derive database identity early so we can acquire the in-process lock.
     let namespace = resource.namespace().ok_or(ReconcileError::NoNamespace)?;
     let identity = DatabaseIdentity::from_connection(&namespace, &resource.spec.connection);
-
-    // Acquire in-process lock for this database target.
-    let _db_lock = match ctx.try_lock_database(identity.as_str()).await {
-        Some(guard) => guard,
-        None => {
-            ctx.observability.record_lock_contention();
-            reconcile_guard.record_result(
-                ReconcileOutcome::LockContention.result(),
-                ReconcileOutcome::LockContention.reason(),
-            );
-            return Err(ReconcileError::LockContention(
-                identity.as_str().to_string(),
-                "in-process lock held by another reconcile".to_string(),
-            ));
-        }
-    };
 
     match reconcile_apply_inner(resource, ctx, &identity).await {
         Ok((action, outcome)) => {
@@ -731,12 +722,41 @@ async fn reconcile_apply_inner(
     let desired = pgroles_core::model::RoleGraph::from_expanded(&expanded, default_owner)?;
 
     // 4. Get a database pool.
+    //
+    // This is the connection probe: a bad URL, refused TCP connection, or
+    // failed authentication surfaces here as `ContextError::DatabaseConnect`,
+    // which the outer error handler in `reconcile_apply` translates into a
+    // `Ready=False/DatabaseConnectionFailed` status update. We do this BEFORE
+    // taking the in-process lock so multiple policies sharing the same
+    // `database_identity` can all observe a connection failure in parallel,
+    // instead of serializing on the lock and starving each other under
+    // sustained bad-credentials conditions.
     let pool = ctx
         .get_or_create_pool(&namespace, &spec.connection)
         .await
         .map_err(Box::new)?;
 
-    // 5. Acquire PostgreSQL advisory lock for cross-replica safety.
+    // 5. Acquire the in-process per-database lock for the DDL phase.
+    //
+    // The lock serializes inspect+diff+apply against a single
+    // `database_identity` within this replica, so two reconciles can't
+    // compute conflicting plans and stack DDL on top of each other. It is
+    // explicitly NOT held during the connection-probe phase above, since
+    // that work is idempotent and side-effect-free against the database.
+    //
+    // `_db_lock` must outlive the advisory lock and `apply_under_lock`
+    // call below; it is dropped at the end of this function.
+    let _db_lock = match ctx.try_lock_database(identity.as_str()).await {
+        Some(guard) => guard,
+        None => {
+            return Err(ReconcileError::LockContention(
+                identity.as_str().to_string(),
+                "in-process lock held by another reconcile".to_string(),
+            ));
+        }
+    };
+
+    // 6. Acquire PostgreSQL advisory lock for cross-replica safety.
     let advisory_lock = match crate::advisory::try_acquire(&pool, identity.as_str()).await {
         Ok(Some(lock)) => lock,
         Ok(None) => {

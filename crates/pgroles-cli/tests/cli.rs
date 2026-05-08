@@ -2955,6 +2955,138 @@ grants:
         ));
     }
 
+    /// Reproduces the partly-dev15 reconcile flap (May 2026): a manifest
+    /// with `function name: "*"` should converge in a single apply even when
+    /// one of the functions in the schema has been DROPped+CREATEd between
+    /// reconciles (resetting its proacl to NULL). Before the fix, the
+    /// inspector's wildcard-collapse failed on the recreated function and
+    /// `diff` emitted both a wildcard GRANT and per-name REVOKEs for every
+    /// previously-granted function — apply order then stripped grants from
+    /// the previously-known set, the next reconcile observed the inversion,
+    /// and the controller flapped indefinitely.
+    #[test]
+    #[ignore]
+    fn wildcard_function_grants_converge_after_function_recreate() {
+        let schema = unique_name("wildfn_schema");
+        let role = unique_name("wildfn_role");
+
+        // Strip EXECUTE from PUBLIC so per-role explicit ACLs are the only
+        // way for `role` to gain EXECUTE. Without this, PostgreSQL's default
+        // GRANT EXECUTE ... TO PUBLIC obscures whether the wildcard convergence
+        // actually re-issued the per-role grants, since `has_function_privilege`
+        // would return true via the PUBLIC grant alone.
+        execute_sql(&format!(
+            r#"
+            DROP SCHEMA IF EXISTS "{schema}" CASCADE;
+            DROP ROLE IF EXISTS "{role}";
+            CREATE SCHEMA "{schema}";
+            CREATE FUNCTION "{schema}".f1() RETURNS int LANGUAGE sql AS 'SELECT 1';
+            CREATE FUNCTION "{schema}".f2() RETURNS int LANGUAGE sql AS 'SELECT 2';
+            CREATE FUNCTION "{schema}".f3() RETURNS int LANGUAGE sql AS 'SELECT 3';
+            REVOKE EXECUTE ON FUNCTION "{schema}".f1() FROM PUBLIC;
+            REVOKE EXECUTE ON FUNCTION "{schema}".f2() FROM PUBLIC;
+            REVOKE EXECUTE ON FUNCTION "{schema}".f3() FROM PUBLIC;
+            "#
+        ));
+
+        let manifest_file = write_temp_manifest(&format!(
+            r#"
+roles:
+  - name: {role}
+
+grants:
+  - role: {role}
+    privileges: [EXECUTE]
+    object: {{ type: function, schema: {schema}, name: "*" }}
+"#
+        ));
+
+        // Initial apply materialises EXECUTE on every function in the schema.
+        pgroles_cmd()
+            .args([
+                "apply",
+                "--file",
+                manifest_file.path().to_str().unwrap(),
+                "--database-url",
+                &database_url(),
+            ])
+            .assert()
+            .success();
+
+        for sig in [
+            format!(r#""{schema}"."f1"()"#),
+            format!(r#""{schema}"."f2"()"#),
+            format!(r#""{schema}"."f3"()"#),
+        ] {
+            assert!(
+                query_has_function_privilege(&role, &sig),
+                "{sig} should have EXECUTE after initial apply"
+            );
+        }
+
+        // Simulate a service (e.g. cdc-relay) recreating one of the functions.
+        // PostgreSQL resets proacl to NULL on DROP+CREATE, so f2 no longer has
+        // the explicit grant — even though the manifest's wildcard still says
+        // it should.
+        execute_sql(&format!(
+            r#"
+            DROP FUNCTION "{schema}".f2();
+            CREATE FUNCTION "{schema}".f2() RETURNS int LANGUAGE sql AS 'SELECT 22';
+            REVOKE EXECUTE ON FUNCTION "{schema}".f2() FROM PUBLIC;
+            "#
+        ));
+
+        assert!(
+            !query_has_function_privilege(&role, &format!(r#""{schema}"."f2"()"#)),
+            "recreated f2 should not yet have EXECUTE"
+        );
+
+        // A single apply must converge: every function should have EXECUTE
+        // and a follow-up diff must produce no changes.
+        pgroles_cmd()
+            .args([
+                "apply",
+                "--file",
+                manifest_file.path().to_str().unwrap(),
+                "--database-url",
+                &database_url(),
+            ])
+            .assert()
+            .success();
+
+        for sig in [
+            format!(r#""{schema}"."f1"()"#),
+            format!(r#""{schema}"."f2"()"#),
+            format!(r#""{schema}"."f3"()"#),
+        ] {
+            assert!(
+                query_has_function_privilege(&role, &sig),
+                "{sig} should have EXECUTE after convergent apply"
+            );
+        }
+
+        pgroles_cmd()
+            .args([
+                "diff",
+                "--file",
+                manifest_file.path().to_str().unwrap(),
+                "--database-url",
+                &database_url(),
+                "--format",
+                "summary",
+            ])
+            .assert()
+            .success()
+            .stdout(predicate::str::contains("No changes needed"));
+
+        execute_sql(&format!(
+            r#"
+            DROP SCHEMA IF EXISTS "{schema}" CASCADE;
+            DROP ROLE IF EXISTS "{role}";
+            "#
+        ));
+    }
+
     #[test]
     #[ignore]
     fn specific_function_grants_apply_and_converge() {
