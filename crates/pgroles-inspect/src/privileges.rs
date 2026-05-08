@@ -18,7 +18,10 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use sqlx::PgPool;
 
-use crate::{UnsatisfiableWildcardGrant, UnsatisfiableWildcardObject, WildcardGrantPattern};
+use crate::{
+    UnsatisfiableWildcardGrant, UnsatisfiableWildcardObject, WildcardGrantPattern,
+    WildcardInspectionStats,
+};
 use pgroles_core::manifest::{ObjectType, Privilege};
 use pgroles_core::model::{GrantKey, GrantState};
 
@@ -57,6 +60,7 @@ struct GrantabilityRow {
 pub(crate) struct PrivilegeInspectionResult {
     pub grants: BTreeMap<GrantKey, GrantState>,
     pub diagnostics: Vec<UnsatisfiableWildcardGrant>,
+    pub wildcard_stats: WildcardInspectionStats,
 }
 
 struct WildcardScopeFilter {
@@ -144,6 +148,10 @@ impl WildcardScopeFilter {
 
     fn is_empty(&self) -> bool {
         self.schema_names.is_empty()
+    }
+
+    fn len(&self) -> usize {
+        self.schema_names.len()
     }
 
     fn contains(&self, object_type: ObjectType, schema_name: &str) -> bool {
@@ -475,6 +483,11 @@ pub(crate) async fn fetch_privileges_with_wildcards(
     let mut grants: BTreeMap<GrantKey, GrantState> = BTreeMap::new();
     let has_wildcards = !wildcard_grants.is_empty();
     let wildcard_scope_filter = WildcardScopeFilter::from_wildcards(wildcard_grants);
+    let mut wildcard_stats = WildcardInspectionStats {
+        configured_grants: wildcard_grants.len(),
+        configured_scopes: wildcard_scope_filter.len(),
+        ..WildcardInspectionStats::default()
+    };
     let mut inventory: BTreeMap<(ObjectType, String), BTreeSet<String>> = BTreeMap::new();
 
     if has_wildcards {
@@ -487,7 +500,6 @@ pub(crate) async fn fetch_privileges_with_wildcards(
             );
         }
     }
-
     // Run all the independent queries and collect results.
     // We use separate queries per object type rather than one giant UNION
     // because the NULL-ACL handling (acldefault) differs per type.
@@ -517,6 +529,7 @@ pub(crate) async fn fetch_privileges_with_wildcards(
                 .insert(row.object_name.clone());
         }
     }
+    wildcard_stats.inventory_objects = inventory.values().map(BTreeSet::len).sum();
 
     for row in all_rows {
         // Skip PUBLIC grantee (NULL)
@@ -568,13 +581,17 @@ pub(crate) async fn fetch_privileges_with_wildcards(
     } else {
         Vec::new()
     };
+    wildcard_stats.unsatisfied_grants = unsatisfied_wildcards.len();
 
     let diagnostics = if unsatisfied_wildcards.is_empty() {
         Vec::new()
     } else {
         let executor = fetch_current_user(pool).await?;
         let grantability_filter = WildcardScopeFilter::from_wildcards(&unsatisfied_wildcards);
+        wildcard_stats.unsatisfied_scopes = grantability_filter.len();
         let grantability = fetch_wildcard_grantability(pool, &grantability_filter).await?;
+        wildcard_stats.grantability_queries = 1;
+        wildcard_stats.grantability_objects = grantability.len();
         detect_unsatisfiable_wildcards(&grants, &grantability, &unsatisfied_wildcards, &executor)
     };
 
@@ -587,6 +604,7 @@ pub(crate) async fn fetch_privileges_with_wildcards(
     Ok(PrivilegeInspectionResult {
         grants,
         diagnostics,
+        wildcard_stats,
     })
 }
 

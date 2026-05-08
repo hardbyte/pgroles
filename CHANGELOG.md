@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [0.7.2] - 2026-05-08
 
+### Added
+
+- **Operator OTLP metrics now expose database inspection cost.** The operator records inspection phase durations, inspected object counts, wildcard inventory size, unsatisfied wildcard scope counts, and grantability query/object counts so large-schema deployments can spot catalog-query regressions.
+
 ### Changed
 
 - Wildcard diagnostics now avoid grantability catalog scans when current ACLs already satisfy the wildcard, and scope grantability checks to the unsatisfied wildcard schema/object-type pairs.
