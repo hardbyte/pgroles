@@ -81,6 +81,7 @@ The operator runs as `nobody` (UID 65534) with a read-only root filesystem, no c
 
 - Use one `PostgresPolicy` per database and credential boundary.
 - Prefer a dedicated management role rather than an application login for reconciliation.
+- Ensure the management role can grant every wildcard-managed privilege on every matching object, either by owning those objects or holding the required `WITH GRANT OPTION`.
 - Validate and review the manifest with the CLI before handing it to the operator.
 - Treat deletion as "stop managing", not "revert the database".
 
@@ -100,6 +101,7 @@ The operator's safety model — serialized reconciliation, conflict detection, f
 
 - Transient operational failures use exponential backoff with jitter.
 - Invalid specs, conflicts, and unsafe role-drop workflows fall back to the normal reconcile interval without hot-looping.
+- Unsatisfiable wildcard grants are reported as `Ready=False` and `Degraded=True` with reason `UnsatisfiableWildcardGrant`; the operator does not create a `PostgresPolicyPlan` or SQL ConfigMap for that reconcile.
 - Lock contention has its own short retry path.
 
 **Observability:**

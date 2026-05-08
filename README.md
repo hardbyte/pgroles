@@ -98,7 +98,12 @@ DROP ROLE "old-reader";
 
 For wildcard relation grants, pgroles expands the current objects of the requested
 type safely, so table grants do not accidentally touch views or materialized
-views.
+views. A wildcard grant remains a strict desired-state declaration: every
+matching current object must either already have the requested privilege or be
+grantable by the database user running pgroles. If some matching objects are
+owned by another role and are missing the required grant option, `diff`, `plan`,
+and `apply` fail with an `UnsatisfiableWildcardGrant` diagnostic instead of
+printing or applying repeated wildcard SQL.
 
 Then `pgroles apply` to execute it.
 
