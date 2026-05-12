@@ -44,7 +44,7 @@ ALTER DEFAULT PRIVILEGES FOR ROLE "app_owner"
 
 ## Owner context
 
-The `owner` field specifies which role's object creation triggers the default grant. This is typically the role that runs migrations or creates tables (e.g. `pgloader_pg`, `app_owner`).
+The `owner` field specifies which role's object creation triggers the default grant. This is typically the role that runs migrations or creates tables (e.g. `app_migrator`, `app_owner`).
 
 If `owner` is omitted on a default privilege entry, the top-level `default_owner` is used. If neither is set, it falls back to `postgres`.
 

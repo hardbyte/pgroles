@@ -24,7 +24,7 @@ const navigation = [
         title: 'User Guide',
         links: [
             {title: 'Installation', href: '/docs/installation'},
-            {title: 'Manifest format', href: '/docs/manifest-format'},
+            {title: 'Manifest guide', href: '/docs/manifest-format'},
             {title: 'Profiles & schemas', href: '/docs/profiles'},
             {title: 'Grants & privileges', href: '/docs/grants'},
             {title: 'Default privileges', href: '/docs/default-privileges'},
@@ -35,6 +35,7 @@ const navigation = [
         title: 'Deployment',
         links: [
             {title: 'CI/CD integration', href: '/docs/ci-cd'},
+            {title: 'App & migration tools', href: '/docs/tooling'},
             {title: 'Google Cloud SQL', href: '/docs/google-cloud-sql'},
             {title: 'AWS RDS & Aurora', href: '/docs/aws-rds'},
             {title: 'Staged adoption', href: '/docs/adoption'},
@@ -47,6 +48,7 @@ const navigation = [
         links: [
             {title: 'CLI commands', href: '/docs/cli'},
             {title: 'Architecture', href: '/docs/architecture'},
+            {title: 'Manifest reference', href: '/docs/manifest-reference'},
         ],
     },
 ]

@@ -2955,7 +2955,7 @@ grants:
         ));
     }
 
-    /// Reproduces the partly-dev15 reconcile flap (May 2026): a manifest
+    /// Reproduces a production reconcile flap: a manifest
     /// with `function name: "*"` should converge in a single apply even when
     /// one of the functions in the schema has been DROPped+CREATEd between
     /// reconciles (resetting its proacl to NULL). Before the fix, the
