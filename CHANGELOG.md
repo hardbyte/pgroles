@@ -5,6 +5,12 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.7.4] - 2026-05-12
+
+### Fixed
+
+- **Wildcard `GRANT EXECUTE` on schemas with long function signatures no longer flaps.** The inventory queries (`fetch_object_inventory` and `fetch_object_inventory_for_wildcards`) `UNION ALL` their per-type rows. All branches except the function one project `object_name` as a PostgreSQL `name`-typed column (`c.relname`, `t.typname`, `n.nspname`, `db.datname`, 63-byte cap), while the function branch projects the text-typed `proname || '(' || identity_args || ')'`. PostgreSQL resolves the UNION result column to the common type — `name` — and silently truncates the text function signatures to 63 bytes. The wildcard satisfaction check in `normalize_wildcard_grants` then iterates the truncated inventory keys against the full-signature grant keys, treats every wildcard on a schema containing a long-signatured function as unsatisfied, and re-emits `GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA … TO …` on every reconcile. Cast each `name`-typed `object_name` column to `text` so the UNION result is uniformly text. This closes the residual flap referenced in #105 for non-trivial function inventories (overloaded helpers, custom-typed arguments, extension defaults). (#109)
+
 ## [0.7.3] - 2026-05-12
 
 ### Fixed

@@ -5,8 +5,8 @@ description: >-
   Define roles, memberships, grants, and default privileges in YAML
   and let the operator converge your database to the desired state.
 type: application
-version: 0.7.3
-appVersion: "0.7.3"
+version: 0.7.4
+appVersion: "0.7.4"
 icon: https://raw.githubusercontent.com/hardbyte/pgroles/main/docs/public/logo.svg
 sources:
   - https://github.com/hardbyte/pgroles
@@ -17,9 +17,7 @@ maintainers:
 annotations:
   artifacthub.io/changes: |
     - kind: fixed
-      description: 'Privilege inspection no longer returns PUBLIC/NULL grantee rows, which previously caused wildcard EXECUTE grants on schemas with extension-managed PUBLIC ACLs to re-plan every reconcile.'
-    - kind: changed
-      description: 'Wildcard inventory and grantability catalog queries are pre-filtered to the wildcard scope schemas, and ACL queries filter to managed grantees in SQL instead of in Rust.'
+      description: 'Wildcard EXECUTE grants on schemas containing functions whose signature exceeds 63 bytes no longer re-plan every reconcile. Inventory queries previously truncated long function signatures via UNION-induced `name`-type coercion; the inventory key then failed to match the full-signature grant key, so the wildcard satisfaction check kept marking the wildcard as unsatisfied.'
   artifacthub.io/category: database
   artifacthub.io/operator: "true"
   artifacthub.io/prerelease: "false"
