@@ -5,8 +5,8 @@ description: >-
   Define roles, memberships, grants, and default privileges in YAML
   and let the operator converge your database to the desired state.
 type: application
-version: 0.7.2
-appVersion: "0.7.2"
+version: 0.7.3
+appVersion: "0.7.3"
 icon: https://raw.githubusercontent.com/hardbyte/pgroles/main/docs/public/logo.svg
 sources:
   - https://github.com/hardbyte/pgroles
@@ -16,12 +16,10 @@ maintainers:
     url: https://hardbyte.nz
 annotations:
   artifacthub.io/changes: |
-    - kind: added
-      description: 'OTLP metrics now include database inspection phase durations and wildcard diagnostic counters.'
     - kind: fixed
-      description: 'Unsatisfiable wildcard grants now fail with clear diagnostics instead of re-planning forever.'
+      description: 'Privilege inspection no longer returns PUBLIC/NULL grantee rows, which previously caused wildcard EXECUTE grants on schemas with extension-managed PUBLIC ACLs to re-plan every reconcile.'
     - kind: changed
-      description: 'Wildcard diagnostics avoid grantability scans on already-satisfied wildcards and scope grantability checks to unsatisfied wildcard targets.'
+      description: 'Wildcard inventory and grantability catalog queries are pre-filtered to the wildcard scope schemas, and ACL queries filter to managed grantees in SQL instead of in Rust.'
   artifacthub.io/category: database
   artifacthub.io/operator: "true"
   artifacthub.io/prerelease: "false"

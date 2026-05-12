@@ -5,6 +5,16 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.7.3] - 2026-05-12
+
+### Fixed
+
+- **Privilege inspection no longer returns PUBLIC / NULL grantee ACL entries.** Extension-installed functions (e.g. `partman`, `pg_stat_statements`) typically carry a `GRANT EXECUTE … TO PUBLIC` entry; previous inspection runs surfaced those PUBLIC rows alongside managed grantees, causing wildcard `GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA … TO {role}` to be re-emitted every reconcile because the inspector couldn't reconcile a PUBLIC row against the managed grantee set. Privilege queries now restrict results to the managed-grantee set in SQL, so the wildcard converges. (#108)
+
+### Changed
+
+- **Inspection catalog queries are constrained to the wildcard scope.** `n.nspname = ANY(...)` predicates are added to each leg of inventory and grantability catalog queries so PostgreSQL can apply namespace filtering before joining the unnest scope rows. ACL filtering moves from Rust to SQL via `unnest(aclexplode(...))` with a managed-grantee predicate, reducing inspector wall time on large databases without changing observable behaviour. (#108)
+
 ## [0.7.2] - 2026-05-08
 
 ### Added
