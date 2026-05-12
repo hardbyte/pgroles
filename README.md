@@ -171,7 +171,7 @@ Full documentation is published at [hardbyte.github.io/pgroles](https://hardbyte
 
 - [Quick start](https://hardbyte.github.io/pgroles/docs/quick-start/)
 - [Installation](https://hardbyte.github.io/pgroles/docs/installation/)
-- [Manifest format](https://hardbyte.github.io/pgroles/docs/manifest-format/)
+- [Manifest guide](https://hardbyte.github.io/pgroles/docs/manifest-format/)
 - [CLI reference](https://hardbyte.github.io/pgroles/docs/cli/)
 - [Kubernetes operator](https://hardbyte.github.io/pgroles/docs/operator/)
 - [Operator architecture](https://hardbyte.github.io/pgroles/docs/operator-architecture/)

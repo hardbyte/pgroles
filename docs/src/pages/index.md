@@ -30,7 +30,7 @@ Built for platform teams, DBAs, and anyone managing more than a handful of Postg
 
 {% quick-link title="Quick start" icon="installation" href="/docs/quick-start" description="Install pgroles and run your first diff against a live database." /%}
 
-{% quick-link title="Manifest format" icon="presets" href="/docs/manifest-format" description="Learn the full YAML manifest schema for defining roles and privileges." /%}
+{% quick-link title="Manifest guide" icon="presets" href="/docs/manifest-format" description="Learn how manifest sections fit together when designing a policy." /%}
 
 {% quick-link title="Profiles & schemas" icon="plugins" href="/docs/profiles" description="Use profiles to define reusable privilege templates across schemas." /%}
 

@@ -31,4 +31,4 @@ cargo install pgroles-cli
 
 - Project README: <https://github.com/hardbyte/pgroles>
 - CLI docs: <https://github.com/hardbyte/pgroles/tree/main/docs/src/pages/docs/cli.md>
-- Manifest reference: <https://github.com/hardbyte/pgroles/tree/main/docs/src/pages/docs/manifest-format.md>
+- Manifest reference: <https://github.com/hardbyte/pgroles/tree/main/docs/src/pages/docs/manifest-reference.md>

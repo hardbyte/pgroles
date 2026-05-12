@@ -120,7 +120,7 @@ The operator's safety model — serialized reconciliation, conflict detection, f
 
 **Scale and HA:**
 
-- The largest tested workload is 200 roles / 100 schemas / 5 policies (scheduled CI, not PR CI).
+- Validate reconcile performance at your target object count before relying on the operator for large role and schema inventories.
 - Advisory locks enable multi-replica deployment, but there is no documented HA pattern, replica guidance, or failure-mode analysis.
 
 **Password drift visibility:**
@@ -129,7 +129,7 @@ The operator's safety model — serialized reconciliation, conflict detection, f
 
 **Managed provider validation:**
 
-- RDS, Cloud SQL, AlloyDB, and Azure detection is implemented but not validated against live managed instances.
+- Treat managed-provider detection as environment-specific. Verify behavior against your target RDS, Cloud SQL, AlloyDB, or Azure PostgreSQL instance before relying on provider-specific SQL planning.
 
 **Deployment security:**
 
@@ -432,18 +432,127 @@ spec:
 
 Plan mode is useful when you want the operator to stay in-cluster but you are not ready to trust it with PostgreSQL mutations yet.
 
-Current behavior in `plan` mode:
+In `plan` mode:
 
 - the operator connects to the database and computes the full diff normally
 - no PostgreSQL SQL is executed
 - `status.change_summary` records the pending changes
 - `status.planned_sql` stores the rendered SQL, truncated if needed for status size safety
+- `status.current_plan_ref.name` points at the generated `PostgresPolicyPlan`
 - `Ready=True` with reason `Planned`
 - `Drifted=True` when changes are pending, `Drifted=False` when the database is already in sync
-- for `password.generate`, the controller may still create or recreate the generated Kubernetes Secret while resolving password inputs for the plan
-- for password-managed roles, `Drifted=False` is only possible after a prior successful `apply` recorded the password source version; a plan-only policy cannot prove an existing database password already matches its Secret
+- for `password.generate`, the controller does not create or recreate the generated Kubernetes Secret while running in `plan` mode
+- for password-managed roles, `Drifted=False` is only possible after a prior successful `apply` recorded the password source version; a plan-only policy cannot prove an existing database password already matches the configured source
+
+Example `kubectl get` output:
+
+```text
+NAME          READY   MODE   DRIFT   CHANGES   LAST RECONCILE   AGE
+plan-policy   True    plan   True    2         2s               2s
+```
+
+Example status fields:
+
+```yaml
+status:
+  change_summary:
+    grants_added: 1
+    roles_created: 1
+    total: 2
+  conditions:
+    - type: Ready
+      status: "True"
+      reason: Planned
+      message: Plan computed; 2 change(s) pending
+    - type: Drifted
+      status: "True"
+      reason: DriftDetected
+      message: 2 planned change(s) pending review
+  current_plan_ref:
+    name: plan-policy-plan-20260512-090308-118e50e437c9
+  last_reconcile_mode: plan
+  planned_sql: |-
+    CREATE ROLE "plan-preview-user" LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE INHERIT NOREPLICATION NOBYPASSRLS;
+    COMMENT ON ROLE "plan-preview-user" IS 'Preview-only role';
+    GRANT CONNECT ON DATABASE "postgres" TO "plan-preview-user";
+  planned_sql_truncated: false
+```
 
 Use `suspend` when you want the controller to stop reconciling entirely. Use `plan` when you want it to keep inspecting and showing you what it would do.
+
+### Plan approval resources
+
+When `spec.approval: manual` is used with `mode: apply`, the operator creates a `PostgresPolicyPlan` and waits for approval instead of immediately executing the SQL.
+
+```yaml
+spec:
+  connection:
+    secretRef:
+      name: postgres-credentials
+  mode: apply
+  approval: manual
+```
+
+A generated plan looks like this:
+
+```text
+NAME                                                     POLICY                 MODE            APPROVED   CHANGES   PHASE     AGE
+plan-approval-policy-plan-20260512-090318-454373251739   plan-approval-policy   authoritative   False      2         Pending   3s
+```
+
+Approve it by annotating the plan:
+
+```shell
+kubectl annotate pgplan plan-approval-policy-plan-20260512-090318-454373251739 \
+  pgroles.io/approved=true --overwrite
+```
+
+After approval, the plan moves to `Applied`:
+
+```text
+NAME                                                     POLICY                 MODE            APPROVED   CHANGES   PHASE     AGE
+plan-approval-policy-plan-20260512-090318-454373251739   plan-approval-policy   authoritative   True       2         Applied   5s
+```
+
+The plan status included:
+
+```yaml
+status:
+  appliedAt: "2026-05-12T09:03:21Z"
+  changeSummary:
+    grants_added: 1
+    roles_created: 1
+    total: 2
+  conditions:
+    - type: Computed
+      status: "True"
+      reason: PlanComputed
+      message: Plan computed with 2 change(s)
+    - type: Approved
+      status: "True"
+      reason: Approved
+      message: Plan approved and executed
+  phase: Applied
+  sqlHash: 454373251739fdfbe188ae07358b01d9e0465eb47011fe2d4f386fa34ef7de1b
+  sqlInline: |-
+    CREATE ROLE "approval_test_user" LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE INHERIT NOREPLICATION NOBYPASSRLS;
+    GRANT CONNECT ON DATABASE "postgres" TO "approval_test_user";
+  sqlStatements: 2
+  sqlTruncated: false
+```
+
+With `spec.approval: auto`, the operator creates a `PostgresPolicyPlan` and applies it immediately:
+
+```text
+NAME                                                     POLICY                 MODE            APPROVED   CHANGES   PHASE     AGE
+auto-approval-policy-plan-20260512-090329-11a6ca1d7c09   auto-approval-policy   authoritative   True       2         Applied   2s
+```
+
+The corresponding database role is present after reconcile:
+
+```text
+auto_approved_user
+```
 
 ### Reconciliation mode
 

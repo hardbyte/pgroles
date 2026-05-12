@@ -1940,7 +1940,7 @@ memberships:
         }
     }
 
-    /// Reproduces the partly-dev15 reconcile flap (May 2026): when the desired
+    /// Reproduces a production reconcile flap: when the desired
     /// graph has a wildcard grant `(role, schema, type, "*")` and `current`
     /// has only per-name entries (because the inspector's wildcard collapse
     /// failed — typically because at least one inventory object lacks the
