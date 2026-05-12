@@ -251,7 +251,7 @@ pub async fn fetch_object_inventory(
             NULL::text AS grantee,
             '' AS privilege_type,
             n.nspname AS schema_name,
-            c.relname AS object_name,
+            c.relname::text AS object_name,
             CASE c.relkind
                 WHEN 'r' THEN 'table'
                 WHEN 'p' THEN 'table'
@@ -269,7 +269,7 @@ pub async fn fetch_object_inventory(
             NULL::text AS grantee,
             '' AS privilege_type,
             n.nspname AS schema_name,
-            c.relname AS object_name,
+            c.relname::text AS object_name,
             'sequence' AS obj_type
         FROM pg_class c
         JOIN pg_namespace n ON n.oid = c.relnamespace
@@ -294,7 +294,7 @@ pub async fn fetch_object_inventory(
             NULL::text AS grantee,
             '' AS privilege_type,
             n.nspname AS schema_name,
-            t.typname AS object_name,
+            t.typname::text AS object_name,
             'type' AS obj_type
         FROM pg_type t
         JOIN pg_namespace n ON n.oid = t.typnamespace
@@ -369,7 +369,7 @@ async fn fetch_object_inventory_for_wildcards(
             NULL::text AS grantee,
             '' AS privilege_type,
             n.nspname AS schema_name,
-            c.relname AS object_name,
+            c.relname::text AS object_name,
             CASE c.relkind
                 WHEN 'r' THEN 'table'
                 WHEN 'p' THEN 'table'
@@ -395,7 +395,7 @@ async fn fetch_object_inventory_for_wildcards(
             NULL::text AS grantee,
             '' AS privilege_type,
             n.nspname AS schema_name,
-            c.relname AS object_name,
+            c.relname::text AS object_name,
             'sequence' AS obj_type
         FROM pg_class c
         JOIN pg_namespace n ON n.oid = c.relnamespace
@@ -426,7 +426,7 @@ async fn fetch_object_inventory_for_wildcards(
             NULL::text AS grantee,
             '' AS privilege_type,
             n.nspname AS schema_name,
-            t.typname AS object_name,
+            t.typname::text AS object_name,
             'type' AS obj_type
         FROM pg_type t
         JOIN pg_namespace n ON n.oid = t.typnamespace
@@ -712,7 +712,7 @@ async fn fetch_wildcard_grantability(
         )
         SELECT
             n.nspname AS schema_name,
-            c.relname AS object_name,
+            c.relname::text AS object_name,
             pg_get_userbyid(c.relowner) AS owner_name,
             CASE c.relkind
                 WHEN 'r' THEN 'table'
@@ -763,7 +763,7 @@ async fn fetch_wildcard_grantability(
 
         SELECT
             n.nspname AS schema_name,
-            c.relname AS object_name,
+            c.relname::text AS object_name,
             pg_get_userbyid(c.relowner) AS owner_name,
             'sequence' AS obj_type,
             CASE WHEN owner_grant.can_grant_as_owner THEN scope.need_select
@@ -824,7 +824,7 @@ async fn fetch_wildcard_grantability(
 
         SELECT
             n.nspname AS schema_name,
-            t.typname AS object_name,
+            t.typname::text AS object_name,
             pg_get_userbyid(t.typowner) AS owner_name,
             'type' AS obj_type,
             false AS can_select,
@@ -1102,7 +1102,7 @@ async fn fetch_relation_privileges(
             grantee.rolname AS grantee,
             acl.privilege_type,
             n.nspname AS schema_name,
-            c.relname AS object_name,
+            c.relname::text AS object_name,
             CASE c.relkind
                 WHEN 'r' THEN 'table'
                 WHEN 'p' THEN 'table'
@@ -1141,7 +1141,7 @@ async fn fetch_schema_privileges(
             grantee.rolname AS grantee,
             acl.privilege_type,
             NULL::text AS schema_name,
-            n.nspname AS object_name,
+            n.nspname::text AS object_name,
             'schema' AS obj_type
         FROM pg_namespace n
         CROSS JOIN LATERAL aclexplode(n.nspacl) AS acl
@@ -1208,7 +1208,7 @@ async fn fetch_type_privileges(
             grantee.rolname AS grantee,
             acl.privilege_type,
             n.nspname AS schema_name,
-            t.typname AS object_name,
+            t.typname::text AS object_name,
             'type' AS obj_type
         FROM pg_type t
         JOIN pg_namespace n ON n.oid = t.typnamespace
@@ -1241,7 +1241,7 @@ pub async fn fetch_database_privileges(
             grantee.rolname AS grantee,
             acl.privilege_type,
             NULL::text AS schema_name,
-            db.datname AS object_name,
+            db.datname::text AS object_name,
             'database' AS obj_type
         FROM pg_database db
         CROSS JOIN LATERAL aclexplode(db.datacl) AS acl
