@@ -160,6 +160,42 @@ jobs:
             diff -f smoke-test.yaml --no-exit-code
 
   # ---------------------------------------------------------------------------
+  # Job 4b: Example smoke tests — verify executable examples against PostgreSQL
+  # ---------------------------------------------------------------------------
+  example-smoke:
+    name: Example Smoke Tests
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_PASSWORD: testpassword
+          POSTGRES_DB: pgroles_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd="pg_isready -U postgres"
+          --health-interval=5s
+          --health-timeout=5s
+          --health-retries=10
+    env:
+      DATABASE_URL: "postgres://postgres:testpassword@localhost:5432/pgroles_test"
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install PostgreSQL client
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y postgresql-client
+
+      - name: Run multi-service microservices example
+        run: scripts/test-microservices-example.sh
+
+  # ---------------------------------------------------------------------------
   # Job 5a: E2E — Operator Scenarios
   # ---------------------------------------------------------------------------
   e2e-operator:

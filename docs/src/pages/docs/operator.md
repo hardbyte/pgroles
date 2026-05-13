@@ -116,7 +116,7 @@ The operator's safety model — serialized reconciliation, conflict detection, f
 **API stability:**
 
 - The CRD is `v1alpha1`. There is no conversion webhook, no migration tooling, and no documented upgrade path between versions.
-- Controller semantics that should be part of the API contract are currently implementation-only conventions.
+- Controller semantics that should be part of the API contract are implementation-only conventions.
 
 **Scale and HA:**
 
