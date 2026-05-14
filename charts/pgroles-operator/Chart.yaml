@@ -5,8 +5,8 @@ description: >-
   Define roles, memberships, grants, and default privileges in YAML
   and let the operator converge your database to the desired state.
 type: application
-version: 0.7.4
-appVersion: "0.7.4"
+version: 0.7.5
+appVersion: "0.7.5"
 icon: https://raw.githubusercontent.com/hardbyte/pgroles/main/docs/public/logo.svg
 sources:
   - https://github.com/hardbyte/pgroles
@@ -16,8 +16,10 @@ maintainers:
     url: https://hardbyte.nz
 annotations:
   artifacthub.io/changes: |
-    - kind: fixed
-      description: 'Wildcard EXECUTE grants on schemas containing functions whose signature exceeds 63 bytes no longer re-plan every reconcile. Inventory queries previously truncated long function signatures via UNION-induced `name`-type coercion; the inventory key then failed to match the full-signature grant key, so the wildcard satisfaction check kept marking the wildcard as unsatisfied.'
+    - kind: added
+      description: 'Operator connection params can now use native GKE Workload Identity for Cloud SQL IAM authentication via `connection.params.auth.type: gcp_workload_identity`, including optional Google service account impersonation and token-aware pool refresh.'
+    - kind: changed
+      description: 'Operator and manifest documentation now include validated tooling guidance, a dedicated manifest reference, and native Cloud SQL IAM examples.'
   artifacthub.io/category: database
   artifacthub.io/operator: "true"
   artifacthub.io/prerelease: "false"

@@ -5,6 +5,16 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.7.5] - 2026-05-14
+
+### Added
+
+- **The operator can now authenticate to Cloud SQL with native GKE Workload Identity.** Structured connection params accept `auth.type: gcp_workload_identity`, fetch short-lived Cloud SQL IAM login tokens from the GKE metadata server, optionally impersonate a target Google service account through IAMCredentials, and refresh cached pools before token expiry. Static `password` / `passwordSecret` fields are mutually exclusive with provider-backed auth, and `sslMode` defaults to `require` for this mode. (#114, #115)
+
+### Changed
+
+- **Operator and manifest documentation are easier to validate and navigate.** The docs now include a dedicated manifest reference, a tooling guide with schema-validation examples, and Cloud SQL examples that cover native Workload Identity auth as well as proxy-based connectivity. (#111, #115)
+
 ## [0.7.4] - 2026-05-12
 
 ### Fixed
