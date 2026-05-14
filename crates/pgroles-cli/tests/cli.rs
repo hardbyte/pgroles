@@ -3089,6 +3089,101 @@ grants:
 
     #[test]
     #[ignore]
+    fn wildcard_function_grant_converges_with_procedures_in_schema() {
+        let schema = unique_name("wildfn_proc_schema");
+        let role = unique_name("wildfn_proc_role");
+
+        execute_sql(&format!(
+            r#"
+            DROP SCHEMA IF EXISTS "{schema}" CASCADE;
+            DROP ROLE IF EXISTS "{role}";
+            CREATE SCHEMA "{schema}";
+            CREATE FUNCTION "{schema}".do_thing() RETURNS int LANGUAGE sql AS 'SELECT 1';
+            CREATE PROCEDURE "{schema}".run_something() LANGUAGE sql AS 'SELECT 1';
+            REVOKE EXECUTE ON FUNCTION "{schema}".do_thing() FROM PUBLIC;
+            REVOKE EXECUTE ON PROCEDURE "{schema}".run_something() FROM PUBLIC;
+            "#
+        ));
+
+        let manifest_file = write_temp_manifest(&format!(
+            r#"
+roles:
+  - name: {role}
+
+grants:
+  - role: {role}
+    privileges: [EXECUTE]
+    object: {{ type: function, schema: {schema}, name: "*" }}
+"#
+        ));
+
+        pgroles_cmd()
+            .args([
+                "apply",
+                "--file",
+                manifest_file.path().to_str().unwrap(),
+                "--database-url",
+                &database_url(),
+            ])
+            .assert()
+            .success();
+
+        pgroles_cmd()
+            .args([
+                "diff",
+                "--file",
+                manifest_file.path().to_str().unwrap(),
+                "--database-url",
+                &database_url(),
+                "--format",
+                "summary",
+            ])
+            .assert()
+            .success()
+            .stdout(predicate::str::contains("No changes needed"));
+
+        let removed_manifest_file = write_temp_manifest(&format!(
+            r#"
+roles:
+  - name: {role}
+"#
+        ));
+
+        pgroles_cmd()
+            .args([
+                "apply",
+                "--file",
+                removed_manifest_file.path().to_str().unwrap(),
+                "--database-url",
+                &database_url(),
+            ])
+            .assert()
+            .success();
+
+        pgroles_cmd()
+            .args([
+                "diff",
+                "--file",
+                removed_manifest_file.path().to_str().unwrap(),
+                "--database-url",
+                &database_url(),
+                "--format",
+                "summary",
+            ])
+            .assert()
+            .success()
+            .stdout(predicate::str::contains("No changes needed"));
+
+        execute_sql(&format!(
+            r#"
+            DROP SCHEMA IF EXISTS "{schema}" CASCADE;
+            DROP ROLE IF EXISTS "{role}";
+            "#
+        ));
+    }
+
+    #[test]
+    #[ignore]
     fn wildcard_function_grant_fails_before_partial_apply_when_object_not_grantable() {
         let schema = unique_name("wildfn_mixed_owner_schema");
         let executor = unique_name("wildfn_executor");
@@ -3153,7 +3248,7 @@ grants:
             .stderr(predicate::str::contains("UnsatisfiableWildcardGrant"))
             .stderr(predicate::str::contains("f2()"))
             .stderr(predicate::str::contains(&definer))
-            .stderr(predicate::str::contains("GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA").not());
+            .stderr(predicate::str::contains("GRANT EXECUTE ON ALL ROUTINES IN SCHEMA").not());
 
         pgroles_cmd()
             .args([
@@ -4386,7 +4481,7 @@ retirements:
     /// This test creates a function with a long signature, applies a wildcard
     /// EXECUTE grant, and asserts a follow-up diff converges to zero changes.
     /// Before the inventory-column casts, the second diff would re-emit
-    /// `GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA ... TO ...` forever.
+    /// `GRANT EXECUTE ON ALL ROUTINES IN SCHEMA ... TO ...` forever.
     #[test]
     #[ignore]
     fn wildcard_function_grant_converges_with_signature_longer_than_63_bytes() {

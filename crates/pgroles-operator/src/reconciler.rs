@@ -2783,7 +2783,7 @@ mod tests {
                 ..Default::default()
             }),
             planned_sql: Some(
-                "GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA \"app\" TO \"reader\";".into(),
+                "GRANT EXECUTE ON ALL ROUTINES IN SCHEMA \"app\" TO \"reader\";".into(),
             ),
             planned_sql_truncated: true,
             last_error: None,
