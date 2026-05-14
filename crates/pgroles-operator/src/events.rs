@@ -290,6 +290,7 @@ fn noteworthy_failure_reason(
         "InvalidSpec" => "InvalidSpec",
         "SecretMissing" | "SecretFetchFailed" => "SecretFetchFailed",
         "DatabaseConnectionFailed" => "DatabaseConnectionFailed",
+        "GcpAuthFailed" => "GcpAuthFailed",
         "InsufficientPrivileges" => "InsufficientPrivileges",
         "UnsafeRoleDrops" => "UnsafeRoleDropsBlocked",
         _ => return None,

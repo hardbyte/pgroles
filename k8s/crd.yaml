@@ -82,6 +82,36 @@
                         "description": "Structured connection parameters. Each field is either a plain string\nor a reference to a Secret key. Mutually exclusive with `secretRef`.",
                         "nullable": true,
                         "properties": {
+                          "auth": {
+                            "description": "Provider-backed authentication for connections that use short-lived\ncredentials instead of a static PostgreSQL password.",
+                            "nullable": true,
+                            "oneOf": [
+                              {
+                                "required": [
+                                  "type"
+                                ]
+                              }
+                            ],
+                            "properties": {
+                              "impersonateServiceAccount": {
+                                "description": "Target Google service account to impersonate before requesting the\nCloud SQL login token. Omit to use the pod's bound identity.",
+                                "nullable": true,
+                                "type": "string"
+                              },
+                              "scope": {
+                                "description": "OAuth scope requested for the access token.",
+                                "nullable": true,
+                                "type": "string"
+                              },
+                              "type": {
+                                "enum": [
+                                  "gcp_workload_identity"
+                                ],
+                                "type": "string"
+                              }
+                            },
+                            "type": "object"
+                          },
                           "dbname": {
                             "description": "Database name as a literal value.",
                             "nullable": true,

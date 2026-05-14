@@ -375,6 +375,14 @@ fn retry_class_for_reconcile_error(error: &ReconcileError) -> RetryClass {
                     RetryClass::Transient
                 }
             }
+            ContextError::GcpAuthRejected { .. } | ContextError::GcpAuthInvalidResponse { .. } => {
+                if context.is_gcp_auth_non_transient() {
+                    RetryClass::Slow
+                } else {
+                    RetryClass::Transient
+                }
+            }
+            ContextError::GcpAuthHttp { .. } => RetryClass::Transient,
             ContextError::DatabaseConnect { .. } => RetryClass::Transient,
             ContextError::EmptyResolvedValue { .. }
             | ContextError::InvalidResolvedSslMode { .. } => RetryClass::Slow,
@@ -2087,6 +2095,9 @@ impl ReconcileError {
             ReconcileError::Context(context) => match context.as_ref() {
                 ContextError::SecretFetch { .. } => "SecretFetchFailed",
                 ContextError::SecretMissing { .. } => "SecretMissing",
+                ContextError::GcpAuthHttp { .. }
+                | ContextError::GcpAuthRejected { .. }
+                | ContextError::GcpAuthInvalidResponse { .. } => "GcpAuthFailed",
                 ContextError::DatabaseConnect { .. } => "DatabaseConnectionFailed",
                 ContextError::EmptyResolvedValue { .. } => "InvalidConnectionParams",
                 ContextError::InvalidResolvedSslMode { .. } => "InvalidConnectionParams",
@@ -3479,6 +3490,41 @@ mod tests {
             },
         ));
         assert_eq!(err.reason(), "InvalidConnectionParams");
+    }
+
+    #[test]
+    fn retry_classifies_gcp_auth_permission_error_as_slow() {
+        let error = finalizer::Error::ApplyFailed(ReconcileError::Context(Box::new(
+            crate::context::ContextError::GcpAuthRejected {
+                endpoint: "metadata".to_string(),
+                status: 403,
+                body: "forbidden".to_string(),
+            },
+        )));
+        assert_eq!(retry_class(&error), RetryClass::Slow);
+    }
+
+    #[test]
+    fn retry_classifies_gcp_auth_http_error_as_transient() {
+        let error = finalizer::Error::ApplyFailed(ReconcileError::Context(Box::new(
+            crate::context::ContextError::GcpAuthRejected {
+                endpoint: "metadata".to_string(),
+                status: 503,
+                body: "unavailable".to_string(),
+            },
+        )));
+        assert_eq!(retry_class(&error), RetryClass::Transient);
+    }
+
+    #[test]
+    fn error_reason_gcp_auth_failure() {
+        let err =
+            ReconcileError::Context(Box::new(crate::context::ContextError::GcpAuthRejected {
+                endpoint: "metadata".to_string(),
+                status: 403,
+                body: "forbidden".to_string(),
+            }));
+        assert_eq!(err.reason(), "GcpAuthFailed");
     }
 
     #[test]

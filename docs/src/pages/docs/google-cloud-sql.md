@@ -110,4 +110,18 @@ kubectl create secret generic mydb-credentials \
   --from-literal=DATABASE_URL='postgres://postgres:PASSWORD@127.0.0.1:5432/mydb'
 ```
 
-With [Workload Identity](https://cloud.google.com/kubernetes-engine/docs/how-to/workload-identity), run the [Cloud SQL Auth Proxy](https://cloud.google.com/sql/docs/postgres/sql-proxy) as a sidecar or standalone Deployment in the same namespace. See the [operator docs](/docs/operator) for the full `PostgresPolicy` CRD reference.
+With [Workload Identity](https://cloud.google.com/kubernetes-engine/docs/how-to/workload-identity), the operator can authenticate directly to Cloud SQL IAM without a Cloud SQL Auth Proxy sidecar:
+
+```yaml
+spec:
+  connection:
+    params:
+      host: 10.0.0.5
+      port: 5432
+      dbname: mydb
+      username: pgroles-operator@my-project.iam
+      auth:
+        type: gcp_workload_identity
+```
+
+The operator fetches a short-lived Cloud SQL login token from the GKE metadata server and uses it as the PostgreSQL password. If `sslMode` is omitted, the operator uses `require`. A Cloud SQL Auth Proxy sidecar or standalone Deployment is still supported when you prefer proxy-managed connectivity. See the [operator docs](/docs/operator) for the full `PostgresPolicy` CRD reference.

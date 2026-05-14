@@ -217,6 +217,9 @@ impl From<CrdReconciliationMode> for pgroles_core::diff::ReconciliationMode {
 ///     usernameSecret: { name: zalando-creds, key: username }
 ///     passwordSecret: { name: zalando-creds, key: password }
 /// ```
+///
+/// Params mode can also use provider-backed authentication instead of a static
+/// password, for example GKE Workload Identity to Cloud SQL IAM.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct ConnectionSpec {
@@ -310,6 +313,11 @@ impl ConnectionSpec {
         if let Some(ref params) = self.params {
             let user_part = field_identity_repr(&params.username, &params.username_secret);
             let pass_part = field_identity_repr(&params.password, &params.password_secret);
+            let auth_part = params
+                .auth
+                .as_ref()
+                .map(ConnectionAuth::cache_key)
+                .unwrap_or_default();
             let ssl_part = params
                 .ssl_mode
                 .as_ref()
@@ -322,7 +330,7 @@ impl ConnectionSpec {
                 })
                 .unwrap_or_default();
             format!(
-                "{namespace}/{}\0user={user_part}\0pass={pass_part}\0ssl={ssl_part}",
+                "{namespace}/{}\0user={user_part}\0pass={pass_part}\0auth={auth_part}\0ssl={ssl_part}",
                 self.identity_key()
             )
         } else {
@@ -344,6 +352,10 @@ fn field_identity_repr(literal: &Option<String>, secret: &Option<SecretKeySelect
         String::new()
     }
 }
+
+/// Default OAuth scope used for Cloud SQL IAM database login tokens.
+pub const DEFAULT_GCP_CLOUD_SQL_LOGIN_SCOPE: &str =
+    "https://www.googleapis.com/auth/sqlservice.login";
 
 /// Structured connection parameters for building a PostgreSQL connection URL.
 ///
@@ -403,12 +415,70 @@ pub struct ConnectionParams {
     #[serde(default)]
     pub password_secret: Option<SecretKeySelector>,
 
+    /// Provider-backed authentication for connections that use short-lived
+    /// credentials instead of a static PostgreSQL password.
+    #[serde(default)]
+    pub auth: Option<ConnectionAuth>,
+
     /// SSL mode as a literal value.
     #[serde(default)]
     pub ssl_mode: Option<String>,
     /// SSL mode from a Secret key.
     #[serde(default)]
     pub ssl_mode_secret: Option<SecretKeySelector>,
+}
+
+/// Provider-backed authentication for `connection.params`.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(tag = "type")]
+pub enum ConnectionAuth {
+    /// Fetch a Cloud SQL IAM database login token using the GKE metadata
+    /// server. `username` must be the Cloud SQL PostgreSQL IAM role name
+    /// (for service accounts, the email without `.gserviceaccount.com`).
+    #[serde(rename = "gcp_workload_identity", rename_all = "camelCase")]
+    GcpWorkloadIdentity {
+        /// Target Google service account to impersonate before requesting the
+        /// Cloud SQL login token. Omit to use the pod's bound identity.
+        #[serde(default)]
+        impersonate_service_account: Option<String>,
+        /// OAuth scope requested for the access token.
+        #[serde(default)]
+        scope: Option<String>,
+    },
+}
+
+impl ConnectionAuth {
+    pub fn gcp_scope(&self) -> &str {
+        match self {
+            Self::GcpWorkloadIdentity { scope, .. } => scope
+                .as_deref()
+                .unwrap_or(DEFAULT_GCP_CLOUD_SQL_LOGIN_SCOPE),
+        }
+    }
+
+    pub fn gcp_impersonate_service_account(&self) -> Option<&str> {
+        match self {
+            Self::GcpWorkloadIdentity {
+                impersonate_service_account,
+                ..
+            } => impersonate_service_account.as_deref(),
+        }
+    }
+
+    fn cache_key(&self) -> String {
+        match self {
+            Self::GcpWorkloadIdentity {
+                impersonate_service_account,
+                scope,
+            } => format!(
+                "gcp_workload_identity\0impersonate={}\0scope={}",
+                impersonate_service_account.as_deref().unwrap_or_default(),
+                scope
+                    .as_deref()
+                    .unwrap_or(DEFAULT_GCP_CLOUD_SQL_LOGIN_SCOPE)
+            ),
+        }
+    }
 }
 
 /// Reference to a specific key within a Kubernetes Secret.
@@ -618,6 +688,12 @@ pub enum ConnectionValidationError {
         "connection.params: only one of {field} or {field}Secret may be set, but both were provided"
     )]
     BothFieldsSet { field: String },
+
+    #[error("connection.params.auth: {field} must not be empty or whitespace-only")]
+    EmptyAuthField { field: String },
+
+    #[error("connection.params: password/passwordSecret are mutually exclusive with auth")]
+    AuthWithPassword,
 }
 
 /// Validate a Kubernetes Secret name per RFC 1123 DNS subdomain rules:
@@ -1152,11 +1228,39 @@ impl PostgresPolicySpec {
                     Ok(())
                 }
 
-                // Required fields: host, dbname, username, password.
+                // Required fields: host, dbname, username. Password is only
+                // required for static-password auth.
                 validate_required_field("host", &params.host, &params.host_secret)?;
                 validate_required_field("dbname", &params.dbname, &params.dbname_secret)?;
                 validate_required_field("username", &params.username, &params.username_secret)?;
-                validate_required_field("password", &params.password, &params.password_secret)?;
+                if let Some(auth) = &params.auth {
+                    if params.password.is_some() || params.password_secret.is_some() {
+                        return Err(ConnectionValidationError::AuthWithPassword);
+                    }
+                    match auth {
+                        ConnectionAuth::GcpWorkloadIdentity {
+                            impersonate_service_account,
+                            scope,
+                        } => {
+                            if let Some(value) = impersonate_service_account
+                                && value.trim().is_empty()
+                            {
+                                return Err(ConnectionValidationError::EmptyAuthField {
+                                    field: "impersonateServiceAccount".to_string(),
+                                });
+                            }
+                            if let Some(value) = scope
+                                && value.trim().is_empty()
+                            {
+                                return Err(ConnectionValidationError::EmptyAuthField {
+                                    field: "scope".to_string(),
+                                });
+                            }
+                        }
+                    }
+                } else {
+                    validate_required_field("password", &params.password, &params.password_secret)?;
+                }
 
                 // Optional fields: port, sslMode.
                 // Port is u16 so we wrap it for the generic check.
@@ -1758,6 +1862,7 @@ mod tests {
                 username_secret: None,
                 password: Some("pass-a".into()),
                 password_secret: None,
+                auth: None,
                 ssl_mode: None,
                 ssl_mode_secret: None,
             }),
@@ -1776,6 +1881,7 @@ mod tests {
                 username_secret: None,
                 password: Some("pass-b".into()),
                 password_secret: None,
+                auth: None,
                 ssl_mode: None,
                 ssl_mode_secret: None,
             }),
@@ -1812,6 +1918,7 @@ mod tests {
                 username_secret: None,
                 password: Some("pass".into()),
                 password_secret: None,
+                auth: None,
                 ssl_mode: None,
                 ssl_mode_secret: None,
             }),
@@ -1833,6 +1940,7 @@ mod tests {
                 }),
                 password: Some("pass".into()),
                 password_secret: None,
+                auth: None,
                 ssl_mode: None,
                 ssl_mode_secret: None,
             }),
@@ -1861,6 +1969,7 @@ mod tests {
                 username_secret: None,
                 password: Some("pass".into()),
                 password_secret: None,
+                auth: None,
                 ssl_mode: None,
                 ssl_mode_secret: None,
             }),
@@ -1879,6 +1988,7 @@ mod tests {
                 username_secret: None,
                 password: Some("pass".into()),
                 password_secret: None,
+                auth: None,
                 ssl_mode: Some("require".into()),
                 ssl_mode_secret: None,
             }),
@@ -1907,6 +2017,7 @@ mod tests {
                 username_secret: None,
                 password: Some("pass".into()),
                 password_secret: None,
+                auth: None,
                 ssl_mode: None,
                 ssl_mode_secret: None,
             }),
@@ -1935,6 +2046,7 @@ mod tests {
                 username_secret: None,
                 password: Some("pass".into()),
                 password_secret: None,
+                auth: None,
                 ssl_mode: None,
                 ssl_mode_secret: None,
             }),
@@ -1998,6 +2110,7 @@ mod tests {
                     name: "pg-creds".into(),
                     key: "password".into(),
                 }),
+                auth: None,
                 ssl_mode: None,
                 ssl_mode_secret: None,
             }),
@@ -2036,6 +2149,7 @@ mod tests {
                 username_secret: None,
                 password: Some("pass".into()),
                 password_secret: None,
+                auth: None,
                 ssl_mode: None,
                 ssl_mode_secret: None,
             }),
@@ -2072,11 +2186,104 @@ mod tests {
                 username_secret: None,
                 password: Some("pass".into()),
                 password_secret: None,
+                auth: None,
                 ssl_mode: Some("invalid-mode".into()),
                 ssl_mode_secret: None,
             }),
         });
         assert!(spec.validate_connection_spec().is_err());
+    }
+
+    #[test]
+    fn validate_connection_accepts_gcp_workload_identity_without_password() {
+        let spec = spec_with_connection(ConnectionSpec {
+            secret_ref: None,
+            secret_key: None,
+            params: Some(ConnectionParams {
+                host: Some("10.0.0.5".into()),
+                host_secret: None,
+                port: None,
+                port_secret: None,
+                dbname: Some("discovery".into()),
+                dbname_secret: None,
+                username: Some("pgroles-operator@my-project.iam".into()),
+                username_secret: None,
+                password: None,
+                password_secret: None,
+                auth: Some(ConnectionAuth::GcpWorkloadIdentity {
+                    impersonate_service_account: None,
+                    scope: None,
+                }),
+                ssl_mode: None,
+                ssl_mode_secret: None,
+            }),
+        });
+
+        assert!(spec.validate_connection_spec().is_ok());
+        assert!(spec.referenced_secret_names("policy").is_empty());
+    }
+
+    #[test]
+    fn validate_connection_rejects_gcp_workload_identity_with_password() {
+        let spec = spec_with_connection(ConnectionSpec {
+            secret_ref: None,
+            secret_key: None,
+            params: Some(ConnectionParams {
+                host: Some("10.0.0.5".into()),
+                host_secret: None,
+                port: None,
+                port_secret: None,
+                dbname: Some("discovery".into()),
+                dbname_secret: None,
+                username: Some("pgroles-operator@my-project.iam".into()),
+                username_secret: None,
+                password: Some("static-password".into()),
+                password_secret: None,
+                auth: Some(ConnectionAuth::GcpWorkloadIdentity {
+                    impersonate_service_account: None,
+                    scope: None,
+                }),
+                ssl_mode: None,
+                ssl_mode_secret: None,
+            }),
+        });
+
+        assert!(matches!(
+            spec.validate_connection_spec(),
+            Err(ConnectionValidationError::AuthWithPassword)
+        ));
+    }
+
+    #[test]
+    fn validate_connection_rejects_empty_gcp_auth_fields() {
+        let spec = spec_with_connection(ConnectionSpec {
+            secret_ref: None,
+            secret_key: None,
+            params: Some(ConnectionParams {
+                host: Some("10.0.0.5".into()),
+                host_secret: None,
+                port: None,
+                port_secret: None,
+                dbname: Some("discovery".into()),
+                dbname_secret: None,
+                username: Some("pgroles-operator@my-project.iam".into()),
+                username_secret: None,
+                password: None,
+                password_secret: None,
+                auth: Some(ConnectionAuth::GcpWorkloadIdentity {
+                    impersonate_service_account: Some(" ".into()),
+                    scope: None,
+                }),
+                ssl_mode: None,
+                ssl_mode_secret: None,
+            }),
+        });
+
+        assert!(matches!(
+            spec.validate_connection_spec(),
+            Err(ConnectionValidationError::EmptyAuthField { ref field })
+                if field == "impersonateServiceAccount"
+        ));
     }
 
     #[test]
@@ -2103,6 +2310,7 @@ mod tests {
                     username_secret: None,
                     password: Some("pass".into()),
                     password_secret: None,
+                    auth: None,
                     ssl_mode: Some((*mode).into()),
                     ssl_mode_secret: None,
                 }),
@@ -2133,6 +2341,7 @@ mod tests {
                 }),
                 password: Some("pass".into()),
                 password_secret: None,
+                auth: None,
                 ssl_mode: None,
                 ssl_mode_secret: None,
             }),
@@ -2159,6 +2368,7 @@ mod tests {
                 username_secret: None,
                 password: Some("pass".into()),
                 password_secret: None,
+                auth: None,
                 ssl_mode: None,
                 ssl_mode_secret: None,
             }),
@@ -2185,6 +2395,7 @@ mod tests {
                 username_secret: None,
                 password: Some("pass".into()),
                 password_secret: None,
+                auth: None,
                 ssl_mode: None,
                 ssl_mode_secret: None,
             }),
@@ -2244,6 +2455,35 @@ params:
         assert!(params.username_secret.is_some());
         assert_eq!(params.username_secret.as_ref().unwrap().name, "creds");
         assert_eq!(params.ssl_mode.as_deref(), Some("require"));
+    }
+
+    #[test]
+    fn connection_spec_params_mode_deserializes_gcp_workload_identity_auth() {
+        let yaml = r#"
+params:
+  host: 10.0.0.5
+  port: 5432
+  dbname: discovery
+  username: pgroles-operator@my-project.iam
+  auth:
+    type: gcp_workload_identity
+    impersonateServiceAccount: target@other-project.iam.gserviceaccount.com
+    scope: https://www.googleapis.com/auth/sqlservice.login
+"#;
+        let conn: ConnectionSpec = serde_yaml::from_str(yaml).unwrap();
+        let params = conn.params.as_ref().unwrap();
+        let auth = params.auth.as_ref().expect("auth should deserialize");
+
+        assert!(params.password.is_none());
+        assert_eq!(auth.gcp_scope(), DEFAULT_GCP_CLOUD_SQL_LOGIN_SCOPE);
+        assert_eq!(
+            auth.gcp_impersonate_service_account(),
+            Some("target@other-project.iam.gserviceaccount.com")
+        );
+        assert!(conn.cache_key("prod").contains("gcp_workload_identity"));
+
+        let spec = spec_with_connection(conn);
+        assert!(spec.validate_connection_spec().is_ok());
     }
 
     #[test]
