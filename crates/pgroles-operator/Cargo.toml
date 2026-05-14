@@ -41,6 +41,7 @@ base64 = "0.22.1"
 sha2 = "0.11"
 percent-encoding = "2.3.2"
 flate2 = "1.1.5"
+reqwest = { workspace = true }
 
 [[bin]]
 name = "pgroles-operator"

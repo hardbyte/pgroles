@@ -2,14 +2,16 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::{Duration, SystemTime};
 
+use futures::future::{BoxFuture, FutureExt};
 use kube::runtime::events::Recorder;
-use std::time::Duration;
+use serde::{Deserialize, Serialize};
 
 use sqlx::postgres::{PgPool, PgPoolOptions};
 use tokio::sync::{Mutex, RwLock};
 
-use crate::crd::{ConnectionSpec, SecretKeySelector};
+use crate::crd::{ConnectionAuth, ConnectionSpec, SecretKeySelector};
 use crate::observability::OperatorObservability;
 
 /// Minimum pool size required for reconciliation.
@@ -24,12 +26,257 @@ const POOL_ACQUIRE_TIMEOUT_SECS: u64 = 10;
 
 const _: () = assert!(POOL_MAX_CONNECTIONS >= 2);
 
+const GCP_METADATA_TOKEN_ENDPOINT: &str =
+    "http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token";
+const GCP_IAM_CREDENTIALS_SCOPE: &str = "https://www.googleapis.com/auth/cloud-platform";
+const GCP_TOKEN_CACHE_SKEW_SECS: u64 = 300;
+const GCP_IMPERSONATED_TOKEN_LIFETIME_SECS: u64 = 3600;
+const GCP_AUTH_HTTP_TIMEOUT_SECS: u64 = 10;
+
 #[derive(Clone)]
 struct CachedPool {
     resource_version: Option<String>,
     /// Fingerprint of all referenced secrets' resourceVersions (params mode).
     secret_fingerprint: Option<String>,
+    /// Expiry for token-backed connection passwords.
+    token_expires_at: Option<SystemTime>,
     pool: PgPool,
+}
+
+struct ResolvedConnectionUrl {
+    database_url: String,
+    token_expires_at: Option<SystemTime>,
+}
+
+#[derive(Clone)]
+struct GcpAccessToken {
+    token: String,
+    expires_at: SystemTime,
+}
+
+trait GcpAccessTokenProvider: Send + Sync {
+    fn fetch_token<'a>(
+        &'a self,
+        auth: &'a ConnectionAuth,
+    ) -> BoxFuture<'a, Result<GcpAccessToken, ContextError>>;
+}
+
+#[derive(Clone)]
+struct MetadataGcpAccessTokenProvider {
+    client: reqwest::Client,
+}
+
+impl Default for MetadataGcpAccessTokenProvider {
+    fn default() -> Self {
+        Self {
+            client: reqwest::Client::builder()
+                .no_proxy()
+                .timeout(Duration::from_secs(GCP_AUTH_HTTP_TIMEOUT_SECS))
+                .build()
+                .expect("GCP auth HTTP client should build"),
+        }
+    }
+}
+
+impl GcpAccessTokenProvider for MetadataGcpAccessTokenProvider {
+    fn fetch_token<'a>(
+        &'a self,
+        auth: &'a ConnectionAuth,
+    ) -> BoxFuture<'a, Result<GcpAccessToken, ContextError>> {
+        async move {
+            let scope = auth.gcp_scope();
+            if let Some(target) = auth.gcp_impersonate_service_account() {
+                self.fetch_impersonated_access_token(target, scope).await
+            } else {
+                self.fetch_metadata_access_token(scope).await
+            }
+        }
+        .boxed()
+    }
+}
+
+impl MetadataGcpAccessTokenProvider {
+    async fn fetch_metadata_access_token(
+        &self,
+        scope: &str,
+    ) -> Result<GcpAccessToken, ContextError> {
+        let response = self
+            .client
+            .get(GCP_METADATA_TOKEN_ENDPOINT)
+            .header("Metadata-Flavor", "Google")
+            .query(&[("scopes", scope)])
+            .send()
+            .await
+            .map_err(|source| ContextError::GcpAuthHttp {
+                endpoint: "metadata",
+                source,
+            })?;
+
+        let status = response.status();
+        if !status.is_success() {
+            let body = response_body_for_error(response).await;
+            return Err(ContextError::GcpAuthRejected {
+                endpoint: "metadata".to_string(),
+                status: status.as_u16(),
+                body,
+            });
+        }
+
+        let body: MetadataTokenResponse =
+            response
+                .json()
+                .await
+                .map_err(|source| ContextError::GcpAuthHttp {
+                    endpoint: "metadata",
+                    source,
+                })?;
+
+        if body.access_token.trim().is_empty() {
+            return Err(ContextError::GcpAuthInvalidResponse {
+                detail: "metadata token response omitted access_token".to_string(),
+            });
+        }
+        if body.expires_in == 0 {
+            return Err(ContextError::GcpAuthInvalidResponse {
+                detail: "metadata token response had zero expires_in".to_string(),
+            });
+        }
+
+        Ok(GcpAccessToken {
+            token: body.access_token,
+            expires_at: SystemTime::now() + Duration::from_secs(body.expires_in),
+        })
+    }
+
+    async fn fetch_impersonated_access_token(
+        &self,
+        target_service_account: &str,
+        scope: &str,
+    ) -> Result<GcpAccessToken, ContextError> {
+        let source = self
+            .fetch_metadata_access_token(GCP_IAM_CREDENTIALS_SCOPE)
+            .await?;
+        let encoded_target = percent_encoding::utf8_percent_encode(
+            target_service_account,
+            percent_encoding::NON_ALPHANUMERIC,
+        )
+        .to_string();
+        let endpoint = format!(
+            "https://iamcredentials.googleapis.com/v1/projects/-/serviceAccounts/{encoded_target}:generateAccessToken"
+        );
+        let request = GenerateAccessTokenRequest {
+            scope: vec![scope.to_string()],
+            lifetime: format!("{GCP_IMPERSONATED_TOKEN_LIFETIME_SECS}s"),
+        };
+
+        let response = self
+            .client
+            .post(&endpoint)
+            .bearer_auth(&source.token)
+            .json(&request)
+            .send()
+            .await
+            .map_err(|source| ContextError::GcpAuthHttp {
+                endpoint: "iamcredentials",
+                source,
+            })?;
+
+        let status = response.status();
+        if !status.is_success() {
+            let body = response_body_for_error(response).await;
+            return Err(ContextError::GcpAuthRejected {
+                endpoint: "iamcredentials".to_string(),
+                status: status.as_u16(),
+                body,
+            });
+        }
+
+        let body: GenerateAccessTokenResponse =
+            response
+                .json()
+                .await
+                .map_err(|source| ContextError::GcpAuthHttp {
+                    endpoint: "iamcredentials",
+                    source,
+                })?;
+
+        if body.access_token.trim().is_empty() {
+            return Err(ContextError::GcpAuthInvalidResponse {
+                detail: "IAMCredentials response omitted accessToken".to_string(),
+            });
+        }
+        let expires_at = parse_google_expire_time(&body.expire_time).ok_or_else(|| {
+            ContextError::GcpAuthInvalidResponse {
+                detail: format!(
+                    "IAMCredentials response had invalid expireTime {:?}",
+                    body.expire_time
+                ),
+            }
+        })?;
+
+        Ok(GcpAccessToken {
+            token: body.access_token,
+            expires_at,
+        })
+    }
+}
+
+#[derive(Deserialize)]
+struct MetadataTokenResponse {
+    access_token: String,
+    expires_in: u64,
+}
+
+#[derive(Serialize)]
+struct GenerateAccessTokenRequest {
+    scope: Vec<String>,
+    lifetime: String,
+}
+
+#[derive(Deserialize)]
+struct GenerateAccessTokenResponse {
+    #[serde(rename = "accessToken")]
+    access_token: String,
+    #[serde(rename = "expireTime")]
+    expire_time: String,
+}
+
+async fn response_body_for_error(response: reqwest::Response) -> String {
+    match response.text().await {
+        Ok(body) => truncate_for_error(body),
+        Err(error) => format!("failed to read error body: {error}"),
+    }
+}
+
+fn truncate_for_error(mut body: String) -> String {
+    const MAX_ERROR_BODY_BYTES: usize = 512;
+    if body.len() <= MAX_ERROR_BODY_BYTES {
+        return body;
+    }
+    let mut end = MAX_ERROR_BODY_BYTES;
+    while !body.is_char_boundary(end) {
+        end -= 1;
+    }
+    body.truncate(end);
+    body.push_str("...");
+    body
+}
+
+fn parse_google_expire_time(expire_time: &str) -> Option<SystemTime> {
+    expire_time
+        .parse::<jiff::Timestamp>()
+        .ok()
+        .map(SystemTime::from)
+}
+
+fn token_expires_after_skew(expires_at: Option<SystemTime>, now: SystemTime) -> bool {
+    let Some(expires_at) = expires_at else {
+        return true;
+    };
+    let Some(refresh_at) = now.checked_add(Duration::from_secs(GCP_TOKEN_CACHE_SKEW_SECS)) else {
+        return false;
+    };
+    expires_at > refresh_at
 }
 
 /// Guard returned by [`OperatorContext::try_lock_database`].
@@ -97,6 +344,9 @@ pub struct OperatorContext {
 
     /// Shared health/metrics state.
     pub observability: OperatorObservability,
+
+    /// Fetches short-lived provider-backed database passwords.
+    gcp_token_provider: Arc<dyn GcpAccessTokenProvider>,
 }
 
 impl OperatorContext {
@@ -112,6 +362,7 @@ impl OperatorContext {
             pool_cache: Arc::new(RwLock::new(HashMap::new())),
             observability,
             database_locks: Arc::new(Mutex::new(HashMap::new())),
+            gcp_token_provider: Arc::new(MetadataGcpAccessTokenProvider::default()),
         }
     }
 
@@ -167,14 +418,30 @@ impl OperatorContext {
         namespace: &str,
         connection: &ConnectionSpec,
     ) -> Result<String, ContextError> {
+        Ok(self
+            .resolve_connection_url_with_metadata(namespace, connection)
+            .await?
+            .database_url)
+    }
+
+    async fn resolve_connection_url_with_metadata(
+        &self,
+        namespace: &str,
+        connection: &ConnectionSpec,
+    ) -> Result<ResolvedConnectionUrl, ContextError> {
         if let Some(ref secret_ref) = connection.secret_ref {
             // URL mode — read the full connection URL from the Secret.
-            self.fetch_secret_value(
-                namespace,
-                &secret_ref.name,
-                connection.effective_secret_key(),
-            )
-            .await
+            let database_url = self
+                .fetch_secret_value(
+                    namespace,
+                    &secret_ref.name,
+                    connection.effective_secret_key(),
+                )
+                .await?;
+            Ok(ResolvedConnectionUrl {
+                database_url,
+                token_expires_at: None,
+            })
         } else if let Some(ref params) = connection.params {
             // Params mode — resolve each field and build the URL.
             let host = self
@@ -224,12 +491,18 @@ impl OperatorContext {
                 });
             }
 
-            let password = self
-                .resolve_param(namespace, &params.password, &params.password_secret)
-                .await?
-                .ok_or_else(|| ContextError::EmptyResolvedValue {
-                    field: "password".to_string(),
-                })?;
+            let (password, token_expires_at) = if let Some(auth) = &params.auth {
+                let token = self.gcp_token_provider.fetch_token(auth).await?;
+                (token.token, Some(token.expires_at))
+            } else {
+                let password = self
+                    .resolve_param(namespace, &params.password, &params.password_secret)
+                    .await?
+                    .ok_or_else(|| ContextError::EmptyResolvedValue {
+                        field: "password".to_string(),
+                    })?;
+                (password, None)
+            };
             if password.trim().is_empty() {
                 return Err(ContextError::EmptyResolvedValue {
                     field: "password".to_string(),
@@ -244,10 +517,11 @@ impl OperatorContext {
                 "postgresql://{encoded_username}:{encoded_password}@{host}:{port}/{dbname}"
             );
 
-            if let Some(ssl_mode) = self
+            let ssl_mode = self
                 .resolve_param(namespace, &params.ssl_mode, &params.ssl_mode_secret)
                 .await?
-            {
+                .or_else(|| params.auth.as_ref().map(|_| "require".to_string()));
+            if let Some(ssl_mode) = ssl_mode {
                 // Validate sslMode at runtime — CRD validation only catches
                 // literal values; a secret ref could resolve to anything.
                 if !crate::crd::VALID_SSL_MODES.contains(&ssl_mode.as_str()) {
@@ -257,7 +531,10 @@ impl OperatorContext {
                 url.push_str(&ssl_mode);
             }
 
-            Ok(url)
+            Ok(ResolvedConnectionUrl {
+                database_url: url,
+                token_expires_at,
+            })
         } else {
             Err(ContextError::SecretMissing {
                 name: "connection".to_string(),
@@ -340,13 +617,17 @@ impl OperatorContext {
                     (None, None) => true,
                     _ => false,
                 };
-                if version_matches && fingerprint_matches {
+                let token_fresh =
+                    token_expires_after_skew(cached.token_expires_at, SystemTime::now());
+                if version_matches && fingerprint_matches && token_fresh {
                     return Ok(cached.pool.clone());
                 }
             }
         }
 
-        let database_url = self.resolve_connection_url(namespace, connection).await?;
+        let resolved = self
+            .resolve_connection_url_with_metadata(namespace, connection)
+            .await?;
 
         // Create pool with explicit sizing. Reconciliation holds one dedicated
         // connection for PostgreSQL advisory locking and needs additional pool
@@ -354,7 +635,7 @@ impl OperatorContext {
         let pool = PgPoolOptions::new()
             .max_connections(POOL_MAX_CONNECTIONS)
             .acquire_timeout(Duration::from_secs(POOL_ACQUIRE_TIMEOUT_SECS))
-            .connect(&database_url)
+            .connect(&resolved.database_url)
             .await
             .map_err(|err| ContextError::DatabaseConnect { source: err })?;
 
@@ -366,6 +647,7 @@ impl OperatorContext {
                 CachedPool {
                     resource_version,
                     secret_fingerprint,
+                    token_expires_at: resolved.token_expires_at,
                     pool: pool.clone(),
                 },
             );
@@ -445,6 +727,22 @@ pub enum ContextError {
         "connection param sslMode resolved to invalid value \"{value}\" (expected one of: disable, allow, prefer, require, verify-ca, verify-full)"
     )]
     InvalidResolvedSslMode { value: String },
+
+    #[error("failed to fetch GCP auth token from {endpoint}: {source}")]
+    GcpAuthHttp {
+        endpoint: &'static str,
+        source: reqwest::Error,
+    },
+
+    #[error("GCP auth token endpoint {endpoint} returned HTTP {status}: {body}")]
+    GcpAuthRejected {
+        endpoint: String,
+        status: u16,
+        body: String,
+    },
+
+    #[error("GCP auth token response was invalid: {detail}")]
+    GcpAuthInvalidResponse { detail: String },
 }
 
 impl ContextError {
@@ -457,6 +755,14 @@ impl ContextError {
                 ..
             } if (400..500).contains(&response.code) && response.code != 429
         )
+    }
+
+    pub fn is_gcp_auth_non_transient(&self) -> bool {
+        matches!(
+            self,
+            ContextError::GcpAuthRejected { status, .. }
+                if (400..500).contains(status) && *status != 429
+        ) || matches!(self, ContextError::GcpAuthInvalidResponse { .. })
     }
 }
 
@@ -514,6 +820,63 @@ mod tests {
         };
 
         assert!(!error.is_secret_fetch_non_transient());
+    }
+
+    #[test]
+    fn gcp_auth_client_error_is_non_transient() {
+        let error = ContextError::GcpAuthRejected {
+            endpoint: "metadata".into(),
+            status: 403,
+            body: "forbidden".into(),
+        };
+
+        assert!(error.is_gcp_auth_non_transient());
+    }
+
+    #[test]
+    fn gcp_auth_rate_limit_remains_transient() {
+        let error = ContextError::GcpAuthRejected {
+            endpoint: "metadata".into(),
+            status: 429,
+            body: "rate limited".into(),
+        };
+
+        assert!(!error.is_gcp_auth_non_transient());
+    }
+
+    #[test]
+    fn token_expiry_uses_five_minute_refresh_skew() {
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000);
+        assert!(token_expires_after_skew(
+            Some(now + Duration::from_secs(GCP_TOKEN_CACHE_SKEW_SECS + 1)),
+            now
+        ));
+        assert!(!token_expires_after_skew(
+            Some(now + Duration::from_secs(GCP_TOKEN_CACHE_SKEW_SECS)),
+            now
+        ));
+    }
+
+    #[test]
+    fn parse_google_expire_time_accepts_rfc3339() {
+        let parsed =
+            parse_google_expire_time("2026-05-14T02:30:00Z").expect("expireTime should parse");
+        assert_eq!(
+            parsed
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap()
+                .as_secs(),
+            1_778_725_800
+        );
+    }
+
+    #[test]
+    fn truncate_for_error_keeps_utf8_boundary() {
+        let body = "é".repeat(300);
+        let truncated = truncate_for_error(body);
+
+        assert!(truncated.ends_with("..."));
+        assert!(truncated.is_char_boundary(truncated.len() - 3));
     }
 
     #[tokio::test]

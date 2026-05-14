@@ -305,12 +305,34 @@ Each connection field supports a literal value and a `*Secret` variant:
 | `port` / `portSecret` | Integer (default 5432) | SecretKeySelector | No |
 | `dbname` / `dbnameSecret` | Database name | SecretKeySelector | Yes (exactly one) |
 | `username` / `usernameSecret` | Username string | SecretKeySelector | Yes (exactly one) |
-| `password` / `passwordSecret` | Password string | SecretKeySelector | Yes (exactly one) |
+| `password` / `passwordSecret` | Password string | SecretKeySelector | Yes unless `auth` is set |
+| `auth` | Provider-backed auth config | n/a | No |
 | `sslMode` / `sslModeSecret` | SSL mode string | SecretKeySelector | No |
 
 Valid `sslMode` values: `disable`, `allow`, `prefer`, `require`, `verify-ca`, `verify-full`.
 
 For required fields, exactly one of the literal or Secret variant must be set. For optional fields, at most one may be set. When a Secret referenced by `params` changes, the operator detects the `resourceVersion` change and reconnects automatically.
+
+#### GKE Workload Identity for Cloud SQL IAM
+
+Use `connection.params.auth.type: gcp_workload_identity` when the operator pod runs on GKE with Workload Identity and connects to Cloud SQL using IAM database authentication. The operator fetches a short-lived OAuth token from the GKE metadata server and uses it as the PostgreSQL password. `password` and `passwordSecret` must be omitted. If `sslMode` is omitted, the operator uses `require`.
+
+```yaml
+connection:
+  params:
+    host: 10.0.0.5
+    port: 5432
+    dbname: discovery
+    username: pgroles-operator@my-project.iam
+    auth:
+      type: gcp_workload_identity
+      # Optional: impersonate a different GCP service account.
+      impersonateServiceAccount: target-sa@other-project.iam.gserviceaccount.com
+      # Optional: defaults to https://www.googleapis.com/auth/sqlservice.login
+      scope: https://www.googleapis.com/auth/sqlservice.login
+```
+
+The Kubernetes ServiceAccount used by the operator must be annotated for Workload Identity, and the Google service account must have Cloud SQL IAM database login permissions for the target instance.
 
 {% callout type="note" title="Host resolution" %}
 The `host` must be reachable from the operator pod. For an in-cluster database in a different namespace, use the fully qualified service name (e.g. `my-postgres.my-namespace.svc`). For a database outside the cluster, use the external hostname or IP directly (e.g. `db.example.com` or `10.0.1.50`).
