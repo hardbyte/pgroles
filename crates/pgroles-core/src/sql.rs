@@ -469,7 +469,7 @@ fn format_object_target(
         ObjectType::Function => match name {
             Some("*") => {
                 let schema_name = schema.unwrap_or("public");
-                format!("ALL FUNCTIONS IN SCHEMA {}", quote_ident(schema_name))
+                format!("ALL ROUTINES IN SCHEMA {}", quote_ident(schema_name))
             }
             Some(function_name) => format_function_target(schema, function_name),
             None => {
@@ -890,6 +890,22 @@ mod tests {
         assert_eq!(
             sql,
             "GRANT EXECUTE ON FUNCTION \"public\".\"refresh_users\"(integer, text) TO \"r1\";"
+        );
+    }
+
+    #[test]
+    fn render_grant_all_routines_for_function_wildcard() {
+        let change = Change::Grant {
+            role: "inventory-editor".to_string(),
+            privileges: BTreeSet::from([Privilege::Execute]),
+            object_type: ObjectType::Function,
+            schema: Some("inventory".to_string()),
+            name: Some("*".to_string()),
+        };
+        let sql = render(&change);
+        assert_eq!(
+            sql,
+            "GRANT EXECUTE ON ALL ROUTINES IN SCHEMA \"inventory\" TO \"inventory-editor\";"
         );
     }
 

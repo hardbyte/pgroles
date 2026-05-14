@@ -1947,7 +1947,7 @@ memberships:
     /// privilege, e.g. a function that was DROPped+CREATEd between reconciles
     /// resetting its proacl to NULL), `diff()` must NOT emit per-name REVOKEs
     /// for objects covered by the desired wildcard. Otherwise apply order
-    /// (GRANTs before REVOKEs) re-grants on ALL FUNCTIONS and then strips
+    /// (GRANTs before REVOKEs) re-grants on ALL ROUTINES and then strips
     /// privileges from the previously-granted set, producing a permanent
     /// oscillation between two stable states.
     #[test]
