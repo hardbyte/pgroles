@@ -3142,6 +3142,38 @@ grants:
             .success()
             .stdout(predicate::str::contains("No changes needed"));
 
+        let removed_manifest_file = write_temp_manifest(&format!(
+            r#"
+roles:
+  - name: {role}
+"#
+        ));
+
+        pgroles_cmd()
+            .args([
+                "apply",
+                "--file",
+                removed_manifest_file.path().to_str().unwrap(),
+                "--database-url",
+                &database_url(),
+            ])
+            .assert()
+            .success();
+
+        pgroles_cmd()
+            .args([
+                "diff",
+                "--file",
+                removed_manifest_file.path().to_str().unwrap(),
+                "--database-url",
+                &database_url(),
+                "--format",
+                "summary",
+            ])
+            .assert()
+            .success()
+            .stdout(predicate::str::contains("No changes needed"));
+
         execute_sql(&format!(
             r#"
             DROP SCHEMA IF EXISTS "{schema}" CASCADE;
@@ -4449,7 +4481,7 @@ retirements:
     /// This test creates a function with a long signature, applies a wildcard
     /// EXECUTE grant, and asserts a follow-up diff converges to zero changes.
     /// Before the inventory-column casts, the second diff would re-emit
-    /// `GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA ... TO ...` forever.
+    /// `GRANT EXECUTE ON ALL ROUTINES IN SCHEMA ... TO ...` forever.
     #[test]
     #[ignore]
     fn wildcard_function_grant_converges_with_signature_longer_than_63_bytes() {

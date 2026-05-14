@@ -512,14 +512,14 @@ fn format_function_target(schema: Option<&str>, function_name: &str) -> String {
             let base_name = &function_name[..paren_idx];
             let args = &function_name[paren_idx..];
             format!(
-                "FUNCTION {}.{}{}",
+                "ROUTINE {}.{}{}",
                 quote_ident(schema_name),
                 quote_ident(base_name),
                 args
             )
         }
         _ => format!(
-            "FUNCTION {}.{}",
+            "ROUTINE {}.{}",
             quote_ident(schema_name),
             quote_ident(function_name)
         ),
@@ -533,7 +533,7 @@ fn sql_object_type_keyword(object_type: ObjectType) -> &'static str {
         ObjectType::View => "TABLE", // PostgreSQL treats views as tables for GRANT
         ObjectType::MaterializedView => "TABLE", // Same
         ObjectType::Sequence => "SEQUENCE",
-        ObjectType::Function => "FUNCTION",
+        ObjectType::Function => "ROUTINE",
         ObjectType::Schema => "SCHEMA",
         ObjectType::Database => "DATABASE",
         ObjectType::Type => "TYPE",
@@ -545,7 +545,7 @@ fn sql_object_type_plural(object_type: ObjectType) -> &'static str {
     match object_type {
         ObjectType::Table | ObjectType::View | ObjectType::MaterializedView => "TABLES",
         ObjectType::Sequence => "SEQUENCES",
-        ObjectType::Function => "FUNCTIONS",
+        ObjectType::Function => "ROUTINES",
         // PostgreSQL has no ALL TYPES IN SCHEMA syntax. Type grants should use
         // specific object names, not wildcards. If we get here the manifest is
         // likely misconfigured, but produce the closest valid SQL anyway.
@@ -889,7 +889,23 @@ mod tests {
         let sql = render(&change);
         assert_eq!(
             sql,
-            "GRANT EXECUTE ON FUNCTION \"public\".\"refresh_users\"(integer, text) TO \"r1\";"
+            "GRANT EXECUTE ON ROUTINE \"public\".\"refresh_users\"(integer, text) TO \"r1\";"
+        );
+    }
+
+    #[test]
+    fn render_revoke_specific_routine_for_function_object() {
+        let change = Change::Revoke {
+            role: "r1".to_string(),
+            privileges: BTreeSet::from([Privilege::Execute]),
+            object_type: ObjectType::Function,
+            schema: Some("public".to_string()),
+            name: Some("run_something()".to_string()),
+        };
+        let sql = render(&change);
+        assert_eq!(
+            sql,
+            "REVOKE EXECUTE ON ROUTINE \"public\".\"run_something\"() FROM \"r1\";"
         );
     }
 
@@ -953,7 +969,7 @@ mod tests {
         let sql = render(&change);
         assert_eq!(
             sql,
-            "ALTER DEFAULT PRIVILEGES FOR ROLE \"app_owner\" IN SCHEMA \"inventory\" REVOKE EXECUTE ON FUNCTIONS FROM \"inventory-editor\";"
+            "ALTER DEFAULT PRIVILEGES FOR ROLE \"app_owner\" IN SCHEMA \"inventory\" REVOKE EXECUTE ON ROUTINES FROM \"inventory-editor\";"
         );
     }
 
