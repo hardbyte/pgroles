@@ -70,6 +70,7 @@ impl Default for MetadataGcpAccessTokenProvider {
     fn default() -> Self {
         Self {
             client: reqwest::Client::builder()
+                .no_proxy()
                 .timeout(Duration::from_secs(GCP_AUTH_HTTP_TIMEOUT_SECS))
                 .build()
                 .expect("GCP auth HTTP client should build"),

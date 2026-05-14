@@ -2468,14 +2468,14 @@ params:
   auth:
     type: gcp_workload_identity
     impersonateServiceAccount: target@other-project.iam.gserviceaccount.com
-    scope: https://www.googleapis.com/auth/sqlservice.login
+    scope: https://example.com/custom-scope
 "#;
         let conn: ConnectionSpec = serde_yaml::from_str(yaml).unwrap();
         let params = conn.params.as_ref().unwrap();
         let auth = params.auth.as_ref().expect("auth should deserialize");
 
         assert!(params.password.is_none());
-        assert_eq!(auth.gcp_scope(), DEFAULT_GCP_CLOUD_SQL_LOGIN_SCOPE);
+        assert_eq!(auth.gcp_scope(), "https://example.com/custom-scope");
         assert_eq!(
             auth.gcp_impersonate_service_account(),
             Some("target@other-project.iam.gserviceaccount.com")

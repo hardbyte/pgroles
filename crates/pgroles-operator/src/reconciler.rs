@@ -3504,13 +3504,17 @@ mod tests {
         assert_eq!(retry_class(&error), RetryClass::Slow);
     }
 
-    #[test]
-    fn retry_classifies_gcp_auth_http_error_as_transient() {
+    #[tokio::test]
+    async fn retry_classifies_gcp_auth_http_error_as_transient() {
+        let source = reqwest::Client::new()
+            .get("http://")
+            .send()
+            .await
+            .expect_err("invalid URL should produce a reqwest error");
         let error = finalizer::Error::ApplyFailed(ReconcileError::Context(Box::new(
-            crate::context::ContextError::GcpAuthRejected {
-                endpoint: "metadata".to_string(),
-                status: 503,
-                body: "unavailable".to_string(),
+            crate::context::ContextError::GcpAuthHttp {
+                endpoint: "metadata",
+                source,
             },
         )));
         assert_eq!(retry_class(&error), RetryClass::Transient);
