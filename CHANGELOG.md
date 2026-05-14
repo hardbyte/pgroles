@@ -5,6 +5,12 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.7.6] - 2026-05-14
+
+### Fixed
+
+- **Wildcard `GRANT EXECUTE` no longer flaps on schemas that contain procedures.** PostgreSQL's `GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA ...` does not cover procedures, but the inspector includes procedures in routine inventory. Function wildcard grants now render as `ALL ROUTINES`, and specific function/procedure grant and revoke targets render as `ROUTINE`, so manifests using `object.type: function` remain backward-compatible while converging on schemas with extension-installed procedures. (#113, #114)
+
 ## [0.7.5] - 2026-05-14
 
 ### Added
