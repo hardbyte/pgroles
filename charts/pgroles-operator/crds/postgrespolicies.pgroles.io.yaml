@@ -977,6 +977,11 @@
                     ],
                     "type": "object"
                   },
+                  "lastHandledReconcileAt": {
+                    "description": "Last force-reconcile annotation value handled by the operator.",
+                    "nullable": true,
+                    "type": "string"
+                  },
                   "last_attempted_generation": {
                     "description": "The `.metadata.generation` that was last attempted.",
                     "format": "int64",
