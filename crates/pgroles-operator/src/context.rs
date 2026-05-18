@@ -46,6 +46,20 @@ struct CachedPool {
 struct ResolvedConnectionUrl {
     database_url: String,
     token_expires_at: Option<SystemTime>,
+    /// Optional role to `SET ROLE` to on every pooled connection. The value
+    /// has already passed CRD-level identifier validation; the after-connect
+    /// hook re-quotes defensively before interpolating it into SQL.
+    set_role: Option<String>,
+}
+
+/// Build the `SET ROLE` SQL statement for the given identifier.
+///
+/// `SET ROLE` does not accept bind parameters, so the value is interpolated.
+/// CRD admission already restricts the identifier to
+/// `^[A-Za-z_][A-Za-z0-9_$-]*$`; the embedded `"` doubling here is defence
+/// in depth for the connection-pool path.
+pub fn build_set_role_stmt(role: &str) -> String {
+    format!("SET ROLE \"{}\"", role.replace('"', "\"\""))
 }
 
 #[derive(Clone)]
@@ -441,6 +455,7 @@ impl OperatorContext {
             Ok(ResolvedConnectionUrl {
                 database_url,
                 token_expires_at: None,
+                set_role: None,
             })
         } else if let Some(ref params) = connection.params {
             // Params mode — resolve each field and build the URL.
@@ -534,6 +549,7 @@ impl OperatorContext {
             Ok(ResolvedConnectionUrl {
                 database_url: url,
                 token_expires_at,
+                set_role: params.set_role.clone(),
             })
         } else {
             Err(ContextError::SecretMissing {
@@ -632,9 +648,20 @@ impl OperatorContext {
         // Create pool with explicit sizing. Reconciliation holds one dedicated
         // connection for PostgreSQL advisory locking and needs additional pool
         // capacity for inspection/apply queries.
+        let set_role = resolved.set_role.clone();
         let pool = PgPoolOptions::new()
             .max_connections(POOL_MAX_CONNECTIONS)
             .acquire_timeout(Duration::from_secs(POOL_ACQUIRE_TIMEOUT_SECS))
+            .after_connect(move |conn, _meta| {
+                let set_role = set_role.clone();
+                Box::pin(async move {
+                    if let Some(role) = set_role {
+                        let stmt = build_set_role_stmt(&role);
+                        sqlx::Executor::execute(&mut *conn, stmt.as_str()).await?;
+                    }
+                    Ok(())
+                })
+            })
             .connect(&resolved.database_url)
             .await
             .map_err(|err| ContextError::DatabaseConnect { source: err })?;
@@ -769,6 +796,22 @@ impl ContextError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn build_set_role_stmt_quotes_identifier() {
+        assert_eq!(
+            build_set_role_stmt("cloudsqlsuperuser"),
+            "SET ROLE \"cloudsqlsuperuser\"",
+        );
+    }
+
+    #[test]
+    fn build_set_role_stmt_doubles_embedded_quote() {
+        // CRD validation rejects identifiers containing `"`. This test pins
+        // the defensive quoting in the connection-pool path anyway, so a
+        // future relaxation of the validator can't silently allow injection.
+        assert_eq!(build_set_role_stmt("a\"b"), "SET ROLE \"a\"\"b\"",);
+    }
 
     #[test]
     fn pool_cache_key_format() {

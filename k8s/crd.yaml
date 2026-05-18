@@ -211,6 +211,11 @@
                             ],
                             "type": "object"
                           },
+                          "setRole": {
+                            "description": "Run `SET ROLE \"<value>\"` once on every pooled connection. Useful when\nthe operator authenticates as a low-privilege identity (e.g. a Cloud\nSQL IAM user) that has been granted membership in a privileged role\nlike `cloudsqlsuperuser` — PostgreSQL does not inherit role\n*attributes* (`CREATEROLE`, `CREATEDB`, …) through `GRANT … TO …`, so\n`SET ROLE` is required for the connection to act with the parent\nrole's attributes. The value must be a simple PostgreSQL identifier\n(`^[A-Za-z_][A-Za-z0-9_$-]*$`).",
+                            "nullable": true,
+                            "type": "string"
+                          },
                           "sslMode": {
                             "description": "SSL mode as a literal value.",
                             "nullable": true,
