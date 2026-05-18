@@ -329,8 +329,9 @@ impl ConnectionSpec {
                         .map(|s| format!("secret={}\0{}", s.name, s.key))
                 })
                 .unwrap_or_default();
+            let role_part = params.set_role.as_deref().unwrap_or("");
             format!(
-                "{namespace}/{}\0user={user_part}\0pass={pass_part}\0auth={auth_part}\0ssl={ssl_part}",
+                "{namespace}/{}\0user={user_part}\0pass={pass_part}\0auth={auth_part}\0ssl={ssl_part}\0role={role_part}",
                 self.identity_key()
             )
         } else {
@@ -426,6 +427,24 @@ pub struct ConnectionParams {
     /// SSL mode from a Secret key.
     #[serde(default)]
     pub ssl_mode_secret: Option<SecretKeySelector>,
+
+    /// Run `SET ROLE "<value>"` once on every pooled connection. Useful when
+    /// the operator authenticates as a low-privilege identity (e.g. a Cloud
+    /// SQL IAM user) that has been granted membership in a privileged role
+    /// like `cloudsqlsuperuser` — PostgreSQL does not inherit role
+    /// *attributes* (`CREATEROLE`, `CREATEDB`, …) through `GRANT … TO …`, so
+    /// `SET ROLE` is required for the connection to act with the parent
+    /// role's attributes.
+    ///
+    /// Must be a simple PostgreSQL identifier matching
+    /// `^[A-Za-z_][A-Za-z0-9_$-]*$`. The pattern intentionally excludes `@`
+    /// and `.` — `setRole` is for switching to a privileged *group* role
+    /// (e.g. `cloudsqlsuperuser`), not an IAM-style principal like
+    /// `pgroles-operator@project.iam`, which has no extra attributes to
+    /// inherit via `SET ROLE`.
+    #[serde(default)]
+    #[schemars(regex(pattern = SET_ROLE_PATTERN))]
+    pub set_role: Option<String>,
 }
 
 /// Provider-backed authentication for `connection.params`.
@@ -694,6 +713,42 @@ pub enum ConnectionValidationError {
 
     #[error("connection.params: password/passwordSecret are mutually exclusive with auth")]
     AuthWithPassword,
+
+    #[error(
+        "connection.params.setRole: \"{value}\" is not a valid PostgreSQL role identifier (must match {pattern})",
+        pattern = SET_ROLE_PATTERN,
+    )]
+    InvalidRoleName { value: String },
+}
+
+/// Regex pattern restricting `connection.params.setRole` values.
+///
+/// Single source of truth: used by the `#[schemars(...)]` attribute on the
+/// field (emitted into the CRD's OpenAPI schema), referenced by the
+/// `InvalidRoleName` error message, and pinned by `is_valid_set_role_identifier`
+/// via unit tests.
+///
+/// Intentionally rejects `@` and `.`, so IAM-email-style identifiers
+/// (e.g. `pgroles-operator@project.iam`) cannot be a `setRole` target.
+/// `SET ROLE` is meant for switching to a privileged *group* role like
+/// `cloudsqlsuperuser`; IAM principals don't carry role attributes worth
+/// switching to.
+pub(crate) const SET_ROLE_PATTERN: &str = "^[A-Za-z_][A-Za-z0-9_$-]*$";
+
+/// Returns true if `s` is a simple PostgreSQL role identifier matching
+/// [`SET_ROLE_PATTERN`].
+///
+/// `SET ROLE` does not accept bind parameters, so any value reaching the
+/// connection-pool hook is interpolated into the SQL string. Restricting
+/// identifiers at admission time is defence in depth on top of the
+/// double-quoting in the `after_connect` callback.
+pub(crate) fn is_valid_set_role_identifier(s: &str) -> bool {
+    let mut bytes = s.bytes();
+    match bytes.next() {
+        Some(b) if b.is_ascii_alphabetic() || b == b'_' => {}
+        _ => return false,
+    }
+    bytes.all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'$' || b == b'-')
 }
 
 /// Validate a Kubernetes Secret name per RFC 1123 DNS subdomain rules:
@@ -1276,6 +1331,21 @@ impl PostgresPolicySpec {
                     return Err(ConnectionValidationError::InvalidSslMode {
                         value: value.clone(),
                     });
+                }
+
+                // Validate setRole identifier. `SET ROLE` does not accept bind
+                // params, so the identifier is restricted at admission time.
+                if let Some(value) = &params.set_role {
+                    if value.trim().is_empty() {
+                        return Err(ConnectionValidationError::EmptyLiteral {
+                            field: "setRole".to_string(),
+                        });
+                    }
+                    if !is_valid_set_role_identifier(value) {
+                        return Err(ConnectionValidationError::InvalidRoleName {
+                            value: value.clone(),
+                        });
+                    }
                 }
 
                 Ok(())
@@ -1865,6 +1935,7 @@ mod tests {
                 auth: None,
                 ssl_mode: None,
                 ssl_mode_secret: None,
+                set_role: None,
             }),
         };
         let user_b = ConnectionSpec {
@@ -1884,6 +1955,7 @@ mod tests {
                 auth: None,
                 ssl_mode: None,
                 ssl_mode_secret: None,
+                set_role: None,
             }),
         };
 
@@ -1921,6 +1993,7 @@ mod tests {
                 auth: None,
                 ssl_mode: None,
                 ssl_mode_secret: None,
+                set_role: None,
             }),
         };
         let secret_conn = ConnectionSpec {
@@ -1943,6 +2016,7 @@ mod tests {
                 auth: None,
                 ssl_mode: None,
                 ssl_mode_secret: None,
+                set_role: None,
             }),
         };
 
@@ -1972,6 +2046,7 @@ mod tests {
                 auth: None,
                 ssl_mode: None,
                 ssl_mode_secret: None,
+                set_role: None,
             }),
         };
         let conn_with_ssl = ConnectionSpec {
@@ -1991,6 +2066,7 @@ mod tests {
                 auth: None,
                 ssl_mode: Some("require".into()),
                 ssl_mode_secret: None,
+                set_role: None,
             }),
         };
 
@@ -2020,6 +2096,7 @@ mod tests {
                 auth: None,
                 ssl_mode: None,
                 ssl_mode_secret: None,
+                set_role: None,
             }),
         });
 
@@ -2049,6 +2126,7 @@ mod tests {
                 auth: None,
                 ssl_mode: None,
                 ssl_mode_secret: None,
+                set_role: None,
             }),
         });
 
@@ -2113,6 +2191,7 @@ mod tests {
                 auth: None,
                 ssl_mode: None,
                 ssl_mode_secret: None,
+                set_role: None,
             }),
         }
     }
@@ -2152,6 +2231,7 @@ mod tests {
                 auth: None,
                 ssl_mode: None,
                 ssl_mode_secret: None,
+                set_role: None,
             }),
         });
         assert!(matches!(
@@ -2189,9 +2269,108 @@ mod tests {
                 auth: None,
                 ssl_mode: Some("invalid-mode".into()),
                 ssl_mode_secret: None,
+                set_role: None,
             }),
         });
         assert!(spec.validate_connection_spec().is_err());
+    }
+
+    fn params_with_set_role(set_role: Option<String>) -> ConnectionParams {
+        ConnectionParams {
+            host: Some("host".into()),
+            host_secret: None,
+            port: None,
+            port_secret: None,
+            dbname: Some("db".into()),
+            dbname_secret: None,
+            username: Some("user".into()),
+            username_secret: None,
+            password: Some("pass".into()),
+            password_secret: None,
+            auth: None,
+            ssl_mode: None,
+            ssl_mode_secret: None,
+            set_role,
+        }
+    }
+
+    #[test]
+    fn validate_connection_accepts_valid_set_role() {
+        for role in [
+            "cloudsqlsuperuser",
+            "_underscore_start",
+            "role-with-dash",
+            "role_with$dollar",
+            "Mixed_Case_Role",
+            "r2d2",
+        ] {
+            let spec = spec_with_connection(ConnectionSpec {
+                secret_ref: None,
+                secret_key: None,
+                params: Some(params_with_set_role(Some(role.into()))),
+            });
+            assert!(
+                spec.validate_connection_spec().is_ok(),
+                "expected {role} to be accepted"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_connection_rejects_invalid_set_role() {
+        for role in [
+            "1leading_digit",
+            "has space",
+            "has\"quote",
+            "has;semicolon",
+            "has'singlequote",
+            "ünicode",
+        ] {
+            let spec = spec_with_connection(ConnectionSpec {
+                secret_ref: None,
+                secret_key: None,
+                params: Some(params_with_set_role(Some(role.into()))),
+            });
+            let err = spec
+                .validate_connection_spec()
+                .expect_err(&format!("expected {role} to be rejected"));
+            assert!(
+                matches!(err, ConnectionValidationError::InvalidRoleName { ref value } if value == role),
+                "unexpected error for {role}: {err:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn validate_connection_rejects_empty_set_role() {
+        let spec = spec_with_connection(ConnectionSpec {
+            secret_ref: None,
+            secret_key: None,
+            params: Some(params_with_set_role(Some("   ".into()))),
+        });
+        assert!(matches!(
+            spec.validate_connection_spec(),
+            Err(ConnectionValidationError::EmptyLiteral { ref field }) if field == "setRole"
+        ));
+    }
+
+    #[test]
+    fn cache_key_includes_set_role() {
+        let conn_no_role = ConnectionSpec {
+            secret_ref: None,
+            secret_key: None,
+            params: Some(params_with_set_role(None)),
+        };
+        let conn_with_role = ConnectionSpec {
+            secret_ref: None,
+            secret_key: None,
+            params: Some(params_with_set_role(Some("cloudsqlsuperuser".into()))),
+        };
+        assert_ne!(
+            conn_no_role.cache_key("ns"),
+            conn_with_role.cache_key("ns"),
+            "cache key should differ when setRole is present"
+        );
     }
 
     #[test]
@@ -2216,6 +2395,7 @@ mod tests {
                 }),
                 ssl_mode: None,
                 ssl_mode_secret: None,
+                set_role: None,
             }),
         });
 
@@ -2245,6 +2425,7 @@ mod tests {
                 }),
                 ssl_mode: None,
                 ssl_mode_secret: None,
+                set_role: None,
             }),
         });
 
@@ -2276,6 +2457,7 @@ mod tests {
                 }),
                 ssl_mode: None,
                 ssl_mode_secret: None,
+                set_role: None,
             }),
         });
 
@@ -2313,6 +2495,7 @@ mod tests {
                     auth: None,
                     ssl_mode: Some((*mode).into()),
                     ssl_mode_secret: None,
+                    set_role: None,
                 }),
             });
             assert!(
@@ -2344,6 +2527,7 @@ mod tests {
                 auth: None,
                 ssl_mode: None,
                 ssl_mode_secret: None,
+                set_role: None,
             }),
         });
         assert!(spec.validate_connection_spec().is_err());
@@ -2371,6 +2555,7 @@ mod tests {
                 auth: None,
                 ssl_mode: None,
                 ssl_mode_secret: None,
+                set_role: None,
             }),
         });
         assert!(matches!(
@@ -2398,6 +2583,7 @@ mod tests {
                 auth: None,
                 ssl_mode: None,
                 ssl_mode_secret: None,
+                set_role: None,
             }),
         });
         assert!(matches!(

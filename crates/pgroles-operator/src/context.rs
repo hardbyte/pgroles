@@ -46,6 +46,46 @@ struct CachedPool {
 struct ResolvedConnectionUrl {
     database_url: String,
     token_expires_at: Option<SystemTime>,
+    /// Optional role to `SET ROLE` to on every pooled connection. The value
+    /// has already passed CRD-level identifier validation; the after-connect
+    /// hook re-quotes defensively before interpolating it into SQL.
+    set_role: Option<String>,
+}
+
+/// Build the `SET ROLE` SQL statement for the given identifier.
+///
+/// `SET ROLE` does not accept bind parameters, so the value is interpolated.
+/// CRD admission already restricts the identifier to the
+/// [`crate::crd::SET_ROLE_PATTERN`] regex; the embedded `"` doubling here is
+/// defence in depth for the connection-pool path.
+pub fn build_set_role_stmt(role: &str) -> String {
+    format!("SET ROLE \"{}\"", role.replace('"', "\"\""))
+}
+
+/// Marker prefix used to flag SET-ROLE failures from the `after_connect`
+/// hook so they can be distinguished from other connect-time errors.
+const SET_ROLE_FAILURE_MARKER: &str = "pgroles:set-role-failed:";
+
+/// Wrap a SET-ROLE failure in [`sqlx::Error::Protocol`] with a marker so
+/// the outer `connect()` error can be classified as
+/// [`ContextError::SetRoleFailed`] instead of a generic database connect
+/// failure.
+fn wrap_set_role_failure(role: &str, source: sqlx::Error) -> sqlx::Error {
+    sqlx::Error::Protocol(format!("{SET_ROLE_FAILURE_MARKER}{role}: {source}"))
+}
+
+/// Classify a pool-level connect error, surfacing SET-ROLE hook failures
+/// distinctly from genuine database-connect failures.
+fn classify_pool_connect_error(set_role: Option<&str>, err: sqlx::Error) -> ContextError {
+    if let (Some(role), sqlx::Error::Protocol(msg)) = (set_role, &err)
+        && msg.starts_with(SET_ROLE_FAILURE_MARKER)
+    {
+        return ContextError::SetRoleFailed {
+            role: role.to_string(),
+            source: err,
+        };
+    }
+    ContextError::DatabaseConnect { source: err }
 }
 
 #[derive(Clone)]
@@ -441,6 +481,7 @@ impl OperatorContext {
             Ok(ResolvedConnectionUrl {
                 database_url,
                 token_expires_at: None,
+                set_role: None,
             })
         } else if let Some(ref params) = connection.params {
             // Params mode — resolve each field and build the URL.
@@ -534,6 +575,7 @@ impl OperatorContext {
             Ok(ResolvedConnectionUrl {
                 database_url: url,
                 token_expires_at,
+                set_role: params.set_role.clone(),
             })
         } else {
             Err(ContextError::SecretMissing {
@@ -632,12 +674,25 @@ impl OperatorContext {
         // Create pool with explicit sizing. Reconciliation holds one dedicated
         // connection for PostgreSQL advisory locking and needs additional pool
         // capacity for inspection/apply queries.
+        let set_role = resolved.set_role.clone();
         let pool = PgPoolOptions::new()
             .max_connections(POOL_MAX_CONNECTIONS)
             .acquire_timeout(Duration::from_secs(POOL_ACQUIRE_TIMEOUT_SECS))
+            .after_connect(move |conn, _meta| {
+                let set_role = set_role.clone();
+                Box::pin(async move {
+                    if let Some(role) = set_role {
+                        let stmt = build_set_role_stmt(&role);
+                        sqlx::Executor::execute(&mut *conn, stmt.as_str())
+                            .await
+                            .map_err(|err| wrap_set_role_failure(&role, err))?;
+                    }
+                    Ok(())
+                })
+            })
             .connect(&resolved.database_url)
             .await
-            .map_err(|err| ContextError::DatabaseConnect { source: err })?;
+            .map_err(|err| classify_pool_connect_error(resolved.set_role.as_deref(), err))?;
 
         // Cache it (write lock).
         {
@@ -720,6 +775,9 @@ pub enum ContextError {
     #[error("failed to connect to database: {source}")]
     DatabaseConnect { source: sqlx::Error },
 
+    #[error("failed to apply SET ROLE \"{role}\" on pooled connection: {source}")]
+    SetRoleFailed { role: String, source: sqlx::Error },
+
     #[error("connection param \"{field}\" resolved to an empty or whitespace-only value")]
     EmptyResolvedValue { field: String },
 
@@ -769,6 +827,51 @@ impl ContextError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn build_set_role_stmt_quotes_identifier() {
+        assert_eq!(
+            build_set_role_stmt("cloudsqlsuperuser"),
+            "SET ROLE \"cloudsqlsuperuser\"",
+        );
+    }
+
+    #[test]
+    fn classify_pool_connect_error_surfaces_set_role_failure_with_role() {
+        let raw = wrap_set_role_failure(
+            "cloudsqlsuperuser",
+            sqlx::Error::Protocol("permission denied".to_string()),
+        );
+        let classified = classify_pool_connect_error(Some("cloudsqlsuperuser"), raw);
+        assert!(matches!(
+            classified,
+            ContextError::SetRoleFailed { ref role, .. } if role == "cloudsqlsuperuser"
+        ));
+    }
+
+    #[test]
+    fn classify_pool_connect_error_passes_through_unrelated_errors() {
+        let err = sqlx::Error::PoolTimedOut;
+        let classified = classify_pool_connect_error(Some("any_role"), err);
+        assert!(matches!(classified, ContextError::DatabaseConnect { .. }));
+    }
+
+    #[test]
+    fn classify_pool_connect_error_without_set_role_is_database_connect() {
+        // Even a Protocol error with our marker shouldn't be classified as
+        // SetRoleFailed when no role was configured for this pool.
+        let raw = wrap_set_role_failure("ghost", sqlx::Error::Protocol("oops".to_string()));
+        let classified = classify_pool_connect_error(None, raw);
+        assert!(matches!(classified, ContextError::DatabaseConnect { .. }));
+    }
+
+    #[test]
+    fn build_set_role_stmt_doubles_embedded_quote() {
+        // CRD validation rejects identifiers containing `"`. This test pins
+        // the defensive quoting in the connection-pool path anyway, so a
+        // future relaxation of the validator can't silently allow injection.
+        assert_eq!(build_set_role_stmt("a\"b"), "SET ROLE \"a\"\"b\"",);
+    }
 
     #[test]
     fn pool_cache_key_format() {

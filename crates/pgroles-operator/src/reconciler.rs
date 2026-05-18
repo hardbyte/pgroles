@@ -384,6 +384,9 @@ fn retry_class_for_reconcile_error(error: &ReconcileError) -> RetryClass {
             }
             ContextError::GcpAuthHttp { .. } => RetryClass::Transient,
             ContextError::DatabaseConnect { .. } => RetryClass::Transient,
+            // `SET ROLE "<role>"` failing on a freshly-connected session is
+            // a permission/config issue, not a transient connectivity blip.
+            ContextError::SetRoleFailed { .. } => RetryClass::Slow,
             ContextError::EmptyResolvedValue { .. }
             | ContextError::InvalidResolvedSslMode { .. } => RetryClass::Slow,
         },
@@ -2099,6 +2102,7 @@ impl ReconcileError {
                 | ContextError::GcpAuthRejected { .. }
                 | ContextError::GcpAuthInvalidResponse { .. } => "GcpAuthFailed",
                 ContextError::DatabaseConnect { .. } => "DatabaseConnectionFailed",
+                ContextError::SetRoleFailed { .. } => "SetRoleFailed",
                 ContextError::EmptyResolvedValue { .. } => "InvalidConnectionParams",
                 ContextError::InvalidResolvedSslMode { .. } => "InvalidConnectionParams",
             },
@@ -3371,6 +3375,17 @@ mod tests {
             },
         )));
         assert_eq!(retry_class(&error), RetryClass::Transient);
+    }
+
+    #[test]
+    fn retry_classifies_set_role_failed_as_slow() {
+        let error = finalizer::Error::ApplyFailed(ReconcileError::Context(Box::new(
+            crate::context::ContextError::SetRoleFailed {
+                role: "cloudsqlsuperuser".to_string(),
+                source: sqlx::Error::Protocol("permission denied".to_string()),
+            },
+        )));
+        assert_eq!(retry_class(&error), RetryClass::Slow);
     }
 
     #[test]
