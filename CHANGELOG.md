@@ -5,6 +5,12 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.7.7] - 2026-05-18
+
+### Added
+
+- **The operator can now `SET ROLE` to a privileged parent role on every pooled connection.** Set `connection.params.setRole: <role>` on a `PostgresPolicy` and the operator's sqlx pool runs `SET ROLE "<role>"` once via `after_connect`, so the session's `current_user` becomes that role and its attributes (`CREATEROLE`, `CREATEDB`, …) apply to every subsequent statement. This unblocks the "operator authenticates as a low-privilege identity (e.g. Cloud SQL IAM user via Workload Identity) that has been granted membership in `cloudsqlsuperuser`" pattern, where PostgreSQL's role membership semantics otherwise refuse role-attribute inheritance. The role identifier is validated at admission time against `^[A-Za-z_][A-Za-z0-9_$-]*$` via the CRD's OpenAPI `pattern`, and `SET ROLE` failures surface as a distinct `SetRoleFailed` status reason instead of being conflated with database connection failures. (#119, #120)
+
 ## [0.7.6] - 2026-05-14
 
 ### Fixed
