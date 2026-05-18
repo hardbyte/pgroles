@@ -17,6 +17,11 @@ spec:
         name: zalando-creds
         key: password
       sslMode: require
+      # setRole: cloudsqlsuperuser
+      #   Run `SET ROLE "<value>"` on every pooled connection. Use when
+      #   the operator authenticates as a low-privilege identity that has
+      #   been granted membership in a privileged role (e.g. Cloud SQL
+      #   IAM user + cloudsqlsuperuser).
   interval: "5m"
   default_owner: postgres
 

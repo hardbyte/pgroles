@@ -434,10 +434,16 @@ pub struct ConnectionParams {
     /// like `cloudsqlsuperuser` — PostgreSQL does not inherit role
     /// *attributes* (`CREATEROLE`, `CREATEDB`, …) through `GRANT … TO …`, so
     /// `SET ROLE` is required for the connection to act with the parent
-    /// role's attributes. The value must be a simple PostgreSQL identifier
-    /// (`^[A-Za-z_][A-Za-z0-9_$-]*$`).
+    /// role's attributes.
+    ///
+    /// Must be a simple PostgreSQL identifier matching
+    /// `^[A-Za-z_][A-Za-z0-9_$-]*$`. The pattern intentionally excludes `@`
+    /// and `.` — `setRole` is for switching to a privileged *group* role
+    /// (e.g. `cloudsqlsuperuser`), not an IAM-style principal like
+    /// `pgroles-operator@project.iam`, which has no extra attributes to
+    /// inherit via `SET ROLE`.
     #[serde(default)]
-    #[schemars(regex(pattern = r"^[A-Za-z_][A-Za-z0-9_$-]*$"))]
+    #[schemars(regex(pattern = SET_ROLE_PATTERN))]
     pub set_role: Option<String>,
 }
 
@@ -709,13 +715,28 @@ pub enum ConnectionValidationError {
     AuthWithPassword,
 
     #[error(
-        "connection.params.setRole: \"{value}\" is not a valid PostgreSQL role identifier (must match ^[A-Za-z_][A-Za-z0-9_$-]*$)"
+        "connection.params.setRole: \"{value}\" is not a valid PostgreSQL role identifier (must match {pattern})",
+        pattern = SET_ROLE_PATTERN,
     )]
     InvalidRoleName { value: String },
 }
 
+/// Regex pattern restricting `connection.params.setRole` values.
+///
+/// Single source of truth: used by the `#[schemars(...)]` attribute on the
+/// field (emitted into the CRD's OpenAPI schema), referenced by the
+/// `InvalidRoleName` error message, and pinned by `is_valid_set_role_identifier`
+/// via unit tests.
+///
+/// Intentionally rejects `@` and `.`, so IAM-email-style identifiers
+/// (e.g. `pgroles-operator@project.iam`) cannot be a `setRole` target.
+/// `SET ROLE` is meant for switching to a privileged *group* role like
+/// `cloudsqlsuperuser`; IAM principals don't carry role attributes worth
+/// switching to.
+pub(crate) const SET_ROLE_PATTERN: &str = "^[A-Za-z_][A-Za-z0-9_$-]*$";
+
 /// Returns true if `s` is a simple PostgreSQL role identifier matching
-/// `^[A-Za-z_][A-Za-z0-9_$-]*$`.
+/// [`SET_ROLE_PATTERN`].
 ///
 /// `SET ROLE` does not accept bind parameters, so any value reaching the
 /// connection-pool hook is interpolated into the SQL string. Restricting
