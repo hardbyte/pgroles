@@ -437,6 +437,7 @@ pub struct ConnectionParams {
     /// role's attributes. The value must be a simple PostgreSQL identifier
     /// (`^[A-Za-z_][A-Za-z0-9_$-]*$`).
     #[serde(default)]
+    #[schemars(regex(pattern = r"^[A-Za-z_][A-Za-z0-9_$-]*$"))]
     pub set_role: Option<String>,
 }
 
