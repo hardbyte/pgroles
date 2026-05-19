@@ -303,6 +303,175 @@ roles:
 }
 
 // =========================================================================
+// render-bundle subcommand
+// =========================================================================
+
+const RENDER_BUNDLE_YAML: &str = r#"
+shared:
+  profiles:
+    editor:
+      grants:
+        - privileges: [USAGE]
+          object: { type: schema }
+        - privileges: [SELECT, INSERT, UPDATE, DELETE]
+          object: { type: table, name: "*" }
+sources:
+  - file: platform.yaml
+  - file: app.yaml
+"#;
+
+const RENDER_BUNDLE_PLATFORM: &str = r#"
+policy:
+  name: platform
+scope:
+  roles: [app_owner]
+  schemas:
+    - name: inventory
+      facets: [owner]
+roles:
+  - name: app_owner
+    login: false
+schemas:
+  - name: inventory
+    owner: app_owner
+"#;
+
+const RENDER_BUNDLE_APP: &str = r#"
+policy:
+  name: app
+scope:
+  schemas:
+    - name: inventory
+      facets: [bindings]
+schemas:
+  - name: inventory
+    profiles: [editor]
+"#;
+
+#[test]
+fn render_bundle_emits_composed_manifest_with_header() {
+    let (bundle_dir, bundle_path) = write_temp_bundle(
+        RENDER_BUNDLE_YAML,
+        &[
+            ("platform.yaml", RENDER_BUNDLE_PLATFORM),
+            ("app.yaml", RENDER_BUNDLE_APP),
+        ],
+    );
+    let _keep_dir = bundle_dir;
+
+    pgroles_cmd()
+        .args([
+            "render-bundle",
+            "--bundle",
+            bundle_path.to_str().expect("bundle path should be utf-8"),
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "# Rendered by `pgroles render-bundle`.",
+        ))
+        .stdout(predicate::str::contains(
+            "# Do not edit by hand — regenerate from the source bundle.",
+        ))
+        .stdout(predicate::str::contains("#   - platform.yaml (platform)"))
+        .stdout(predicate::str::contains("#   - app.yaml (app)"))
+        // Composed manifest content
+        .stdout(predicate::str::contains("app_owner"))
+        .stdout(predicate::str::contains("inventory"))
+        .stdout(predicate::str::contains("editor"));
+}
+
+#[test]
+fn render_bundle_output_round_trips_through_validate() {
+    let (bundle_dir, bundle_path) = write_temp_bundle(
+        RENDER_BUNDLE_YAML,
+        &[
+            ("platform.yaml", RENDER_BUNDLE_PLATFORM),
+            ("app.yaml", RENDER_BUNDLE_APP),
+        ],
+    );
+    let _keep_dir = bundle_dir;
+
+    let rendered_file = NamedTempFile::new().expect("failed to create temp output file");
+
+    pgroles_cmd()
+        .args([
+            "render-bundle",
+            "--bundle",
+            bundle_path.to_str().unwrap(),
+            "--output",
+            rendered_file.path().to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+
+    // The rendered manifest must validate as a regular flat manifest.
+    pgroles_cmd()
+        .args([
+            "validate",
+            "--file",
+            rendered_file.path().to_str().unwrap(),
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Manifest is valid."));
+}
+
+#[test]
+fn render_bundle_no_header_omits_comment_block() {
+    let (bundle_dir, bundle_path) = write_temp_bundle(
+        RENDER_BUNDLE_YAML,
+        &[
+            ("platform.yaml", RENDER_BUNDLE_PLATFORM),
+            ("app.yaml", RENDER_BUNDLE_APP),
+        ],
+    );
+    let _keep_dir = bundle_dir;
+
+    pgroles_cmd()
+        .args([
+            "render-bundle",
+            "--bundle",
+            bundle_path.to_str().unwrap(),
+            "--no-header",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("# Rendered by").not());
+}
+
+#[test]
+fn render_bundle_fails_on_scope_conflict() {
+    let (bundle_dir, bundle_path) = write_temp_bundle(
+        r#"
+sources:
+  - file: app.yaml
+"#,
+        &[(
+            "app.yaml",
+            r#"
+roles:
+  - name: out_of_scope_role
+    login: true
+"#,
+        )],
+    );
+    let _keep_dir = bundle_dir;
+
+    // No scope declared, so the role is out of scope and validation should fail
+    // *before* anything is emitted.
+    pgroles_cmd()
+        .args([
+            "render-bundle",
+            "--bundle",
+            bundle_path.to_str().unwrap(),
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("outside its declared scope"));
+}
+
+// =========================================================================
 // graph subcommand
 // =========================================================================
 

@@ -10,6 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - **Externally managed roles can now be marked `external: true`.** External roles may still be referenced in grants, schema ownership, default privileges, and as members of managed roles, but pgroles will not create, alter, drop, password-manage, or manage memberships granted from those roles. This avoids breaking Cloud SQL IAM users and groups whose `LOGIN` attribute and provider memberships are owned outside pgroles. (#123)
+- **`pgroles render-bundle` composes a policy bundle into a single flat manifest.** Validates and composes the bundle (rejecting scope/ownership conflicts up front), then emits the resulting `PolicyManifest` as YAML with an optional provenance header recording the source bundle path and the fragments it composed. The output round-trips through `pgroles validate -f` / `diff -f` / `apply -f`, so a bundle can be composed in CI and the rendered manifest committed as the source of a `PostgresPolicy` in a GitOps repo. Pre-rendering keeps cross-team and cross-environment fragment composition available to operator users without adding operator-side CRDs. Use `--no-header` to omit the header for diff-friendly diffs, and `--output <path>` to write to a file. (#92)
 
 ## [0.7.7] - 2026-05-18
 

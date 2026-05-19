@@ -16,9 +16,9 @@ use tracing::{info, warn};
 use pgroles_cli::{
     PlanSummary, apply_role_retirements, compute_plan, format_bundle_plan_json,
     format_bundle_validation_result, format_managed_scope_summary, format_plan_json,
-    format_plan_sql_with_context, format_role_graph_summary, format_validation_result,
-    inject_password_changes, planned_role_drops, read_manifest_file, resolve_passwords,
-    validate_bundle_file, validate_manifest,
+    format_plan_sql_with_context, format_rendered_bundle, format_role_graph_summary,
+    format_validation_result, inject_password_changes, planned_role_drops, read_manifest_file,
+    resolve_passwords, validate_bundle_file, validate_manifest,
 };
 use pgroles_core::diff::{ReconciliationMode, filter_changes, filter_external_role_changes};
 use pgroles_core::ownership::validate_changes_against_managed_surface;
@@ -188,6 +188,26 @@ enum Commands {
     Graph {
         #[command(subcommand)]
         source: GraphSource,
+    },
+
+    /// Compose a policy bundle into a single flat manifest YAML.
+    ///
+    /// Validates and composes the bundle (rejecting scope/ownership conflicts),
+    /// then emits the resulting manifest. The output round-trips through
+    /// `pgroles validate -f` / `diff -f` / `apply -f`, and is suitable for
+    /// committing as a `PostgresPolicy` source in a GitOps repo.
+    RenderBundle {
+        /// Path to the policy bundle YAML file.
+        #[arg(long)]
+        bundle: PathBuf,
+
+        /// Write output to this file instead of stdout.
+        #[arg(short, long)]
+        output: Option<PathBuf>,
+
+        /// Suppress the provenance header comment block at the top of the output.
+        #[arg(long)]
+        no_header: bool,
     },
 }
 
@@ -382,6 +402,14 @@ async fn run(cli: Cli) -> Result<ExitCode> {
             timeout,
         } => {
             cmd_reconcile(&resource, &namespace, wait, &timeout).await?;
+            Ok(ExitCode::SUCCESS)
+        }
+        Commands::RenderBundle {
+            bundle,
+            output,
+            no_header,
+        } => {
+            cmd_render_bundle(&bundle, output.as_deref(), !no_header)?;
             Ok(ExitCode::SUCCESS)
         }
         Commands::Graph { source } => match source {
@@ -630,6 +658,26 @@ fn cmd_validate(file: Option<&Path>, bundle: Option<&Path>) -> Result<()> {
     let yaml = read_manifest_file(file_path)?;
     let validated = validate_manifest(&yaml)?;
     print!("{}", format_validation_result(&validated));
+    Ok(())
+}
+
+fn cmd_render_bundle(
+    bundle_path: &Path,
+    output: Option<&Path>,
+    include_header: bool,
+) -> Result<()> {
+    let validated = validate_bundle_file(bundle_path)?;
+    let source_label = bundle_path.display().to_string();
+    let rendered = format_rendered_bundle(&validated, &source_label, include_header)?;
+
+    match output {
+        Some(path) => {
+            std::fs::write(path, &rendered)
+                .with_context(|| format!("failed to write rendered bundle to {}", path.display()))?;
+            info!(path = %path.display(), "rendered bundle written");
+        }
+        None => print!("{rendered}"),
+    }
     Ok(())
 }
 

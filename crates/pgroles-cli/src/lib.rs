@@ -361,6 +361,41 @@ pub fn format_validation_result(validated: &ValidatedManifest) -> String {
     output
 }
 
+/// Render a validated bundle as a single composed manifest YAML.
+///
+/// When `include_header` is true, the output is prefixed with a YAML comment
+/// block recording the bundle source label and the fragments it composed,
+/// for traceability when the rendered file is committed to a GitOps repo.
+/// The body is the composed `PolicyManifest` serialized via serde_yaml, so
+/// the result round-trips through `pgroles validate -f` / `diff -f` / `apply -f`.
+pub fn format_rendered_bundle(
+    validated: &ValidatedBundle,
+    source_label: &str,
+    include_header: bool,
+) -> Result<String> {
+    let body =
+        serde_yaml::to_string(&validated.composed.manifest).map_err(|err| anyhow::anyhow!(err))?;
+
+    if !include_header {
+        return Ok(body);
+    }
+
+    let mut header = String::new();
+    header.push_str("# Rendered by `pgroles render-bundle`.\n");
+    header.push_str("# Do not edit by hand — regenerate from the source bundle.\n");
+    header.push_str(&format!("# Source bundle: {source_label}\n"));
+    header.push_str("# Fragments:\n");
+    for document in &validated.documents {
+        let label = document.fragment.policy.name.as_deref();
+        match label {
+            Some(name) => header.push_str(&format!("#   - {} ({name})\n", document.source)),
+            None => header.push_str(&format!("#   - {}\n", document.source)),
+        }
+    }
+    header.push_str("#\n");
+    Ok(format!("{header}{body}"))
+}
+
 /// Format bundle validation results for human-readable output.
 pub fn format_bundle_validation_result(validated: &ValidatedBundle) -> String {
     let mut output = String::new();
@@ -1060,5 +1095,114 @@ roles:
         assert!(display.contains("1 schema(s) to create"), "got: {display}");
         assert!(display.contains("2 grant(s) to add"), "got: {display}");
         assert!(!display.contains("Plan:"), "got: {display}");
+    }
+
+    // -----------------------------------------------------------------------
+    // format_rendered_bundle
+    // -----------------------------------------------------------------------
+
+    fn validated_bundle_for_render() -> ValidatedBundle {
+        let bundle = composition::parse_policy_bundle(
+            r#"
+sources:
+  - file: platform.yaml
+  - file: app.yaml
+"#,
+        )
+        .unwrap();
+        let documents = vec![
+            composition::PolicyDocument {
+                source: "platform.yaml".to_string(),
+                fragment: composition::parse_policy_fragment(
+                    r#"
+policy:
+  name: platform
+scope:
+  roles: [app_owner]
+  schemas:
+    - name: inventory
+      facets: [owner]
+roles:
+  - name: app_owner
+    login: false
+schemas:
+  - name: inventory
+    owner: app_owner
+"#,
+                )
+                .unwrap(),
+            },
+            composition::PolicyDocument {
+                source: "app.yaml".to_string(),
+                fragment: composition::parse_policy_fragment(
+                    r#"
+policy:
+  name: app
+scope:
+  roles: [app_service]
+roles:
+  - name: app_service
+    login: true
+"#,
+                )
+                .unwrap(),
+            },
+        ];
+        let composed = composition::compose_bundle(&bundle, &documents).unwrap();
+        ValidatedBundle {
+            bundle,
+            documents,
+            composed,
+        }
+    }
+
+    #[test]
+    fn rendered_bundle_round_trips_through_validate_manifest() {
+        let validated = validated_bundle_for_render();
+        let rendered = format_rendered_bundle(&validated, "bundle.yaml", true).unwrap();
+
+        // Header should not break the YAML body.
+        let reparsed = validate_manifest(&rendered).expect("rendered output must validate");
+        assert_eq!(reparsed.expanded.roles.len(), 2);
+        assert!(reparsed.expanded.roles.iter().any(|r| r.name == "app_owner"));
+        assert!(
+            reparsed
+                .expanded
+                .roles
+                .iter()
+                .any(|r| r.name == "app_service")
+        );
+    }
+
+    #[test]
+    fn rendered_bundle_header_records_source_and_fragments() {
+        let validated = validated_bundle_for_render();
+        let rendered = format_rendered_bundle(&validated, "bundles/prod.yaml", true).unwrap();
+
+        assert!(rendered.starts_with("# Rendered by `pgroles render-bundle`."));
+        assert!(rendered.contains("# Source bundle: bundles/prod.yaml"));
+        assert!(rendered.contains("#   - platform.yaml (platform)"));
+        assert!(rendered.contains("#   - app.yaml (app)"));
+    }
+
+    #[test]
+    fn rendered_bundle_no_header_emits_only_yaml() {
+        let validated = validated_bundle_for_render();
+        let rendered = format_rendered_bundle(&validated, "bundle.yaml", false).unwrap();
+
+        assert!(
+            !rendered.starts_with('#'),
+            "without header, output should start with YAML, got: {rendered}"
+        );
+        // Still a valid manifest.
+        validate_manifest(&rendered).expect("rendered output must validate");
+    }
+
+    #[test]
+    fn rendered_bundle_is_deterministic() {
+        let validated = validated_bundle_for_render();
+        let first = format_rendered_bundle(&validated, "bundle.yaml", true).unwrap();
+        let second = format_rendered_bundle(&validated, "bundle.yaml", true).unwrap();
+        assert_eq!(first, second);
     }
 }
