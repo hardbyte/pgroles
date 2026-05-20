@@ -136,6 +136,7 @@ roles:
 | Attribute | Type | Default | Description |
 |---|---|---|---|
 | `name` | string | *required* | Role name |
+| `external` | bool | `false` | Role lifecycle is managed outside pgroles |
 | `login` | bool | `false` | Can the role log in? |
 | `superuser` | bool | `false` | Superuser privileges |
 | `createdb` | bool | `false` | Can create databases |
@@ -151,6 +152,8 @@ roles:
 Roles with `login: true` can declare a password source. The password value is never stored in the manifest; it is resolved at apply time from an environment variable in CLI mode or from a Kubernetes Secret in operator mode.
 
 Only `login: true` roles may have a password. Declaring a password on a non-login role is a validation error.
+
+Use `external: true` for roles whose lifecycle is owned by another system, such as Cloud SQL IAM users or groups created by Terraform or the cloud provider API. pgroles may still reference external roles in grants, schema ownership, default privileges, and as members of managed roles, but it will not create, alter, drop, password-manage, or manage memberships granted from the external role.
 
 {% callout type="note" title="Passwords and drift detection" %}
 Because PostgreSQL does not expose password hashes for comparison, password changes always appear in the plan. The `diff --exit-code` flag treats password-only changes as non-structural; they do not trigger exit code 2.

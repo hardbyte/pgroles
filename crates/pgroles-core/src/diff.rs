@@ -10,7 +10,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use crate::manifest::{ObjectType, Privilege, RoleRetirement};
+use crate::manifest::{ObjectType, Privilege, RoleDefinition, RoleRetirement};
 use crate::model::{
     DefaultPrivKey, GrantKey, MembershipEdge, RoleAttribute, RoleGraph, RoleState,
     default_schema_owner_privileges,
@@ -202,6 +202,47 @@ pub fn filter_changes(changes: Vec<Change>, mode: ReconciliationMode) -> Vec<Cha
             .into_iter()
             .filter(|change| !is_role_drop_or_retirement(change))
             .collect(),
+    }
+}
+
+/// Remove role-lifecycle and granted-role membership changes for external roles.
+///
+/// External roles are still valid references for grants, schema ownership, and
+/// as members of managed roles. pgroles simply avoids taking ownership of the
+/// external role object itself or of memberships granted from that role.
+pub fn filter_external_role_changes(changes: Vec<Change>, roles: &[RoleDefinition]) -> Vec<Change> {
+    let external_roles: BTreeSet<&str> = roles
+        .iter()
+        .filter(|role| role.external)
+        .map(|role| role.name.as_str())
+        .collect();
+
+    if external_roles.is_empty() {
+        return changes;
+    }
+
+    changes
+        .into_iter()
+        .filter(|change| !is_external_role_change(change, &external_roles))
+        .collect()
+}
+
+fn is_external_role_change(change: &Change, external_roles: &BTreeSet<&str>) -> bool {
+    match change {
+        Change::CreateRole { name, .. }
+        | Change::AlterRole { name, .. }
+        | Change::SetComment { name, .. }
+        | Change::SetPassword { name, .. }
+        | Change::DropRole { name } => external_roles.contains(name.as_str()),
+        Change::AddMember { role, .. } | Change::RemoveMember { role, .. } => {
+            external_roles.contains(role.as_str())
+        }
+        Change::TerminateSessions { role }
+        | Change::DropOwned { role }
+        | Change::ReassignOwned {
+            from_role: role, ..
+        } => external_roles.contains(role.as_str()),
+        _ => false,
     }
 }
 
@@ -818,6 +859,24 @@ mod tests {
         }
     }
 
+    fn role_definition(name: &str, external: bool) -> RoleDefinition {
+        RoleDefinition {
+            name: name.to_string(),
+            external,
+            login: None,
+            superuser: None,
+            createdb: None,
+            createrole: None,
+            inherit: None,
+            replication: None,
+            bypassrls: None,
+            connection_limit: None,
+            comment: None,
+            password: None,
+            password_valid_until: None,
+        }
+    }
+
     #[test]
     fn diff_empty_to_empty_is_empty() {
         let changes = diff(&empty_graph(), &empty_graph());
@@ -875,6 +934,62 @@ mod tests {
             }
             other => panic!("expected AlterRole, got: {other:?}"),
         }
+    }
+
+    #[test]
+    fn external_role_filter_suppresses_lifecycle_and_granted_role_memberships() {
+        let external = "analytics-admin@example.com";
+        let mut current = empty_graph();
+        current.roles.insert(
+            external.to_string(),
+            RoleState {
+                login: true,
+                ..RoleState::default()
+            },
+        );
+        current.memberships.insert(MembershipEdge {
+            role: external.to_string(),
+            member: "cloudsqlsuperuser".to_string(),
+            inherit: true,
+            admin: false,
+        });
+
+        let mut desired = empty_graph();
+        desired
+            .roles
+            .insert(external.to_string(), RoleState::default());
+
+        let changes = diff(&current, &desired);
+        assert!(changes.iter().any(|change| {
+            matches!(
+                change,
+                Change::AlterRole { name, attributes }
+                    if name == external && attributes.contains(&RoleAttribute::Login(false))
+            )
+        }));
+        assert!(changes.iter().any(|change| {
+            matches!(
+                change,
+                Change::RemoveMember { role, member }
+                    if role == external && member == "cloudsqlsuperuser"
+            )
+        }));
+
+        let filtered = filter_external_role_changes(changes, &[role_definition(external, true)]);
+        assert!(filtered.is_empty());
+    }
+
+    #[test]
+    fn external_role_filter_keeps_external_role_as_managed_member() {
+        let external = "team@example.com";
+        let changes = vec![Change::RemoveMember {
+            role: "kv-editor".to_string(),
+            member: external.to_string(),
+        }];
+
+        let filtered =
+            filter_external_role_changes(changes.clone(), &[role_definition(external, true)]);
+        assert_eq!(filtered, changes);
     }
 
     #[test]
@@ -1748,6 +1863,7 @@ memberships:
     fn resolve_passwords_missing_env_var() {
         let roles = vec![crate::manifest::RoleDefinition {
             name: "app-svc".to_string(),
+            external: false,
             login: Some(true),
             password: Some(crate::manifest::PasswordSource {
                 from_env: "PGROLES_TEST_MISSING_VAR_9a8b7c6d".to_string(),
@@ -1781,6 +1897,7 @@ memberships:
     fn resolve_passwords_empty_env_var() {
         let roles = vec![crate::manifest::RoleDefinition {
             name: "app-svc".to_string(),
+            external: false,
             login: Some(true),
             password: Some(crate::manifest::PasswordSource {
                 from_env: "PGROLES_TEST_EMPTY_VAR_1a2b3c4d".to_string(),
@@ -1818,6 +1935,7 @@ memberships:
     fn resolve_passwords_happy_path() {
         let roles = vec![crate::manifest::RoleDefinition {
             name: "app-svc".to_string(),
+            external: false,
             login: Some(true),
             password: Some(crate::manifest::PasswordSource {
                 from_env: "PGROLES_TEST_RESOLVE_VAR_5e6f7g8h".to_string(),
@@ -1849,6 +1967,7 @@ memberships:
     fn resolve_passwords_skips_roles_without_password() {
         let roles = vec![crate::manifest::RoleDefinition {
             name: "no-password".to_string(),
+            external: false,
             login: Some(true),
             password: None,
             password_valid_until: None,

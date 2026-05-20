@@ -931,6 +931,7 @@ async fn apply_under_lock(
     if !password_changes.is_empty() {
         changes = pgroles_core::diff::inject_password_changes(changes, &password_changes);
     }
+    changes = pgroles_core::diff::filter_external_role_changes(changes, &expanded.roles);
     let dropped_roles: Vec<String> = changes
         .iter()
         .filter_map(|change| match change {
@@ -2291,6 +2292,7 @@ mod tests {
                 schemas: Vec::new(),
                 roles: vec![RoleSpec {
                     name: role_name.to_string(),
+                    external: false,
                     login: Some(true),
                     superuser: None,
                     createdb: None,
@@ -2366,6 +2368,7 @@ mod tests {
                 roles: vec![
                     RoleSpec {
                         name: "app".to_string(),
+                        external: false,
                         login: Some(true),
                         superuser: None,
                         createdb: None,
@@ -2386,6 +2389,7 @@ mod tests {
                     },
                     RoleSpec {
                         name: "reporter".to_string(),
+                        external: false,
                         login: Some(true),
                         superuser: None,
                         createdb: None,

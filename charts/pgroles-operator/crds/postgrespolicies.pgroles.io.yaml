@@ -705,6 +705,11 @@
                           "nullable": true,
                           "type": "boolean"
                         },
+                        "external": {
+                          "default": false,
+                          "description": "Treat this role as externally managed. The operator may reference it in\ngrants, ownership, and memberships, but will not create, alter, drop,\npassword-manage, or manage memberships granted from this role.",
+                          "type": "boolean"
+                        },
                         "inherit": {
                           "nullable": true,
                           "type": "boolean"

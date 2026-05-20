@@ -391,6 +391,7 @@ mod tests {
     fn role_state_from_definition_applies_overrides() {
         let definition = RoleDefinition {
             name: "test".to_string(),
+            external: false,
             login: Some(true),
             superuser: None,
             createdb: Some(true),
