@@ -420,22 +420,20 @@ async fn cmd_diff(
         let pool = connect_db(database_url).await?;
         let inspect_config = inspect_config_for_bundle(&validated);
         let current = inspect_current_for_plan_with_config(&pool, &inspect_config).await?;
-        let resolved_passwords = resolve_passwords(&validated.composed.expanded)
-            .context("failed to resolve role passwords")?;
         info!(%mode, "reconciliation mode");
         let changes = filter_external_role_changes(
-            inject_password_changes(
-                filter_changes(
-                    apply_role_retirements(
-                        compute_plan(&current, &validated.composed.desired),
-                        &validated.composed.manifest.retirements,
-                    ),
-                    mode,
+            filter_changes(
+                apply_role_retirements(
+                    compute_plan(&current, &validated.composed.desired),
+                    &validated.composed.manifest.retirements,
                 ),
-                &resolved_passwords,
+                mode,
             ),
             &validated.composed.expanded.roles,
         );
+        let resolved_passwords = resolve_passwords(&validated.composed.expanded)
+            .context("failed to resolve role passwords")?;
+        let changes = inject_password_changes(changes, &resolved_passwords);
         validate_changes_against_managed_surface(
             &changes,
             &validated.composed.managed_change_surface,
@@ -485,22 +483,20 @@ async fn cmd_diff(
     let pool = connect_db(database_url).await?;
     let current = inspect_current_for_plan(&pool, &validated).await?;
 
-    let resolved_passwords =
-        resolve_passwords(&validated.expanded).context("failed to resolve role passwords")?;
     info!(%mode, "reconciliation mode");
     let changes = filter_external_role_changes(
-        inject_password_changes(
-            filter_changes(
-                apply_role_retirements(
-                    compute_plan(&current, &validated.desired),
-                    &validated.manifest.retirements,
-                ),
-                mode,
+        filter_changes(
+            apply_role_retirements(
+                compute_plan(&current, &validated.desired),
+                &validated.manifest.retirements,
             ),
-            &resolved_passwords,
+            mode,
         ),
         &validated.expanded.roles,
     );
+    let resolved_passwords =
+        resolve_passwords(&validated.expanded).context("failed to resolve role passwords")?;
+    let changes = inject_password_changes(changes, &resolved_passwords);
     let drop_safety = inspect_drop_safety(&pool, &changes, &validated.manifest.retirements).await?;
     let summary = PlanSummary::from_changes(&changes);
 
@@ -558,22 +554,20 @@ async fn cmd_apply(
 
         let current = inspect_current_for_plan_with_config(&pool, &inspect_config).await?;
 
-        let resolved_passwords = resolve_passwords(&validated.composed.expanded)
-            .context("failed to resolve role passwords")?;
         info!(%mode, "reconciliation mode");
         let changes = filter_external_role_changes(
-            inject_password_changes(
-                filter_changes(
-                    apply_role_retirements(
-                        compute_plan(&current, &validated.composed.desired),
-                        &validated.composed.manifest.retirements,
-                    ),
-                    mode,
+            filter_changes(
+                apply_role_retirements(
+                    compute_plan(&current, &validated.composed.desired),
+                    &validated.composed.manifest.retirements,
                 ),
-                &resolved_passwords,
+                mode,
             ),
             &validated.composed.expanded.roles,
         );
+        let resolved_passwords = resolve_passwords(&validated.composed.expanded)
+            .context("failed to resolve role passwords")?;
+        let changes = inject_password_changes(changes, &resolved_passwords);
         validate_changes_against_managed_surface(
             &changes,
             &validated.composed.managed_change_surface,
@@ -647,22 +641,20 @@ async fn cmd_apply(
 
     let current = inspect_current_for_plan(&pool, &validated).await?;
 
-    let resolved_passwords =
-        resolve_passwords(&validated.expanded).context("failed to resolve role passwords")?;
     info!(%mode, "reconciliation mode");
     let changes = filter_external_role_changes(
-        inject_password_changes(
-            filter_changes(
-                apply_role_retirements(
-                    compute_plan(&current, &validated.desired),
-                    &validated.manifest.retirements,
-                ),
-                mode,
+        filter_changes(
+            apply_role_retirements(
+                compute_plan(&current, &validated.desired),
+                &validated.manifest.retirements,
             ),
-            &resolved_passwords,
+            mode,
         ),
         &validated.expanded.roles,
     );
+    let resolved_passwords =
+        resolve_passwords(&validated.expanded).context("failed to resolve role passwords")?;
+    let changes = inject_password_changes(changes, &resolved_passwords);
 
     // Validate changes against privilege level.
     let priv_warnings =

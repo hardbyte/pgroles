@@ -485,14 +485,17 @@ pub fn apply_role_retirements(changes: Vec<Change>, retirements: &[RoleRetiremen
 
 /// Resolve password sources from environment variables.
 ///
-/// Returns a map of role name → resolved password for every role that declares
-/// a `password.from_env` source. Returns an error if a referenced environment
-/// variable is not set.
+/// Returns a map of role name → resolved password for every managed role that
+/// declares a `password.from_env` source. External roles are reference-only and
+/// never participate in password management.
 pub fn resolve_passwords(
     roles: &[crate::manifest::RoleDefinition],
 ) -> Result<std::collections::BTreeMap<String, String>, PasswordResolutionError> {
     let mut resolved = std::collections::BTreeMap::new();
     for role in roles {
+        if role.external {
+            continue;
+        }
         if let Some(source) = &role.password {
             let value = std::env::var(&source.from_env).map_err(|_| {
                 PasswordResolutionError::MissingEnvVar {
@@ -1961,6 +1964,33 @@ memberships:
         let resolved = result.expect("should succeed");
         assert_eq!(resolved.len(), 1);
         assert_eq!(resolved["app-svc"], "my_secret_pw");
+    }
+
+    #[test]
+    fn resolve_passwords_skips_external_roles() {
+        let roles = vec![crate::manifest::RoleDefinition {
+            name: "external-svc".to_string(),
+            external: true,
+            login: Some(true),
+            password: Some(crate::manifest::PasswordSource {
+                from_env: "PGROLES_TEST_EXTERNAL_MISSING_VAR_2b4d6f8h".to_string(),
+            }),
+            password_valid_until: None,
+            superuser: None,
+            createdb: None,
+            createrole: None,
+            inherit: None,
+            replication: None,
+            bypassrls: None,
+            connection_limit: None,
+            comment: None,
+        }];
+
+        // SAFETY: test-only, unique var name avoids conflicts with parallel tests.
+        unsafe { std::env::remove_var("PGROLES_TEST_EXTERNAL_MISSING_VAR_2b4d6f8h") };
+
+        let resolved = resolve_passwords(&roles).expect("external role passwords are ignored");
+        assert!(resolved.is_empty());
     }
 
     #[test]

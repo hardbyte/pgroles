@@ -924,6 +924,7 @@ async fn apply_under_lock(
         ),
         reconciliation_mode,
     );
+    changes = pgroles_core::diff::filter_external_role_changes(changes, &expanded.roles);
 
     let resolved_passwords = resolve_passwords_from_secrets(ctx, resource, namespace).await?;
     let (password_changes, applied_password_source_versions) =
@@ -931,7 +932,6 @@ async fn apply_under_lock(
     if !password_changes.is_empty() {
         changes = pgroles_core::diff::inject_password_changes(changes, &password_changes);
     }
-    changes = pgroles_core::diff::filter_external_role_changes(changes, &expanded.roles);
     let dropped_roles: Vec<String> = changes
         .iter()
         .filter_map(|change| match change {
@@ -1588,6 +1588,9 @@ async fn resolve_passwords_from_secrets(
 
     // First pass: fetch all referenced Secrets for secretRef roles.
     for role_spec in &resource.spec.roles {
+        if role_spec.external {
+            continue;
+        }
         if let Some(pw) = &role_spec.password
             && let Some(secret_ref) = &pw.secret_ref
         {
@@ -1607,6 +1610,9 @@ async fn resolve_passwords_from_secrets(
 
     // Second pass: resolve passwords from cache (secretRef) or generate.
     for role_spec in &resource.spec.roles {
+        if role_spec.external {
+            continue;
+        }
         if let Some(pw) = &role_spec.password {
             if let Some(gen_spec) = &pw.generate {
                 let password = if resource.spec.mode == PolicyMode::Plan {
@@ -1744,6 +1750,9 @@ fn resolve_passwords_from_cached_secrets(
 ) -> Result<std::collections::BTreeMap<String, ResolvedPassword>, ReconcileError> {
     let mut resolved = std::collections::BTreeMap::new();
     for role_spec in &resource.spec.roles {
+        if role_spec.external {
+            continue;
+        }
         if let Some(pw) = &role_spec.password
             && pw.secret_ref.is_some()
         {
@@ -3783,6 +3792,27 @@ mod tests {
                 .map(|password| password.cleartext.as_str()),
             Some("reporter-secret")
         );
+    }
+
+    #[test]
+    fn resolve_passwords_from_cached_secrets_skips_external_roles() {
+        let mut resource = password_role_policy();
+        resource.spec.roles[1].external = true;
+        let cache = BTreeMap::from([(
+            "role-passwords".to_string(),
+            secret_with_keys("role-passwords", &[("app", "app-secret")]),
+        )]);
+
+        let resolved =
+            resolve_passwords_from_cached_secrets(&resource, &cache).expect("should resolve");
+
+        assert_eq!(
+            resolved
+                .get("app")
+                .map(|password| password.cleartext.as_str()),
+            Some("app-secret")
+        );
+        assert!(!resolved.contains_key("reporter"));
     }
 
     #[test]

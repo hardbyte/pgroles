@@ -1714,7 +1714,7 @@ mod tests {
             schemas: vec![],
             roles: vec![RoleSpec {
                 name: "analytics".to_string(),
-                external: false,
+                external: true,
                 login: Some(true),
                 superuser: None,
                 createdb: None,
@@ -1743,6 +1743,7 @@ mod tests {
         assert_eq!(manifest.default_owner, Some("app_owner".to_string()));
         assert_eq!(manifest.roles.len(), 1);
         assert_eq!(manifest.roles[0].name, "analytics");
+        assert!(manifest.roles[0].external);
         assert_eq!(manifest.roles[0].login, Some(true));
         assert_eq!(manifest.roles[0].comment, Some("test role".to_string()));
         assert_eq!(manifest.retirements.len(), 1);
