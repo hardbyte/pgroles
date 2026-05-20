@@ -702,8 +702,9 @@ fn cmd_render_bundle(
 
     match output {
         Some(path) => {
-            std::fs::write(path, &rendered)
-                .with_context(|| format!("failed to write rendered bundle to {}", path.display()))?;
+            std::fs::write(path, &rendered).with_context(|| {
+                format!("failed to write rendered bundle to {}", path.display())
+            })?;
             info!(path = %path.display(), "rendered bundle written");
         }
         None => print!("{rendered}"),

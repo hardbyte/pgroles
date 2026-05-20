@@ -385,8 +385,8 @@ pub fn format_rendered_bundle(
     source_label: &str,
     include_header: bool,
 ) -> Result<String> {
-    let raw = serde_yaml::to_value(&validated.composed.manifest)
-        .map_err(|err| anyhow::anyhow!(err))?;
+    let raw =
+        serde_yaml::to_value(&validated.composed.manifest).map_err(|err| anyhow::anyhow!(err))?;
     let cleaned = strip_manifest_defaults(raw);
     let body = serde_yaml::to_string(&cleaned).map_err(|err| anyhow::anyhow!(err))?;
 
@@ -451,7 +451,21 @@ fn is_strippable(key: &serde_yaml::Value, value: &serde_yaml::Value) -> bool {
     use serde_yaml::Value;
     match value {
         Value::Null => true,
-        Value::Sequence(s) if s.is_empty() => true,
+        Value::Sequence(s) if s.is_empty() => {
+            // Some sequence-valued fields in `PolicyManifest` are required
+            // (no `#[serde(default)]` on the struct field) and stripping an
+            // empty value would produce YAML that no longer deserializes
+            // back into the same type. Keep this list aligned with the
+            // struct definitions in `pgroles_core::manifest`:
+            //   - `Grant.privileges`, `ProfileGrant.privileges`,
+            //     `DefaultPrivilegeGrant.privileges`
+            //   - `DefaultPrivilege.grant`
+            //   - `Membership.members`
+            !matches!(
+                key.as_str(),
+                Some("privileges") | Some("grant") | Some("members")
+            )
+        }
         Value::Mapping(m) if m.is_empty() => true,
         Value::String(s) => match key.as_str() {
             Some("role_pattern") => s == DEFAULT_ROLE_PATTERN,
@@ -1349,5 +1363,55 @@ roles:
         let first = format_rendered_bundle(&validated, "bundle.yaml", true).unwrap();
         let second = format_rendered_bundle(&validated, "bundle.yaml", true).unwrap();
         assert_eq!(first, second);
+    }
+
+    #[test]
+    fn rendered_bundle_preserves_required_empty_sequences() {
+        // Membership.members and Grant.privileges are required fields (no
+        // `#[serde(default)]`). The renderer must NOT strip them even when
+        // empty, or the rendered YAML fails to deserialize as a manifest.
+        let bundle = composition::parse_policy_bundle(
+            r#"
+sources:
+  - file: app.yaml
+"#,
+        )
+        .unwrap();
+        let documents = vec![composition::PolicyDocument {
+            source: "app.yaml".to_string(),
+            fragment: composition::parse_policy_fragment(
+                r#"
+policy:
+  name: app
+scope:
+  roles: [empty_group]
+roles:
+  - name: empty_group
+    login: false
+memberships:
+  - role: empty_group
+    members: []
+"#,
+            )
+            .unwrap(),
+        }];
+        let composed = composition::compose_bundle(&bundle, &documents).unwrap();
+        let validated = ValidatedBundle {
+            bundle,
+            documents,
+            composed,
+        };
+
+        let rendered = format_rendered_bundle(&validated, "bundle.yaml", false).unwrap();
+
+        // The required `members:` key must remain even when its value is `[]`.
+        assert!(
+            rendered.contains("members:"),
+            "required `members` field must not be stripped, got: {rendered}"
+        );
+
+        // And the round trip must succeed.
+        validate_manifest(&rendered)
+            .expect("rendered output with empty required sequence must still parse");
     }
 }

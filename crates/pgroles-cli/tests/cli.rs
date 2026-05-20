@@ -407,11 +407,7 @@ fn render_bundle_output_round_trips_through_validate() {
 
     // The rendered manifest must validate as a regular flat manifest.
     pgroles_cmd()
-        .args([
-            "validate",
-            "--file",
-            rendered_file.path().to_str().unwrap(),
-        ])
+        .args(["validate", "--file", rendered_file.path().to_str().unwrap()])
         .assert()
         .success()
         .stdout(predicate::str::contains("Manifest is valid."));
@@ -452,11 +448,7 @@ fn render_bundle_header_uses_only_basename_for_determinism() {
     let _keep_dir = bundle_dir;
 
     let stdout = pgroles_cmd()
-        .args([
-            "render-bundle",
-            "--bundle",
-            bundle_path.to_str().unwrap(),
-        ])
+        .args(["render-bundle", "--bundle", bundle_path.to_str().unwrap()])
         .assert()
         .success()
         .get_output()
@@ -491,11 +483,7 @@ fn render_bundle_output_strips_defaults() {
     let _keep_dir = bundle_dir;
 
     pgroles_cmd()
-        .args([
-            "render-bundle",
-            "--bundle",
-            bundle_path.to_str().unwrap(),
-        ])
+        .args(["render-bundle", "--bundle", bundle_path.to_str().unwrap()])
         .assert()
         .success()
         .stdout(predicate::str::contains("auth_providers:").not())
@@ -616,11 +604,7 @@ roles:
     // No scope declared, so the role is out of scope and validation should fail
     // *before* anything is emitted.
     pgroles_cmd()
-        .args([
-            "render-bundle",
-            "--bundle",
-            bundle_path.to_str().unwrap(),
-        ])
+        .args(["render-bundle", "--bundle", bundle_path.to_str().unwrap()])
         .assert()
         .failure()
         .stderr(predicate::str::contains("outside its declared scope"));
