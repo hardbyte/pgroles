@@ -202,12 +202,18 @@ enum Commands {
         bundle: PathBuf,
 
         /// Write output to this file instead of stdout.
-        #[arg(short, long)]
+        #[arg(short, long, conflicts_with = "check")]
         output: Option<PathBuf>,
 
         /// Suppress the provenance header comment block at the top of the output.
         #[arg(long)]
         no_header: bool,
+
+        /// Compare the rendered output against an existing file and exit
+        /// with code 2 if they differ (useful as a CI gate that catches
+        /// stale checked-in renders).
+        #[arg(long, conflicts_with = "output", value_name = "PATH")]
+        check: Option<PathBuf>,
     },
 }
 
@@ -408,10 +414,8 @@ async fn run(cli: Cli) -> Result<ExitCode> {
             bundle,
             output,
             no_header,
-        } => {
-            cmd_render_bundle(&bundle, output.as_deref(), !no_header)?;
-            Ok(ExitCode::SUCCESS)
-        }
+            check,
+        } => cmd_render_bundle(&bundle, output.as_deref(), !no_header, check.as_deref()),
         Commands::Graph { source } => match source {
             GraphSource::Desired {
                 file,
@@ -665,10 +669,36 @@ fn cmd_render_bundle(
     bundle_path: &Path,
     output: Option<&Path>,
     include_header: bool,
-) -> Result<()> {
+    check: Option<&Path>,
+) -> Result<ExitCode> {
     let validated = validate_bundle_file(bundle_path)?;
-    let source_label = bundle_path.display().to_string();
+    // The source label must be stable across machines so committed renders
+    // diff cleanly; use only the bundle file's basename, not its full path.
+    let source_label = bundle_path
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| bundle_path.display().to_string());
     let rendered = format_rendered_bundle(&validated, &source_label, include_header)?;
+
+    if let Some(check_path) = check {
+        let existing = std::fs::read_to_string(check_path).with_context(|| {
+            format!(
+                "failed to read existing rendered file for --check: {}",
+                check_path.display()
+            )
+        })?;
+        if existing == rendered {
+            info!(path = %check_path.display(), "rendered bundle matches existing file");
+            return Ok(ExitCode::SUCCESS);
+        }
+        eprintln!(
+            "rendered bundle differs from {}; regenerate with `pgroles render-bundle --bundle {} --output {}`",
+            check_path.display(),
+            bundle_path.display(),
+            check_path.display(),
+        );
+        return Ok(ExitCode::from(EXIT_DRIFT));
+    }
 
     match output {
         Some(path) => {
@@ -678,7 +708,7 @@ fn cmd_render_bundle(
         }
         None => print!("{rendered}"),
     }
-    Ok(())
+    Ok(ExitCode::SUCCESS)
 }
 
 async fn cmd_diff(
