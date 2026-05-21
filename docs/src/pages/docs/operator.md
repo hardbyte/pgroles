@@ -444,7 +444,7 @@ kubectl annotate postgrespolicy my-policy \
   --overwrite
 ```
 
-The same timestamp is idempotent. Re-setting it is a no-op, while setting a newer value bypasses the normal `interval` wait. The operator mirrors handled requests to `status.lastHandledReconcileAt`, which is useful for scripts and runbooks that need to verify the request was observed.
+The same timestamp is idempotent. Re-setting it is a no-op, while setting a newer value bypasses the normal `interval` wait. The operator mirrors successfully handled requests to `status.lastHandledReconcileAt`, which is useful for scripts and runbooks that need to verify the request completed or produced a plan.
 
 The CLI wraps the same annotation flow:
 

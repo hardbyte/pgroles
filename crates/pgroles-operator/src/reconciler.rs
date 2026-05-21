@@ -84,6 +84,13 @@ impl ReconcileOutcome {
             ReconcileOutcome::LockContention => "LockContention",
         }
     }
+
+    fn marks_requested_reconcile_handled(&self) -> bool {
+        matches!(
+            self,
+            ReconcileOutcome::Reconciled | ReconcileOutcome::Planned
+        )
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -574,8 +581,10 @@ async fn reconcile_apply(
 
     match reconcile_apply_inner(resource, ctx, &identity).await {
         Ok((action, outcome)) => {
-            mark_requested_reconcile_handled(ctx, resource, requested_reconcile_at.as_deref())
-                .await?;
+            if outcome.marks_requested_reconcile_handled() {
+                mark_requested_reconcile_handled(ctx, resource, requested_reconcile_at.as_deref())
+                    .await?;
+            }
             reconcile_guard.record_result(outcome.result(), outcome.reason());
             Ok(action)
         }
@@ -619,9 +628,6 @@ async fn reconcile_apply(
                     is_transient_failure,
                     clear_current_plan_ref,
                 );
-                if let Some(requested_reconcile_at) = requested_reconcile_at.as_deref() {
-                    status.last_handled_reconcile_at = Some(requested_reconcile_at.to_string());
-                }
             })
             .await
             {
@@ -3173,6 +3179,15 @@ mod tests {
     fn error_reason_conflicting_policy() {
         let err = ReconcileError::ConflictingPolicy("overlaps with other".into());
         assert_eq!(err.reason(), "ConflictingPolicy");
+    }
+
+    #[test]
+    fn requested_reconcile_is_handled_only_after_successful_outcomes() {
+        assert!(ReconcileOutcome::Reconciled.marks_requested_reconcile_handled());
+        assert!(ReconcileOutcome::Planned.marks_requested_reconcile_handled());
+        assert!(!ReconcileOutcome::Suspended.marks_requested_reconcile_handled());
+        assert!(!ReconcileOutcome::Conflict.marks_requested_reconcile_handled());
+        assert!(!ReconcileOutcome::LockContention.marks_requested_reconcile_handled());
     }
 
     #[test]

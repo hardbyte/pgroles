@@ -240,7 +240,7 @@ pgroles reconcile my-policy -n platform
 pgroles reconcile postgrespolicy/my-policy -n platform --wait
 ```
 
-The command patches the policy annotation `reconcile.pgroles.io/requestedAt` with the current RFC 3339 timestamp. The operator treats a new annotation value as an immediate reconcile trigger and mirrors the handled value to `status.lastHandledReconcileAt`.
+The command patches the policy annotation `reconcile.pgroles.io/requestedAt` with the current RFC 3339 timestamp. The operator treats a new annotation value as an immediate reconcile trigger and mirrors the value to `status.lastHandledReconcileAt` after a successful reconcile or plan.
 
 ### Options
 
