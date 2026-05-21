@@ -302,7 +302,7 @@ schemas:
     profiles: [editor]
 ```
 
-Bundle composition is currently a CLI/core feature. The Kubernetes operator still reconciles a single `PostgresPolicy` resource.
+Bundle composition is a CLI/core feature. The Kubernetes operator reconciles a single `PostgresPolicy` resource, but you can still feed it composed bundle output via `pgroles render-bundle`, which emits a flat `PolicyManifest` suitable for wrapping into a `PostgresPolicy` resource. See the [bundle composition guide](/docs/bundle-composition).
 
 ### Shared bundle fields
 

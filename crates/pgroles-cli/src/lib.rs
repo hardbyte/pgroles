@@ -364,8 +364,9 @@ pub fn format_validation_result(validated: &ValidatedManifest) -> String {
 /// Render a validated bundle as a single composed manifest YAML.
 ///
 /// When `include_header` is true, the output is prefixed with a YAML comment
-/// block recording the source bundle label and the fragments it composed,
-/// for traceability when the rendered file is committed to a GitOps repo.
+/// block recording the source bundle label, the manifest schema version
+/// against which the body was rendered, and the fragments it composed, for
+/// traceability when the rendered file is committed to a GitOps repo.
 ///
 /// `source_label` should be a stable, machine-independent label (e.g. the
 /// bundle file's basename). Callers must NOT pass absolute or `pwd`-relative
@@ -376,7 +377,8 @@ pub fn format_validation_result(validated: &ValidatedManifest) -> String {
 /// The body is the composed `PolicyManifest` serialized via serde_yaml and
 /// then post-processed to drop noise that would otherwise churn under
 /// upgrades or render in irrelevant places: `null` scalars, empty sequences
-/// and mappings, and known-default scalar values (e.g. the default
+/// (except for required-field keys like `members`/`privileges`/`grant`),
+/// empty mappings, and known-default scalar values (e.g. the default
 /// `role_pattern`). The cleaned output still round-trips through
 /// `pgroles validate -f` / `diff -f` / `apply -f` because the parser fills
 /// the same defaults back in on read.
@@ -398,6 +400,7 @@ pub fn format_rendered_bundle(
     header.push_str("# Rendered by `pgroles render-bundle`.\n");
     header.push_str("# Do not edit by hand — regenerate from the source bundle.\n");
     header.push_str(&format!("# Source bundle: {source_label}\n"));
+    header.push_str(&format!("# Manifest schema: {RENDERED_MANIFEST_SCHEMA}\n"));
     header.push_str("# Fragments:\n");
     for document in &validated.documents {
         let label = document.fragment.policy.name.as_deref();
@@ -409,6 +412,13 @@ pub fn format_rendered_bundle(
     header.push_str("#\n");
     Ok(format!("{header}{body}"))
 }
+
+/// Schema identifier for the YAML body emitted by `render-bundle`. Bumped
+/// only on incompatible changes to the `PolicyManifest` serialization shape.
+/// Recorded in the header so `--check` failures after a pgroles upgrade can
+/// be diagnosed as "schema bump → re-render required" rather than mystery
+/// drift, and so consumers parsing the rendered file can detect mismatches.
+pub const RENDERED_MANIFEST_SCHEMA: &str = "pgroles.manifest.v1";
 
 /// The default value of `SchemaBinding::role_pattern`. Kept in sync with
 /// `pgroles_core::manifest::default_role_pattern()`; if that default ever
@@ -1299,6 +1309,21 @@ roles:
         assert!(rendered.contains("# Source bundle: prod.yaml"));
         assert!(rendered.contains("#   - platform.yaml (platform)"));
         assert!(rendered.contains("#   - app.yaml (app)"));
+    }
+
+    #[test]
+    fn rendered_bundle_header_records_manifest_schema_version() {
+        // The schema-version marker is the diagnostic anchor that lets
+        // users tell "the rendered file is stale because someone edited
+        // the bundle" apart from "the rendered file is stale because
+        // pgroles upgraded to a new manifest schema". It must always appear
+        // in the header.
+        let validated = validated_bundle_for_render();
+        let rendered = format_rendered_bundle(&validated, "bundle.yaml", true).unwrap();
+        assert!(
+            rendered.contains(&format!("# Manifest schema: {RENDERED_MANIFEST_SCHEMA}")),
+            "header must record manifest schema, got: {rendered}"
+        );
     }
 
     #[test]

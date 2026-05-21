@@ -231,6 +231,45 @@ The generated manifest — flat or with suggested profiles — is a snapshot of 
 `generate` is best used as a starting point for brownfield adoption. Before applying the generated manifest in production, review it like any other infrastructure policy because once committed it becomes the desired state.
 {% /callout %}
 
+## render-bundle
+
+Compose a policy bundle into a single flat `PolicyManifest` YAML. The output round-trips through `validate -f`, `diff -f`, and `apply -f`, and is suitable for committing as the source of a `PostgresPolicy` resource in a GitOps repo.
+
+```shell
+pgroles render-bundle --bundle path/to/pgroles.bundle.yaml
+pgroles render-bundle --bundle path/to/pgroles.bundle.yaml --output pgroles.yaml
+pgroles render-bundle --bundle path/to/pgroles.bundle.yaml --check pgroles.yaml
+```
+
+### Options
+
+| Flag | Description |
+|---|---|
+| `--bundle` | Bundle root file path (required) |
+| `-o`, `--output` | Write the rendered manifest to a file instead of stdout |
+| `--no-header` | Omit the provenance comment block at the top of the output |
+| `--check` | Compare the rendered output against an existing file. Exits with code **2** on drift, **0** on match. Mutually exclusive with `--output`. |
+
+### Output shape
+
+The rendered file is byte-deterministic across machines: the header records only the bundle file's basename (never an absolute or `pwd`-relative path), and the YAML body is post-processed to strip serde-emitted defaults (empty optional sequences, `null` scalars, and the default `role_pattern`) so the file does not churn under unrelated upgrades.
+
+The header records the manifest schema version (`pgroles.manifest.v1` today). The schema identifier is bumped only on incompatible changes to the `PolicyManifest` serialization shape, so a `--check` failure after a pgroles upgrade can be diagnosed as "schema bumped — re-render required" rather than mystery drift.
+
+Required-field empty sequences (`Grant.privileges`, `DefaultPrivilege.grant`, `Membership.members`) are preserved so the rendered output always re-parses as a valid manifest.
+
+Composition errors — scope violations, duplicate ownership claims, overlapping schema facets — are reported before any output is written, so `render-bundle` will not emit a partially-valid manifest.
+
+### CI drift gate
+
+Use `--check` to fail the build when the committed rendered manifest is stale:
+
+```shell
+pgroles render-bundle --bundle pgroles.bundle.yaml --check pgroles.yaml
+```
+
+This is the recommended companion to a GitOps workflow where the rendered manifest is committed alongside the source bundle. See [CI/CD integration](/docs/ci-cd) for a full GitHub Actions example.
+
 ## reconcile
 
 Request an immediate operator reconcile for a Kubernetes `PostgresPolicy` without changing `spec`.
