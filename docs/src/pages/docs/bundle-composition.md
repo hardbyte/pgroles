@@ -3,7 +3,7 @@ title: Bundle composition
 description: When to compose policy bundles, and how to feed them to the CLI or operator.
 ---
 
-A policy bundle is one root file plus multiple scoped policy fragments that pgroles composes into a single effective `PolicyManifest`, with ownership boundaries validated up front. Use bundles when different teams or environments own different parts of the same database policy and you want admission-time conflict detection rather than late-binding merges. {% .lead %}
+A policy bundle is one root file plus multiple scoped policy fragments that pgroles composes into a single effective `PolicyManifest`, with ownership boundaries validated up front. Use bundles when different teams or environments own different parts of the same database policy and you want composition-time conflict detection rather than late-binding merges. {% .lead %}
 
 ---
 
@@ -17,7 +17,7 @@ pgroles offers three workflows for managing a `PostgresPolicy`. Pick one per dat
 | **CLI bundle, direct apply** | Multi-team DBs reconciled via the CLI (e.g. local compose, ad-hoc admin) | `pgroles diff` / `apply` time | No — the CLI talks directly to the database |
 | **CLI bundle, rendered for operator** | Multi-team or multi-environment DBs reconciled by the operator | CI time, via `pgroles render-bundle --check` | Yes — render in CI, commit the flat manifest, wrap under `PostgresPolicy.spec` |
 
-The CLI and operator both validate composition before they touch the database, but they validate at different times. Render-bundle moves composition validation into CI so the operator only ever sees an already-composed manifest. That keeps the operator's existing one-policy-per-database guarantee intact while still giving fragment authors independent files to own.
+The CLI validates bundle composition before it touches the database. The operator accepts only a flat manifest in `PostgresPolicy.spec`, so `render-bundle` moves composition validation into CI and lets the operator reconcile an already-composed manifest. That keeps the operator's existing one-policy-per-database guarantee intact while still giving fragment authors independent files to own.
 
 ## Why pre-render for the operator?
 
@@ -123,9 +123,9 @@ spec:
 
 Common ways to automate the wrap step:
 
-- **Kustomize**: keep `postgres-policy.yaml` as a base with `spec: {}`, and use a strategic merge patch that reads the rendered manifest fields.
 - **Helm / cdk8s / Jsonnet**: template the rendered manifest into the resource as part of chart rendering.
-- **`yq`**: `yq eval-all 'select(fi == 0) * {"spec": select(fi == 1)}' postgres-policy.yaml pgroles.yaml > merged.yaml`
+- **`yq` or a small script**: merge the rendered manifest fields under `spec` after setting the operator-only fields such as `connection` and `mode`.
+- **Kustomize**: generate the wrapped resource in CI before Kustomize runs, then let Kustomize handle environment overlays for metadata and connection references.
 
 The rendered file is the source of truth for policy content; the wrapping step is about deployment metadata (connection, mode, schedule) and is orthogonal to composition correctness.
 

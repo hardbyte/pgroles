@@ -256,7 +256,7 @@ The rendered file is byte-deterministic across machines: the header records only
 
 The header records the manifest schema version (`pgroles.manifest.v1` today). The schema identifier is bumped only on incompatible changes to the `PolicyManifest` serialization shape, so a `--check` failure after a pgroles upgrade can be diagnosed as "schema bumped — re-render required" rather than mystery drift.
 
-Required-field empty sequences (`Grant.privileges`, `DefaultPrivilege.grant`, `Membership.members`) are preserved so the rendered output always re-parses as a valid manifest.
+Required-field empty sequences (`Grant.privileges`, `DefaultPrivilege.grant`, `Membership.members`) and named empty profiles such as `noop: {}` are preserved so the rendered output always re-parses as a valid manifest.
 
 Composition errors — scope violations, duplicate ownership claims, overlapping schema facets — are reported before any output is written, so `render-bundle` will not emit a partially-valid manifest.
 

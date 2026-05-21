@@ -378,8 +378,8 @@ pub fn format_validation_result(validated: &ValidatedManifest) -> String {
 /// then post-processed to drop noise that would otherwise churn under
 /// upgrades or render in irrelevant places: `null` scalars, empty sequences
 /// (except for required-field keys like `members`/`privileges`/`grant`),
-/// empty mappings, and known-default scalar values (e.g. the default
-/// `role_pattern`). The cleaned output still round-trips through
+/// known empty top-level maps, and known-default scalar values (e.g. the
+/// default `role_pattern`). The cleaned output still round-trips through
 /// `pgroles validate -f` / `diff -f` / `apply -f` because the parser fills
 /// the same defaults back in on read.
 pub fn format_rendered_bundle(
@@ -431,34 +431,45 @@ const DEFAULT_ROLE_PATTERN: &str = "{schema}-{profile}";
 /// Strips:
 /// - `null` scalars (e.g. `login: null` on profiles, `name: null` on grants),
 /// - empty sequences (`memberships: []`, `retirements: []`, …),
-/// - empty mappings (`profiles: {}` when no profiles are declared),
+/// - empty top-level maps (`profiles: {}` when no profiles are declared),
 /// - known scalar defaults (currently `role_pattern: "{schema}-{profile}"`).
 ///
 /// All stripped fields round-trip on parse because each has a `#[serde(default)]`
 /// on its struct definition, so a re-read produces an equivalent `PolicyManifest`.
 fn strip_manifest_defaults(value: serde_yaml::Value) -> serde_yaml::Value {
+    strip_manifest_defaults_at(value, &[])
+}
+
+fn strip_manifest_defaults_at(value: serde_yaml::Value, path: &[String]) -> serde_yaml::Value {
     use serde_yaml::Value;
     match value {
         Value::Mapping(map) => {
             let mut out = serde_yaml::Mapping::new();
             for (k, v) in map {
-                let cleaned = strip_manifest_defaults(v);
-                if is_strippable(&k, &cleaned) {
+                let mut child_path = path.to_vec();
+                if let Some(key) = k.as_str() {
+                    child_path.push(key.to_string());
+                }
+                let cleaned = strip_manifest_defaults_at(v, &child_path);
+                if is_strippable(&child_path, &cleaned) {
                     continue;
                 }
                 out.insert(k, cleaned);
             }
             Value::Mapping(out)
         }
-        Value::Sequence(seq) => {
-            Value::Sequence(seq.into_iter().map(strip_manifest_defaults).collect())
-        }
+        Value::Sequence(seq) => Value::Sequence(
+            seq.into_iter()
+                .map(|item| strip_manifest_defaults_at(item, path))
+                .collect(),
+        ),
         other => other,
     }
 }
 
-fn is_strippable(key: &serde_yaml::Value, value: &serde_yaml::Value) -> bool {
+fn is_strippable(path: &[String], value: &serde_yaml::Value) -> bool {
     use serde_yaml::Value;
+    let key = path.last().map(String::as_str);
     match value {
         Value::Null => true,
         Value::Sequence(s) if s.is_empty() => {
@@ -471,13 +482,16 @@ fn is_strippable(key: &serde_yaml::Value, value: &serde_yaml::Value) -> bool {
             //     `DefaultPrivilegeGrant.privileges`
             //   - `DefaultPrivilege.grant`
             //   - `Membership.members`
-            !matches!(
-                key.as_str(),
-                Some("privileges") | Some("grant") | Some("members")
-            )
+            !matches!(key, Some("privileges") | Some("grant") | Some("members"))
         }
-        Value::Mapping(m) if m.is_empty() => true,
-        Value::String(s) => match key.as_str() {
+        Value::Mapping(m) if m.is_empty() => {
+            // Only strip empty maps whose position is known to be a defaulted
+            // manifest field. A named profile such as `profiles.noop: {}` is
+            // semantically meaningful even though its serialized profile body
+            // is empty after defaults are removed.
+            matches!(path, [field] if field == "profiles")
+        }
+        Value::String(s) => match key {
             Some("role_pattern") => s == DEFAULT_ROLE_PATTERN,
             _ => false,
         },
@@ -1349,6 +1363,10 @@ roles:
             "rendered output must not include empty memberships, got: {rendered}"
         );
         assert!(
+            !rendered.contains("profiles: {}"),
+            "rendered output must not include empty top-level profiles, got: {rendered}"
+        );
+        assert!(
             !rendered.contains("retirements: []"),
             "rendered output must not include empty retirements, got: {rendered}"
         );
@@ -1438,5 +1456,63 @@ memberships:
         // And the round trip must succeed.
         validate_manifest(&rendered)
             .expect("rendered output with empty required sequence must still parse");
+    }
+
+    #[test]
+    fn rendered_bundle_preserves_referenced_empty_profiles() {
+        // An empty profile body is valid and still meaningful when a schema
+        // references it: expansion creates the schema/profile role using the
+        // default role pattern. The renderer may strip the profile's defaulted
+        // fields, but must keep the named profile entry itself.
+        let bundle = composition::parse_policy_bundle(
+            r#"
+shared:
+  profiles:
+    noop: {}
+sources:
+  - file: app.yaml
+"#,
+        )
+        .unwrap();
+        let documents = vec![composition::PolicyDocument {
+            source: "app.yaml".to_string(),
+            fragment: composition::parse_policy_fragment(
+                r#"
+policy:
+  name: app
+scope:
+  schemas:
+    - name: inventory
+      facets: [bindings]
+schemas:
+  - name: inventory
+    profiles: [noop]
+"#,
+            )
+            .unwrap(),
+        }];
+        let composed = composition::compose_bundle(&bundle, &documents).unwrap();
+        let validated = ValidatedBundle {
+            bundle,
+            documents,
+            composed,
+        };
+
+        let rendered = format_rendered_bundle(&validated, "bundle.yaml", false).unwrap();
+
+        assert!(
+            rendered.contains("noop: {}"),
+            "empty referenced profile must be preserved, got: {rendered}"
+        );
+        let reparsed = validate_manifest(&rendered)
+            .expect("rendered output with an empty referenced profile must still parse");
+        assert!(
+            reparsed
+                .expanded
+                .roles
+                .iter()
+                .any(|role| role.name == "inventory-noop"),
+            "empty profile must still expand to its schema/profile role"
+        );
     }
 }
