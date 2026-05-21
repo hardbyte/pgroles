@@ -712,7 +712,8 @@ fn help_flag() {
         .stdout(predicate::str::contains("validate"))
         .stdout(predicate::str::contains("diff"))
         .stdout(predicate::str::contains("apply"))
-        .stdout(predicate::str::contains("inspect"));
+        .stdout(predicate::str::contains("inspect"))
+        .stdout(predicate::str::contains("reconcile"));
 }
 
 #[test]
@@ -763,6 +764,29 @@ fn inspect_help() {
         .assert()
         .success()
         .stdout(predicate::str::contains("--database-url"));
+}
+
+#[test]
+fn reconcile_help() {
+    pgroles_cmd()
+        .args(["reconcile", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("PostgresPolicy"))
+        .stdout(predicate::str::contains("--namespace"))
+        .stdout(predicate::str::contains("--wait"))
+        .stdout(predicate::str::contains("--timeout"));
+}
+
+#[test]
+fn reconcile_rejects_unsupported_kind_before_kube_client_setup() {
+    pgroles_cmd()
+        .args(["reconcile", "secret/db"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "unsupported reconcile resource kind",
+        ));
 }
 
 #[test]

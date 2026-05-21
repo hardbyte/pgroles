@@ -24,8 +24,8 @@ use tracing::info;
 use crate::context::{ContextError, OperatorContext};
 use crate::crd::{
     ChangeSummary, DatabaseIdentity, PolicyMode, PostgresPolicy, PostgresPolicyPlan,
-    PostgresPolicyStatus, conflict_condition, degraded_condition, drifted_condition,
-    paused_condition, ready_condition, reconciling_condition,
+    PostgresPolicyStatus, REQUESTED_RECONCILE_ANNOTATION, conflict_condition, degraded_condition,
+    drifted_condition, paused_condition, ready_condition, reconciling_condition,
 };
 
 /// Finalizer name for PostgresPolicy resources.
@@ -83,6 +83,13 @@ impl ReconcileOutcome {
             ReconcileOutcome::Conflict => "ConflictingPolicy",
             ReconcileOutcome::LockContention => "LockContention",
         }
+    }
+
+    fn marks_requested_reconcile_handled(&self) -> bool {
+        matches!(
+            self,
+            ReconcileOutcome::Reconciled | ReconcileOutcome::Planned
+        )
     }
 }
 
@@ -567,12 +574,17 @@ async fn reconcile_apply(
     ctx: &OperatorContext,
 ) -> Result<Action, ReconcileError> {
     let reconcile_guard = ctx.observability.start_reconcile();
+    let requested_reconcile_at = requested_reconcile_at(resource);
 
     let namespace = resource.namespace().ok_or(ReconcileError::NoNamespace)?;
     let identity = DatabaseIdentity::from_connection(&namespace, &resource.spec.connection);
 
     match reconcile_apply_inner(resource, ctx, &identity).await {
         Ok((action, outcome)) => {
+            if outcome.marks_requested_reconcile_handled() {
+                mark_requested_reconcile_handled(ctx, resource, requested_reconcile_at.as_deref())
+                    .await?;
+            }
             reconcile_guard.record_result(outcome.result(), outcome.reason());
             Ok(action)
         }
@@ -624,6 +636,28 @@ async fn reconcile_apply(
             Err(err)
         }
     }
+}
+
+fn requested_reconcile_at(resource: &PostgresPolicy) -> Option<String> {
+    resource
+        .annotations()
+        .get(REQUESTED_RECONCILE_ANNOTATION)
+        .cloned()
+}
+
+async fn mark_requested_reconcile_handled(
+    ctx: &OperatorContext,
+    resource: &PostgresPolicy,
+    requested_reconcile_at: Option<&str>,
+) -> Result<(), ReconcileError> {
+    let Some(requested_reconcile_at) = requested_reconcile_at else {
+        return Ok(());
+    };
+
+    update_status(ctx, resource, |status| {
+        status.last_handled_reconcile_at = Some(requested_reconcile_at.to_string());
+    })
+    .await
 }
 
 fn mark_reconcile_failure_status(
@@ -3145,6 +3179,15 @@ mod tests {
     fn error_reason_conflicting_policy() {
         let err = ReconcileError::ConflictingPolicy("overlaps with other".into());
         assert_eq!(err.reason(), "ConflictingPolicy");
+    }
+
+    #[test]
+    fn requested_reconcile_is_handled_only_after_successful_outcomes() {
+        assert!(ReconcileOutcome::Reconciled.marks_requested_reconcile_handled());
+        assert!(ReconcileOutcome::Planned.marks_requested_reconcile_handled());
+        assert!(!ReconcileOutcome::Suspended.marks_requested_reconcile_handled());
+        assert!(!ReconcileOutcome::Conflict.marks_requested_reconcile_handled());
+        assert!(!ReconcileOutcome::LockContention.marks_requested_reconcile_handled());
     }
 
     #[test]

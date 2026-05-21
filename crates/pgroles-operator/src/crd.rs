@@ -175,6 +175,9 @@ pub const PLAN_APPROVED_ANNOTATION: &str = "pgroles.io/approved";
 /// Annotation key used to reject a `PostgresPolicyPlan`.
 pub const PLAN_REJECTED_ANNOTATION: &str = "pgroles.io/rejected";
 
+/// Annotation key used to request an immediate `PostgresPolicy` reconcile.
+pub const REQUESTED_RECONCILE_ANNOTATION: &str = "reconcile.pgroles.io/requestedAt";
+
 /// Label key for the parent policy name on plan resources.
 pub const LABEL_POLICY: &str = "pgroles.io/policy";
 
@@ -809,6 +812,10 @@ pub struct PostgresPolicyStatus {
     /// Deprecated alias retained for compatibility with older status readers.
     #[serde(default)]
     pub last_reconcile_time: Option<String>,
+
+    /// Last force-reconcile annotation value handled by the operator.
+    #[serde(default, rename = "lastHandledReconcileAt")]
+    pub last_handled_reconcile_at: Option<String>,
 
     /// Summary of changes applied in the last reconciliation.
     #[serde(default)]

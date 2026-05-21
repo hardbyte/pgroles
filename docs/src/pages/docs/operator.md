@@ -393,10 +393,11 @@ The controller also emits Kubernetes Events for notable state transitions. These
 
 ## Reconciliation
 
-The operator reconciles on three paths:
+The operator reconciles on four paths:
 
 - `PostgresPolicy` spec changes
 - referenced Secret changes
+- force-reconcile annotation changes
 - the normal periodic `interval`
 
 Each reconcile inspects the current database state, computes a diff from the policy, and then either applies it or publishes a plan depending on `spec.mode`. Plan mode is non-mutating: it does not execute PostgreSQL DDL and it does not create generated password Secrets. Same-database policies are serialized, and status-only updates do not retrigger the controller.
@@ -432,6 +433,24 @@ This catches common misconfigurations like a policy that declares a schema which
 ### Interval
 
 The `interval` field controls how often the operator re-reconciles, even when the resource hasn't changed. This catches drift from manual SQL changes. Supports durations like `30s`, `5m`, `1h`, or compound forms like `1h30m`. Defaults to `5m`.
+
+### Force reconcile
+
+Set `reconcile.pgroles.io/requestedAt` to a new RFC 3339 timestamp to request an immediate reconcile without changing `spec`:
+
+```shell
+kubectl annotate postgrespolicy my-policy \
+  reconcile.pgroles.io/requestedAt="$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+  --overwrite
+```
+
+The same timestamp is idempotent. Re-setting it is a no-op, while setting a newer value bypasses the normal `interval` wait. The operator mirrors successfully handled requests to `status.lastHandledReconcileAt`, which is useful for scripts and runbooks that need to verify the request completed or produced a plan.
+
+The CLI wraps the same annotation flow:
+
+```shell
+pgroles reconcile postgrespolicy/my-policy -n platform --wait
+```
 
 ### Suspending
 
@@ -659,6 +678,7 @@ status:
       last_transition_time: "2026-03-06T10:30:00Z"
   observed_generation: 3
   last_reconcile_time: "2026-03-06T10:30:00Z"
+  lastHandledReconcileAt: "2026-03-06T10:31:00Z"
   transient_failure_count: 0
   change_summary:
     roles_created: 2

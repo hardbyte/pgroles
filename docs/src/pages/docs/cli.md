@@ -3,7 +3,7 @@ title: CLI commands
 description: Reference for all pgroles CLI commands and options.
 ---
 
-The `pgroles` CLI provides six commands for managing PostgreSQL role policies. {% .lead %}
+The `pgroles` CLI provides seven commands for managing PostgreSQL role policies. {% .lead %}
 
 ---
 
@@ -230,6 +230,25 @@ The generated manifest — flat or with suggested profiles — is a snapshot of 
 {% callout type="warning" title="Treat generated manifests as authoritative input" %}
 `generate` is best used as a starting point for brownfield adoption. Before applying the generated manifest in production, review it like any other infrastructure policy because once committed it becomes the desired state.
 {% /callout %}
+
+## reconcile
+
+Request an immediate operator reconcile for a Kubernetes `PostgresPolicy` without changing `spec`.
+
+```shell
+pgroles reconcile my-policy -n platform
+pgroles reconcile postgrespolicy/my-policy -n platform --wait
+```
+
+The command patches the policy annotation `reconcile.pgroles.io/requestedAt` with the current RFC 3339 timestamp. The operator treats a new annotation value as an immediate reconcile trigger and mirrors the value to `status.lastHandledReconcileAt` after a successful reconcile or plan.
+
+### Options
+
+| Flag | Description |
+|---|---|
+| `-n`, `--namespace` | Kubernetes namespace containing the `PostgresPolicy` (default: `default`) |
+| `--wait` | Poll the policy until `status.lastHandledReconcileAt` reaches the requested timestamp |
+| `--timeout` | Maximum wait duration, e.g. `30s`, `2m`, or `1m30s` (default: `2m`) |
 
 ## graph
 
