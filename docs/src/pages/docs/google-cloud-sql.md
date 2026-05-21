@@ -72,8 +72,7 @@ Cloud SQL maps IAM principals to PostgreSQL roles with specific naming rules:
 ```yaml
 roles:
   - name: "my-sa@my-project.iam"
-    login: true
-    comment: "IAM-authenticated service account"
+    external: true
 ```
 
 ### IAM groups
@@ -83,8 +82,7 @@ roles:
 ```yaml
 roles:
   - name: "backend-team@example.com"
-    login: false
-    comment: "Cloud Identity group — members authenticate individually"
+    external: true
 
 grants:
   - role: "backend-team@example.com"
@@ -96,6 +94,8 @@ grants:
 ```
 
 When a group member logs in for the first time, Cloud SQL creates their individual PostgreSQL role automatically and grants them the group's privileges.
+
+Use `external: true` for Cloud SQL IAM users and groups that are created through Cloud SQL IAM APIs, Terraform `google_sql_user`, or another platform owner. That keeps pgroles from changing the role's `LOGIN` attribute or revoking provider-managed role memberships while still allowing grants and ownership references.
 
 {% callout type="note" title="Group membership propagation" %}
 Changes to Cloud Identity group membership take about 15 minutes to propagate. However, changes to the group's database privileges take effect immediately.

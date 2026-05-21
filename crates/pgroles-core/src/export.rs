@@ -26,6 +26,7 @@ pub fn role_graph_to_manifest(graph: &RoleGraph) -> PolicyManifest {
             let defaults = crate::model::RoleState::default();
             RoleDefinition {
                 name: name.clone(),
+                external: false,
                 login: if state.login != defaults.login {
                     Some(state.login)
                 } else {

@@ -290,10 +290,20 @@ pub(crate) fn default_role_pattern() -> String {
     "{schema}-{profile}".to_string()
 }
 
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
 /// A concrete role definition.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RoleDefinition {
     pub name: String,
+
+    /// Treat this role as managed by another system. pgroles may reference it
+    /// in grants, ownership, and memberships, but will not create, alter, drop,
+    /// password-manage, or manage memberships granted from this role.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub external: bool,
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub login: Option<bool>,
@@ -546,6 +556,7 @@ pub fn expand_manifest(manifest: &PolicyManifest) -> Result<ExpandedManifest, Ma
             // Create role definition
             roles.push(RoleDefinition {
                 name: role_name.clone(),
+                external: false,
                 login: profile.login,
                 superuser: None,
                 createdb: None,

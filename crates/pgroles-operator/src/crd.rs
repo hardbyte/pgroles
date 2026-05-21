@@ -564,6 +564,11 @@ pub struct DefaultPrivilegeGrantSpec {
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct RoleSpec {
     pub name: String,
+    /// Treat this role as externally managed. The operator may reference it in
+    /// grants, ownership, and memberships, but will not create, alter, drop,
+    /// password-manage, or manage memberships granted from this role.
+    #[serde(default)]
+    pub external: bool,
     #[serde(default)]
     pub login: Option<bool>,
     #[serde(default)]
@@ -1429,6 +1434,7 @@ impl PostgresPolicySpec {
             .iter()
             .map(|r| RoleDefinition {
                 name: r.name.clone(),
+                external: r.external,
                 login: r.login,
                 superuser: r.superuser,
                 createdb: r.createdb,
@@ -1708,6 +1714,7 @@ mod tests {
             schemas: vec![],
             roles: vec![RoleSpec {
                 name: "analytics".to_string(),
+                external: true,
                 login: Some(true),
                 superuser: None,
                 createdb: None,
@@ -1736,6 +1743,7 @@ mod tests {
         assert_eq!(manifest.default_owner, Some("app_owner".to_string()));
         assert_eq!(manifest.roles.len(), 1);
         assert_eq!(manifest.roles[0].name, "analytics");
+        assert!(manifest.roles[0].external);
         assert_eq!(manifest.roles[0].login, Some(true));
         assert_eq!(manifest.roles[0].comment, Some("test role".to_string()));
         assert_eq!(manifest.retirements.len(), 1);
@@ -1853,6 +1861,7 @@ mod tests {
             }],
             roles: vec![RoleSpec {
                 name: "app-service".to_string(),
+                external: false,
                 login: Some(true),
                 superuser: None,
                 createdb: None,
@@ -2720,6 +2729,7 @@ params:
         let mut spec = spec_with_connection(params_mode_connection());
         spec.roles = vec![RoleSpec {
             name: "app".into(),
+            external: false,
             login: Some(true),
             password: Some(PasswordSpec {
                 secret_ref: Some(SecretReference {
@@ -3283,6 +3293,7 @@ retirements:
             roles: vec![
                 RoleSpec {
                     name: "role-a".to_string(),
+                    external: false,
                     login: Some(true),
                     password: Some(PasswordSpec {
                         secret_ref: Some(SecretReference {
@@ -3303,6 +3314,7 @@ retirements:
                 },
                 RoleSpec {
                     name: "role-b".to_string(),
+                    external: false,
                     login: Some(true),
                     password: Some(PasswordSpec {
                         secret_ref: Some(SecretReference {
@@ -3323,6 +3335,7 @@ retirements:
                 },
                 RoleSpec {
                     name: "role-c".to_string(),
+                    external: false,
                     login: None,
                     password: None,
                     password_valid_until: None,
@@ -3378,6 +3391,7 @@ retirements:
             schemas: vec![],
             roles: vec![RoleSpec {
                 name: "app-user".to_string(),
+                external: false,
                 login: Some(false),
                 superuser: None,
                 createdb: None,
@@ -3428,6 +3442,7 @@ retirements:
             schemas: vec![],
             roles: vec![RoleSpec {
                 name: "app-user".to_string(),
+                external: false,
                 login: None, // omitted, not explicitly false
                 superuser: None,
                 createdb: None,
@@ -3478,6 +3493,7 @@ retirements:
             schemas: vec![],
             roles: vec![RoleSpec {
                 name: "app-user".to_string(),
+                external: false,
                 login: Some(true),
                 superuser: None,
                 createdb: None,
@@ -3532,6 +3548,7 @@ retirements:
             schemas: vec![],
             roles: vec![RoleSpec {
                 name: "app-user".to_string(),
+                external: false,
                 login: Some(true),
                 superuser: None,
                 createdb: None,
@@ -3584,6 +3601,7 @@ retirements:
             schemas: vec![],
             roles: vec![RoleSpec {
                 name: "app-user".to_string(),
+                external: false,
                 login: Some(true),
                 superuser: None,
                 createdb: None,
@@ -3637,6 +3655,7 @@ retirements:
             schemas: vec![],
             roles: vec![RoleSpec {
                 name: "app-user".to_string(),
+                external: false,
                 login: Some(true),
                 superuser: None,
                 createdb: None,
@@ -3689,6 +3708,7 @@ retirements:
             schemas: vec![],
             roles: vec![RoleSpec {
                 name: "app-user".to_string(),
+                external: false,
                 login: Some(true),
                 superuser: None,
                 createdb: None,

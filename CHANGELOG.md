@@ -5,6 +5,12 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **Externally managed roles can now be marked `external: true`.** External roles may still be referenced in grants, schema ownership, default privileges, and as members of managed roles, but pgroles will not create, alter, drop, password-manage, or manage memberships granted from those roles. This avoids breaking Cloud SQL IAM users and groups whose `LOGIN` attribute and provider memberships are owned outside pgroles. (#123)
+
 ## [0.7.7] - 2026-05-18
 
 ### Added
