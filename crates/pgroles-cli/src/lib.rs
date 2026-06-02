@@ -361,6 +361,144 @@ pub fn format_validation_result(validated: &ValidatedManifest) -> String {
     output
 }
 
+/// Render a validated bundle as a single composed manifest YAML.
+///
+/// When `include_header` is true, the output is prefixed with a YAML comment
+/// block recording the source bundle label, the manifest schema version
+/// against which the body was rendered, and the fragments it composed, for
+/// traceability when the rendered file is committed to a GitOps repo.
+///
+/// `source_label` should be a stable, machine-independent label (e.g. the
+/// bundle file's basename). Callers must NOT pass absolute or `pwd`-relative
+/// paths: the rendered output is intended to be byte-identical across
+/// developer machines and CI runners, and embedding a local filesystem path
+/// in the header would break that contract.
+///
+/// The body is the composed `PolicyManifest` serialized via serde_yaml and
+/// then post-processed to drop noise that would otherwise churn under
+/// upgrades or render in irrelevant places: `null` scalars, empty sequences
+/// (except for required-field keys like `members`/`privileges`/`grant`),
+/// known empty top-level maps, and known-default scalar values (e.g. the
+/// default `role_pattern`). The cleaned output still round-trips through
+/// `pgroles validate -f` / `diff -f` / `apply -f` because the parser fills
+/// the same defaults back in on read.
+pub fn format_rendered_bundle(
+    validated: &ValidatedBundle,
+    source_label: &str,
+    include_header: bool,
+) -> Result<String> {
+    let raw =
+        serde_yaml::to_value(&validated.composed.manifest).map_err(|err| anyhow::anyhow!(err))?;
+    let cleaned = strip_manifest_defaults(raw);
+    let body = serde_yaml::to_string(&cleaned).map_err(|err| anyhow::anyhow!(err))?;
+
+    if !include_header {
+        return Ok(body);
+    }
+
+    let mut header = String::new();
+    header.push_str("# Rendered by `pgroles render-bundle`.\n");
+    header.push_str("# Do not edit by hand — regenerate from the source bundle.\n");
+    header.push_str(&format!("# Source bundle: {source_label}\n"));
+    header.push_str(&format!("# Manifest schema: {RENDERED_MANIFEST_SCHEMA}\n"));
+    header.push_str("# Fragments:\n");
+    for document in &validated.documents {
+        let label = document.fragment.policy.name.as_deref();
+        match label {
+            Some(name) => header.push_str(&format!("#   - {} ({name})\n", document.source)),
+            None => header.push_str(&format!("#   - {}\n", document.source)),
+        }
+    }
+    header.push_str("#\n");
+    Ok(format!("{header}{body}"))
+}
+
+/// Schema identifier for the YAML body emitted by `render-bundle`. Bumped
+/// only on incompatible changes to the `PolicyManifest` serialization shape.
+/// Recorded in the header so `--check` failures after a pgroles upgrade can
+/// be diagnosed as "schema bump → re-render required" rather than mystery
+/// drift, and so consumers parsing the rendered file can detect mismatches.
+pub const RENDERED_MANIFEST_SCHEMA: &str = "pgroles.manifest.v1";
+
+/// The default value of `SchemaBinding::role_pattern`. Kept in sync with
+/// `pgroles_core::manifest::default_role_pattern()`; if that default ever
+/// changes, this needs to follow so the renderer keeps stripping it.
+const DEFAULT_ROLE_PATTERN: &str = "{schema}-{profile}";
+
+/// Recursively strip serde-emitted defaults from a serialized manifest so
+/// the rendered YAML stays focused on author-meaningful content.
+///
+/// Strips:
+/// - `null` scalars (e.g. `login: null` on profiles, `name: null` on grants),
+/// - empty sequences (`memberships: []`, `retirements: []`, …),
+/// - empty top-level maps (`profiles: {}` when no profiles are declared),
+/// - known scalar defaults (currently `role_pattern: "{schema}-{profile}"`).
+///
+/// All stripped fields round-trip on parse because each has a `#[serde(default)]`
+/// on its struct definition, so a re-read produces an equivalent `PolicyManifest`.
+fn strip_manifest_defaults(value: serde_yaml::Value) -> serde_yaml::Value {
+    strip_manifest_defaults_at(value, &[])
+}
+
+fn strip_manifest_defaults_at(value: serde_yaml::Value, path: &[String]) -> serde_yaml::Value {
+    use serde_yaml::Value;
+    match value {
+        Value::Mapping(map) => {
+            let mut out = serde_yaml::Mapping::new();
+            for (k, v) in map {
+                let mut child_path = path.to_vec();
+                if let Some(key) = k.as_str() {
+                    child_path.push(key.to_string());
+                }
+                let cleaned = strip_manifest_defaults_at(v, &child_path);
+                if is_strippable(&child_path, &cleaned) {
+                    continue;
+                }
+                out.insert(k, cleaned);
+            }
+            Value::Mapping(out)
+        }
+        Value::Sequence(seq) => Value::Sequence(
+            seq.into_iter()
+                .map(|item| strip_manifest_defaults_at(item, path))
+                .collect(),
+        ),
+        other => other,
+    }
+}
+
+fn is_strippable(path: &[String], value: &serde_yaml::Value) -> bool {
+    use serde_yaml::Value;
+    let key = path.last().map(String::as_str);
+    match value {
+        Value::Null => true,
+        Value::Sequence(s) if s.is_empty() => {
+            // Some sequence-valued fields in `PolicyManifest` are required
+            // (no `#[serde(default)]` on the struct field) and stripping an
+            // empty value would produce YAML that no longer deserializes
+            // back into the same type. Keep this list aligned with the
+            // struct definitions in `pgroles_core::manifest`:
+            //   - `Grant.privileges`, `ProfileGrant.privileges`,
+            //     `DefaultPrivilegeGrant.privileges`
+            //   - `DefaultPrivilege.grant`
+            //   - `Membership.members`
+            !matches!(key, Some("privileges") | Some("grant") | Some("members"))
+        }
+        Value::Mapping(m) if m.is_empty() => {
+            // Only strip empty maps whose position is known to be a defaulted
+            // manifest field. A named profile such as `profiles.noop: {}` is
+            // semantically meaningful even though its serialized profile body
+            // is empty after defaults are removed.
+            matches!(path, [field] if field == "profiles")
+        }
+        Value::String(s) => match key {
+            Some("role_pattern") => s == DEFAULT_ROLE_PATTERN,
+            _ => false,
+        },
+        _ => false,
+    }
+}
+
 /// Format bundle validation results for human-readable output.
 pub fn format_bundle_validation_result(validated: &ValidatedBundle) -> String {
     let mut output = String::new();
@@ -1060,5 +1198,321 @@ roles:
         assert!(display.contains("1 schema(s) to create"), "got: {display}");
         assert!(display.contains("2 grant(s) to add"), "got: {display}");
         assert!(!display.contains("Plan:"), "got: {display}");
+    }
+
+    // -----------------------------------------------------------------------
+    // format_rendered_bundle
+    // -----------------------------------------------------------------------
+
+    fn validated_bundle_for_render() -> ValidatedBundle {
+        let bundle = composition::parse_policy_bundle(
+            r#"
+sources:
+  - file: platform.yaml
+  - file: app.yaml
+"#,
+        )
+        .unwrap();
+        let documents = vec![
+            composition::PolicyDocument {
+                source: "platform.yaml".to_string(),
+                fragment: composition::parse_policy_fragment(
+                    r#"
+policy:
+  name: platform
+scope:
+  roles: [app_owner]
+  schemas:
+    - name: inventory
+      facets: [owner]
+roles:
+  - name: app_owner
+    login: false
+schemas:
+  - name: inventory
+    owner: app_owner
+"#,
+                )
+                .unwrap(),
+            },
+            composition::PolicyDocument {
+                source: "app.yaml".to_string(),
+                fragment: composition::parse_policy_fragment(
+                    r#"
+policy:
+  name: app
+scope:
+  roles: [app_service]
+roles:
+  - name: app_service
+    login: true
+"#,
+                )
+                .unwrap(),
+            },
+        ];
+        let composed = composition::compose_bundle(&bundle, &documents).unwrap();
+        ValidatedBundle {
+            bundle,
+            documents,
+            composed,
+        }
+    }
+
+    #[test]
+    fn rendered_bundle_round_trips_to_equivalent_expansion() {
+        let validated = validated_bundle_for_render();
+        let rendered = format_rendered_bundle(&validated, "bundle.yaml", true).unwrap();
+
+        let reparsed = validate_manifest(&rendered).expect("rendered output must validate");
+
+        // Stronger than just role-count: every role, schema, grant, and
+        // default-privilege key from the composed manifest must be present
+        // after a render -> parse -> expand round trip.
+        use std::collections::BTreeSet;
+        let original_roles: BTreeSet<_> = validated
+            .composed
+            .expanded
+            .roles
+            .iter()
+            .map(|r| r.name.clone())
+            .collect();
+        let rendered_roles: BTreeSet<_> = reparsed
+            .expanded
+            .roles
+            .iter()
+            .map(|r| r.name.clone())
+            .collect();
+        assert_eq!(rendered_roles, original_roles);
+
+        let original_schemas: BTreeSet<_> = validated
+            .composed
+            .expanded
+            .schemas
+            .iter()
+            .map(|s| s.name.clone())
+            .collect();
+        let rendered_schemas: BTreeSet<_> = reparsed
+            .expanded
+            .schemas
+            .iter()
+            .map(|s| s.name.clone())
+            .collect();
+        assert_eq!(rendered_schemas, original_schemas);
+
+        assert_eq!(
+            reparsed.expanded.grants.len(),
+            validated.composed.expanded.grants.len()
+        );
+        assert_eq!(
+            reparsed.expanded.default_privileges.len(),
+            validated.composed.expanded.default_privileges.len()
+        );
+        assert_eq!(
+            reparsed.expanded.memberships.len(),
+            validated.composed.expanded.memberships.len()
+        );
+    }
+
+    #[test]
+    fn rendered_bundle_header_records_source_and_fragments() {
+        let validated = validated_bundle_for_render();
+        let rendered = format_rendered_bundle(&validated, "prod.yaml", true).unwrap();
+
+        assert!(rendered.starts_with("# Rendered by `pgroles render-bundle`."));
+        assert!(rendered.contains("# Source bundle: prod.yaml"));
+        assert!(rendered.contains("#   - platform.yaml (platform)"));
+        assert!(rendered.contains("#   - app.yaml (app)"));
+    }
+
+    #[test]
+    fn rendered_bundle_header_records_manifest_schema_version() {
+        // The schema-version marker is the diagnostic anchor that lets
+        // users tell "the rendered file is stale because someone edited
+        // the bundle" apart from "the rendered file is stale because
+        // pgroles upgraded to a new manifest schema". It must always appear
+        // in the header.
+        let validated = validated_bundle_for_render();
+        let rendered = format_rendered_bundle(&validated, "bundle.yaml", true).unwrap();
+        assert!(
+            rendered.contains(&format!("# Manifest schema: {RENDERED_MANIFEST_SCHEMA}")),
+            "header must record manifest schema, got: {rendered}"
+        );
+    }
+
+    #[test]
+    fn rendered_bundle_strips_empty_collections_and_nulls() {
+        let validated = validated_bundle_for_render();
+        let rendered = format_rendered_bundle(&validated, "bundle.yaml", false).unwrap();
+
+        // Empty top-level collections defaulted by serde must not appear.
+        assert!(
+            !rendered.contains("auth_providers: []"),
+            "rendered output must not include empty auth_providers, got: {rendered}"
+        );
+        assert!(
+            !rendered.contains("grants: []"),
+            "rendered output must not include empty grants, got: {rendered}"
+        );
+        assert!(
+            !rendered.contains("default_privileges: []"),
+            "rendered output must not include empty default_privileges, got: {rendered}"
+        );
+        assert!(
+            !rendered.contains("memberships: []"),
+            "rendered output must not include empty memberships, got: {rendered}"
+        );
+        assert!(
+            !rendered.contains("profiles: {}"),
+            "rendered output must not include empty top-level profiles, got: {rendered}"
+        );
+        assert!(
+            !rendered.contains("retirements: []"),
+            "rendered output must not include empty retirements, got: {rendered}"
+        );
+        // Profile Option fields default to None — they must not serialize as `null`.
+        assert!(
+            !rendered.contains("login: null"),
+            "rendered output must not include null login, got: {rendered}"
+        );
+        assert!(
+            !rendered.contains("inherit: null"),
+            "rendered output must not include null inherit, got: {rendered}"
+        );
+        // The default role_pattern must be elided so it doesn't churn under
+        // future default changes.
+        assert!(
+            !rendered.contains("role_pattern:"),
+            "rendered output must elide default role_pattern, got: {rendered}"
+        );
+    }
+
+    #[test]
+    fn rendered_bundle_no_header_emits_only_yaml() {
+        let validated = validated_bundle_for_render();
+        let rendered = format_rendered_bundle(&validated, "bundle.yaml", false).unwrap();
+
+        assert!(
+            !rendered.starts_with('#'),
+            "without header, output should start with YAML, got: {rendered}"
+        );
+        // Still a valid manifest.
+        validate_manifest(&rendered).expect("rendered output must validate");
+    }
+
+    #[test]
+    fn rendered_bundle_is_deterministic() {
+        let validated = validated_bundle_for_render();
+        let first = format_rendered_bundle(&validated, "bundle.yaml", true).unwrap();
+        let second = format_rendered_bundle(&validated, "bundle.yaml", true).unwrap();
+        assert_eq!(first, second);
+    }
+
+    #[test]
+    fn rendered_bundle_preserves_required_empty_sequences() {
+        // Membership.members and Grant.privileges are required fields (no
+        // `#[serde(default)]`). The renderer must NOT strip them even when
+        // empty, or the rendered YAML fails to deserialize as a manifest.
+        let bundle = composition::parse_policy_bundle(
+            r#"
+sources:
+  - file: app.yaml
+"#,
+        )
+        .unwrap();
+        let documents = vec![composition::PolicyDocument {
+            source: "app.yaml".to_string(),
+            fragment: composition::parse_policy_fragment(
+                r#"
+policy:
+  name: app
+scope:
+  roles: [empty_group]
+roles:
+  - name: empty_group
+    login: false
+memberships:
+  - role: empty_group
+    members: []
+"#,
+            )
+            .unwrap(),
+        }];
+        let composed = composition::compose_bundle(&bundle, &documents).unwrap();
+        let validated = ValidatedBundle {
+            bundle,
+            documents,
+            composed,
+        };
+
+        let rendered = format_rendered_bundle(&validated, "bundle.yaml", false).unwrap();
+
+        // The required `members:` key must remain even when its value is `[]`.
+        assert!(
+            rendered.contains("members:"),
+            "required `members` field must not be stripped, got: {rendered}"
+        );
+
+        // And the round trip must succeed.
+        validate_manifest(&rendered)
+            .expect("rendered output with empty required sequence must still parse");
+    }
+
+    #[test]
+    fn rendered_bundle_preserves_referenced_empty_profiles() {
+        // An empty profile body is valid and still meaningful when a schema
+        // references it: expansion creates the schema/profile role using the
+        // default role pattern. The renderer may strip the profile's defaulted
+        // fields, but must keep the named profile entry itself.
+        let bundle = composition::parse_policy_bundle(
+            r#"
+shared:
+  profiles:
+    noop: {}
+sources:
+  - file: app.yaml
+"#,
+        )
+        .unwrap();
+        let documents = vec![composition::PolicyDocument {
+            source: "app.yaml".to_string(),
+            fragment: composition::parse_policy_fragment(
+                r#"
+policy:
+  name: app
+scope:
+  schemas:
+    - name: inventory
+      facets: [bindings]
+schemas:
+  - name: inventory
+    profiles: [noop]
+"#,
+            )
+            .unwrap(),
+        }];
+        let composed = composition::compose_bundle(&bundle, &documents).unwrap();
+        let validated = ValidatedBundle {
+            bundle,
+            documents,
+            composed,
+        };
+
+        let rendered = format_rendered_bundle(&validated, "bundle.yaml", false).unwrap();
+
+        assert!(
+            rendered.contains("noop: {}"),
+            "empty referenced profile must be preserved, got: {rendered}"
+        );
+        let reparsed = validate_manifest(&rendered)
+            .expect("rendered output with an empty referenced profile must still parse");
+        assert!(
+            reparsed
+                .expanded
+                .roles
+                .iter()
+                .any(|role| role.name == "inventory-noop"),
+            "empty profile must still expand to its schema/profile role"
+        );
     }
 }

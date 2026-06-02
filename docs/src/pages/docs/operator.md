@@ -18,8 +18,8 @@ The operator brings the same convergent model as the CLI into Kubernetes. Instea
 - Status conditions and change summaries on the custom resource
 - Finalizer-based cleanup on resource deletion
 
-{% callout type="note" title="Bundle composition is CLI-only today" %}
-The CLI can compose a multi-file bundle with scoped ownership boundaries before diff or apply. The operator does **not** yet reconcile bundle fragments directly — each `PostgresPolicy` is still a single policy document.
+{% callout type="note" title="Bundle composition reaches the operator via render-bundle" %}
+The operator reconciles a single `PostgresPolicy` per resource — it does not load bundle fragments directly. To get cross-team or cross-environment fragment composition under the operator, compose the bundle in CI with `pgroles render-bundle --bundle pgroles.bundle.yaml --output pgroles.yaml`, then wrap the rendered manifest into a `PostgresPolicy` resource (the manifest fields go under `spec:` alongside `connection:`). Gate the bundle ↔ rendered-manifest relationship with `pgroles render-bundle --bundle … --check pgroles.yaml` in CI. See the [bundle composition guide](/docs/bundle-composition) for the full workflow.
 {% /callout %}
 
 {% callout title="Maturity" %}

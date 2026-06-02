@@ -16,9 +16,9 @@ use tracing::{info, warn};
 use pgroles_cli::{
     PlanSummary, apply_role_retirements, compute_plan, format_bundle_plan_json,
     format_bundle_validation_result, format_managed_scope_summary, format_plan_json,
-    format_plan_sql_with_context, format_role_graph_summary, format_validation_result,
-    inject_password_changes, planned_role_drops, read_manifest_file, resolve_passwords,
-    validate_bundle_file, validate_manifest,
+    format_plan_sql_with_context, format_rendered_bundle, format_role_graph_summary,
+    format_validation_result, inject_password_changes, planned_role_drops, read_manifest_file,
+    resolve_passwords, validate_bundle_file, validate_manifest,
 };
 use pgroles_core::diff::{ReconciliationMode, filter_changes, filter_external_role_changes};
 use pgroles_core::ownership::validate_changes_against_managed_surface;
@@ -188,6 +188,32 @@ enum Commands {
     Graph {
         #[command(subcommand)]
         source: GraphSource,
+    },
+
+    /// Compose a policy bundle into a single flat manifest YAML.
+    ///
+    /// Validates and composes the bundle (rejecting scope/ownership conflicts),
+    /// then emits the resulting manifest. The output round-trips through
+    /// `pgroles validate -f` / `diff -f` / `apply -f`, and is suitable for
+    /// committing as a `PostgresPolicy` source in a GitOps repo.
+    RenderBundle {
+        /// Path to the policy bundle YAML file.
+        #[arg(long)]
+        bundle: PathBuf,
+
+        /// Write output to this file instead of stdout.
+        #[arg(short, long, conflicts_with = "check")]
+        output: Option<PathBuf>,
+
+        /// Suppress the provenance header comment block at the top of the output.
+        #[arg(long)]
+        no_header: bool,
+
+        /// Compare the rendered output against an existing file and exit
+        /// with code 2 if they differ (useful as a CI gate that catches
+        /// stale checked-in renders).
+        #[arg(long, conflicts_with = "output", value_name = "PATH")]
+        check: Option<PathBuf>,
     },
 }
 
@@ -384,6 +410,12 @@ async fn run(cli: Cli) -> Result<ExitCode> {
             cmd_reconcile(&resource, &namespace, wait, &timeout).await?;
             Ok(ExitCode::SUCCESS)
         }
+        Commands::RenderBundle {
+            bundle,
+            output,
+            no_header,
+            check,
+        } => cmd_render_bundle(&bundle, output.as_deref(), !no_header, check.as_deref()),
         Commands::Graph { source } => match source {
             GraphSource::Desired {
                 file,
@@ -631,6 +663,53 @@ fn cmd_validate(file: Option<&Path>, bundle: Option<&Path>) -> Result<()> {
     let validated = validate_manifest(&yaml)?;
     print!("{}", format_validation_result(&validated));
     Ok(())
+}
+
+fn cmd_render_bundle(
+    bundle_path: &Path,
+    output: Option<&Path>,
+    include_header: bool,
+    check: Option<&Path>,
+) -> Result<ExitCode> {
+    let validated = validate_bundle_file(bundle_path)?;
+    // The source label must be stable across machines so committed renders
+    // diff cleanly; use only the bundle file's basename, not its full path.
+    let source_label = bundle_path
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| bundle_path.display().to_string());
+    let rendered = format_rendered_bundle(&validated, &source_label, include_header)?;
+
+    if let Some(check_path) = check {
+        let existing = std::fs::read_to_string(check_path).with_context(|| {
+            format!(
+                "failed to read existing rendered file for --check: {}",
+                check_path.display()
+            )
+        })?;
+        if existing == rendered {
+            info!(path = %check_path.display(), "rendered bundle matches existing file");
+            return Ok(ExitCode::SUCCESS);
+        }
+        eprintln!(
+            "rendered bundle differs from {}; regenerate with `pgroles render-bundle --bundle {} --output {}`",
+            check_path.display(),
+            bundle_path.display(),
+            check_path.display(),
+        );
+        return Ok(ExitCode::from(EXIT_DRIFT));
+    }
+
+    match output {
+        Some(path) => {
+            std::fs::write(path, &rendered).with_context(|| {
+                format!("failed to write rendered bundle to {}", path.display())
+            })?;
+            info!(path = %path.display(), "rendered bundle written");
+        }
+        None => print!("{rendered}"),
+    }
+    Ok(ExitCode::SUCCESS)
 }
 
 async fn cmd_diff(

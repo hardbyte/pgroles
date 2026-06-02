@@ -36,6 +36,7 @@ const navigation = [
         links: [
             {title: 'CI/CD integration', href: '/docs/ci-cd'},
             {title: 'App & migration tools', href: '/docs/tooling'},
+            {title: 'Bundle composition', href: '/docs/bundle-composition'},
             {title: 'Google Cloud SQL', href: '/docs/google-cloud-sql'},
             {title: 'AWS RDS & Aurora', href: '/docs/aws-rds'},
             {title: 'Staged adoption', href: '/docs/adoption'},
