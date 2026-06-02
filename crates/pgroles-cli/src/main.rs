@@ -2,9 +2,13 @@
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
+use kube::api::{ApiResource, DynamicObject, Patch, PatchParams};
+use kube::core::GroupVersionKind;
+use kube::{Api, Client};
 use sqlx::postgres::PgPoolOptions;
 use sqlx::{PgPool, Row};
 use tracing::{info, warn};
@@ -12,11 +16,11 @@ use tracing::{info, warn};
 use pgroles_cli::{
     PlanSummary, apply_role_retirements, compute_plan, format_bundle_plan_json,
     format_bundle_validation_result, format_managed_scope_summary, format_plan_json,
-    format_plan_sql_with_context, format_role_graph_summary, format_validation_result,
-    inject_password_changes, planned_role_drops, read_manifest_file, resolve_passwords,
-    validate_bundle_file, validate_manifest,
+    format_plan_sql_with_context, format_rendered_bundle, format_role_graph_summary,
+    format_validation_result, inject_password_changes, planned_role_drops, read_manifest_file,
+    resolve_passwords, validate_bundle_file, validate_manifest,
 };
-use pgroles_core::diff::{ReconciliationMode, filter_changes};
+use pgroles_core::diff::{ReconciliationMode, filter_changes, filter_external_role_changes};
 use pgroles_core::ownership::validate_changes_against_managed_surface;
 use pgroles_core::visual::{self, VisualManagedScope, VisualSource};
 use pgroles_inspect::{InspectConfig, inspect_drop_role_safety};
@@ -159,6 +163,24 @@ enum Commands {
         suggest_min_schemas: usize,
     },
 
+    /// Request an immediate operator reconcile for a Kubernetes PostgresPolicy.
+    Reconcile {
+        /// Resource to reconcile, either NAME or postgrespolicy/NAME.
+        resource: String,
+
+        /// Kubernetes namespace containing the PostgresPolicy.
+        #[arg(short = 'n', long, default_value = "default")]
+        namespace: String,
+
+        /// Wait until status.lastHandledReconcileAt reflects this request.
+        #[arg(long)]
+        wait: bool,
+
+        /// Maximum time to wait, e.g. "30s", "2m", or "1m30s".
+        #[arg(long, default_value = "2m", requires = "wait")]
+        timeout: String,
+    },
+
     /// Visualize the role graph structure.
     ///
     /// Renders roles, memberships, grants, and default privileges as a graph
@@ -166,6 +188,32 @@ enum Commands {
     Graph {
         #[command(subcommand)]
         source: GraphSource,
+    },
+
+    /// Compose a policy bundle into a single flat manifest YAML.
+    ///
+    /// Validates and composes the bundle (rejecting scope/ownership conflicts),
+    /// then emits the resulting manifest. The output round-trips through
+    /// `pgroles validate -f` / `diff -f` / `apply -f`, and is suitable for
+    /// committing as a `PostgresPolicy` source in a GitOps repo.
+    RenderBundle {
+        /// Path to the policy bundle YAML file.
+        #[arg(long)]
+        bundle: PathBuf,
+
+        /// Write output to this file instead of stdout.
+        #[arg(short, long, conflicts_with = "check")]
+        output: Option<PathBuf>,
+
+        /// Suppress the provenance header comment block at the top of the output.
+        #[arg(long)]
+        no_header: bool,
+
+        /// Compare the rendered output against an existing file and exit
+        /// with code 2 if they differ (useful as a CI gate that catches
+        /// stale checked-in renders).
+        #[arg(long, conflicts_with = "output", value_name = "PATH")]
+        check: Option<PathBuf>,
     },
 }
 
@@ -285,6 +333,8 @@ async fn main() -> ExitCode {
 
 /// Exit code 2 indicates drift was detected (used by `diff`/`plan`).
 const EXIT_DRIFT: u8 = 2;
+const REQUESTED_RECONCILE_ANNOTATION: &str = "reconcile.pgroles.io/requestedAt";
+const LAST_HANDLED_RECONCILE_AT_STATUS_FIELD: &str = "lastHandledReconcileAt";
 
 async fn run(cli: Cli) -> Result<ExitCode> {
     match cli.command {
@@ -351,6 +401,21 @@ async fn run(cli: Cli) -> Result<ExitCode> {
             .await?;
             Ok(ExitCode::SUCCESS)
         }
+        Commands::Reconcile {
+            resource,
+            namespace,
+            wait,
+            timeout,
+        } => {
+            cmd_reconcile(&resource, &namespace, wait, &timeout).await?;
+            Ok(ExitCode::SUCCESS)
+        }
+        Commands::RenderBundle {
+            bundle,
+            output,
+            no_header,
+            check,
+        } => cmd_render_bundle(&bundle, output.as_deref(), !no_header, check.as_deref()),
         Commands::Graph { source } => match source {
             GraphSource::Desired {
                 file,
@@ -393,6 +458,199 @@ async fn run(cli: Cli) -> Result<ExitCode> {
 // Subcommand implementations
 // ---------------------------------------------------------------------------
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReconcileTargetKind {
+    PostgresPolicy,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ReconcileTarget {
+    kind: ReconcileTargetKind,
+    name: String,
+}
+
+fn parse_reconcile_target(resource: &str) -> Result<ReconcileTarget> {
+    let trimmed = resource.trim();
+    if trimmed.is_empty() {
+        anyhow::bail!("resource must not be empty");
+    }
+
+    let (kind, name) = match trimmed.split_once('/') {
+        Some((kind, name)) => (parse_reconcile_kind(kind)?, name),
+        None => (ReconcileTargetKind::PostgresPolicy, trimmed),
+    };
+
+    if name.is_empty() {
+        anyhow::bail!("resource name must not be empty");
+    }
+
+    Ok(ReconcileTarget {
+        kind,
+        name: name.to_string(),
+    })
+}
+
+fn parse_reconcile_kind(kind: &str) -> Result<ReconcileTargetKind> {
+    match kind.to_ascii_lowercase().as_str() {
+        "postgrespolicy" | "postgrespolicies" | "pgr" | "policy" | "policies" => {
+            Ok(ReconcileTargetKind::PostgresPolicy)
+        }
+        other => {
+            anyhow::bail!("unsupported reconcile resource kind {other:?}; use postgrespolicy/NAME")
+        }
+    }
+}
+
+fn parse_cli_duration(duration: &str) -> Result<Duration> {
+    let duration = duration.trim();
+    if duration.is_empty() {
+        anyhow::bail!("duration must not be empty");
+    }
+
+    let mut total_secs: u64 = 0;
+    let mut current_num = String::new();
+
+    for ch in duration.chars() {
+        if ch.is_ascii_digit() {
+            current_num.push(ch);
+            continue;
+        }
+
+        if current_num.is_empty() {
+            anyhow::bail!("invalid duration {duration:?}: missing number before {ch:?}");
+        }
+
+        let num: u64 = current_num
+            .parse()
+            .with_context(|| format!("invalid duration {duration:?}"))?;
+        current_num.clear();
+
+        match ch {
+            'h' => total_secs = total_secs.saturating_add(num.saturating_mul(3600)),
+            'm' => total_secs = total_secs.saturating_add(num.saturating_mul(60)),
+            's' => total_secs = total_secs.saturating_add(num),
+            _ => anyhow::bail!("invalid duration {duration:?}: unknown unit {ch:?}"),
+        }
+    }
+
+    if !current_num.is_empty() {
+        let num: u64 = current_num
+            .parse()
+            .with_context(|| format!("invalid duration {duration:?}"))?;
+        total_secs = total_secs.saturating_add(num);
+    }
+
+    if total_secs == 0 {
+        anyhow::bail!("duration must be greater than zero");
+    }
+
+    Ok(Duration::from_secs(total_secs))
+}
+
+fn postgres_policy_api(client: Client, namespace: &str) -> Api<DynamicObject> {
+    let gvk = GroupVersionKind::gvk("pgroles.io", "v1alpha1", "PostgresPolicy");
+    let resource = ApiResource::from_gvk_with_plural(&gvk, "postgrespolicies");
+    Api::namespaced_with(client, namespace, &resource)
+}
+
+fn now_rfc3339_timestamp() -> String {
+    jiff::Timestamp::now().to_string()
+}
+
+fn handled_reconcile_timestamp(policy: &DynamicObject) -> Option<&str> {
+    policy
+        .data
+        .get("status")?
+        .get(LAST_HANDLED_RECONCILE_AT_STATUS_FIELD)?
+        .as_str()
+}
+
+fn handled_reconcile_at_least(handled: &str, requested: &str) -> Result<bool> {
+    let handled: jiff::Timestamp = handled.parse().with_context(|| {
+        format!("invalid status.{LAST_HANDLED_RECONCILE_AT_STATUS_FIELD} timestamp {handled:?}")
+    })?;
+    let requested: jiff::Timestamp = requested
+        .parse()
+        .with_context(|| format!("invalid requested reconcile timestamp {requested:?}"))?;
+    Ok(handled >= requested)
+}
+
+async fn cmd_reconcile(resource: &str, namespace: &str, wait: bool, timeout: &str) -> Result<()> {
+    let target = parse_reconcile_target(resource)?;
+    let client = Client::try_default()
+        .await
+        .context("failed to create Kubernetes client")?;
+    let policies = match target.kind {
+        ReconcileTargetKind::PostgresPolicy => postgres_policy_api(client, namespace),
+    };
+    let requested_at = now_rfc3339_timestamp();
+    let patch = serde_json::json!({
+        "metadata": {
+            "annotations": {
+                REQUESTED_RECONCILE_ANNOTATION: requested_at,
+            }
+        }
+    });
+
+    policies
+        .patch(&target.name, &PatchParams::default(), &Patch::Merge(&patch))
+        .await
+        .with_context(|| {
+            format!(
+                "failed to annotate postgrespolicy/{} in namespace {}",
+                target.name, namespace
+            )
+        })?;
+
+    println!(
+        "Requested reconcile for postgrespolicy/{} in namespace {} at {}.",
+        target.name, namespace, requested_at
+    );
+
+    if wait {
+        wait_for_reconcile_handled(&policies, &target.name, &requested_at, timeout).await?;
+    }
+
+    Ok(())
+}
+
+async fn wait_for_reconcile_handled(
+    policies: &Api<DynamicObject>,
+    name: &str,
+    requested_at: &str,
+    timeout: &str,
+) -> Result<()> {
+    let timeout = parse_cli_duration(timeout)?;
+    let started = Instant::now();
+
+    loop {
+        let policy = policies
+            .get(name)
+            .await
+            .with_context(|| format!("failed to read postgrespolicy/{name} while waiting"))?;
+        if let Some(handled_at) = handled_reconcile_timestamp(&policy)
+            && handled_reconcile_at_least(handled_at, requested_at)?
+        {
+            println!(
+                "Reconcile request handled at {} for postgrespolicy/{}.",
+                handled_at, name
+            );
+            return Ok(());
+        }
+
+        if started.elapsed() >= timeout {
+            anyhow::bail!(
+                "timed out waiting for postgrespolicy/{} status.{} to reach {}",
+                name,
+                LAST_HANDLED_RECONCILE_AT_STATUS_FIELD,
+                requested_at
+            );
+        }
+
+        tokio::time::sleep(Duration::from_secs(2)).await;
+    }
+}
+
 fn cmd_validate(file: Option<&Path>, bundle: Option<&Path>) -> Result<()> {
     if let Some(bundle_path) = bundle {
         let validated = validate_bundle_file(bundle_path)?;
@@ -405,6 +663,53 @@ fn cmd_validate(file: Option<&Path>, bundle: Option<&Path>) -> Result<()> {
     let validated = validate_manifest(&yaml)?;
     print!("{}", format_validation_result(&validated));
     Ok(())
+}
+
+fn cmd_render_bundle(
+    bundle_path: &Path,
+    output: Option<&Path>,
+    include_header: bool,
+    check: Option<&Path>,
+) -> Result<ExitCode> {
+    let validated = validate_bundle_file(bundle_path)?;
+    // The source label must be stable across machines so committed renders
+    // diff cleanly; use only the bundle file's basename, not its full path.
+    let source_label = bundle_path
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| bundle_path.display().to_string());
+    let rendered = format_rendered_bundle(&validated, &source_label, include_header)?;
+
+    if let Some(check_path) = check {
+        let existing = std::fs::read_to_string(check_path).with_context(|| {
+            format!(
+                "failed to read existing rendered file for --check: {}",
+                check_path.display()
+            )
+        })?;
+        if existing == rendered {
+            info!(path = %check_path.display(), "rendered bundle matches existing file");
+            return Ok(ExitCode::SUCCESS);
+        }
+        eprintln!(
+            "rendered bundle differs from {}; regenerate with `pgroles render-bundle --bundle {} --output {}`",
+            check_path.display(),
+            bundle_path.display(),
+            check_path.display(),
+        );
+        return Ok(ExitCode::from(EXIT_DRIFT));
+    }
+
+    match output {
+        Some(path) => {
+            std::fs::write(path, &rendered).with_context(|| {
+                format!("failed to write rendered bundle to {}", path.display())
+            })?;
+            info!(path = %path.display(), "rendered bundle written");
+        }
+        None => print!("{rendered}"),
+    }
+    Ok(ExitCode::SUCCESS)
 }
 
 async fn cmd_diff(
@@ -420,10 +725,8 @@ async fn cmd_diff(
         let pool = connect_db(database_url).await?;
         let inspect_config = inspect_config_for_bundle(&validated);
         let current = inspect_current_for_plan_with_config(&pool, &inspect_config).await?;
-        let resolved_passwords = resolve_passwords(&validated.composed.expanded)
-            .context("failed to resolve role passwords")?;
         info!(%mode, "reconciliation mode");
-        let changes = inject_password_changes(
+        let changes = filter_external_role_changes(
             filter_changes(
                 apply_role_retirements(
                     compute_plan(&current, &validated.composed.desired),
@@ -431,8 +734,11 @@ async fn cmd_diff(
                 ),
                 mode,
             ),
-            &resolved_passwords,
+            &validated.composed.expanded.roles,
         );
+        let resolved_passwords = resolve_passwords(&validated.composed.expanded)
+            .context("failed to resolve role passwords")?;
+        let changes = inject_password_changes(changes, &resolved_passwords);
         validate_changes_against_managed_surface(
             &changes,
             &validated.composed.managed_change_surface,
@@ -482,10 +788,8 @@ async fn cmd_diff(
     let pool = connect_db(database_url).await?;
     let current = inspect_current_for_plan(&pool, &validated).await?;
 
-    let resolved_passwords =
-        resolve_passwords(&validated.expanded).context("failed to resolve role passwords")?;
     info!(%mode, "reconciliation mode");
-    let changes = inject_password_changes(
+    let changes = filter_external_role_changes(
         filter_changes(
             apply_role_retirements(
                 compute_plan(&current, &validated.desired),
@@ -493,8 +797,11 @@ async fn cmd_diff(
             ),
             mode,
         ),
-        &resolved_passwords,
+        &validated.expanded.roles,
     );
+    let resolved_passwords =
+        resolve_passwords(&validated.expanded).context("failed to resolve role passwords")?;
+    let changes = inject_password_changes(changes, &resolved_passwords);
     let drop_safety = inspect_drop_safety(&pool, &changes, &validated.manifest.retirements).await?;
     let summary = PlanSummary::from_changes(&changes);
 
@@ -552,10 +859,8 @@ async fn cmd_apply(
 
         let current = inspect_current_for_plan_with_config(&pool, &inspect_config).await?;
 
-        let resolved_passwords = resolve_passwords(&validated.composed.expanded)
-            .context("failed to resolve role passwords")?;
         info!(%mode, "reconciliation mode");
-        let changes = inject_password_changes(
+        let changes = filter_external_role_changes(
             filter_changes(
                 apply_role_retirements(
                     compute_plan(&current, &validated.composed.desired),
@@ -563,8 +868,11 @@ async fn cmd_apply(
                 ),
                 mode,
             ),
-            &resolved_passwords,
+            &validated.composed.expanded.roles,
         );
+        let resolved_passwords = resolve_passwords(&validated.composed.expanded)
+            .context("failed to resolve role passwords")?;
+        let changes = inject_password_changes(changes, &resolved_passwords);
         validate_changes_against_managed_surface(
             &changes,
             &validated.composed.managed_change_surface,
@@ -638,10 +946,8 @@ async fn cmd_apply(
 
     let current = inspect_current_for_plan(&pool, &validated).await?;
 
-    let resolved_passwords =
-        resolve_passwords(&validated.expanded).context("failed to resolve role passwords")?;
     info!(%mode, "reconciliation mode");
-    let changes = inject_password_changes(
+    let changes = filter_external_role_changes(
         filter_changes(
             apply_role_retirements(
                 compute_plan(&current, &validated.desired),
@@ -649,8 +955,11 @@ async fn cmd_apply(
             ),
             mode,
         ),
-        &resolved_passwords,
+        &validated.expanded.roles,
     );
+    let resolved_passwords =
+        resolve_passwords(&validated.expanded).context("failed to resolve role passwords")?;
+    let changes = inject_password_changes(changes, &resolved_passwords);
 
     // Validate changes against privilege level.
     let priv_warnings =
@@ -1319,6 +1628,55 @@ mod tests {
         fn kind(&self) -> ErrorKind {
             ErrorKind::Other
         }
+    }
+
+    #[test]
+    fn parse_reconcile_target_defaults_to_postgres_policy() {
+        let target = parse_reconcile_target("accounts").expect("target should parse");
+
+        assert_eq!(target.kind, ReconcileTargetKind::PostgresPolicy);
+        assert_eq!(target.name, "accounts");
+    }
+
+    #[test]
+    fn parse_reconcile_target_accepts_postgres_policy_kind() {
+        let target =
+            parse_reconcile_target("postgrespolicy/accounts").expect("target should parse");
+
+        assert_eq!(target.kind, ReconcileTargetKind::PostgresPolicy);
+        assert_eq!(target.name, "accounts");
+    }
+
+    #[test]
+    fn parse_reconcile_target_rejects_unsupported_kind() {
+        let error =
+            parse_reconcile_target("secret/accounts").expect_err("unsupported kind should fail");
+
+        assert!(
+            error
+                .to_string()
+                .contains("unsupported reconcile resource kind")
+        );
+    }
+
+    #[test]
+    fn parse_cli_duration_accepts_compound_duration() {
+        assert_eq!(
+            parse_cli_duration("1m30s").expect("duration should parse"),
+            Duration::from_secs(90)
+        );
+    }
+
+    #[test]
+    fn handled_reconcile_at_least_compares_rfc3339_timestamps() {
+        assert!(
+            handled_reconcile_at_least("2026-05-15T00:00:01Z", "2026-05-15T00:00:00Z")
+                .expect("timestamps should parse")
+        );
+        assert!(
+            !handled_reconcile_at_least("2026-05-14T23:59:59Z", "2026-05-15T00:00:00Z")
+                .expect("timestamps should parse")
+        );
     }
 
     fn sample_visual_graph() -> pgroles_core::visual::VisualGraph {

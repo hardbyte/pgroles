@@ -1,0 +1,27 @@
+policy:
+  name: shipping-bootstrap
+
+scope:
+  roles:
+    - shipping_migrator
+  schemas:
+    - name: shipping
+      facets: [owner, bindings]
+
+roles:
+  - name: shipping_migrator
+    login: true
+    password: { from_env: SHIPPING_MIGRATOR_PASSWORD }
+    comment: "Runs shipping service migrations and owns shipping objects"
+
+schemas:
+  - name: shipping
+    owner: shipping_migrator
+
+grants:
+  - role: shipping_migrator
+    privileges: [CONNECT]
+    object: { type: database, name: pgroles_test }
+  - role: shipping_migrator
+    privileges: [USAGE, CREATE]
+    object: { type: schema, name: shipping }

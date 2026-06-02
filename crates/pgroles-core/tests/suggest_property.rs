@@ -166,6 +166,7 @@ fn random_manifest(rng: &mut Rng) -> PolicyManifest {
             }
             roles.push(RoleDefinition {
                 name: role_name.clone(),
+                external: false,
                 login: if kind.login { Some(true) } else { None },
                 superuser: None,
                 createdb: None,

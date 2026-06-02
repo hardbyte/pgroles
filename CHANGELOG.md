@@ -5,6 +5,35 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **Externally managed roles can now be marked `external: true`.** External roles may still be referenced in grants, schema ownership, default privileges, and as members of managed roles, but pgroles will not create, alter, drop, password-manage, or manage memberships granted from those roles. This avoids breaking Cloud SQL IAM users and groups whose `LOGIN` attribute and provider memberships are owned outside pgroles. (#123)
+- **`pgroles render-bundle` composes a policy bundle into a single flat manifest.** Validates and composes the bundle (rejecting scope/ownership conflicts up front), then emits the resulting `PolicyManifest` as YAML with a provenance header recording the source bundle basename, the manifest schema version (`pgroles.manifest.v1`), and the fragments it composed. The output round-trips through `pgroles validate -f` / `diff -f` / `apply -f`, so a bundle can be composed in CI and the rendered manifest wrapped into a `PostgresPolicy` resource in a GitOps repo. Pre-rendering keeps cross-team and cross-environment fragment composition available to operator users without adding operator-side CRDs. The renderer is byte-deterministic across machines: the header records only the bundle file's basename (never an absolute or `pwd`-relative path), and the YAML body is post-processed to strip serde-emitted optional defaults (empty optional sequences, `null` scalars, and the default `role_pattern`) so the file doesn't churn under unrelated upgrades. Required fields like `Membership.members`, `Grant.privileges`, and `DefaultPrivilege.grant`, plus named empty profiles, are preserved even when empty so the rendered manifest always re-parses. `--check <path>` compares against an existing rendered file and exits with code 2 on drift, suitable as a CI gate that catches stale checked-in renders. The new [bundle composition guide](https://hardbyte.github.io/pgroles/docs/bundle-composition/) documents when to use each of the three workflows (single manifest, CLI bundle for direct apply, rendered bundle for the operator). Use `--no-header` to omit the header and `--output <path>` to write to a file. (#92)
+
+## [0.7.7] - 2026-05-18
+
+### Added
+
+- **The operator can now `SET ROLE` to a privileged parent role on every pooled connection.** Set `connection.params.setRole: <role>` on a `PostgresPolicy` and the operator's sqlx pool runs `SET ROLE "<role>"` once via `after_connect`, so the session's `current_user` becomes that role and its attributes (`CREATEROLE`, `CREATEDB`, …) apply to every subsequent statement. This unblocks the "operator authenticates as a low-privilege identity (e.g. Cloud SQL IAM user via Workload Identity) that has been granted membership in `cloudsqlsuperuser`" pattern, where PostgreSQL's role membership semantics otherwise refuse role-attribute inheritance. The role identifier is validated at admission time against `^[A-Za-z_][A-Za-z0-9_$-]*$` via the CRD's OpenAPI `pattern`, and `SET ROLE` failures surface as a distinct `SetRoleFailed` status reason instead of being conflated with database connection failures. (#119, #120)
+
+## [0.7.6] - 2026-05-14
+
+### Fixed
+
+- **Wildcard `GRANT EXECUTE` no longer flaps on schemas that contain procedures.** PostgreSQL's `GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA ...` does not cover procedures, but the inspector includes procedures in routine inventory. Function wildcard grants now render as `ALL ROUTINES`, and specific function/procedure grant and revoke targets render as `ROUTINE`, so manifests using `object.type: function` remain backward-compatible while converging on schemas with extension-installed procedures. (#113, #114)
+
+## [0.7.5] - 2026-05-14
+
+### Added
+
+- **The operator can now authenticate to Cloud SQL with native GKE Workload Identity.** Structured connection params accept `auth.type: gcp_workload_identity`, fetch short-lived Cloud SQL IAM login tokens from the GKE metadata server, optionally impersonate a target Google service account through IAMCredentials, and refresh cached pools before token expiry. Static `password` / `passwordSecret` fields are mutually exclusive with provider-backed auth, and `sslMode` defaults to `require` for this mode. (#114, #115)
+
+### Changed
+
+- **Operator and manifest documentation are easier to validate and navigate.** The docs now include a dedicated manifest reference, a tooling guide with schema-validation examples, and Cloud SQL examples that cover native Workload Identity auth as well as proxy-based connectivity. (#111, #115)
+
 ## [0.7.4] - 2026-05-12
 
 ### Fixed

@@ -15,7 +15,9 @@ use kube::{Api, Client, Resource, ResourceExt};
 use tracing::info;
 
 use pgroles_operator::context::OperatorContext;
-use pgroles_operator::crd::{LABEL_POLICY, PostgresPolicy, PostgresPolicyPlan};
+use pgroles_operator::crd::{
+    LABEL_POLICY, PostgresPolicy, PostgresPolicyPlan, REQUESTED_RECONCILE_ANNOTATION,
+};
 use pgroles_operator::observability::{OperatorObservability, serve_health};
 use pgroles_operator::reconciler::{error_policy, reconcile};
 
@@ -49,6 +51,12 @@ fn policy_trigger_hash(policy: &PostgresPolicy) -> Option<u64> {
         .map(|timestamp| timestamp.0.to_string())
         .hash(&mut hasher);
     policy.meta().finalizers.hash(&mut hasher);
+    policy
+        .meta()
+        .annotations
+        .as_ref()
+        .and_then(|annotations| annotations.get(REQUESTED_RECONCILE_ANNOTATION))
+        .hash(&mut hasher);
     Some(hasher.finish())
 }
 
@@ -208,8 +216,9 @@ mod tests {
     use super::policy_trigger_hash;
     use pgroles_operator::crd::{
         ConnectionSpec, CrdReconciliationMode, PolicyMode, PostgresPolicy, PostgresPolicySpec,
-        SecretReference,
+        REQUESTED_RECONCILE_ANNOTATION, SecretReference,
     };
+    use std::collections::BTreeMap;
 
     fn test_policy() -> PostgresPolicy {
         let spec = PostgresPolicySpec {
@@ -260,5 +269,33 @@ mod tests {
         changed.metadata.finalizers = Some(vec!["pgroles.io/finalizer".to_string()]);
 
         assert_ne!(original, policy_trigger_hash(&changed));
+    }
+
+    #[test]
+    fn policy_trigger_hash_changes_when_requested_reconcile_annotation_changes() {
+        let policy = test_policy();
+        let original = policy_trigger_hash(&policy);
+
+        let mut changed = policy.clone();
+        changed.metadata.annotations = Some(BTreeMap::from([(
+            REQUESTED_RECONCILE_ANNOTATION.to_string(),
+            "2026-05-15T00:00:00Z".to_string(),
+        )]));
+
+        assert_ne!(original, policy_trigger_hash(&changed));
+    }
+
+    #[test]
+    fn policy_trigger_hash_ignores_unrelated_annotation_changes() {
+        let policy = test_policy();
+        let original = policy_trigger_hash(&policy);
+
+        let mut changed = policy.clone();
+        changed.metadata.annotations = Some(BTreeMap::from([(
+            "argocd.argoproj.io/tracking-id".to_string(),
+            "pgroles/default:pgroles.io/PostgresPolicy/example".to_string(),
+        )]));
+
+        assert_eq!(original, policy_trigger_hash(&changed));
     }
 }

@@ -6,6 +6,11 @@ on:
     paths:
       - "docs/**"
       - ".github/workflows/docs-pages.yml"
+  pull_request:
+    branches: [main]
+    paths:
+      - "docs/**"
+      - ".github/workflows/docs-pages.yml"
   workflow_dispatch:
 
 permissions:
@@ -55,6 +60,7 @@ jobs:
 
   deploy:
     name: Deploy docs
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     environment:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}

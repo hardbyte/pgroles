@@ -290,6 +290,7 @@ fn noteworthy_failure_reason(
         "InvalidSpec" => "InvalidSpec",
         "SecretMissing" | "SecretFetchFailed" => "SecretFetchFailed",
         "DatabaseConnectionFailed" => "DatabaseConnectionFailed",
+        "GcpAuthFailed" => "GcpAuthFailed",
         "InsufficientPrivileges" => "InsufficientPrivileges",
         "UnsafeRoleDrops" => "UnsafeRoleDropsBlocked",
         _ => return None,
@@ -428,6 +429,24 @@ mod tests {
 
         let events = derive_status_events(Some(&old_status), &new_status);
         assert_eq!(reasons(&events), vec!["InsufficientPrivileges"]);
+    }
+
+    #[test]
+    fn emits_gcp_auth_failed_on_failure_transition() {
+        let mut old_status = PostgresPolicyStatus::default();
+        old_status.set_condition(ready_condition(true, "Reconciled", "All changes applied"));
+
+        let mut new_status = PostgresPolicyStatus::default();
+        new_status.set_condition(ready_condition(
+            false,
+            "GcpAuthFailed",
+            "token request rejected",
+        ));
+
+        let events = derive_status_events(Some(&old_status), &new_status);
+        assert_eq!(reasons(&events), vec!["GcpAuthFailed"]);
+        assert!(matches!(events[0].type_, EventType::Warning));
+        assert_eq!(events[0].note.as_deref(), Some("token request rejected"));
     }
 
     #[test]

@@ -175,6 +175,9 @@ pub const PLAN_APPROVED_ANNOTATION: &str = "pgroles.io/approved";
 /// Annotation key used to reject a `PostgresPolicyPlan`.
 pub const PLAN_REJECTED_ANNOTATION: &str = "pgroles.io/rejected";
 
+/// Annotation key used to request an immediate `PostgresPolicy` reconcile.
+pub const REQUESTED_RECONCILE_ANNOTATION: &str = "reconcile.pgroles.io/requestedAt";
+
 /// Label key for the parent policy name on plan resources.
 pub const LABEL_POLICY: &str = "pgroles.io/policy";
 
@@ -217,6 +220,9 @@ impl From<CrdReconciliationMode> for pgroles_core::diff::ReconciliationMode {
 ///     usernameSecret: { name: zalando-creds, key: username }
 ///     passwordSecret: { name: zalando-creds, key: password }
 /// ```
+///
+/// Params mode can also use provider-backed authentication instead of a static
+/// password, for example GKE Workload Identity to Cloud SQL IAM.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct ConnectionSpec {
@@ -310,6 +316,11 @@ impl ConnectionSpec {
         if let Some(ref params) = self.params {
             let user_part = field_identity_repr(&params.username, &params.username_secret);
             let pass_part = field_identity_repr(&params.password, &params.password_secret);
+            let auth_part = params
+                .auth
+                .as_ref()
+                .map(ConnectionAuth::cache_key)
+                .unwrap_or_default();
             let ssl_part = params
                 .ssl_mode
                 .as_ref()
@@ -321,8 +332,9 @@ impl ConnectionSpec {
                         .map(|s| format!("secret={}\0{}", s.name, s.key))
                 })
                 .unwrap_or_default();
+            let role_part = params.set_role.as_deref().unwrap_or("");
             format!(
-                "{namespace}/{}\0user={user_part}\0pass={pass_part}\0ssl={ssl_part}",
+                "{namespace}/{}\0user={user_part}\0pass={pass_part}\0auth={auth_part}\0ssl={ssl_part}\0role={role_part}",
                 self.identity_key()
             )
         } else {
@@ -344,6 +356,10 @@ fn field_identity_repr(literal: &Option<String>, secret: &Option<SecretKeySelect
         String::new()
     }
 }
+
+/// Default OAuth scope used for Cloud SQL IAM database login tokens.
+pub const DEFAULT_GCP_CLOUD_SQL_LOGIN_SCOPE: &str =
+    "https://www.googleapis.com/auth/sqlservice.login";
 
 /// Structured connection parameters for building a PostgreSQL connection URL.
 ///
@@ -403,12 +419,88 @@ pub struct ConnectionParams {
     #[serde(default)]
     pub password_secret: Option<SecretKeySelector>,
 
+    /// Provider-backed authentication for connections that use short-lived
+    /// credentials instead of a static PostgreSQL password.
+    #[serde(default)]
+    pub auth: Option<ConnectionAuth>,
+
     /// SSL mode as a literal value.
     #[serde(default)]
     pub ssl_mode: Option<String>,
     /// SSL mode from a Secret key.
     #[serde(default)]
     pub ssl_mode_secret: Option<SecretKeySelector>,
+
+    /// Run `SET ROLE "<value>"` once on every pooled connection. Useful when
+    /// the operator authenticates as a low-privilege identity (e.g. a Cloud
+    /// SQL IAM user) that has been granted membership in a privileged role
+    /// like `cloudsqlsuperuser` — PostgreSQL does not inherit role
+    /// *attributes* (`CREATEROLE`, `CREATEDB`, …) through `GRANT … TO …`, so
+    /// `SET ROLE` is required for the connection to act with the parent
+    /// role's attributes.
+    ///
+    /// Must be a simple PostgreSQL identifier matching
+    /// `^[A-Za-z_][A-Za-z0-9_$-]*$`. The pattern intentionally excludes `@`
+    /// and `.` — `setRole` is for switching to a privileged *group* role
+    /// (e.g. `cloudsqlsuperuser`), not an IAM-style principal like
+    /// `pgroles-operator@project.iam`, which has no extra attributes to
+    /// inherit via `SET ROLE`.
+    #[serde(default)]
+    #[schemars(regex(pattern = SET_ROLE_PATTERN))]
+    pub set_role: Option<String>,
+}
+
+/// Provider-backed authentication for `connection.params`.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(tag = "type")]
+pub enum ConnectionAuth {
+    /// Fetch a Cloud SQL IAM database login token using the GKE metadata
+    /// server. `username` must be the Cloud SQL PostgreSQL IAM role name
+    /// (for service accounts, the email without `.gserviceaccount.com`).
+    #[serde(rename = "gcp_workload_identity", rename_all = "camelCase")]
+    GcpWorkloadIdentity {
+        /// Target Google service account to impersonate before requesting the
+        /// Cloud SQL login token. Omit to use the pod's bound identity.
+        #[serde(default)]
+        impersonate_service_account: Option<String>,
+        /// OAuth scope requested for the access token.
+        #[serde(default)]
+        scope: Option<String>,
+    },
+}
+
+impl ConnectionAuth {
+    pub fn gcp_scope(&self) -> &str {
+        match self {
+            Self::GcpWorkloadIdentity { scope, .. } => scope
+                .as_deref()
+                .unwrap_or(DEFAULT_GCP_CLOUD_SQL_LOGIN_SCOPE),
+        }
+    }
+
+    pub fn gcp_impersonate_service_account(&self) -> Option<&str> {
+        match self {
+            Self::GcpWorkloadIdentity {
+                impersonate_service_account,
+                ..
+            } => impersonate_service_account.as_deref(),
+        }
+    }
+
+    fn cache_key(&self) -> String {
+        match self {
+            Self::GcpWorkloadIdentity {
+                impersonate_service_account,
+                scope,
+            } => format!(
+                "gcp_workload_identity\0impersonate={}\0scope={}",
+                impersonate_service_account.as_deref().unwrap_or_default(),
+                scope
+                    .as_deref()
+                    .unwrap_or(DEFAULT_GCP_CLOUD_SQL_LOGIN_SCOPE)
+            ),
+        }
+    }
 }
 
 /// Reference to a specific key within a Kubernetes Secret.
@@ -475,6 +567,11 @@ pub struct DefaultPrivilegeGrantSpec {
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct RoleSpec {
     pub name: String,
+    /// Treat this role as externally managed. The operator may reference it in
+    /// grants, ownership, and memberships, but will not create, alter, drop,
+    /// password-manage, or manage memberships granted from this role.
+    #[serde(default)]
+    pub external: bool,
     #[serde(default)]
     pub login: Option<bool>,
     #[serde(default)]
@@ -618,6 +715,48 @@ pub enum ConnectionValidationError {
         "connection.params: only one of {field} or {field}Secret may be set, but both were provided"
     )]
     BothFieldsSet { field: String },
+
+    #[error("connection.params.auth: {field} must not be empty or whitespace-only")]
+    EmptyAuthField { field: String },
+
+    #[error("connection.params: password/passwordSecret are mutually exclusive with auth")]
+    AuthWithPassword,
+
+    #[error(
+        "connection.params.setRole: \"{value}\" is not a valid PostgreSQL role identifier (must match {pattern})",
+        pattern = SET_ROLE_PATTERN,
+    )]
+    InvalidRoleName { value: String },
+}
+
+/// Regex pattern restricting `connection.params.setRole` values.
+///
+/// Single source of truth: used by the `#[schemars(...)]` attribute on the
+/// field (emitted into the CRD's OpenAPI schema), referenced by the
+/// `InvalidRoleName` error message, and pinned by `is_valid_set_role_identifier`
+/// via unit tests.
+///
+/// Intentionally rejects `@` and `.`, so IAM-email-style identifiers
+/// (e.g. `pgroles-operator@project.iam`) cannot be a `setRole` target.
+/// `SET ROLE` is meant for switching to a privileged *group* role like
+/// `cloudsqlsuperuser`; IAM principals don't carry role attributes worth
+/// switching to.
+pub(crate) const SET_ROLE_PATTERN: &str = "^[A-Za-z_][A-Za-z0-9_$-]*$";
+
+/// Returns true if `s` is a simple PostgreSQL role identifier matching
+/// [`SET_ROLE_PATTERN`].
+///
+/// `SET ROLE` does not accept bind parameters, so any value reaching the
+/// connection-pool hook is interpolated into the SQL string. Restricting
+/// identifiers at admission time is defence in depth on top of the
+/// double-quoting in the `after_connect` callback.
+pub(crate) fn is_valid_set_role_identifier(s: &str) -> bool {
+    let mut bytes = s.bytes();
+    match bytes.next() {
+        Some(b) if b.is_ascii_alphabetic() || b == b'_' => {}
+        _ => return false,
+    }
+    bytes.all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'$' || b == b'-')
 }
 
 /// Validate a Kubernetes Secret name per RFC 1123 DNS subdomain rules:
@@ -673,6 +812,10 @@ pub struct PostgresPolicyStatus {
     /// Deprecated alias retained for compatibility with older status readers.
     #[serde(default)]
     pub last_reconcile_time: Option<String>,
+
+    /// Last force-reconcile annotation value handled by the operator.
+    #[serde(default, rename = "lastHandledReconcileAt")]
+    pub last_handled_reconcile_at: Option<String>,
 
     /// Summary of changes applied in the last reconciliation.
     #[serde(default)]
@@ -1152,11 +1295,39 @@ impl PostgresPolicySpec {
                     Ok(())
                 }
 
-                // Required fields: host, dbname, username, password.
+                // Required fields: host, dbname, username. Password is only
+                // required for static-password auth.
                 validate_required_field("host", &params.host, &params.host_secret)?;
                 validate_required_field("dbname", &params.dbname, &params.dbname_secret)?;
                 validate_required_field("username", &params.username, &params.username_secret)?;
-                validate_required_field("password", &params.password, &params.password_secret)?;
+                if let Some(auth) = &params.auth {
+                    if params.password.is_some() || params.password_secret.is_some() {
+                        return Err(ConnectionValidationError::AuthWithPassword);
+                    }
+                    match auth {
+                        ConnectionAuth::GcpWorkloadIdentity {
+                            impersonate_service_account,
+                            scope,
+                        } => {
+                            if let Some(value) = impersonate_service_account
+                                && value.trim().is_empty()
+                            {
+                                return Err(ConnectionValidationError::EmptyAuthField {
+                                    field: "impersonateServiceAccount".to_string(),
+                                });
+                            }
+                            if let Some(value) = scope
+                                && value.trim().is_empty()
+                            {
+                                return Err(ConnectionValidationError::EmptyAuthField {
+                                    field: "scope".to_string(),
+                                });
+                            }
+                        }
+                    }
+                } else {
+                    validate_required_field("password", &params.password, &params.password_secret)?;
+                }
 
                 // Optional fields: port, sslMode.
                 // Port is u16 so we wrap it for the generic check.
@@ -1172,6 +1343,21 @@ impl PostgresPolicySpec {
                     return Err(ConnectionValidationError::InvalidSslMode {
                         value: value.clone(),
                     });
+                }
+
+                // Validate setRole identifier. `SET ROLE` does not accept bind
+                // params, so the identifier is restricted at admission time.
+                if let Some(value) = &params.set_role {
+                    if value.trim().is_empty() {
+                        return Err(ConnectionValidationError::EmptyLiteral {
+                            field: "setRole".to_string(),
+                        });
+                    }
+                    if !is_valid_set_role_identifier(value) {
+                        return Err(ConnectionValidationError::InvalidRoleName {
+                            value: value.clone(),
+                        });
+                    }
                 }
 
                 Ok(())
@@ -1255,6 +1441,7 @@ impl PostgresPolicySpec {
             .iter()
             .map(|r| RoleDefinition {
                 name: r.name.clone(),
+                external: r.external,
                 login: r.login,
                 superuser: r.superuser,
                 createdb: r.createdb,
@@ -1534,6 +1721,7 @@ mod tests {
             schemas: vec![],
             roles: vec![RoleSpec {
                 name: "analytics".to_string(),
+                external: true,
                 login: Some(true),
                 superuser: None,
                 createdb: None,
@@ -1562,6 +1750,7 @@ mod tests {
         assert_eq!(manifest.default_owner, Some("app_owner".to_string()));
         assert_eq!(manifest.roles.len(), 1);
         assert_eq!(manifest.roles[0].name, "analytics");
+        assert!(manifest.roles[0].external);
         assert_eq!(manifest.roles[0].login, Some(true));
         assert_eq!(manifest.roles[0].comment, Some("test role".to_string()));
         assert_eq!(manifest.retirements.len(), 1);
@@ -1679,6 +1868,7 @@ mod tests {
             }],
             roles: vec![RoleSpec {
                 name: "app-service".to_string(),
+                external: false,
                 login: Some(true),
                 superuser: None,
                 createdb: None,
@@ -1758,8 +1948,10 @@ mod tests {
                 username_secret: None,
                 password: Some("pass-a".into()),
                 password_secret: None,
+                auth: None,
                 ssl_mode: None,
                 ssl_mode_secret: None,
+                set_role: None,
             }),
         };
         let user_b = ConnectionSpec {
@@ -1776,8 +1968,10 @@ mod tests {
                 username_secret: None,
                 password: Some("pass-b".into()),
                 password_secret: None,
+                auth: None,
                 ssl_mode: None,
                 ssl_mode_secret: None,
+                set_role: None,
             }),
         };
 
@@ -1812,8 +2006,10 @@ mod tests {
                 username_secret: None,
                 password: Some("pass".into()),
                 password_secret: None,
+                auth: None,
                 ssl_mode: None,
                 ssl_mode_secret: None,
+                set_role: None,
             }),
         };
         let secret_conn = ConnectionSpec {
@@ -1833,8 +2029,10 @@ mod tests {
                 }),
                 password: Some("pass".into()),
                 password_secret: None,
+                auth: None,
                 ssl_mode: None,
                 ssl_mode_secret: None,
+                set_role: None,
             }),
         };
 
@@ -1861,8 +2059,10 @@ mod tests {
                 username_secret: None,
                 password: Some("pass".into()),
                 password_secret: None,
+                auth: None,
                 ssl_mode: None,
                 ssl_mode_secret: None,
+                set_role: None,
             }),
         };
         let conn_with_ssl = ConnectionSpec {
@@ -1879,8 +2079,10 @@ mod tests {
                 username_secret: None,
                 password: Some("pass".into()),
                 password_secret: None,
+                auth: None,
                 ssl_mode: Some("require".into()),
                 ssl_mode_secret: None,
+                set_role: None,
             }),
         };
 
@@ -1907,8 +2109,10 @@ mod tests {
                 username_secret: None,
                 password: Some("pass".into()),
                 password_secret: None,
+                auth: None,
                 ssl_mode: None,
                 ssl_mode_secret: None,
+                set_role: None,
             }),
         });
 
@@ -1935,8 +2139,10 @@ mod tests {
                 username_secret: None,
                 password: Some("pass".into()),
                 password_secret: None,
+                auth: None,
                 ssl_mode: None,
                 ssl_mode_secret: None,
+                set_role: None,
             }),
         });
 
@@ -1998,8 +2204,10 @@ mod tests {
                     name: "pg-creds".into(),
                     key: "password".into(),
                 }),
+                auth: None,
                 ssl_mode: None,
                 ssl_mode_secret: None,
+                set_role: None,
             }),
         }
     }
@@ -2036,8 +2244,10 @@ mod tests {
                 username_secret: None,
                 password: Some("pass".into()),
                 password_secret: None,
+                auth: None,
                 ssl_mode: None,
                 ssl_mode_secret: None,
+                set_role: None,
             }),
         });
         assert!(matches!(
@@ -2072,11 +2282,206 @@ mod tests {
                 username_secret: None,
                 password: Some("pass".into()),
                 password_secret: None,
+                auth: None,
                 ssl_mode: Some("invalid-mode".into()),
                 ssl_mode_secret: None,
+                set_role: None,
             }),
         });
         assert!(spec.validate_connection_spec().is_err());
+    }
+
+    fn params_with_set_role(set_role: Option<String>) -> ConnectionParams {
+        ConnectionParams {
+            host: Some("host".into()),
+            host_secret: None,
+            port: None,
+            port_secret: None,
+            dbname: Some("db".into()),
+            dbname_secret: None,
+            username: Some("user".into()),
+            username_secret: None,
+            password: Some("pass".into()),
+            password_secret: None,
+            auth: None,
+            ssl_mode: None,
+            ssl_mode_secret: None,
+            set_role,
+        }
+    }
+
+    #[test]
+    fn validate_connection_accepts_valid_set_role() {
+        for role in [
+            "cloudsqlsuperuser",
+            "_underscore_start",
+            "role-with-dash",
+            "role_with$dollar",
+            "Mixed_Case_Role",
+            "r2d2",
+        ] {
+            let spec = spec_with_connection(ConnectionSpec {
+                secret_ref: None,
+                secret_key: None,
+                params: Some(params_with_set_role(Some(role.into()))),
+            });
+            assert!(
+                spec.validate_connection_spec().is_ok(),
+                "expected {role} to be accepted"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_connection_rejects_invalid_set_role() {
+        for role in [
+            "1leading_digit",
+            "has space",
+            "has\"quote",
+            "has;semicolon",
+            "has'singlequote",
+            "ünicode",
+        ] {
+            let spec = spec_with_connection(ConnectionSpec {
+                secret_ref: None,
+                secret_key: None,
+                params: Some(params_with_set_role(Some(role.into()))),
+            });
+            let err = spec
+                .validate_connection_spec()
+                .expect_err(&format!("expected {role} to be rejected"));
+            assert!(
+                matches!(err, ConnectionValidationError::InvalidRoleName { ref value } if value == role),
+                "unexpected error for {role}: {err:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn validate_connection_rejects_empty_set_role() {
+        let spec = spec_with_connection(ConnectionSpec {
+            secret_ref: None,
+            secret_key: None,
+            params: Some(params_with_set_role(Some("   ".into()))),
+        });
+        assert!(matches!(
+            spec.validate_connection_spec(),
+            Err(ConnectionValidationError::EmptyLiteral { ref field }) if field == "setRole"
+        ));
+    }
+
+    #[test]
+    fn cache_key_includes_set_role() {
+        let conn_no_role = ConnectionSpec {
+            secret_ref: None,
+            secret_key: None,
+            params: Some(params_with_set_role(None)),
+        };
+        let conn_with_role = ConnectionSpec {
+            secret_ref: None,
+            secret_key: None,
+            params: Some(params_with_set_role(Some("cloudsqlsuperuser".into()))),
+        };
+        assert_ne!(
+            conn_no_role.cache_key("ns"),
+            conn_with_role.cache_key("ns"),
+            "cache key should differ when setRole is present"
+        );
+    }
+
+    #[test]
+    fn validate_connection_accepts_gcp_workload_identity_without_password() {
+        let spec = spec_with_connection(ConnectionSpec {
+            secret_ref: None,
+            secret_key: None,
+            params: Some(ConnectionParams {
+                host: Some("10.0.0.5".into()),
+                host_secret: None,
+                port: None,
+                port_secret: None,
+                dbname: Some("discovery".into()),
+                dbname_secret: None,
+                username: Some("pgroles-operator@my-project.iam".into()),
+                username_secret: None,
+                password: None,
+                password_secret: None,
+                auth: Some(ConnectionAuth::GcpWorkloadIdentity {
+                    impersonate_service_account: None,
+                    scope: None,
+                }),
+                ssl_mode: None,
+                ssl_mode_secret: None,
+                set_role: None,
+            }),
+        });
+
+        assert!(spec.validate_connection_spec().is_ok());
+        assert!(spec.referenced_secret_names("policy").is_empty());
+    }
+
+    #[test]
+    fn validate_connection_rejects_gcp_workload_identity_with_password() {
+        let spec = spec_with_connection(ConnectionSpec {
+            secret_ref: None,
+            secret_key: None,
+            params: Some(ConnectionParams {
+                host: Some("10.0.0.5".into()),
+                host_secret: None,
+                port: None,
+                port_secret: None,
+                dbname: Some("discovery".into()),
+                dbname_secret: None,
+                username: Some("pgroles-operator@my-project.iam".into()),
+                username_secret: None,
+                password: Some("static-password".into()),
+                password_secret: None,
+                auth: Some(ConnectionAuth::GcpWorkloadIdentity {
+                    impersonate_service_account: None,
+                    scope: None,
+                }),
+                ssl_mode: None,
+                ssl_mode_secret: None,
+                set_role: None,
+            }),
+        });
+
+        assert!(matches!(
+            spec.validate_connection_spec(),
+            Err(ConnectionValidationError::AuthWithPassword)
+        ));
+    }
+
+    #[test]
+    fn validate_connection_rejects_empty_gcp_auth_fields() {
+        let spec = spec_with_connection(ConnectionSpec {
+            secret_ref: None,
+            secret_key: None,
+            params: Some(ConnectionParams {
+                host: Some("10.0.0.5".into()),
+                host_secret: None,
+                port: None,
+                port_secret: None,
+                dbname: Some("discovery".into()),
+                dbname_secret: None,
+                username: Some("pgroles-operator@my-project.iam".into()),
+                username_secret: None,
+                password: None,
+                password_secret: None,
+                auth: Some(ConnectionAuth::GcpWorkloadIdentity {
+                    impersonate_service_account: Some(" ".into()),
+                    scope: None,
+                }),
+                ssl_mode: None,
+                ssl_mode_secret: None,
+                set_role: None,
+            }),
+        });
+
+        assert!(matches!(
+            spec.validate_connection_spec(),
+            Err(ConnectionValidationError::EmptyAuthField { ref field })
+                if field == "impersonateServiceAccount"
+        ));
     }
 
     #[test]
@@ -2103,8 +2508,10 @@ mod tests {
                     username_secret: None,
                     password: Some("pass".into()),
                     password_secret: None,
+                    auth: None,
                     ssl_mode: Some((*mode).into()),
                     ssl_mode_secret: None,
+                    set_role: None,
                 }),
             });
             assert!(
@@ -2133,8 +2540,10 @@ mod tests {
                 }),
                 password: Some("pass".into()),
                 password_secret: None,
+                auth: None,
                 ssl_mode: None,
                 ssl_mode_secret: None,
+                set_role: None,
             }),
         });
         assert!(spec.validate_connection_spec().is_err());
@@ -2159,8 +2568,10 @@ mod tests {
                 username_secret: None,
                 password: Some("pass".into()),
                 password_secret: None,
+                auth: None,
                 ssl_mode: None,
                 ssl_mode_secret: None,
+                set_role: None,
             }),
         });
         assert!(matches!(
@@ -2185,8 +2596,10 @@ mod tests {
                 username_secret: None,
                 password: Some("pass".into()),
                 password_secret: None,
+                auth: None,
                 ssl_mode: None,
                 ssl_mode_secret: None,
+                set_role: None,
             }),
         });
         assert!(matches!(
@@ -2247,6 +2660,35 @@ params:
     }
 
     #[test]
+    fn connection_spec_params_mode_deserializes_gcp_workload_identity_auth() {
+        let yaml = r#"
+params:
+  host: 10.0.0.5
+  port: 5432
+  dbname: discovery
+  username: pgroles-operator@my-project.iam
+  auth:
+    type: gcp_workload_identity
+    impersonateServiceAccount: target@other-project.iam.gserviceaccount.com
+    scope: https://example.com/custom-scope
+"#;
+        let conn: ConnectionSpec = serde_yaml::from_str(yaml).unwrap();
+        let params = conn.params.as_ref().unwrap();
+        let auth = params.auth.as_ref().expect("auth should deserialize");
+
+        assert!(params.password.is_none());
+        assert_eq!(auth.gcp_scope(), "https://example.com/custom-scope");
+        assert_eq!(
+            auth.gcp_impersonate_service_account(),
+            Some("target@other-project.iam.gserviceaccount.com")
+        );
+        assert!(conn.cache_key("prod").contains("gcp_workload_identity"));
+
+        let spec = spec_with_connection(conn);
+        assert!(spec.validate_connection_spec().is_ok());
+    }
+
+    #[test]
     fn connection_spec_params_mode_all_secrets() {
         // CNPG/PGO pattern — everything from one secret.
         let yaml = r#"
@@ -2294,6 +2736,7 @@ params:
         let mut spec = spec_with_connection(params_mode_connection());
         spec.roles = vec![RoleSpec {
             name: "app".into(),
+            external: false,
             login: Some(true),
             password: Some(PasswordSpec {
                 secret_ref: Some(SecretReference {
@@ -2857,6 +3300,7 @@ retirements:
             roles: vec![
                 RoleSpec {
                     name: "role-a".to_string(),
+                    external: false,
                     login: Some(true),
                     password: Some(PasswordSpec {
                         secret_ref: Some(SecretReference {
@@ -2877,6 +3321,7 @@ retirements:
                 },
                 RoleSpec {
                     name: "role-b".to_string(),
+                    external: false,
                     login: Some(true),
                     password: Some(PasswordSpec {
                         secret_ref: Some(SecretReference {
@@ -2897,6 +3342,7 @@ retirements:
                 },
                 RoleSpec {
                     name: "role-c".to_string(),
+                    external: false,
                     login: None,
                     password: None,
                     password_valid_until: None,
@@ -2952,6 +3398,7 @@ retirements:
             schemas: vec![],
             roles: vec![RoleSpec {
                 name: "app-user".to_string(),
+                external: false,
                 login: Some(false),
                 superuser: None,
                 createdb: None,
@@ -3002,6 +3449,7 @@ retirements:
             schemas: vec![],
             roles: vec![RoleSpec {
                 name: "app-user".to_string(),
+                external: false,
                 login: None, // omitted, not explicitly false
                 superuser: None,
                 createdb: None,
@@ -3052,6 +3500,7 @@ retirements:
             schemas: vec![],
             roles: vec![RoleSpec {
                 name: "app-user".to_string(),
+                external: false,
                 login: Some(true),
                 superuser: None,
                 createdb: None,
@@ -3106,6 +3555,7 @@ retirements:
             schemas: vec![],
             roles: vec![RoleSpec {
                 name: "app-user".to_string(),
+                external: false,
                 login: Some(true),
                 superuser: None,
                 createdb: None,
@@ -3158,6 +3608,7 @@ retirements:
             schemas: vec![],
             roles: vec![RoleSpec {
                 name: "app-user".to_string(),
+                external: false,
                 login: Some(true),
                 superuser: None,
                 createdb: None,
@@ -3211,6 +3662,7 @@ retirements:
             schemas: vec![],
             roles: vec![RoleSpec {
                 name: "app-user".to_string(),
+                external: false,
                 login: Some(true),
                 superuser: None,
                 createdb: None,
@@ -3263,6 +3715,7 @@ retirements:
             schemas: vec![],
             roles: vec![RoleSpec {
                 name: "app-user".to_string(),
+                external: false,
                 login: Some(true),
                 superuser: None,
                 createdb: None,

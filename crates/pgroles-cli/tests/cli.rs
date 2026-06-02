@@ -303,6 +303,314 @@ roles:
 }
 
 // =========================================================================
+// render-bundle subcommand
+// =========================================================================
+
+const RENDER_BUNDLE_YAML: &str = r#"
+shared:
+  profiles:
+    editor:
+      grants:
+        - privileges: [USAGE]
+          object: { type: schema }
+        - privileges: [SELECT, INSERT, UPDATE, DELETE]
+          object: { type: table, name: "*" }
+sources:
+  - file: platform.yaml
+  - file: app.yaml
+"#;
+
+const RENDER_BUNDLE_PLATFORM: &str = r#"
+policy:
+  name: platform
+scope:
+  roles: [app_owner]
+  schemas:
+    - name: inventory
+      facets: [owner]
+roles:
+  - name: app_owner
+    login: false
+schemas:
+  - name: inventory
+    owner: app_owner
+"#;
+
+const RENDER_BUNDLE_APP: &str = r#"
+policy:
+  name: app
+scope:
+  schemas:
+    - name: inventory
+      facets: [bindings]
+schemas:
+  - name: inventory
+    profiles: [editor]
+"#;
+
+#[test]
+fn render_bundle_emits_composed_manifest_with_header() {
+    let (bundle_dir, bundle_path) = write_temp_bundle(
+        RENDER_BUNDLE_YAML,
+        &[
+            ("platform.yaml", RENDER_BUNDLE_PLATFORM),
+            ("app.yaml", RENDER_BUNDLE_APP),
+        ],
+    );
+    let _keep_dir = bundle_dir;
+
+    pgroles_cmd()
+        .args([
+            "render-bundle",
+            "--bundle",
+            bundle_path.to_str().expect("bundle path should be utf-8"),
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "# Rendered by `pgroles render-bundle`.",
+        ))
+        .stdout(predicate::str::contains(
+            "# Do not edit by hand — regenerate from the source bundle.",
+        ))
+        .stdout(predicate::str::contains("#   - platform.yaml (platform)"))
+        .stdout(predicate::str::contains("#   - app.yaml (app)"))
+        // Composed manifest content
+        .stdout(predicate::str::contains("app_owner"))
+        .stdout(predicate::str::contains("inventory"))
+        .stdout(predicate::str::contains("editor"));
+}
+
+#[test]
+fn render_bundle_output_round_trips_through_validate() {
+    let (bundle_dir, bundle_path) = write_temp_bundle(
+        RENDER_BUNDLE_YAML,
+        &[
+            ("platform.yaml", RENDER_BUNDLE_PLATFORM),
+            ("app.yaml", RENDER_BUNDLE_APP),
+        ],
+    );
+    let _keep_dir = bundle_dir;
+
+    let rendered_file = NamedTempFile::new().expect("failed to create temp output file");
+
+    pgroles_cmd()
+        .args([
+            "render-bundle",
+            "--bundle",
+            bundle_path.to_str().unwrap(),
+            "--output",
+            rendered_file.path().to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+
+    // The rendered manifest must validate as a regular flat manifest.
+    pgroles_cmd()
+        .args(["validate", "--file", rendered_file.path().to_str().unwrap()])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Manifest is valid."));
+}
+
+#[test]
+fn render_bundle_no_header_omits_comment_block() {
+    let (bundle_dir, bundle_path) = write_temp_bundle(
+        RENDER_BUNDLE_YAML,
+        &[
+            ("platform.yaml", RENDER_BUNDLE_PLATFORM),
+            ("app.yaml", RENDER_BUNDLE_APP),
+        ],
+    );
+    let _keep_dir = bundle_dir;
+
+    pgroles_cmd()
+        .args([
+            "render-bundle",
+            "--bundle",
+            bundle_path.to_str().unwrap(),
+            "--no-header",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("# Rendered by").not());
+}
+
+#[test]
+fn render_bundle_header_uses_only_basename_for_determinism() {
+    let (bundle_dir, bundle_path) = write_temp_bundle(
+        RENDER_BUNDLE_YAML,
+        &[
+            ("platform.yaml", RENDER_BUNDLE_PLATFORM),
+            ("app.yaml", RENDER_BUNDLE_APP),
+        ],
+    );
+    let _keep_dir = bundle_dir;
+
+    let stdout = pgroles_cmd()
+        .args(["render-bundle", "--bundle", bundle_path.to_str().unwrap()])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let rendered = String::from_utf8(stdout).expect("stdout not utf-8");
+
+    // The header MUST NOT contain the per-machine tempdir path; only the
+    // bundle file's basename. Otherwise the committed render would diff
+    // every time a developer runs the command from a different cwd.
+    let tempdir_path = bundle_path
+        .parent()
+        .expect("bundle has parent")
+        .display()
+        .to_string();
+    assert!(
+        !rendered.contains(&tempdir_path),
+        "rendered output leaked filesystem path {tempdir_path:?}: {rendered}"
+    );
+    assert!(rendered.contains("# Source bundle: bundle.yaml"));
+}
+
+#[test]
+fn render_bundle_output_strips_defaults() {
+    let (bundle_dir, bundle_path) = write_temp_bundle(
+        RENDER_BUNDLE_YAML,
+        &[
+            ("platform.yaml", RENDER_BUNDLE_PLATFORM),
+            ("app.yaml", RENDER_BUNDLE_APP),
+        ],
+    );
+    let _keep_dir = bundle_dir;
+
+    pgroles_cmd()
+        .args(["render-bundle", "--bundle", bundle_path.to_str().unwrap()])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("auth_providers:").not())
+        .stdout(predicate::str::contains("memberships: []").not())
+        .stdout(predicate::str::contains("retirements: []").not())
+        .stdout(predicate::str::contains("login: null").not())
+        .stdout(predicate::str::contains("role_pattern:").not());
+}
+
+#[test]
+fn render_bundle_check_succeeds_when_file_matches() {
+    let (bundle_dir, bundle_path) = write_temp_bundle(
+        RENDER_BUNDLE_YAML,
+        &[
+            ("platform.yaml", RENDER_BUNDLE_PLATFORM),
+            ("app.yaml", RENDER_BUNDLE_APP),
+        ],
+    );
+    let _keep_dir = bundle_dir;
+
+    let rendered_file = NamedTempFile::new().expect("failed to create temp output file");
+
+    // First, render to a file.
+    pgroles_cmd()
+        .args([
+            "render-bundle",
+            "--bundle",
+            bundle_path.to_str().unwrap(),
+            "--output",
+            rendered_file.path().to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+
+    // Then verify --check confirms it matches.
+    pgroles_cmd()
+        .args([
+            "render-bundle",
+            "--bundle",
+            bundle_path.to_str().unwrap(),
+            "--check",
+            rendered_file.path().to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+}
+
+#[test]
+fn render_bundle_check_exits_two_on_drift() {
+    let (bundle_dir, bundle_path) = write_temp_bundle(
+        RENDER_BUNDLE_YAML,
+        &[
+            ("platform.yaml", RENDER_BUNDLE_PLATFORM),
+            ("app.yaml", RENDER_BUNDLE_APP),
+        ],
+    );
+    let _keep_dir = bundle_dir;
+
+    let stale_file = write_temp_manifest("# intentionally stale\nroles: []\n");
+
+    pgroles_cmd()
+        .args([
+            "render-bundle",
+            "--bundle",
+            bundle_path.to_str().unwrap(),
+            "--check",
+            stale_file.path().to_str().unwrap(),
+        ])
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains("rendered bundle differs from"));
+}
+
+#[test]
+fn render_bundle_check_conflicts_with_output() {
+    let (bundle_dir, bundle_path) = write_temp_bundle(
+        RENDER_BUNDLE_YAML,
+        &[
+            ("platform.yaml", RENDER_BUNDLE_PLATFORM),
+            ("app.yaml", RENDER_BUNDLE_APP),
+        ],
+    );
+    let _keep_dir = bundle_dir;
+
+    pgroles_cmd()
+        .args([
+            "render-bundle",
+            "--bundle",
+            bundle_path.to_str().unwrap(),
+            "--output",
+            "/tmp/never.yaml",
+            "--check",
+            "/tmp/also-never.yaml",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("cannot be used with"));
+}
+
+#[test]
+fn render_bundle_fails_on_scope_conflict() {
+    let (bundle_dir, bundle_path) = write_temp_bundle(
+        r#"
+sources:
+  - file: app.yaml
+"#,
+        &[(
+            "app.yaml",
+            r#"
+roles:
+  - name: out_of_scope_role
+    login: true
+"#,
+        )],
+    );
+    let _keep_dir = bundle_dir;
+
+    // No scope declared, so the role is out of scope and validation should fail
+    // *before* anything is emitted.
+    pgroles_cmd()
+        .args(["render-bundle", "--bundle", bundle_path.to_str().unwrap()])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("outside its declared scope"));
+}
+
+// =========================================================================
 // graph subcommand
 // =========================================================================
 
@@ -712,7 +1020,8 @@ fn help_flag() {
         .stdout(predicate::str::contains("validate"))
         .stdout(predicate::str::contains("diff"))
         .stdout(predicate::str::contains("apply"))
-        .stdout(predicate::str::contains("inspect"));
+        .stdout(predicate::str::contains("inspect"))
+        .stdout(predicate::str::contains("reconcile"));
 }
 
 #[test]
@@ -763,6 +1072,29 @@ fn inspect_help() {
         .assert()
         .success()
         .stdout(predicate::str::contains("--database-url"));
+}
+
+#[test]
+fn reconcile_help() {
+    pgroles_cmd()
+        .args(["reconcile", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("PostgresPolicy"))
+        .stdout(predicate::str::contains("--namespace"))
+        .stdout(predicate::str::contains("--wait"))
+        .stdout(predicate::str::contains("--timeout"));
+}
+
+#[test]
+fn reconcile_rejects_unsupported_kind_before_kube_client_setup() {
+    pgroles_cmd()
+        .args(["reconcile", "secret/db"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "unsupported reconcile resource kind",
+        ));
 }
 
 #[test]
@@ -2955,7 +3287,7 @@ grants:
         ));
     }
 
-    /// Reproduces the partly-dev15 reconcile flap (May 2026): a manifest
+    /// Reproduces a production reconcile flap: a manifest
     /// with `function name: "*"` should converge in a single apply even when
     /// one of the functions in the schema has been DROPped+CREATEd between
     /// reconciles (resetting its proacl to NULL). Before the fix, the
@@ -3089,6 +3421,101 @@ grants:
 
     #[test]
     #[ignore]
+    fn wildcard_function_grant_converges_with_procedures_in_schema() {
+        let schema = unique_name("wildfn_proc_schema");
+        let role = unique_name("wildfn_proc_role");
+
+        execute_sql(&format!(
+            r#"
+            DROP SCHEMA IF EXISTS "{schema}" CASCADE;
+            DROP ROLE IF EXISTS "{role}";
+            CREATE SCHEMA "{schema}";
+            CREATE FUNCTION "{schema}".do_thing() RETURNS int LANGUAGE sql AS 'SELECT 1';
+            CREATE PROCEDURE "{schema}".run_something() LANGUAGE sql AS 'SELECT 1';
+            REVOKE EXECUTE ON FUNCTION "{schema}".do_thing() FROM PUBLIC;
+            REVOKE EXECUTE ON PROCEDURE "{schema}".run_something() FROM PUBLIC;
+            "#
+        ));
+
+        let manifest_file = write_temp_manifest(&format!(
+            r#"
+roles:
+  - name: {role}
+
+grants:
+  - role: {role}
+    privileges: [EXECUTE]
+    object: {{ type: function, schema: {schema}, name: "*" }}
+"#
+        ));
+
+        pgroles_cmd()
+            .args([
+                "apply",
+                "--file",
+                manifest_file.path().to_str().unwrap(),
+                "--database-url",
+                &database_url(),
+            ])
+            .assert()
+            .success();
+
+        pgroles_cmd()
+            .args([
+                "diff",
+                "--file",
+                manifest_file.path().to_str().unwrap(),
+                "--database-url",
+                &database_url(),
+                "--format",
+                "summary",
+            ])
+            .assert()
+            .success()
+            .stdout(predicate::str::contains("No changes needed"));
+
+        let removed_manifest_file = write_temp_manifest(&format!(
+            r#"
+roles:
+  - name: {role}
+"#
+        ));
+
+        pgroles_cmd()
+            .args([
+                "apply",
+                "--file",
+                removed_manifest_file.path().to_str().unwrap(),
+                "--database-url",
+                &database_url(),
+            ])
+            .assert()
+            .success();
+
+        pgroles_cmd()
+            .args([
+                "diff",
+                "--file",
+                removed_manifest_file.path().to_str().unwrap(),
+                "--database-url",
+                &database_url(),
+                "--format",
+                "summary",
+            ])
+            .assert()
+            .success()
+            .stdout(predicate::str::contains("No changes needed"));
+
+        execute_sql(&format!(
+            r#"
+            DROP SCHEMA IF EXISTS "{schema}" CASCADE;
+            DROP ROLE IF EXISTS "{role}";
+            "#
+        ));
+    }
+
+    #[test]
+    #[ignore]
     fn wildcard_function_grant_fails_before_partial_apply_when_object_not_grantable() {
         let schema = unique_name("wildfn_mixed_owner_schema");
         let executor = unique_name("wildfn_executor");
@@ -3153,7 +3580,7 @@ grants:
             .stderr(predicate::str::contains("UnsatisfiableWildcardGrant"))
             .stderr(predicate::str::contains("f2()"))
             .stderr(predicate::str::contains(&definer))
-            .stderr(predicate::str::contains("GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA").not());
+            .stderr(predicate::str::contains("GRANT EXECUTE ON ALL ROUTINES IN SCHEMA").not());
 
         pgroles_cmd()
             .args([
@@ -4386,7 +4813,7 @@ retirements:
     /// This test creates a function with a long signature, applies a wildcard
     /// EXECUTE grant, and asserts a follow-up diff converges to zero changes.
     /// Before the inventory-column casts, the second diff would re-emit
-    /// `GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA ... TO ...` forever.
+    /// `GRANT EXECUTE ON ALL ROUTINES IN SCHEMA ... TO ...` forever.
     #[test]
     #[ignore]
     fn wildcard_function_grant_converges_with_signature_longer_than_63_bytes() {

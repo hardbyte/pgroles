@@ -82,7 +82,7 @@ This split is especially useful when platform owns schema creation/ownership, wh
 
 ## App-owned schemas
 
-Applications that create their own schemas via migrations (e.g. `awa`, `analytics`) now have two viable patterns:
+Applications that create their own schemas via migrations (e.g. `app`, `analytics`) have two viable patterns:
 
 1. **Let pgroles manage the schema** — declare it under `schemas:` with an optional `owner`, and pgroles can create it before grants/default privileges are applied.
 2. **Let the application manage the schema** — keep using a two-stage manifest where migrations create the schema first, then pgroles applies schema/object grants afterward.

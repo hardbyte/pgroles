@@ -41,6 +41,27 @@ jobs:
             diff -f /work/pgroles.yaml --exit-code
 ```
 
+### Bundle render-check on PRs
+
+If you compose policy from a bundle of fragments and commit the rendered `pgroles.yaml` alongside the source bundle (see the [bundle composition guide](/docs/bundle-composition)), gate the bundle ↔ render relationship with `render-bundle --check`. This catches the case where a fragment was edited but nobody re-ran the renderer.
+
+```yaml
+jobs:
+  render-check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Verify rendered manifest matches the source bundle
+        run: |
+          docker run --rm \
+            -v "${{ github.workspace }}:/work" \
+            ghcr.io/hardbyte/pgroles:latest \
+            render-bundle --bundle /work/bundle.yaml --check /work/pgroles.yaml
+```
+
+`--check` exits with code `2` on drift and `0` on match, so it composes naturally with the drift-check job above.
+
 ### Apply on merge
 
 ```yaml

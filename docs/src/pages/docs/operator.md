@@ -18,8 +18,8 @@ The operator brings the same convergent model as the CLI into Kubernetes. Instea
 - Status conditions and change summaries on the custom resource
 - Finalizer-based cleanup on resource deletion
 
-{% callout type="note" title="Bundle composition is CLI-only today" %}
-The CLI can compose a multi-file bundle with scoped ownership boundaries before diff or apply. The operator does **not** yet reconcile bundle fragments directly — each `PostgresPolicy` is still a single policy document.
+{% callout type="note" title="Bundle composition reaches the operator via render-bundle" %}
+The operator reconciles a single `PostgresPolicy` per resource — it does not load bundle fragments directly. To get cross-team or cross-environment fragment composition under the operator, compose the bundle in CI with `pgroles render-bundle --bundle pgroles.bundle.yaml --output pgroles.yaml`, then wrap the rendered manifest into a `PostgresPolicy` resource (the manifest fields go under `spec:` alongside `connection:`). Gate the bundle ↔ rendered-manifest relationship with `pgroles render-bundle --bundle … --check pgroles.yaml` in CI. See the [bundle composition guide](/docs/bundle-composition) for the full workflow.
 {% /callout %}
 
 {% callout title="Maturity" %}
@@ -116,11 +116,11 @@ The operator's safety model — serialized reconciliation, conflict detection, f
 **API stability:**
 
 - The CRD is `v1alpha1`. There is no conversion webhook, no migration tooling, and no documented upgrade path between versions.
-- Controller semantics that should be part of the API contract are currently implementation-only conventions.
+- Controller semantics that should be part of the API contract are implementation-only conventions.
 
 **Scale and HA:**
 
-- The largest tested workload is 200 roles / 100 schemas / 5 policies (scheduled CI, not PR CI).
+- Validate reconcile performance at your target object count before relying on the operator for large role and schema inventories.
 - Advisory locks enable multi-replica deployment, but there is no documented HA pattern, replica guidance, or failure-mode analysis.
 
 **Password drift visibility:**
@@ -129,7 +129,7 @@ The operator's safety model — serialized reconciliation, conflict detection, f
 
 **Managed provider validation:**
 
-- RDS, Cloud SQL, AlloyDB, and Azure detection is implemented but not validated against live managed instances.
+- Treat managed-provider detection as environment-specific. Verify behavior against your target RDS, Cloud SQL, AlloyDB, or Azure PostgreSQL instance before relying on provider-specific SQL planning.
 
 **Deployment security:**
 
@@ -305,12 +305,34 @@ Each connection field supports a literal value and a `*Secret` variant:
 | `port` / `portSecret` | Integer (default 5432) | SecretKeySelector | No |
 | `dbname` / `dbnameSecret` | Database name | SecretKeySelector | Yes (exactly one) |
 | `username` / `usernameSecret` | Username string | SecretKeySelector | Yes (exactly one) |
-| `password` / `passwordSecret` | Password string | SecretKeySelector | Yes (exactly one) |
+| `password` / `passwordSecret` | Password string | SecretKeySelector | Yes unless `auth` is set |
+| `auth` | Provider-backed auth config | n/a | No |
 | `sslMode` / `sslModeSecret` | SSL mode string | SecretKeySelector | No |
 
 Valid `sslMode` values: `disable`, `allow`, `prefer`, `require`, `verify-ca`, `verify-full`.
 
 For required fields, exactly one of the literal or Secret variant must be set. For optional fields, at most one may be set. When a Secret referenced by `params` changes, the operator detects the `resourceVersion` change and reconnects automatically.
+
+#### GKE Workload Identity for Cloud SQL IAM
+
+Use `connection.params.auth.type: gcp_workload_identity` when the operator pod runs on GKE with Workload Identity and connects to Cloud SQL using IAM database authentication. The operator fetches a short-lived OAuth token from the GKE metadata server and uses it as the PostgreSQL password. `password` and `passwordSecret` must be omitted. If `sslMode` is omitted, the operator uses `require`.
+
+```yaml
+connection:
+  params:
+    host: 10.0.0.5
+    port: 5432
+    dbname: discovery
+    username: pgroles-operator@my-project.iam
+    auth:
+      type: gcp_workload_identity
+      # Optional: impersonate a different GCP service account.
+      impersonateServiceAccount: target-sa@other-project.iam.gserviceaccount.com
+      # Optional: defaults to https://www.googleapis.com/auth/sqlservice.login
+      scope: https://www.googleapis.com/auth/sqlservice.login
+```
+
+The Kubernetes ServiceAccount used by the operator must be annotated for Workload Identity, and the Google service account must have Cloud SQL IAM database login permissions for the target instance.
 
 {% callout type="note" title="Host resolution" %}
 The `host` must be reachable from the operator pod. For an in-cluster database in a different namespace, use the fully qualified service name (e.g. `my-postgres.my-namespace.svc`). For a database outside the cluster, use the external hostname or IP directly (e.g. `db.example.com` or `10.0.1.50`).
@@ -371,10 +393,11 @@ The controller also emits Kubernetes Events for notable state transitions. These
 
 ## Reconciliation
 
-The operator reconciles on three paths:
+The operator reconciles on four paths:
 
 - `PostgresPolicy` spec changes
 - referenced Secret changes
+- force-reconcile annotation changes
 - the normal periodic `interval`
 
 Each reconcile inspects the current database state, computes a diff from the policy, and then either applies it or publishes a plan depending on `spec.mode`. Plan mode is non-mutating: it does not execute PostgreSQL DDL and it does not create generated password Secrets. Same-database policies are serialized, and status-only updates do not retrigger the controller.
@@ -411,6 +434,24 @@ This catches common misconfigurations like a policy that declares a schema which
 
 The `interval` field controls how often the operator re-reconciles, even when the resource hasn't changed. This catches drift from manual SQL changes. Supports durations like `30s`, `5m`, `1h`, or compound forms like `1h30m`. Defaults to `5m`.
 
+### Force reconcile
+
+Set `reconcile.pgroles.io/requestedAt` to a new RFC 3339 timestamp to request an immediate reconcile without changing `spec`:
+
+```shell
+kubectl annotate postgrespolicy my-policy \
+  reconcile.pgroles.io/requestedAt="$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+  --overwrite
+```
+
+The same timestamp is idempotent. Re-setting it is a no-op, while setting a newer value bypasses the normal `interval` wait. The operator mirrors successfully handled requests to `status.lastHandledReconcileAt`, which is useful for scripts and runbooks that need to verify the request completed or produced a plan.
+
+The CLI wraps the same annotation flow:
+
+```shell
+pgroles reconcile postgrespolicy/my-policy -n platform --wait
+```
+
 ### Suspending
 
 Set `suspend: true` to pause reconciliation without deleting the resource. The operator will skip the resource until `suspend` is set back to `false`.
@@ -432,18 +473,127 @@ spec:
 
 Plan mode is useful when you want the operator to stay in-cluster but you are not ready to trust it with PostgreSQL mutations yet.
 
-Current behavior in `plan` mode:
+In `plan` mode:
 
 - the operator connects to the database and computes the full diff normally
 - no PostgreSQL SQL is executed
 - `status.change_summary` records the pending changes
 - `status.planned_sql` stores the rendered SQL, truncated if needed for status size safety
+- `status.current_plan_ref.name` points at the generated `PostgresPolicyPlan`
 - `Ready=True` with reason `Planned`
 - `Drifted=True` when changes are pending, `Drifted=False` when the database is already in sync
-- for `password.generate`, the controller may still create or recreate the generated Kubernetes Secret while resolving password inputs for the plan
-- for password-managed roles, `Drifted=False` is only possible after a prior successful `apply` recorded the password source version; a plan-only policy cannot prove an existing database password already matches its Secret
+- for `password.generate`, the controller does not create or recreate the generated Kubernetes Secret while running in `plan` mode
+- for password-managed roles, `Drifted=False` is only possible after a prior successful `apply` recorded the password source version; a plan-only policy cannot prove an existing database password already matches the configured source
+
+Example `kubectl get` output:
+
+```text
+NAME          READY   MODE   DRIFT   CHANGES   LAST RECONCILE   AGE
+plan-policy   True    plan   True    2         2s               2s
+```
+
+Example status fields:
+
+```yaml
+status:
+  change_summary:
+    grants_added: 1
+    roles_created: 1
+    total: 2
+  conditions:
+    - type: Ready
+      status: "True"
+      reason: Planned
+      message: Plan computed; 2 change(s) pending
+    - type: Drifted
+      status: "True"
+      reason: DriftDetected
+      message: 2 planned change(s) pending review
+  current_plan_ref:
+    name: plan-policy-plan-20260512-090308-118e50e437c9
+  last_reconcile_mode: plan
+  planned_sql: |-
+    CREATE ROLE "plan-preview-user" LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE INHERIT NOREPLICATION NOBYPASSRLS;
+    COMMENT ON ROLE "plan-preview-user" IS 'Preview-only role';
+    GRANT CONNECT ON DATABASE "postgres" TO "plan-preview-user";
+  planned_sql_truncated: false
+```
 
 Use `suspend` when you want the controller to stop reconciling entirely. Use `plan` when you want it to keep inspecting and showing you what it would do.
+
+### Plan approval resources
+
+When `spec.approval: manual` is used with `mode: apply`, the operator creates a `PostgresPolicyPlan` and waits for approval instead of immediately executing the SQL.
+
+```yaml
+spec:
+  connection:
+    secretRef:
+      name: postgres-credentials
+  mode: apply
+  approval: manual
+```
+
+A generated plan looks like this:
+
+```text
+NAME                                                     POLICY                 MODE            APPROVED   CHANGES   PHASE     AGE
+plan-approval-policy-plan-20260512-090318-454373251739   plan-approval-policy   authoritative   False      2         Pending   3s
+```
+
+Approve it by annotating the plan:
+
+```shell
+kubectl annotate pgplan plan-approval-policy-plan-20260512-090318-454373251739 \
+  pgroles.io/approved=true --overwrite
+```
+
+After approval, the plan moves to `Applied`:
+
+```text
+NAME                                                     POLICY                 MODE            APPROVED   CHANGES   PHASE     AGE
+plan-approval-policy-plan-20260512-090318-454373251739   plan-approval-policy   authoritative   True       2         Applied   5s
+```
+
+The plan status included:
+
+```yaml
+status:
+  appliedAt: "2026-05-12T09:03:21Z"
+  changeSummary:
+    grants_added: 1
+    roles_created: 1
+    total: 2
+  conditions:
+    - type: Computed
+      status: "True"
+      reason: PlanComputed
+      message: Plan computed with 2 change(s)
+    - type: Approved
+      status: "True"
+      reason: Approved
+      message: Plan approved and executed
+  phase: Applied
+  sqlHash: 454373251739fdfbe188ae07358b01d9e0465eb47011fe2d4f386fa34ef7de1b
+  sqlInline: |-
+    CREATE ROLE "approval_test_user" LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE INHERIT NOREPLICATION NOBYPASSRLS;
+    GRANT CONNECT ON DATABASE "postgres" TO "approval_test_user";
+  sqlStatements: 2
+  sqlTruncated: false
+```
+
+With `spec.approval: auto`, the operator creates a `PostgresPolicyPlan` and applies it immediately:
+
+```text
+NAME                                                     POLICY                 MODE            APPROVED   CHANGES   PHASE     AGE
+auto-approval-policy-plan-20260512-090329-11a6ca1d7c09   auto-approval-policy   authoritative   True       2         Applied   2s
+```
+
+The corresponding database role is present after reconcile:
+
+```text
+auto_approved_user
+```
 
 ### Reconciliation mode
 
@@ -528,6 +678,7 @@ status:
       last_transition_time: "2026-03-06T10:30:00Z"
   observed_generation: 3
   last_reconcile_time: "2026-03-06T10:30:00Z"
+  lastHandledReconcileAt: "2026-03-06T10:31:00Z"
   transient_failure_count: 0
   change_summary:
     roles_created: 2

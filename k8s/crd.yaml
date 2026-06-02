@@ -82,6 +82,36 @@
                         "description": "Structured connection parameters. Each field is either a plain string\nor a reference to a Secret key. Mutually exclusive with `secretRef`.",
                         "nullable": true,
                         "properties": {
+                          "auth": {
+                            "description": "Provider-backed authentication for connections that use short-lived\ncredentials instead of a static PostgreSQL password.",
+                            "nullable": true,
+                            "oneOf": [
+                              {
+                                "required": [
+                                  "type"
+                                ]
+                              }
+                            ],
+                            "properties": {
+                              "impersonateServiceAccount": {
+                                "description": "Target Google service account to impersonate before requesting the\nCloud SQL login token. Omit to use the pod's bound identity.",
+                                "nullable": true,
+                                "type": "string"
+                              },
+                              "scope": {
+                                "description": "OAuth scope requested for the access token.",
+                                "nullable": true,
+                                "type": "string"
+                              },
+                              "type": {
+                                "enum": [
+                                  "gcp_workload_identity"
+                                ],
+                                "type": "string"
+                              }
+                            },
+                            "type": "object"
+                          },
                           "dbname": {
                             "description": "Database name as a literal value.",
                             "nullable": true,
@@ -180,6 +210,12 @@
                               "name"
                             ],
                             "type": "object"
+                          },
+                          "setRole": {
+                            "description": "Run `SET ROLE \"<value>\"` once on every pooled connection. Useful when\nthe operator authenticates as a low-privilege identity (e.g. a Cloud\nSQL IAM user) that has been granted membership in a privileged role\nlike `cloudsqlsuperuser` — PostgreSQL does not inherit role\n*attributes* (`CREATEROLE`, `CREATEDB`, …) through `GRANT … TO …`, so\n`SET ROLE` is required for the connection to act with the parent\nrole's attributes.\n\nMust be a simple PostgreSQL identifier matching\n`^[A-Za-z_][A-Za-z0-9_$-]*$`. The pattern intentionally excludes `@`\nand `.` — `setRole` is for switching to a privileged *group* role\n(e.g. `cloudsqlsuperuser`), not an IAM-style principal like\n`pgroles-operator@project.iam`, which has no extra attributes to\ninherit via `SET ROLE`.",
+                            "nullable": true,
+                            "pattern": "^[A-Za-z_][A-Za-z0-9_$-]*$",
+                            "type": "string"
                           },
                           "sslMode": {
                             "description": "SSL mode as a literal value.",
@@ -669,6 +705,11 @@
                           "nullable": true,
                           "type": "boolean"
                         },
+                        "external": {
+                          "default": false,
+                          "description": "Treat this role as externally managed. The operator may reference it in\ngrants, ownership, and memberships, but will not create, alter, drop,\npassword-manage, or manage memberships granted from this role.",
+                          "type": "boolean"
+                        },
                         "inherit": {
                           "nullable": true,
                           "type": "boolean"
@@ -935,6 +976,11 @@
                       "name"
                     ],
                     "type": "object"
+                  },
+                  "lastHandledReconcileAt": {
+                    "description": "Last force-reconcile annotation value handled by the operator.",
+                    "nullable": true,
+                    "type": "string"
                   },
                   "last_attempted_generation": {
                     "description": "The `.metadata.generation` that was last attempted.",

@@ -1,0 +1,11 @@
+# Bundle root for a shared database owned by multiple teams.
+#
+# Each source file declares its own management scope. pgroles composes the
+# fragments, rejects overlapping ownership, and then diffs/applies one desired
+# database policy.
+
+sources:
+  - file: policies/platform.yaml
+  - file: policies/billing.yaml
+  - file: policies/shipping.yaml
+

@@ -3,7 +3,7 @@ title: CLI commands
 description: Reference for all pgroles CLI commands and options.
 ---
 
-The `pgroles` CLI provides six commands for managing PostgreSQL role policies. {% .lead %}
+The `pgroles` CLI provides seven commands for managing PostgreSQL role policies. {% .lead %}
 
 ---
 
@@ -122,7 +122,7 @@ pgroles apply --bundle path/to/pgroles.bundle.yaml --database-url postgres://loc
 
 Before executing changes, `apply` detects the connecting role's privilege level — true superuser, cloud provider superuser (for the explicitly supported providers), or regular user — and warns about any planned changes that exceed the detected privileges (for example setting `SUPERUSER` or `BYPASSRLS` through a managed-service admin role).
 
-Provider-aware warning logic currently recognizes `rds_superuser`, `cloudsqlsuperuser`, `alloydbsuperuser`, and `azure_pg_admin`. Other PostgreSQL-compatible managed services, including Supabase and PlanetScale PostgreSQL, may still work, but privilege warnings will be generic rather than provider-specific.
+Provider-aware warning logic recognizes `rds_superuser`, `cloudsqlsuperuser`, `alloydbsuperuser`, and `azure_pg_admin`. Other PostgreSQL-compatible managed services, including Supabase and PlanetScale PostgreSQL, may still work, but privilege warnings are generic rather than provider-specific.
 
 ### Insufficient privileges
 
@@ -230,6 +230,64 @@ The generated manifest — flat or with suggested profiles — is a snapshot of 
 {% callout type="warning" title="Treat generated manifests as authoritative input" %}
 `generate` is best used as a starting point for brownfield adoption. Before applying the generated manifest in production, review it like any other infrastructure policy because once committed it becomes the desired state.
 {% /callout %}
+
+## render-bundle
+
+Compose a policy bundle into a single flat `PolicyManifest` YAML. The output round-trips through `validate -f`, `diff -f`, and `apply -f`, and is suitable for committing as the source of a `PostgresPolicy` resource in a GitOps repo.
+
+```shell
+pgroles render-bundle --bundle path/to/pgroles.bundle.yaml
+pgroles render-bundle --bundle path/to/pgroles.bundle.yaml --output pgroles.yaml
+pgroles render-bundle --bundle path/to/pgroles.bundle.yaml --check pgroles.yaml
+```
+
+### Options
+
+| Flag | Description |
+|---|---|
+| `--bundle` | Bundle root file path (required) |
+| `-o`, `--output` | Write the rendered manifest to a file instead of stdout |
+| `--no-header` | Omit the provenance comment block at the top of the output |
+| `--check` | Compare the rendered output against an existing file. Exits with code **2** on drift, **0** on match. Mutually exclusive with `--output`. |
+
+### Output shape
+
+The rendered file is byte-deterministic across machines: the header records only the bundle file's basename (never an absolute or `pwd`-relative path), and the YAML body is post-processed to strip serde-emitted defaults (empty optional sequences, `null` scalars, and the default `role_pattern`) so the file does not churn under unrelated upgrades.
+
+The header records the manifest schema version (`pgroles.manifest.v1` today). The schema identifier is bumped only on incompatible changes to the `PolicyManifest` serialization shape, so a `--check` failure after a pgroles upgrade can be diagnosed as "schema bumped — re-render required" rather than mystery drift.
+
+Required-field empty sequences (`Grant.privileges`, `DefaultPrivilege.grant`, `Membership.members`) and named empty profiles such as `noop: {}` are preserved so the rendered output always re-parses as a valid manifest.
+
+Composition errors — scope violations, duplicate ownership claims, overlapping schema facets — are reported before any output is written, so `render-bundle` will not emit a partially-valid manifest.
+
+### CI drift gate
+
+Use `--check` to fail the build when the committed rendered manifest is stale:
+
+```shell
+pgroles render-bundle --bundle pgroles.bundle.yaml --check pgroles.yaml
+```
+
+This is the recommended companion to a GitOps workflow where the rendered manifest is committed alongside the source bundle. See [CI/CD integration](/docs/ci-cd) for a full GitHub Actions example.
+
+## reconcile
+
+Request an immediate operator reconcile for a Kubernetes `PostgresPolicy` without changing `spec`.
+
+```shell
+pgroles reconcile my-policy -n platform
+pgroles reconcile postgrespolicy/my-policy -n platform --wait
+```
+
+The command patches the policy annotation `reconcile.pgroles.io/requestedAt` with the current RFC 3339 timestamp. The operator treats a new annotation value as an immediate reconcile trigger and mirrors the value to `status.lastHandledReconcileAt` after a successful reconcile or plan.
+
+### Options
+
+| Flag | Description |
+|---|---|
+| `-n`, `--namespace` | Kubernetes namespace containing the `PostgresPolicy` (default: `default`) |
+| `--wait` | Poll the policy until `status.lastHandledReconcileAt` reaches the requested timestamp |
+| `--timeout` | Maximum wait duration, e.g. `30s`, `2m`, or `1m30s` (default: `2m`) |
 
 ## graph
 

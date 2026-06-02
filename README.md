@@ -150,7 +150,7 @@ docker run --rm ghcr.io/hardbyte/pgroles --help
 - **Convergent** — the manifest is the desired state. Missing roles get created, extra roles get dropped, drifted grants get fixed.
 - **Reconciliation modes** — `--mode authoritative` (default) for full convergence, `--mode additive` to only grant and never revoke, `--mode adopt` to manage declared roles without dropping undeclared ones. Additive mode is the safest way to start using pgroles on an existing database.
 - **Profiles** — define privilege templates once, apply them across schemas. Each `schema x profile` pair becomes a role, and profiles can set generated-role `login` and `inherit` attributes.
-- **Bundle composition** — compose shared profiles plus multiple scoped policy fragments in the CLI, with duplicate/conflict detection and managed-scope enforcement before diff or apply.
+- **Bundle composition** — compose shared profiles plus multiple scoped policy fragments in the CLI, with duplicate/conflict detection and managed-scope enforcement before diff or apply. Use `pgroles render-bundle --bundle bundle.yaml --output pgroles.yaml` to compose a bundle into a single flat manifest suitable for committing as a `PostgresPolicy` source in GitOps.
 - **Schema management** — declared schemas can be created and have ownership converged, while undeclared referenced schemas must already exist.
 - **Safer privilege bundles** — common application profiles can pair table, sequence, and function privileges so identity columns and trigger-driven routines are covered together.
 - **Brownfield adoption** — `pgroles generate` introspects an existing database and produces a manifest you can refine. Add `--suggest-profiles` to deterministically refactor roles that share a privilege shape across schemas into reusable profiles, with a built-in round-trip check that guarantees the suggested manifest doesn't widen privileges.
@@ -171,7 +171,7 @@ Full documentation is published at [hardbyte.github.io/pgroles](https://hardbyte
 
 - [Quick start](https://hardbyte.github.io/pgroles/docs/quick-start/)
 - [Installation](https://hardbyte.github.io/pgroles/docs/installation/)
-- [Manifest format](https://hardbyte.github.io/pgroles/docs/manifest-format/)
+- [Manifest guide](https://hardbyte.github.io/pgroles/docs/manifest-format/)
 - [CLI reference](https://hardbyte.github.io/pgroles/docs/cli/)
 - [Kubernetes operator](https://hardbyte.github.io/pgroles/docs/operator/)
 - [Operator architecture](https://hardbyte.github.io/pgroles/docs/operator-architecture/)

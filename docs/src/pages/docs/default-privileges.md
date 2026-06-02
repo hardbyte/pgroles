@@ -9,7 +9,7 @@ Default privileges control what privileges are automatically granted when new ob
 
 ## Why default privileges?
 
-Wildcard grants like `GRANT SELECT ON ALL TABLES IN SCHEMA` only apply to objects that exist **right now**. When a migration creates a new table, existing roles won't have access to it unless you re-run the grant.
+Wildcard grants like `GRANT SELECT ON ALL TABLES IN SCHEMA` only apply to objects that exist when the grant runs. When a schema change creates a new table later, existing roles won't have access to it unless you re-run the grant.
 
 `ALTER DEFAULT PRIVILEGES` solves this by configuring automatic grants for future objects.
 
@@ -44,7 +44,7 @@ ALTER DEFAULT PRIVILEGES FOR ROLE "app_owner"
 
 ## Owner context
 
-The `owner` field specifies which role's object creation triggers the default grant. This is typically the role that runs migrations or creates tables (e.g. `pgloader_pg`, `app_owner`).
+The `owner` field specifies which role's object creation triggers the default grant. This is typically the role that creates tables, such as `app_migrator` or `app_owner`.
 
 If `owner` is omitted on a default privilege entry, the top-level `default_owner` is used. If neither is set, it falls back to `postgres`.
 
@@ -74,5 +74,5 @@ It's good practice to pair wildcard grants (`name: "*"`) with matching default p
 {% /callout %}
 
 {% callout title="Tables are not enough" %}
-If a role writes to tables created by migrations, check whether it also needs sequence and function defaults. Identity/serial-backed inserts typically need sequence access, and trigger-driven schemas often need `EXECUTE` on functions too.
+If a role writes to tables created after pgroles runs, check whether it also needs sequence and function defaults. Identity/serial-backed inserts typically need sequence access, and trigger-driven schemas often need `EXECUTE` on functions too.
 {% /callout %}

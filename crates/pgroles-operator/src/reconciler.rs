@@ -24,8 +24,8 @@ use tracing::info;
 use crate::context::{ContextError, OperatorContext};
 use crate::crd::{
     ChangeSummary, DatabaseIdentity, PolicyMode, PostgresPolicy, PostgresPolicyPlan,
-    PostgresPolicyStatus, conflict_condition, degraded_condition, drifted_condition,
-    paused_condition, ready_condition, reconciling_condition,
+    PostgresPolicyStatus, REQUESTED_RECONCILE_ANNOTATION, conflict_condition, degraded_condition,
+    drifted_condition, paused_condition, ready_condition, reconciling_condition,
 };
 
 /// Finalizer name for PostgresPolicy resources.
@@ -83,6 +83,13 @@ impl ReconcileOutcome {
             ReconcileOutcome::Conflict => "ConflictingPolicy",
             ReconcileOutcome::LockContention => "LockContention",
         }
+    }
+
+    fn marks_requested_reconcile_handled(&self) -> bool {
+        matches!(
+            self,
+            ReconcileOutcome::Reconciled | ReconcileOutcome::Planned
+        )
     }
 }
 
@@ -375,7 +382,18 @@ fn retry_class_for_reconcile_error(error: &ReconcileError) -> RetryClass {
                     RetryClass::Transient
                 }
             }
+            ContextError::GcpAuthRejected { .. } | ContextError::GcpAuthInvalidResponse { .. } => {
+                if context.is_gcp_auth_non_transient() {
+                    RetryClass::Slow
+                } else {
+                    RetryClass::Transient
+                }
+            }
+            ContextError::GcpAuthHttp { .. } => RetryClass::Transient,
             ContextError::DatabaseConnect { .. } => RetryClass::Transient,
+            // `SET ROLE "<role>"` failing on a freshly-connected session is
+            // a permission/config issue, not a transient connectivity blip.
+            ContextError::SetRoleFailed { .. } => RetryClass::Slow,
             ContextError::EmptyResolvedValue { .. }
             | ContextError::InvalidResolvedSslMode { .. } => RetryClass::Slow,
         },
@@ -556,12 +574,17 @@ async fn reconcile_apply(
     ctx: &OperatorContext,
 ) -> Result<Action, ReconcileError> {
     let reconcile_guard = ctx.observability.start_reconcile();
+    let requested_reconcile_at = requested_reconcile_at(resource);
 
     let namespace = resource.namespace().ok_or(ReconcileError::NoNamespace)?;
     let identity = DatabaseIdentity::from_connection(&namespace, &resource.spec.connection);
 
     match reconcile_apply_inner(resource, ctx, &identity).await {
         Ok((action, outcome)) => {
+            if outcome.marks_requested_reconcile_handled() {
+                mark_requested_reconcile_handled(ctx, resource, requested_reconcile_at.as_deref())
+                    .await?;
+            }
             reconcile_guard.record_result(outcome.result(), outcome.reason());
             Ok(action)
         }
@@ -613,6 +636,28 @@ async fn reconcile_apply(
             Err(err)
         }
     }
+}
+
+fn requested_reconcile_at(resource: &PostgresPolicy) -> Option<String> {
+    resource
+        .annotations()
+        .get(REQUESTED_RECONCILE_ANNOTATION)
+        .cloned()
+}
+
+async fn mark_requested_reconcile_handled(
+    ctx: &OperatorContext,
+    resource: &PostgresPolicy,
+    requested_reconcile_at: Option<&str>,
+) -> Result<(), ReconcileError> {
+    let Some(requested_reconcile_at) = requested_reconcile_at else {
+        return Ok(());
+    };
+
+    update_status(ctx, resource, |status| {
+        status.last_handled_reconcile_at = Some(requested_reconcile_at.to_string());
+    })
+    .await
 }
 
 fn mark_reconcile_failure_status(
@@ -913,6 +958,7 @@ async fn apply_under_lock(
         ),
         reconciliation_mode,
     );
+    changes = pgroles_core::diff::filter_external_role_changes(changes, &expanded.roles);
 
     let resolved_passwords = resolve_passwords_from_secrets(ctx, resource, namespace).await?;
     let (password_changes, applied_password_source_versions) =
@@ -1576,6 +1622,9 @@ async fn resolve_passwords_from_secrets(
 
     // First pass: fetch all referenced Secrets for secretRef roles.
     for role_spec in &resource.spec.roles {
+        if role_spec.external {
+            continue;
+        }
         if let Some(pw) = &role_spec.password
             && let Some(secret_ref) = &pw.secret_ref
         {
@@ -1595,6 +1644,9 @@ async fn resolve_passwords_from_secrets(
 
     // Second pass: resolve passwords from cache (secretRef) or generate.
     for role_spec in &resource.spec.roles {
+        if role_spec.external {
+            continue;
+        }
         if let Some(pw) = &role_spec.password {
             if let Some(gen_spec) = &pw.generate {
                 let password = if resource.spec.mode == PolicyMode::Plan {
@@ -1732,6 +1784,9 @@ fn resolve_passwords_from_cached_secrets(
 ) -> Result<std::collections::BTreeMap<String, ResolvedPassword>, ReconcileError> {
     let mut resolved = std::collections::BTreeMap::new();
     for role_spec in &resource.spec.roles {
+        if role_spec.external {
+            continue;
+        }
         if let Some(pw) = &role_spec.password
             && pw.secret_ref.is_some()
         {
@@ -2087,7 +2142,11 @@ impl ReconcileError {
             ReconcileError::Context(context) => match context.as_ref() {
                 ContextError::SecretFetch { .. } => "SecretFetchFailed",
                 ContextError::SecretMissing { .. } => "SecretMissing",
+                ContextError::GcpAuthHttp { .. }
+                | ContextError::GcpAuthRejected { .. }
+                | ContextError::GcpAuthInvalidResponse { .. } => "GcpAuthFailed",
                 ContextError::DatabaseConnect { .. } => "DatabaseConnectionFailed",
+                ContextError::SetRoleFailed { .. } => "SetRoleFailed",
                 ContextError::EmptyResolvedValue { .. } => "InvalidConnectionParams",
                 ContextError::InvalidResolvedSslMode { .. } => "InvalidConnectionParams",
             },
@@ -2276,6 +2335,7 @@ mod tests {
                 schemas: Vec::new(),
                 roles: vec![RoleSpec {
                     name: role_name.to_string(),
+                    external: false,
                     login: Some(true),
                     superuser: None,
                     createdb: None,
@@ -2351,6 +2411,7 @@ mod tests {
                 roles: vec![
                     RoleSpec {
                         name: "app".to_string(),
+                        external: false,
                         login: Some(true),
                         superuser: None,
                         createdb: None,
@@ -2371,6 +2432,7 @@ mod tests {
                     },
                     RoleSpec {
                         name: "reporter".to_string(),
+                        external: false,
                         login: Some(true),
                         superuser: None,
                         createdb: None,
@@ -2772,7 +2834,7 @@ mod tests {
                 ..Default::default()
             }),
             planned_sql: Some(
-                "GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA \"app\" TO \"reader\";".into(),
+                "GRANT EXECUTE ON ALL ROUTINES IN SCHEMA \"app\" TO \"reader\";".into(),
             ),
             planned_sql_truncated: true,
             last_error: None,
@@ -3120,6 +3182,15 @@ mod tests {
     }
 
     #[test]
+    fn requested_reconcile_is_handled_only_after_successful_outcomes() {
+        assert!(ReconcileOutcome::Reconciled.marks_requested_reconcile_handled());
+        assert!(ReconcileOutcome::Planned.marks_requested_reconcile_handled());
+        assert!(!ReconcileOutcome::Suspended.marks_requested_reconcile_handled());
+        assert!(!ReconcileOutcome::Conflict.marks_requested_reconcile_handled());
+        assert!(!ReconcileOutcome::LockContention.marks_requested_reconcile_handled());
+    }
+
+    #[test]
     fn error_reason_unsafe_role_drops() {
         let err = ReconcileError::UnsafeRoleDrops("role owns objects".into());
         assert_eq!(err.reason(), "UnsafeRoleDrops");
@@ -3363,6 +3434,17 @@ mod tests {
     }
 
     #[test]
+    fn retry_classifies_set_role_failed_as_slow() {
+        let error = finalizer::Error::ApplyFailed(ReconcileError::Context(Box::new(
+            crate::context::ContextError::SetRoleFailed {
+                role: "cloudsqlsuperuser".to_string(),
+                source: sqlx::Error::Protocol("permission denied".to_string()),
+            },
+        )));
+        assert_eq!(retry_class(&error), RetryClass::Slow);
+    }
+
+    #[test]
     fn retry_classifies_sql_exec_insufficient_privilege_as_slow() {
         let error = finalizer::Error::ApplyFailed(ReconcileError::SqlExec(
             insufficient_privilege_sqlx_error(),
@@ -3479,6 +3561,45 @@ mod tests {
             },
         ));
         assert_eq!(err.reason(), "InvalidConnectionParams");
+    }
+
+    #[test]
+    fn retry_classifies_gcp_auth_permission_error_as_slow() {
+        let error = finalizer::Error::ApplyFailed(ReconcileError::Context(Box::new(
+            crate::context::ContextError::GcpAuthRejected {
+                endpoint: "metadata".to_string(),
+                status: 403,
+                body: "forbidden".to_string(),
+            },
+        )));
+        assert_eq!(retry_class(&error), RetryClass::Slow);
+    }
+
+    #[tokio::test]
+    async fn retry_classifies_gcp_auth_http_error_as_transient() {
+        let source = reqwest::Client::new()
+            .get("http://")
+            .send()
+            .await
+            .expect_err("invalid URL should produce a reqwest error");
+        let error = finalizer::Error::ApplyFailed(ReconcileError::Context(Box::new(
+            crate::context::ContextError::GcpAuthHttp {
+                endpoint: "metadata",
+                source,
+            },
+        )));
+        assert_eq!(retry_class(&error), RetryClass::Transient);
+    }
+
+    #[test]
+    fn error_reason_gcp_auth_failure() {
+        let err =
+            ReconcileError::Context(Box::new(crate::context::ContextError::GcpAuthRejected {
+                endpoint: "metadata".to_string(),
+                status: 403,
+                body: "forbidden".to_string(),
+            }));
+        assert_eq!(err.reason(), "GcpAuthFailed");
     }
 
     #[test]
@@ -3714,6 +3835,27 @@ mod tests {
                 .map(|password| password.cleartext.as_str()),
             Some("reporter-secret")
         );
+    }
+
+    #[test]
+    fn resolve_passwords_from_cached_secrets_skips_external_roles() {
+        let mut resource = password_role_policy();
+        resource.spec.roles[1].external = true;
+        let cache = BTreeMap::from([(
+            "role-passwords".to_string(),
+            secret_with_keys("role-passwords", &[("app", "app-secret")]),
+        )]);
+
+        let resolved =
+            resolve_passwords_from_cached_secrets(&resource, &cache).expect("should resolve");
+
+        assert_eq!(
+            resolved
+                .get("app")
+                .map(|password| password.cleartext.as_str()),
+            Some("app-secret")
+        );
+        assert!(!resolved.contains_key("reporter"));
     }
 
     #[test]

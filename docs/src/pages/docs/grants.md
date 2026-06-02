@@ -126,4 +126,4 @@ This is equivalent to granting `SELECT, INSERT, UPDATE` on all tables.
 
 ## Convergent revocation
 
-Privileges present in the database but absent from the manifest are revoked. If a role currently has `DELETE` on a table but your manifest only grants `SELECT`, pgroles will generate a `REVOKE DELETE` statement.
+Privileges present in the database but absent from the manifest are revoked. If a role has `DELETE` on a table but your manifest only grants `SELECT`, pgroles will generate a `REVOKE DELETE` statement.

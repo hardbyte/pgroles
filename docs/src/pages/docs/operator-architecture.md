@@ -38,12 +38,13 @@ The controller converts the CRD into the same manifest types used by the CLI, so
 
 ### Watch sources
 
-The operator currently reconciles from two primary trigger sources:
+The operator currently reconciles from three primary trigger sources:
 
 - `PostgresPolicy` generation changes
+- `PostgresPolicy` `reconcile.pgroles.io/requestedAt` annotation changes
 - Secret `resourceVersion` changes for referenced database credentials
 
-Generation filtering matters. The controller intentionally ignores status-only `PostgresPolicy` updates as reconcile triggers, otherwise successful status patches create hot loops and can starve other policies targeting the same database.
+Generation and annotation filtering matter. The controller intentionally ignores status-only `PostgresPolicy` updates and unrelated annotation changes as reconcile triggers, otherwise successful status patches and GitOps tracking metadata can create hot loops that starve other policies targeting the same database.
 
 ### Database connection handling
 
@@ -116,6 +117,7 @@ It also records:
 
 - last attempted generation
 - last successful reconcile time
+- last handled force-reconcile annotation timestamp
 - managed database identity
 - owned roles and schemas
 - last error
@@ -147,7 +149,7 @@ For object-local debugging, the controller also emits transition-based Kubernete
 - Events: notable transitions visible in `kubectl describe`
 - OTLP metrics: fleet-level trends and alerting
 
-## Current CI coverage
+## CI coverage
 
 CI covers:
 
@@ -167,7 +169,7 @@ CI covers:
 
 Further hardening work:
 
-- broader scale and long-run validation beyond the current scheduled workflow profile
+- broader scale and long-run validation beyond the scheduled workflow profile
 
 ## Relationship to the CLI
 
