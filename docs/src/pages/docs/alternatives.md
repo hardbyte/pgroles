@@ -81,13 +81,13 @@ Development effectively stopped around 2018. If you're starting fresh, pgroles c
 
 ## SQL migration scripts
 
-The most common approach is no dedicated tool at all — teams write `CREATE ROLE` and `GRANT` statements in migration files (Flyway, Alembic, plain SQL) or run them ad-hoc.
+The most common approach is no dedicated tool at all — teams write `CREATE ROLE` and `GRANT` statements in schema-change files or run them ad-hoc.
 
 This works for simple setups but breaks down as complexity grows:
 
 - **No convergence** — migrations are additive. Removing a grant from a migration file doesn't revoke it from the database.
 - **No drift detection** — if someone runs a manual `GRANT` in production, nothing catches it.
 - **No templating** — the same privilege pattern repeated across 10 schemas means 10 copies of the same SQL.
-- **Ordering headaches** — role drops require careful dependency management that migration tools don't help with.
+- **Ordering headaches** — role drops require careful dependency management that schema-change workflows don't help with.
 
 pgroles' `generate` command can bootstrap a manifest from an existing database managed this way, making adoption incremental.

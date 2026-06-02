@@ -1,0 +1,7 @@
+# Bootstrap roles and schemas so service-owned migrations can run before
+# object-level grants are available.
+
+sources:
+  - file: policies/billing-bootstrap.yaml
+  - file: policies/shipping-bootstrap.yaml
+

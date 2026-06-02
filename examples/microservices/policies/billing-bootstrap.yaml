@@ -1,0 +1,27 @@
+policy:
+  name: billing-bootstrap
+
+scope:
+  roles:
+    - billing_migrator
+  schemas:
+    - name: billing
+      facets: [owner, bindings]
+
+roles:
+  - name: billing_migrator
+    login: true
+    password: { from_env: BILLING_MIGRATOR_PASSWORD }
+    comment: "Runs billing service migrations and owns billing objects"
+
+schemas:
+  - name: billing
+    owner: billing_migrator
+
+grants:
+  - role: billing_migrator
+    privileges: [CONNECT]
+    object: { type: database, name: pgroles_test }
+  - role: billing_migrator
+    privileges: [USAGE, CREATE]
+    object: { type: schema, name: billing }

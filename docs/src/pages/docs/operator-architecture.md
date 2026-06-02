@@ -149,7 +149,7 @@ For object-local debugging, the controller also emits transition-based Kubernete
 - Events: notable transitions visible in `kubectl describe`
 - OTLP metrics: fleet-level trends and alerting
 
-## Current CI coverage
+## CI coverage
 
 CI covers:
 
@@ -169,7 +169,7 @@ CI covers:
 
 Further hardening work:
 
-- broader scale and long-run validation beyond the current scheduled workflow profile
+- broader scale and long-run validation beyond the scheduled workflow profile
 
 ## Relationship to the CLI
 

@@ -25,7 +25,7 @@ retirements: []                   # Safe role removal workflows
 
 ## auth_providers
 
-Declare cloud authentication providers to document how IAM-mapped roles connect to the database. This is currently informational metadata used for validation and documentation purposes.
+Declare cloud authentication providers to document how IAM-mapped roles connect to the database. This metadata is used for validation and documentation.
 
 ```yaml
 auth_providers:
@@ -54,7 +54,7 @@ auth_providers:
 | `planet_scale` | PlanetScale PostgreSQL metadata. Optional `organization` field. |
 
 {% callout type="note" title="Managed service metadata is intentionally narrow" %}
-The `auth_providers` block models the provider types listed above, but not every variant has provider-specific runtime behavior yet. Today the privilege-warning path has explicit detection for RDS/Aurora, Cloud SQL, AlloyDB, and Azure. Supabase and PlanetScale PostgreSQL entries are currently documentation and validation metadata.
+The `auth_providers` block models the provider types listed above, but only RDS/Aurora, Cloud SQL, AlloyDB, and Azure have provider-specific privilege-warning behavior. Supabase and PlanetScale PostgreSQL entries are documentation and validation metadata.
 {% /callout %}
 
 ## default_owner
