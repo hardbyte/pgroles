@@ -43,7 +43,7 @@ spec:
   reconciliation_mode: additive
 ```
 
-The operator will report planned changes in the CRD status, including the full SQL.
+The operator will report planned changes in status and store the SQL preview on the generated `PostgresPolicyPlan`.
 
 ### 3. Validate with diff
 
@@ -62,6 +62,7 @@ Switch to `mode: apply` with `reconciliation_mode: additive`. This applies all n
 ```yaml
 spec:
   mode: apply
+  approval: auto
   reconciliation_mode: additive
 ```
 

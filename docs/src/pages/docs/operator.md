@@ -180,6 +180,7 @@ spec:
   interval: "5m"   # reconciliation interval (supports 5m, 1h, 30s, 1h30m)
   suspend: false   # set true to pause reconciliation
   mode: apply      # apply changes, or use plan for non-mutating drift preview
+  approval: auto   # auto-apply plans; omit or set manual to require approval
   reconciliation_mode: authoritative  # authoritative | additive | adopt
 
   default_owner: app_owner
