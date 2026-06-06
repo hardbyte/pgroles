@@ -676,7 +676,11 @@
                       ],
                       "type": "object"
                     },
-                    "type": "array"
+                    "type": "array",
+                    "x-kubernetes-list-map-keys": [
+                      "role"
+                    ],
+                    "x-kubernetes-list-type": "map"
                   },
                   "roles": {
                     "default": [],
@@ -790,7 +794,11 @@
                       ],
                       "type": "object"
                     },
-                    "type": "array"
+                    "type": "array",
+                    "x-kubernetes-list-map-keys": [
+                      "name"
+                    ],
+                    "x-kubernetes-list-type": "map"
                   },
                   "schemas": {
                     "default": [],
@@ -824,7 +832,11 @@
                       ],
                       "type": "object"
                     },
-                    "type": "array"
+                    "type": "array",
+                    "x-kubernetes-list-map-keys": [
+                      "name"
+                    ],
+                    "x-kubernetes-list-type": "map"
                   },
                   "suspend": {
                     "default": false,
@@ -1003,11 +1015,6 @@
                     "nullable": true,
                     "type": "string"
                   },
-                  "last_reconcile_time": {
-                    "description": "Deprecated alias retained for compatibility with older status readers.",
-                    "nullable": true,
-                    "type": "string"
-                  },
                   "last_successful_reconcile_time": {
                     "description": "ISO 8601 timestamp of the last successful reconciliation.",
                     "nullable": true,
@@ -1039,16 +1046,6 @@
                       "type": "string"
                     },
                     "type": "array"
-                  },
-                  "planned_sql": {
-                    "description": "Planned SQL for the last successful plan-mode reconcile.",
-                    "nullable": true,
-                    "type": "string"
-                  },
-                  "planned_sql_truncated": {
-                    "default": false,
-                    "description": "Whether `planned_sql` was truncated to fit safely in status.",
-                    "type": "boolean"
                   },
                   "transient_failure_count": {
                     "default": 0,

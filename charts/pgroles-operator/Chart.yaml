@@ -5,8 +5,8 @@ description: >-
   Define roles, memberships, grants, and default privileges in YAML
   and let the operator converge your database to the desired state.
 type: application
-version: 0.7.8
-appVersion: "0.7.8"
+version: 0.7.9
+appVersion: "0.7.9"
 icon: https://raw.githubusercontent.com/hardbyte/pgroles/main/docs/public/logo.svg
 sources:
   - https://github.com/hardbyte/pgroles
@@ -20,6 +20,12 @@ annotations:
       description: 'PostgresPolicy roles can now be marked external: true so provider-managed roles remain referenceable without pgroles creating, altering, dropping, password-managing, or pruning memberships granted from them.'
     - kind: added
       description: 'PostgresPolicy resources now support immediate reconcile requests through the reconcile.pgroles.io/requestedAt annotation; pgroles reconcile can set it and optionally wait for status.lastHandledReconcileAt.'
+    - kind: changed
+      description: 'PostgresPolicy plans now require manual approval by default when spec.approval is omitted; set approval: auto for immediate apply.'
+    - kind: changed
+      description: 'PostgresPolicy status no longer includes deprecated planned_sql, planned_sql_truncated, or last_reconcile_time fields; use PostgresPolicyPlan and last_successful_reconcile_time instead.'
+    - kind: changed
+      description: 'PostgresPolicy CRD marks schemas, roles, and retirements as Kubernetes map lists for better server-side-apply merge behavior.'
   artifacthub.io/category: database
   artifacthub.io/operator: "true"
   artifacthub.io/prerelease: "false"

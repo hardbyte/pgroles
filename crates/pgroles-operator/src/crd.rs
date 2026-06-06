@@ -83,10 +83,18 @@ pub struct PostgresPolicySpec {
 
     /// Schema bindings that expand profiles into concrete roles/grants.
     #[serde(default)]
+    #[schemars(extend(
+        "x-kubernetes-list-type" = "map",
+        "x-kubernetes-list-map-keys" = ["name"]
+    ))]
     pub schemas: Vec<SchemaBinding>,
 
     /// One-off role definitions.
     #[serde(default)]
+    #[schemars(extend(
+        "x-kubernetes-list-type" = "map",
+        "x-kubernetes-list-map-keys" = ["name"]
+    ))]
     pub roles: Vec<RoleSpec>,
 
     /// One-off grants.
@@ -103,13 +111,16 @@ pub struct PostgresPolicySpec {
 
     /// Explicit role-retirement workflows for roles that should be removed.
     #[serde(default)]
+    #[schemars(extend(
+        "x-kubernetes-list-type" = "map",
+        "x-kubernetes-list-map-keys" = ["role"]
+    ))]
     pub retirements: Vec<RoleRetirement>,
 
     /// Approval mode for plans: `auto` or `manual`.
     /// When `manual`, plans require explicit approval before execution.
     /// When `auto`, plans are approved and applied immediately.
-    /// When omitted, inferred from `mode`: `apply` → `auto`, `plan` → `manual`.
-    /// This ensures backward compatibility for existing `mode: apply` users.
+    /// When omitted, defaults to `manual`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub approval: Option<ApprovalMode>,
 }
@@ -152,15 +163,11 @@ pub enum ApprovalMode {
 }
 
 impl PostgresPolicySpec {
-    /// Resolve the effective approval mode, inferring from `mode` when not set.
-    /// `apply` → `Auto` (backward compat), `plan` → `Manual`.
+    /// Resolve the effective approval mode. Omitted approval defaults to manual.
     pub fn effective_approval(&self) -> ApprovalMode {
         match &self.approval {
             Some(mode) => mode.clone(),
-            None => match self.mode {
-                PolicyMode::Apply => ApprovalMode::Auto,
-                PolicyMode::Plan => ApprovalMode::Manual,
-            },
+            None => ApprovalMode::Manual,
         }
     }
 }
@@ -809,10 +816,6 @@ pub struct PostgresPolicyStatus {
     #[serde(default)]
     pub last_successful_reconcile_time: Option<String>,
 
-    /// Deprecated alias retained for compatibility with older status readers.
-    #[serde(default)]
-    pub last_reconcile_time: Option<String>,
-
     /// Last force-reconcile annotation value handled by the operator.
     #[serde(default, rename = "lastHandledReconcileAt")]
     pub last_handled_reconcile_at: Option<String>,
@@ -824,14 +827,6 @@ pub struct PostgresPolicyStatus {
     /// The reconciliation mode used for the last successful reconcile.
     #[serde(default)]
     pub last_reconcile_mode: Option<PolicyMode>,
-
-    /// Planned SQL for the last successful plan-mode reconcile.
-    #[serde(default)]
-    pub planned_sql: Option<String>,
-
-    /// Whether `planned_sql` was truncated to fit safely in status.
-    #[serde(default)]
-    pub planned_sql_truncated: bool,
 
     /// Canonical identity of the managed database target.
     #[serde(default)]
@@ -3032,7 +3027,6 @@ params:
         status.observed_generation = generation;
         status.last_attempted_generation = generation;
         status.last_successful_reconcile_time = Some(now_rfc3339());
-        status.last_reconcile_time = Some(now_rfc3339());
         status.change_summary = Some(summary);
         status.last_error = None;
 
@@ -3051,7 +3045,6 @@ params:
 
         // Verify timestamps set
         assert!(status.last_successful_reconcile_time.is_some());
-        assert!(status.last_reconcile_time.is_some());
 
         // Verify summary
         let summary = status.change_summary.as_ref().unwrap();
@@ -3764,6 +3757,23 @@ retirements:
     }
 
     #[test]
+    fn postgres_policy_crd_marks_named_lists_as_maps() {
+        let crd = PostgresPolicy::crd();
+        let yaml = serde_yaml::to_string(&crd).expect("CRD should serialize to YAML");
+
+        for field_name in ["schemas", "roles"] {
+            assert!(
+                yaml.contains(&format!("{field_name}:\n")),
+                "CRD should contain spec.{field_name}"
+            );
+        }
+        assert!(yaml.contains("x-kubernetes-list-type: map"));
+        assert!(yaml.contains("x-kubernetes-list-map-keys:"));
+        assert!(yaml.contains("- name"));
+        assert!(yaml.contains("- role"));
+    }
+
+    #[test]
     fn plan_phase_display() {
         assert_eq!(PlanPhase::Pending.to_string(), "Pending");
         assert_eq!(PlanPhase::Approved.to_string(), "Approved");
@@ -3779,7 +3789,7 @@ retirements:
     }
 
     #[test]
-    fn effective_approval_infers_from_mode() {
+    fn effective_approval_defaults_to_manual() {
         let base = PostgresPolicySpec {
             connection: ConnectionSpec {
                 secret_ref: Some(SecretReference {
@@ -3803,10 +3813,8 @@ retirements:
             approval: None,
         };
 
-        // apply mode with no explicit approval → Auto
-        assert_eq!(base.effective_approval(), ApprovalMode::Auto);
+        assert_eq!(base.effective_approval(), ApprovalMode::Manual);
 
-        // plan mode with no explicit approval → Manual
         let plan = PostgresPolicySpec {
             mode: PolicyMode::Plan,
             ..base.clone()
@@ -3870,8 +3878,8 @@ retirements:
         );
         assert_eq!(
             spec.effective_approval(),
-            ApprovalMode::Auto,
-            "effective_approval should infer Auto from apply mode"
+            ApprovalMode::Manual,
+            "effective_approval should default to Manual when omitted"
         );
     }
 
