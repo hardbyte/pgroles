@@ -3759,18 +3759,25 @@ retirements:
     #[test]
     fn postgres_policy_crd_marks_named_lists_as_maps() {
         let crd = PostgresPolicy::crd();
-        let yaml = serde_yaml::to_string(&crd).expect("CRD should serialize to YAML");
+        let value = serde_yaml::to_value(&crd).expect("CRD should serialize to YAML value");
+        let spec_properties = &value["spec"]["versions"][0]["schema"]["openAPIV3Schema"]["properties"]
+            ["spec"]["properties"];
 
-        for field_name in ["schemas", "roles"] {
-            assert!(
-                yaml.contains(&format!("{field_name}:\n")),
-                "CRD should contain spec.{field_name}"
+        for (field_name, map_key) in [
+            ("schemas", "name"),
+            ("roles", "name"),
+            ("retirements", "role"),
+        ] {
+            let field_schema = &spec_properties[field_name];
+            assert_eq!(
+                field_schema["x-kubernetes-list-type"], "map",
+                "spec.{field_name} should be a Kubernetes map-list"
+            );
+            assert_eq!(
+                field_schema["x-kubernetes-list-map-keys"][0], map_key,
+                "spec.{field_name} should be keyed by {map_key}"
             );
         }
-        assert!(yaml.contains("x-kubernetes-list-type: map"));
-        assert!(yaml.contains("x-kubernetes-list-map-keys:"));
-        assert!(yaml.contains("- name"));
-        assert!(yaml.contains("- role"));
     }
 
     #[test]
