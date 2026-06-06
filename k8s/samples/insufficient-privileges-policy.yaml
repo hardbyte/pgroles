@@ -9,6 +9,7 @@ spec:
     secretRef:
       name: limited-postgres-credentials
   interval: "5m"
+  approval: auto
 
   roles:
     - name: insufficient-privileges-user

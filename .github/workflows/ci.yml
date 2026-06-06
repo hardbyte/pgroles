@@ -259,7 +259,8 @@ jobs:
           wait_for_ready_status_reason plan-policy True Planned
           wait_for_drift_status plan-policy True
           kubectl get pgr plan-policy -o jsonpath='{.status.last_reconcile_mode}' | grep -qx "plan"
-          kubectl get pgr plan-policy -o jsonpath='{.status.planned_sql}' | grep -q 'CREATE ROLE \"plan-preview-user\"'
+          plan_name=$(wait_for_current_plan_ref plan-policy)
+          get_plan_sql "$plan_name" | grep -q 'CREATE ROLE "plan-preview-user"'
           assert_role_absent plan-preview-user
           wait_for_event_reason plan-policy DriftDetected
 

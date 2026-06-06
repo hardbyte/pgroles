@@ -9,6 +9,7 @@ spec:
     secretRef:
       name: postgres-credentials
   interval: "5m"
+  approval: auto
 
   roles:
     - name: analytics

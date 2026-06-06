@@ -18,6 +18,7 @@ spec:
         name: params-pg-credentials
         key: password
   interval: "15s"
+  approval: auto
 
   roles:
     - name: params-test-role

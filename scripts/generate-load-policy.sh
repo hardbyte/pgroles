@@ -20,6 +20,7 @@ spec:
     secretRef:
       name: ${secret_name}
   interval: "5m"
+  approval: auto
   default_owner: postgres
 
   profiles:
