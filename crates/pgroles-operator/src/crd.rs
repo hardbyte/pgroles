@@ -120,8 +120,10 @@ pub struct PostgresPolicySpec {
     /// Approval mode for plans: `auto` or `manual`.
     /// When `manual`, plans require explicit approval before execution.
     /// When `auto`, plans are approved and applied immediately.
+    /// Only affects `mode: apply`; `mode: plan` never executes SQL.
     /// When omitted, defaults to `manual`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("default" = "manual"))]
     pub approval: Option<ApprovalMode>,
 }
 
@@ -3778,6 +3780,11 @@ retirements:
                 "spec.{field_name} should be keyed by {map_key}"
             );
         }
+
+        assert_eq!(
+            spec_properties["approval"]["default"], "manual",
+            "spec.approval should advertise the runtime default in the CRD schema"
+        );
     }
 
     #[test]
@@ -3904,6 +3911,28 @@ retirements:
             status.current_plan_ref.is_none(),
             "current_plan_ref should be None when omitted"
         );
+    }
+
+    #[test]
+    fn status_with_removed_legacy_fields_still_deserializes() {
+        let json = serde_json::json!({
+            "conditions": [],
+            "last_reconcile_time": "2026-06-01T00:00:00Z",
+            "last_successful_reconcile_time": "2026-06-01T00:00:00Z",
+            "planned_sql": "CREATE ROLE \"legacy\";",
+            "planned_sql_truncated": false,
+            "owned_roles": [],
+            "owned_schemas": []
+        });
+
+        let status: PostgresPolicyStatus = serde_json::from_value(json)
+            .expect("old stored status fields should not block deserialization");
+
+        assert_eq!(
+            status.last_successful_reconcile_time.as_deref(),
+            Some("2026-06-01T00:00:00Z")
+        );
+        assert!(status.current_plan_ref.is_none());
     }
 
     #[test]

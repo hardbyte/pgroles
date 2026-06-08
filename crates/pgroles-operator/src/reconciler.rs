@@ -1955,9 +1955,9 @@ where
 
     mutate(&mut status);
 
-    let patch = serde_json::json!({
-        "status": status
-    });
+    let patch = status_patch_with_removed_legacy_fields(&status).map_err(|err| {
+        ReconcileError::InvalidSpec(format!("failed to serialize status patch: {err}"))
+    })?;
 
     api.patch_status(
         &name,
@@ -1973,6 +1973,23 @@ where
     }
 
     Ok(())
+}
+
+fn status_patch_with_removed_legacy_fields(
+    status: &PostgresPolicyStatus,
+) -> Result<serde_json::Value, serde_json::Error> {
+    let mut status_value = serde_json::to_value(status)?;
+    if let Some(status_object) = status_value.as_object_mut() {
+        // JSON merge-patch only deletes fields that are explicitly set to null.
+        // Keep sending nulls until all pre-removal status keys have aged out of clusters.
+        status_object.insert("last_reconcile_time".to_string(), serde_json::Value::Null);
+        status_object.insert("planned_sql".to_string(), serde_json::Value::Null);
+        status_object.insert("planned_sql_truncated".to_string(), serde_json::Value::Null);
+    }
+
+    Ok(serde_json::json!({
+        "status": status_value,
+    }))
 }
 
 async fn detect_policy_conflict(
@@ -2831,6 +2848,32 @@ mod tests {
             Some("SQL execution error: connection closed")
         );
         assert_eq!(status.transient_failure_count, 3);
+    }
+
+    #[test]
+    fn status_patch_explicitly_removes_legacy_status_fields() {
+        let status = PostgresPolicyStatus {
+            last_successful_reconcile_time: Some("2026-06-01T00:00:00Z".into()),
+            current_plan_ref: Some(crate::crd::PlanReference {
+                name: "current-plan".into(),
+            }),
+            ..Default::default()
+        };
+
+        let patch = status_patch_with_removed_legacy_fields(&status)
+            .expect("status should serialize to merge patch");
+
+        assert_eq!(
+            patch["status"]["last_successful_reconcile_time"],
+            "2026-06-01T00:00:00Z"
+        );
+        assert_eq!(patch["status"]["current_plan_ref"]["name"], "current-plan");
+        assert!(patch["status"].get("last_reconcile_time").is_some());
+        assert!(patch["status"].get("planned_sql").is_some());
+        assert!(patch["status"].get("planned_sql_truncated").is_some());
+        assert!(patch["status"]["last_reconcile_time"].is_null());
+        assert!(patch["status"]["planned_sql"].is_null());
+        assert!(patch["status"]["planned_sql_truncated"].is_null());
     }
 
     #[test]
