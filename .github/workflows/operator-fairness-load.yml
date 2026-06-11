@@ -25,7 +25,7 @@ jobs:
       should_run: ${{ steps.decide.outputs.should_run }}
       reason: ${{ steps.decide.outputs.reason }}
     steps:
-      - uses: actions/github-script@v7
+      - uses: actions/github-script@v9
         id: decide
         with:
           script: |
