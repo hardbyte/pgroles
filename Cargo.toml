@@ -46,7 +46,7 @@ futures = "0.3"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 axum = "0.8.9"
 opentelemetry = { version = "0.31", features = ["metrics"] }
-opentelemetry_sdk = { version = "0.31", features = ["metrics", "rt-tokio", "testing"] }
+opentelemetry_sdk = { version = "0.32", features = ["metrics", "rt-tokio", "testing"] }
 opentelemetry-otlp = { version = "0.31", features = ["metrics", "grpc-tonic"] }
 
 # Kubernetes
