@@ -363,8 +363,11 @@ pub struct RoleDefinition {
 
 /// A role configuration parameter value.
 ///
-/// Accepts any YAML scalar (string, number, or boolean) and normalizes it to
-/// the string form PostgreSQL stores in `pg_roles.rolconfig`.
+/// Values are always strings — quote numbers and booleans (e.g.
+/// `statement_timeout: "30000"`, `jit: "off"`). The Kubernetes CRD schema
+/// types config values as strings, and the CLI enforces the same rule so a
+/// manifest means the same thing whether it is applied with `pgroles` or
+/// `kubectl`. PostgreSQL coerces the string to the parameter's type.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, JsonSchema)]
 #[serde(transparent)]
 pub struct ConfigValue(pub String);
@@ -374,15 +377,50 @@ impl<'de> Deserialize<'de> for ConfigValue {
     where
         D: serde::Deserializer<'de>,
     {
-        let value = serde_yaml::Value::deserialize(deserializer)?;
-        match value {
-            serde_yaml::Value::String(s) => Ok(ConfigValue(s)),
-            serde_yaml::Value::Number(n) => Ok(ConfigValue(n.to_string())),
-            serde_yaml::Value::Bool(b) => Ok(ConfigValue(if b { "on" } else { "off" }.to_string())),
-            _ => Err(serde::de::Error::custom(
-                "config values must be scalars (string, number, or boolean)",
-            )),
+        struct ConfigValueVisitor;
+
+        impl serde::de::Visitor<'_> for ConfigValueVisitor {
+            type Value = ConfigValue;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("a string")
+            }
+
+            fn visit_str<E: serde::de::Error>(self, v: &str) -> Result<Self::Value, E> {
+                Ok(ConfigValue(v.to_string()))
+            }
+
+            fn visit_string<E: serde::de::Error>(self, v: String) -> Result<Self::Value, E> {
+                Ok(ConfigValue(v))
+            }
+
+            fn visit_i64<E: serde::de::Error>(self, v: i64) -> Result<Self::Value, E> {
+                Err(E::custom(format!(
+                    "config values must be quoted strings: write \"{v}\" instead of {v}"
+                )))
+            }
+
+            fn visit_u64<E: serde::de::Error>(self, v: u64) -> Result<Self::Value, E> {
+                Err(E::custom(format!(
+                    "config values must be quoted strings: write \"{v}\" instead of {v}"
+                )))
+            }
+
+            fn visit_f64<E: serde::de::Error>(self, v: f64) -> Result<Self::Value, E> {
+                Err(E::custom(format!(
+                    "config values must be quoted strings: write \"{v}\" instead of {v}"
+                )))
+            }
+
+            fn visit_bool<E: serde::de::Error>(self, v: bool) -> Result<Self::Value, E> {
+                let suggestion = if v { "on" } else { "off" };
+                Err(E::custom(format!(
+                    "config values must be quoted strings: write \"{suggestion}\" (or \"{v}\") instead of {v}"
+                )))
+            }
         }
+
+        deserializer.deserialize_any(ConfigValueVisitor)
     }
 }
 
@@ -913,21 +951,53 @@ roles:
     }
 
     #[test]
-    fn parse_role_config_accepts_scalars() {
+    fn parse_role_config_accepts_strings() {
         let yaml = r#"
 roles:
   - name: blue
     login: true
     config:
       role: combined
-      statement_timeout: 30000
-      jit: false
+      statement_timeout: "30000"
+      jit: "off"
 "#;
         let manifest = parse_manifest(yaml).unwrap();
         let config = &manifest.roles[0].config;
         assert_eq!(config["role"].0, "combined");
         assert_eq!(config["statement_timeout"].0, "30000");
         assert_eq!(config["jit"].0, "off");
+    }
+
+    #[test]
+    fn parse_role_config_rejects_unquoted_number() {
+        // The CRD schema types config values as strings, so the CLI enforces
+        // the same rule — the same manifest must be valid in both paths.
+        let yaml = r#"
+roles:
+  - name: blue
+    config:
+      statement_timeout: 30000
+"#;
+        let err = parse_manifest(yaml).unwrap_err();
+        assert!(
+            err.to_string().contains("write \"30000\" instead of 30000"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn parse_role_config_rejects_unquoted_boolean() {
+        let yaml = r#"
+roles:
+  - name: blue
+    config:
+      jit: false
+"#;
+        let err = parse_manifest(yaml).unwrap_err();
+        assert!(
+            err.to_string().contains("write \"off\""),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]

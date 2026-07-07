@@ -510,7 +510,7 @@ roles:
     login: true
     config:
       Role: combined
-      statement_timeout: 30000
+      statement_timeout: "30000"
 "#;
         let manifest = parse_manifest(yaml).unwrap();
         let graph = RoleGraph::from_expanded(&expand_manifest(&manifest).unwrap(), None).unwrap();

@@ -172,6 +172,7 @@ roles:
     config:
       role: combined
       search_path: app
+      statement_timeout: "30s"
   - name: green
     login: true
     config:
@@ -184,7 +185,9 @@ memberships:
       - name: green
 ```
 
-Keys are PostgreSQL setting names (including dot-qualified custom settings like `app.tenant`); values may be strings, numbers, or booleans. Settings are compared against the cluster-wide entries in `pg_roles.rolconfig`. In authoritative and adopt modes, settings present on a managed role in the database but absent from the manifest are removed with `ALTER ROLE ... RESET`. In additive mode, config on pre-existing roles is left unchanged (config on newly created roles is still applied).
+Keys are PostgreSQL setting names (including dot-qualified custom settings like `app.tenant`); values are always strings — quote numbers and booleans, e.g. `statement_timeout: "30000"` and `jit: "off"`. The Kubernetes CRD schema types config values as strings, and the CLI enforces the same rule, so a manifest means the same thing whether it is applied with `pgroles` or `kubectl`. PostgreSQL coerces the string to the parameter's type.
+
+Settings are compared against the cluster-wide entries in `pg_roles.rolconfig`. In authoritative and adopt modes, settings present on a managed role in the database but absent from the manifest are removed with `ALTER ROLE ... RESET`. In additive mode, config on pre-existing roles is left unchanged (config on newly created roles is still applied).
 
 The `role: <group>` setting is the standard fix for blue/green credential rotation: both login roles switch to a shared group role at connect time, so objects created by either credential are owned by the group and remain fully accessible after rotation. When the target of a `role:` setting is declared in the same manifest, pgroles validates that a matching membership is declared too — without membership, PostgreSQL rejects the setting at login.
 
