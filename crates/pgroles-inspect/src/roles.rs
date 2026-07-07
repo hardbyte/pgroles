@@ -20,6 +20,10 @@ pub struct RoleRow {
     pub comment: Option<String>,
     /// Password expiration from pg_roles.rolvaliduntil (NULL if no expiration).
     pub rolvaliduntil: Option<String>,
+    /// Cluster-wide role config defaults from pg_roles.rolconfig, as
+    /// `parameter=value` strings (NULL if none). Per-database settings
+    /// (`ALTER ROLE ... IN DATABASE`) do not appear here.
+    pub rolconfig: Option<Vec<String>>,
 }
 
 impl RoleRow {
@@ -36,8 +40,32 @@ impl RoleRow {
             connection_limit: self.rolconnlimit,
             comment: self.comment.clone(),
             password_valid_until: self.rolvaliduntil.clone(),
+            config: self
+                .rolconfig
+                .as_deref()
+                .unwrap_or_default()
+                .iter()
+                .filter_map(|entry| parse_rolconfig_entry(entry))
+                .collect(),
         }
     }
+}
+
+/// Parse one `pg_roles.rolconfig` entry (`parameter=value`) into a
+/// `(parameter, value)` pair.
+///
+/// PostgreSQL wraps list-typed values that were set from a single string
+/// literal in double quotes (e.g. `search_path="app, public"`); we strip one
+/// level of outer quotes so the stored form compares equal to the manifest
+/// value pgroles applied.
+fn parse_rolconfig_entry(entry: &str) -> Option<(String, String)> {
+    let (parameter, raw_value) = entry.split_once('=')?;
+    let value = raw_value
+        .strip_prefix('"')
+        .and_then(|v| v.strip_suffix('"'))
+        .map(|v| v.replace("\"\"", "\""))
+        .unwrap_or_else(|| raw_value.to_string());
+    Some((parameter.to_ascii_lowercase(), value))
 }
 
 /// Fetch all non-system roles from the database.
@@ -73,7 +101,8 @@ pub async fn fetch_roles(
                     d.description AS comment,
                     CASE WHEN r.rolvaliduntil IS NOT NULL
                          THEN to_char(r.rolvaliduntil AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"')
-                         ELSE NULL END AS rolvaliduntil
+                         ELSE NULL END AS rolvaliduntil,
+                    r.rolconfig
                 FROM pg_roles r
                 LEFT JOIN pg_shdescription d
                     ON d.objoid = r.oid
@@ -102,7 +131,8 @@ pub async fn fetch_roles(
                     d.description AS comment,
                     CASE WHEN r.rolvaliduntil IS NOT NULL
                          THEN to_char(r.rolvaliduntil AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"')
-                         ELSE NULL END AS rolvaliduntil
+                         ELSE NULL END AS rolvaliduntil,
+                    r.rolconfig
                 FROM pg_roles r
                 LEFT JOIN pg_shdescription d
                     ON d.objoid = r.oid
@@ -140,9 +170,21 @@ mod tests {
             rolconnlimit: 12,
             comment: Some("analytics login".to_string()),
             rolvaliduntil: Some("2026-12-31T00:00:00Z".to_string()),
+            rolconfig: Some(vec![
+                "role=combined".to_string(),
+                "search_path=\"app, public\"".to_string(),
+            ]),
         };
 
         let state = row.to_role_state();
+        assert_eq!(
+            state.config.get("role").map(String::as_str),
+            Some("combined")
+        );
+        assert_eq!(
+            state.config.get("search_path").map(String::as_str),
+            Some("app, public")
+        );
         assert!(state.login);
         assert!(!state.superuser);
         assert!(!state.inherit);

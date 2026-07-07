@@ -255,6 +255,17 @@ fn filter_additive_changes(changes: Vec<Change>) -> Vec<Change> {
         })
         .collect();
 
+    // Roles created in this same plan: their config-only follow-up alters are
+    // part of the creation, not a mutation of a pre-existing role, so
+    // additive mode keeps them.
+    let created_roles: BTreeSet<String> = changes
+        .iter()
+        .filter_map(|change| match change {
+            Change::CreateRole { name, .. } => Some(name.clone()),
+            _ => None,
+        })
+        .collect();
+
     changes
         .into_iter()
         .filter(|change| match change {
@@ -264,7 +275,13 @@ fn filter_additive_changes(changes: Vec<Change>) -> Vec<Change> {
             Change::SetDefaultPrivilege { schema, owner, .. } => {
                 !skipped_owner_transfers.contains(&(schema.clone(), owner.clone()))
             }
-            Change::AlterRole { .. } | Change::SetComment { .. } => false,
+            Change::AlterRole { name, attributes } => {
+                created_roles.contains(name)
+                    && attributes
+                        .iter()
+                        .all(|attr| matches!(attr, RoleAttribute::SetConfig(..)))
+            }
+            Change::SetComment { .. } => false,
             _ => !is_destructive(change),
         })
         .collect()
@@ -327,6 +344,21 @@ pub fn diff(current: &RoleGraph, desired: &RoleGraph) -> Vec<Change> {
                     name: name.clone(),
                     state: desired_state.clone(),
                 });
+                // Config defaults are applied as a follow-up alter so the
+                // statements land after all CREATE ROLEs — a `role` setting
+                // may reference another role created in this same plan.
+                if !desired_state.config.is_empty() {
+                    alters.push(Change::AlterRole {
+                        name: name.clone(),
+                        attributes: desired_state
+                            .config
+                            .iter()
+                            .map(|(parameter, value)| {
+                                RoleAttribute::SetConfig(parameter.clone(), value.clone())
+                            })
+                            .collect(),
+                    });
+                }
             }
             Some(current_state) => {
                 // Role exists — check for attribute changes
@@ -877,6 +909,7 @@ mod tests {
             comment: None,
             password: None,
             password_valid_until: None,
+            config: Default::default(),
         }
     }
 
@@ -937,6 +970,59 @@ mod tests {
             }
             other => panic!("expected AlterRole, got: {other:?}"),
         }
+    }
+
+    #[test]
+    fn diff_converges_role_config_via_manifest_pipeline() {
+        // The issue-132 blue/green scenario: login roles blue and green both
+        // SET ROLE to a shared "combined" owner role on connect.
+        let yaml = r#"
+roles:
+  - name: blue
+    login: true
+    config:
+      role: combined
+  - name: green
+    login: true
+    config:
+      role: combined
+  - name: combined
+
+memberships:
+  - role: combined
+    members:
+      - name: blue
+      - name: green
+"#;
+        let manifest = crate::manifest::parse_manifest(yaml).unwrap();
+        let expanded = crate::manifest::expand_manifest(&manifest).unwrap();
+        let desired = RoleGraph::from_expanded(&expanded, None).unwrap();
+
+        // Fresh database: everything is created, including config statements.
+        let changes = diff(&empty_graph(), &desired);
+        let sql = crate::sql::render_all(&changes);
+        assert!(sql.contains("ALTER ROLE \"blue\" SET \"role\" = 'combined';"));
+        assert!(sql.contains("ALTER ROLE \"green\" SET \"role\" = 'combined';"));
+        assert!(sql.contains("GRANT \"combined\" TO \"blue\""));
+
+        // Converged database: config matches, no changes.
+        let changes = diff(&desired, &desired);
+        assert!(changes.is_empty());
+
+        // Drifted database: green lost its setting, blue has a stray one.
+        let mut current = desired.clone();
+        current.roles.get_mut("green").unwrap().config.clear();
+        current
+            .roles
+            .get_mut("blue")
+            .unwrap()
+            .config
+            .insert("statement_timeout".to_string(), "10s".to_string());
+        let changes = diff(&current, &desired);
+        let sql = crate::sql::render_all(&changes);
+        assert!(sql.contains("ALTER ROLE \"green\" SET \"role\" = 'combined';"));
+        assert!(sql.contains("ALTER ROLE \"blue\" RESET \"statement_timeout\";"));
+        assert!(!sql.contains("ALTER ROLE \"blue\" SET"));
     }
 
     #[test]
@@ -1872,6 +1958,7 @@ memberships:
                 from_env: "PGROLES_TEST_MISSING_VAR_9a8b7c6d".to_string(),
             }),
             password_valid_until: None,
+            config: Default::default(),
             superuser: None,
             createdb: None,
             createrole: None,
@@ -1906,6 +1993,7 @@ memberships:
                 from_env: "PGROLES_TEST_EMPTY_VAR_1a2b3c4d".to_string(),
             }),
             password_valid_until: None,
+            config: Default::default(),
             superuser: None,
             createdb: None,
             createrole: None,
@@ -1944,6 +2032,7 @@ memberships:
                 from_env: "PGROLES_TEST_RESOLVE_VAR_5e6f7g8h".to_string(),
             }),
             password_valid_until: None,
+            config: Default::default(),
             superuser: None,
             createdb: None,
             createrole: None,
@@ -1976,6 +2065,7 @@ memberships:
                 from_env: "PGROLES_TEST_EXTERNAL_MISSING_VAR_2b4d6f8h".to_string(),
             }),
             password_valid_until: None,
+            config: Default::default(),
             superuser: None,
             createdb: None,
             createrole: None,
@@ -2001,6 +2091,7 @@ memberships:
             login: Some(true),
             password: None,
             password_valid_until: None,
+            config: Default::default(),
             superuser: None,
             createdb: None,
             createrole: None,
@@ -2072,6 +2163,7 @@ memberships:
             RoleState {
                 login: true,
                 password_valid_until: Some("2025-12-31T00:00:00Z".to_string()),
+                config: Default::default(),
                 ..RoleState::default()
             },
         );
@@ -2274,6 +2366,7 @@ memberships:
             RoleState {
                 login: true,
                 password_valid_until: Some("2025-12-31T00:00:00Z".to_string()),
+                config: Default::default(),
                 ..RoleState::default()
             },
         );

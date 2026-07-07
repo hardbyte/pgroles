@@ -692,6 +692,14 @@
                           "nullable": true,
                           "type": "string"
                         },
+                        "config": {
+                          "additionalProperties": {
+                            "description": "A role configuration parameter value.\n\nAccepts any YAML scalar (string, number, or boolean) and normalizes it to\nthe string form PostgreSQL stores in `pg_roles.rolconfig`.",
+                            "type": "string"
+                          },
+                          "description": "Role-level configuration parameter defaults, applied via\n`ALTER ROLE ... SET parameter = value` (e.g. `role: combined`,\n`search_path: app`). Settings present on the role in the database but\nabsent here are RESET in authoritative mode.",
+                          "type": "object"
+                        },
                         "connection_limit": {
                           "format": "int32",
                           "nullable": true,

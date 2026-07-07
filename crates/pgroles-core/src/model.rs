@@ -29,6 +29,12 @@ pub struct RoleState {
     /// `None` means no expiration (PostgreSQL default).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub password_valid_until: Option<String>,
+    /// Role-level configuration parameter defaults (`ALTER ROLE ... SET`),
+    /// keyed by lowercase parameter name. Mirrors the cluster-wide entries in
+    /// `pg_roles.rolconfig` (per-database `ALTER ROLE ... IN DATABASE` settings
+    /// are not managed).
+    #[serde(skip_serializing_if = "BTreeMap::is_empty", default)]
+    pub config: BTreeMap<String, String>,
 }
 
 impl Default for RoleState {
@@ -44,6 +50,7 @@ impl Default for RoleState {
             connection_limit: -1, // unlimited
             comment: None,
             password_valid_until: None,
+            config: BTreeMap::new(),
         }
     }
 }
@@ -66,6 +73,13 @@ impl RoleState {
                 .unwrap_or(defaults.connection_limit),
             comment: definition.comment.clone(),
             password_valid_until: definition.password_valid_until.clone(),
+            // GUC names are case-insensitive; normalize to lowercase so the
+            // desired state compares cleanly against pg_roles.rolconfig.
+            config: definition
+                .config
+                .iter()
+                .map(|(name, value)| (name.to_ascii_lowercase(), value.0.clone()))
+                .collect(),
         }
     }
 
@@ -101,6 +115,16 @@ impl RoleState {
                 other.password_valid_until.clone(),
             ));
         }
+        for (parameter, value) in &other.config {
+            if self.config.get(parameter) != Some(value) {
+                changes.push(RoleAttribute::SetConfig(parameter.clone(), value.clone()));
+            }
+        }
+        for parameter in self.config.keys() {
+            if !other.config.contains_key(parameter) {
+                changes.push(RoleAttribute::ResetConfig(parameter.clone()));
+            }
+        }
         changes
     }
 }
@@ -118,6 +142,10 @@ pub enum RoleAttribute {
     ConnectionLimit(i32),
     /// Password expiration change. `None` removes the expiration (`VALID UNTIL 'infinity'`).
     ValidUntil(Option<String>),
+    /// Set a role-level configuration default (`ALTER ROLE ... SET name = value`).
+    SetConfig(String, String),
+    /// Remove a role-level configuration default (`ALTER ROLE ... RESET name`).
+    ResetConfig(String),
 }
 
 // ---------------------------------------------------------------------------
@@ -403,6 +431,7 @@ mod tests {
             comment: Some("test role".to_string()),
             password: None,
             password_valid_until: Some("2025-12-31T00:00:00Z".to_string()),
+            config: Default::default(),
         };
         let state = RoleState::from_definition(&definition);
         assert!(state.login);
@@ -436,6 +465,61 @@ mod tests {
     fn changed_attributes_empty_when_equal() {
         let state = RoleState::default();
         assert!(state.changed_attributes(&state.clone()).is_empty());
+    }
+
+    #[test]
+    fn changed_attributes_detects_config_set_change_and_reset() {
+        let current = RoleState {
+            config: [
+                ("role".to_string(), "combined".to_string()),
+                ("statement_timeout".to_string(), "30s".to_string()),
+            ]
+            .into_iter()
+            .collect(),
+            ..RoleState::default()
+        };
+        let desired = RoleState {
+            config: [
+                ("role".to_string(), "combined".to_string()),
+                ("search_path".to_string(), "app".to_string()),
+            ]
+            .into_iter()
+            .collect(),
+            ..RoleState::default()
+        };
+        let changes = current.changed_attributes(&desired);
+        assert_eq!(changes.len(), 2);
+        assert!(changes.contains(&RoleAttribute::SetConfig(
+            "search_path".to_string(),
+            "app".to_string()
+        )));
+        assert!(changes.contains(&RoleAttribute::ResetConfig("statement_timeout".to_string())));
+        // Unchanged `role` setting produces no change.
+        assert!(
+            !changes
+                .iter()
+                .any(|c| matches!(c, RoleAttribute::SetConfig(p, _) if p == "role"))
+        );
+    }
+
+    #[test]
+    fn from_definition_lowercases_config_parameter_names() {
+        let yaml = r#"
+roles:
+  - name: blue
+    login: true
+    config:
+      Role: combined
+      statement_timeout: 30000
+"#;
+        let manifest = parse_manifest(yaml).unwrap();
+        let graph = RoleGraph::from_expanded(&expand_manifest(&manifest).unwrap(), None).unwrap();
+        let config = &graph.roles["blue"].config;
+        assert_eq!(config.get("role").map(String::as_str), Some("combined"));
+        assert_eq!(
+            config.get("statement_timeout").map(String::as_str),
+            Some("30000")
+        );
     }
 
     #[test]

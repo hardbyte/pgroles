@@ -148,6 +148,7 @@ roles:
 | `comment` | string | *none* | Comment on the role |
 | `password` | object | *none* | Password source |
 | `password_valid_until` | string | *none* | Password expiration (ISO 8601) |
+| `config` | map | `{}` | Role-level configuration defaults (`ALTER ROLE ... SET`) |
 
 Roles with `login: true` can declare a password source. The password value is never stored in the manifest; it is resolved at apply time from an environment variable in CLI mode or from a Kubernetes Secret in operator mode.
 
@@ -157,6 +158,40 @@ Use `external: true` for roles whose lifecycle is owned by another system, such 
 
 {% callout type="note" title="Passwords and drift detection" %}
 Because PostgreSQL does not expose password hashes for comparison, password changes always appear in the plan. The `diff --exit-code` flag treats password-only changes as non-structural; they do not trigger exit code 2.
+{% /callout %}
+
+### Role configuration defaults
+
+`config` declares session defaults that PostgreSQL applies whenever the role logs in, managed via `ALTER ROLE ... SET parameter = value`:
+
+```yaml
+roles:
+  - name: combined
+  - name: blue
+    login: true
+    config:
+      role: combined
+      search_path: app
+  - name: green
+    login: true
+    config:
+      role: combined
+
+memberships:
+  - role: combined
+    members:
+      - name: blue
+      - name: green
+```
+
+Keys are PostgreSQL setting names (including dot-qualified custom settings like `app.tenant`); values may be strings, numbers, or booleans. Settings are compared against the cluster-wide entries in `pg_roles.rolconfig`. In authoritative and adopt modes, settings present on a managed role in the database but absent from the manifest are removed with `ALTER ROLE ... RESET`. In additive mode, config on pre-existing roles is left unchanged (config on newly created roles is still applied).
+
+The `role: <group>` setting is the standard fix for blue/green credential rotation: both login roles switch to a shared group role at connect time, so objects created by either credential are owned by the group and remain fully accessible after rotation. When the target of a `role:` setting is declared in the same manifest, pgroles validates that a matching membership is declared too — without membership, PostgreSQL rejects the setting at login.
+
+Per-database settings (`ALTER ROLE ... IN DATABASE ... SET`) are not managed and are left untouched.
+
+{% callout type="note" title="Value normalization" %}
+Values are applied as string literals and read back from `pg_roles.rolconfig`. PostgreSQL stores most values verbatim, so writing the same form you want stored (e.g. `30s` or `30000`, but not both interchangeably) keeps the plan empty once converged.
 {% /callout %}
 
 ## grants
