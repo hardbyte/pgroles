@@ -214,6 +214,9 @@ spec:
     - name: app-service
       login: true
       comment: "Application service account"
+      config:
+        search_path: inventory
+        statement_timeout: "30s"   # config values are always strings
 
   grants:
     - role: app-service
@@ -390,6 +393,34 @@ Generated Secrets are created in the same namespace as the `PostgresPolicy`, own
 - pgroles cannot detect direct password changes made in PostgreSQL outside the operator, because PostgreSQL does not expose comparable password state safely.
 
 The controller also emits Kubernetes Events for notable state transitions. These are intended for `kubectl describe` and quick operational debugging, not as a durable audit trail or alerting mechanism.
+
+### Role configuration defaults
+
+Roles can declare session defaults that PostgreSQL applies at login, managed via `ALTER ROLE ... SET`:
+
+```yaml
+spec:
+  roles:
+    - name: combined
+    - name: blue
+      login: true
+      config:
+        role: combined
+    - name: green
+      login: true
+      config:
+        role: combined
+
+  memberships:
+    - role: combined
+      members:
+        - name: blue
+        - name: green
+```
+
+Config values are always strings in the CRD schema — quote numbers and booleans (`statement_timeout: "30000"`, `jit: "off"`); the API server rejects unquoted scalars at admission time. The `role: <group>` setting shown above implements blue/green credential rotation: both login roles switch to a shared owner role at connect, so objects created under either credential survive rotation. See [role configuration defaults](/docs/manifest-reference#role-configuration-defaults) in the manifest reference for semantics, reconciliation-mode behavior, and validation rules.
+
+Note that this is distinct from `connection.params.setRole`, which controls the role the *operator's own connection* switches to; `roles[].config.role` controls what *managed application roles* switch to when they log in.
 
 ## Reconciliation
 

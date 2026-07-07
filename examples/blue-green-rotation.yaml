@@ -1,0 +1,55 @@
+# Example: Blue/green login roles for zero-downtime password rotation
+#
+# Two login roles ("blue" and "green") share one NOLOGIN owner role
+# ("combined"). Both login roles carry `config: { role: combined }`, so
+# PostgreSQL runs SET ROLE at connect time and every object created under
+# either credential is owned by "combined".
+#
+# Rotation flow:
+#   1. The application authenticates as blue.
+#   2. To rotate, switch application credentials to green and let blue's
+#      connections drain, then rotate blue's password.
+#   3. Repeat in the other direction for the next rotation.
+#
+# Because both roles create objects as "combined", a table created while
+# running as green stays fully accessible (indexes, ALTERs, ...) after
+# switching back to blue — the failure mode from
+# https://github.com/hardbyte/pgroles/issues/132 cannot occur.
+#
+# Config values are always strings — quote numbers and booleans
+# (e.g. statement_timeout: "30s").
+#
+# Usage:
+#   export BLUE_PASSWORD="strong-random-password"
+#   export GREEN_PASSWORD="another-strong-password"
+#   pgroles apply -f examples/blue-green-rotation.yaml --database-url postgres://...
+
+schemas:
+  - name: app
+    owner: combined
+
+roles:
+  # Shared owner role. Never logs in; owns the schema and all objects.
+  - name: combined
+
+  - name: blue
+    login: true
+    password:
+      from_env: BLUE_PASSWORD
+    config:
+      role: combined
+
+  - name: green
+    login: true
+    password:
+      from_env: GREEN_PASSWORD
+    config:
+      role: combined
+
+# The `role: combined` setting only works if the login roles are members
+# of "combined" — pgroles validates this at manifest-validation time.
+memberships:
+  - role: combined
+    members:
+      - name: blue
+      - name: green
