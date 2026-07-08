@@ -692,6 +692,14 @@
                           "nullable": true,
                           "type": "string"
                         },
+                        "config": {
+                          "additionalProperties": {
+                            "description": "A role configuration parameter value.\n\nValues are always strings — quote numbers and booleans (e.g.\n`statement_timeout: \"30000\"`, `jit: \"off\"`). The Kubernetes CRD schema\ntypes config values as strings, and the CLI enforces the same rule so a\nmanifest means the same thing whether it is applied with `pgroles` or\n`kubectl`. PostgreSQL coerces the string to the parameter's type.",
+                            "type": "string"
+                          },
+                          "description": "Role-level configuration parameter defaults, applied via\n`ALTER ROLE ... SET parameter = value` (e.g. `role: combined`,\n`search_path: app`). Settings present on the role in the database but\nabsent here are RESET in authoritative mode.",
+                          "type": "object"
+                        },
                         "connection_limit": {
                           "format": "int32",
                           "nullable": true,

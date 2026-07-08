@@ -71,6 +71,31 @@ memberships:
       - name: app-service
 ```
 
+### Blue/green login roles sharing an owner role
+
+For zero-downtime password rotation, two login roles alternate as the application credential while a shared NOLOGIN role owns all objects. Combining membership with a [`config.role` setting](/docs/manifest-reference#role-configuration-defaults) makes PostgreSQL `SET ROLE` at connect time, so objects created under either credential are owned by the shared role:
+
+```yaml
+roles:
+  - name: combined
+  - name: blue
+    login: true
+    config:
+      role: combined
+  - name: green
+    login: true
+    config:
+      role: combined
+
+memberships:
+  - role: combined
+    members:
+      - name: blue
+      - name: green
+```
+
+Without the membership, PostgreSQL would reject the `role` setting at login — pgroles validates the pair at manifest-validation time. See [examples/zero-downtime-password-rotation.yaml](https://github.com/hardbyte/pgroles/blob/main/examples/zero-downtime-password-rotation.yaml) for a complete manifest.
+
 ### Email-based roles (e.g. IAM authentication)
 
 PostgreSQL roles can have names like email addresses. pgroles handles quoting automatically:

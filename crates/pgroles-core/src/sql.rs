@@ -251,6 +251,11 @@ fn render_create_role(name: &str, state: &RoleState) -> Vec<String> {
         ));
     }
 
+    // NOTE: state.config is intentionally not rendered here. Config defaults
+    // cannot be part of CREATE ROLE, and a `role` setting may reference a
+    // role created later in the same plan — the diff engine emits a separate
+    // AlterRole with SetConfig attributes that orders after all creates.
+
     statements
 }
 
@@ -294,13 +299,67 @@ fn render_alter_role(name: &str, attributes: &[RoleAttribute]) -> Vec<String> {
                 Some(ts) => options.push(format!("VALID UNTIL {}", quote_literal(ts))),
                 None => options.push("VALID UNTIL 'infinity'".to_string()),
             },
+            // SET/RESET are separate ALTER ROLE forms that cannot be combined
+            // with attribute options — rendered as standalone statements below.
+            RoleAttribute::SetConfig(..) | RoleAttribute::ResetConfig(..) => {}
         }
     }
-    vec![format!(
-        "ALTER ROLE {} {};",
+    let mut statements = Vec::new();
+    if !options.is_empty() {
+        statements.push(format!(
+            "ALTER ROLE {} {};",
+            quote_ident(name),
+            options.join(" ")
+        ));
+    }
+    for attr in attributes {
+        match attr {
+            RoleAttribute::SetConfig(parameter, value) => {
+                statements.push(render_set_config(name, parameter, value));
+            }
+            RoleAttribute::ResetConfig(parameter) => {
+                statements.push(format!(
+                    "ALTER ROLE {} RESET {};",
+                    quote_ident(name),
+                    quote_ident(parameter)
+                ));
+            }
+            _ => {}
+        }
+    }
+    statements
+}
+
+/// Render `ALTER ROLE ... SET parameter = value`.
+///
+/// The parameter name is identifier-quoted (dotted custom GUC names like
+/// `app.tenant` quote as a single unit, which PostgreSQL accepts). List-quoted
+/// parameters (search_path, ...) are rendered as one string literal per list
+/// element — `SET search_path = 'a', 'b'` — because a single literal
+/// `'a, b'` would be stored as ONE element literally named `a, b`. All other
+/// values render as a single string literal; PostgreSQL coerces it to the
+/// parameter's type.
+fn render_set_config(name: &str, parameter: &str, value: &str) -> String {
+    let rendered_value = if crate::guc::is_list_quote_parameter(parameter) {
+        let elements = crate::guc::split_guc_list(value).unwrap_or_default();
+        if elements.is_empty() {
+            quote_literal("")
+        } else {
+            elements
+                .iter()
+                .map(|element| quote_literal(element))
+                .collect::<Vec<_>>()
+                .join(", ")
+        }
+    } else {
+        quote_literal(value)
+    };
+    format!(
+        "ALTER ROLE {} SET {} = {};",
         quote_ident(name),
-        options.join(" ")
-    )]
+        quote_ident(parameter),
+        rendered_value
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -730,6 +789,113 @@ mod tests {
     #[test]
     fn quote_literal_with_embedded_quotes() {
         assert_eq!(quote_literal("it's"), "'it''s'");
+    }
+
+    #[test]
+    fn render_create_role_does_not_inline_config() {
+        // Config for new roles is emitted by the diff engine as a separate
+        // AlterRole change that orders after all CREATE ROLE statements.
+        let change = Change::CreateRole {
+            name: "blue".to_string(),
+            state: RoleState {
+                login: true,
+                config: [("role".to_string(), "combined".to_string())]
+                    .into_iter()
+                    .collect(),
+                ..RoleState::default()
+            },
+        };
+        let statements = render_statements(&change);
+        assert_eq!(statements.len(), 1);
+        assert!(statements[0].starts_with("CREATE ROLE \"blue\""));
+    }
+
+    #[test]
+    fn render_alter_role_config_only_emits_set_and_reset() {
+        let change = Change::AlterRole {
+            name: "blue".to_string(),
+            attributes: vec![
+                RoleAttribute::SetConfig("role".to_string(), "combined".to_string()),
+                RoleAttribute::ResetConfig("statement_timeout".to_string()),
+            ],
+        };
+        let statements = render_statements(&change);
+        assert_eq!(
+            statements,
+            vec![
+                "ALTER ROLE \"blue\" SET \"role\" = 'combined';".to_string(),
+                "ALTER ROLE \"blue\" RESET \"statement_timeout\";".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn render_alter_role_mixes_attributes_and_config() {
+        let change = Change::AlterRole {
+            name: "blue".to_string(),
+            attributes: vec![
+                RoleAttribute::Login(true),
+                RoleAttribute::SetConfig("search_path".to_string(), "app, public".to_string()),
+            ],
+        };
+        let statements = render_statements(&change);
+        assert_eq!(
+            statements,
+            vec![
+                "ALTER ROLE \"blue\" LOGIN;".to_string(),
+                // List-quoted GUCs render one literal per element — a single
+                // 'app, public' literal would store ONE schema named "app, public".
+                "ALTER ROLE \"blue\" SET \"search_path\" = 'app', 'public';".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn render_set_config_splits_list_guc_elements() {
+        let change = Change::AlterRole {
+            name: "blue".to_string(),
+            attributes: vec![RoleAttribute::SetConfig(
+                "search_path".to_string(),
+                "\"$user\", public".to_string(),
+            )],
+        };
+        let statements = render_statements(&change);
+        assert_eq!(
+            statements,
+            vec!["ALTER ROLE \"blue\" SET \"search_path\" = '$user', 'public';".to_string()]
+        );
+    }
+
+    #[test]
+    fn render_set_config_keeps_non_list_values_as_single_literal() {
+        let change = Change::AlterRole {
+            name: "blue".to_string(),
+            attributes: vec![RoleAttribute::SetConfig(
+                "app.motd".to_string(),
+                "hello, world".to_string(),
+            )],
+        };
+        let statements = render_statements(&change);
+        assert_eq!(
+            statements,
+            vec!["ALTER ROLE \"blue\" SET \"app.motd\" = 'hello, world';".to_string()]
+        );
+    }
+
+    #[test]
+    fn render_set_config_quotes_literal_values() {
+        let change = Change::AlterRole {
+            name: "blue".to_string(),
+            attributes: vec![RoleAttribute::SetConfig(
+                "app.tenant".to_string(),
+                "o'brien".to_string(),
+            )],
+        };
+        let statements = render_statements(&change);
+        assert_eq!(
+            statements,
+            vec!["ALTER ROLE \"blue\" SET \"app.tenant\" = 'o''brien';".to_string()]
+        );
     }
 
     #[test]

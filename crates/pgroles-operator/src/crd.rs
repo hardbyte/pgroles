@@ -597,6 +597,12 @@ pub struct RoleSpec {
     /// Password expiration timestamp (ISO 8601, e.g. "2025-12-31T00:00:00Z").
     #[serde(default)]
     pub password_valid_until: Option<String>,
+    /// Role-level configuration parameter defaults, applied via
+    /// `ALTER ROLE ... SET parameter = value` (e.g. `role: combined`,
+    /// `search_path: app`). Settings present on the role in the database but
+    /// absent here are RESET in authoritative mode.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub config: std::collections::BTreeMap<String, pgroles_core::manifest::ConfigValue>,
 }
 
 /// Password configuration: either reference an existing Secret or have the
@@ -1453,6 +1459,7 @@ impl PostgresPolicySpec {
                 comment: r.comment.clone(),
                 password: None, // K8s passwords are resolved separately via Secret refs
                 password_valid_until: r.password_valid_until.clone(),
+                config: r.config.clone(),
             })
             .collect();
 
@@ -1733,6 +1740,7 @@ mod tests {
                 comment: Some("test role".to_string()),
                 password: None,
                 password_valid_until: None,
+                config: Default::default(),
             }],
             grants: vec![],
             default_privileges: vec![],
@@ -1880,6 +1888,7 @@ mod tests {
                 comment: None,
                 password: None,
                 password_valid_until: None,
+                config: Default::default(),
             }],
             grants: vec![],
             default_privileges: vec![],
@@ -2746,6 +2755,7 @@ params:
                 generate: None,
             }),
             password_valid_until: None,
+            config: Default::default(),
             superuser: None,
             createdb: None,
             createrole: None,
@@ -3310,6 +3320,7 @@ retirements:
                         generate: None,
                     }),
                     password_valid_until: None,
+                    config: Default::default(),
                     superuser: None,
                     createdb: None,
                     createrole: None,
@@ -3331,6 +3342,7 @@ retirements:
                         generate: None,
                     }),
                     password_valid_until: None,
+                    config: Default::default(),
                     superuser: None,
                     createdb: None,
                     createrole: None,
@@ -3346,6 +3358,7 @@ retirements:
                     login: None,
                     password: None,
                     password_valid_until: None,
+                    config: Default::default(),
                     superuser: None,
                     createdb: None,
                     createrole: None,
@@ -3416,6 +3429,7 @@ retirements:
                     generate: None,
                 }),
                 password_valid_until: None,
+                config: Default::default(),
             }],
             grants: vec![],
             default_privileges: vec![],
@@ -3467,6 +3481,7 @@ retirements:
                     generate: None,
                 }),
                 password_valid_until: None,
+                config: Default::default(),
             }],
             grants: vec![],
             default_privileges: vec![],
@@ -3522,6 +3537,7 @@ retirements:
                     }),
                 }),
                 password_valid_until: None,
+                config: Default::default(),
             }],
             grants: vec![],
             default_privileges: vec![],
@@ -3575,6 +3591,7 @@ retirements:
                     }),
                 }),
                 password_valid_until: None,
+                config: Default::default(),
             }],
             grants: vec![],
             default_privileges: vec![],
@@ -3628,6 +3645,7 @@ retirements:
                     }),
                 }),
                 password_valid_until: None,
+                config: Default::default(),
             }],
             grants: vec![],
             default_privileges: vec![],
@@ -3682,6 +3700,7 @@ retirements:
                     }),
                 }),
                 password_valid_until: None,
+                config: Default::default(),
             }],
             grants: vec![],
             default_privileges: vec![],
@@ -3735,6 +3754,7 @@ retirements:
                     }),
                 }),
                 password_valid_until: None,
+                config: Default::default(),
             }],
             grants: vec![],
             default_privileges: vec![],

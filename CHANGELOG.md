@@ -5,6 +5,12 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **Roles can now declare configuration parameter defaults via `config`, managed with `ALTER ROLE ... SET`.** Keys are PostgreSQL setting names (including dot-qualified custom settings like `app.tenant`); values are always strings — quote numbers and booleans (`statement_timeout: "30000"`, `jit: "off"`) — and the same rule is enforced by both the CLI parser and the CRD schema, so a manifest means the same thing in both paths. Settings are diffed against the cluster-wide entries in `pg_roles.rolconfig`: authoritative and adopt modes `RESET` settings present on a managed role but absent from the manifest, while additive mode leaves config on pre-existing roles unchanged (config on newly created roles is still applied). Declaring `config: { role: <group> }` on blue/green login roles makes PostgreSQL `SET ROLE` at connect time, so objects created under either credential are owned by the shared group role and survive password rotation; when the target role is declared in the same manifest, pgroles validates that a matching membership is declared too. `pgroles generate` exports existing role config defaults for brownfield adoption. Per-database settings (`ALTER ROLE ... IN DATABASE`) are not managed. See [examples/zero-downtime-password-rotation.yaml](examples/zero-downtime-password-rotation.yaml). (#132)
+
 ## [0.7.8] - 2026-06-04
 
 ### Added

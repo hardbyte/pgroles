@@ -45,6 +45,16 @@ pub enum ManifestError {
         "role \"{role}\" has an invalid password_valid_until value \"{value}\": expected ISO 8601 timestamp (e.g. \"2025-12-31T00:00:00Z\")"
     )]
     InvalidValidUntil { role: String, value: String },
+
+    #[error(
+        "role \"{role}\" has an invalid config parameter name \"{parameter}\": expected a PostgreSQL setting name (letters, digits, underscores, optionally dot-qualified)"
+    )]
+    InvalidConfigParameter { role: String, parameter: String },
+
+    #[error(
+        "role \"{role}\" sets config `role: {target}` but declares no membership in \"{target}\" — the setting would fail at login; add \"{role}\" to the members of \"{target}\""
+    )]
+    SetRoleWithoutMembership { role: String, target: String },
 }
 
 // ---------------------------------------------------------------------------
@@ -341,6 +351,89 @@ pub struct RoleDefinition {
     /// Maps to PostgreSQL's `VALID UNTIL` clause.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub password_valid_until: Option<String>,
+
+    /// Role-level configuration parameter defaults, applied via
+    /// `ALTER ROLE ... SET parameter = value`. Keys are PostgreSQL setting
+    /// names (e.g. `role`, `search_path`, `statement_timeout`); values are
+    /// applied as string literals. Settings present on the role in the
+    /// database but absent here are `RESET` in authoritative mode.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub config: BTreeMap<String, ConfigValue>,
+}
+
+/// A role configuration parameter value.
+///
+/// Values are always strings — quote numbers and booleans (e.g.
+/// `statement_timeout: "30000"`, `jit: "off"`). The Kubernetes CRD schema
+/// types config values as strings, and the CLI enforces the same rule so a
+/// manifest means the same thing whether it is applied with `pgroles` or
+/// `kubectl`. PostgreSQL coerces the string to the parameter's type.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, JsonSchema)]
+#[serde(transparent)]
+pub struct ConfigValue(pub String);
+
+impl<'de> Deserialize<'de> for ConfigValue {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct ConfigValueVisitor;
+
+        impl serde::de::Visitor<'_> for ConfigValueVisitor {
+            type Value = ConfigValue;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("a string")
+            }
+
+            fn visit_str<E: serde::de::Error>(self, v: &str) -> Result<Self::Value, E> {
+                Ok(ConfigValue(v.to_string()))
+            }
+
+            fn visit_string<E: serde::de::Error>(self, v: String) -> Result<Self::Value, E> {
+                Ok(ConfigValue(v))
+            }
+
+            fn visit_i64<E: serde::de::Error>(self, v: i64) -> Result<Self::Value, E> {
+                Err(E::custom(format!(
+                    "config values must be quoted strings: write \"{v}\" instead of {v}"
+                )))
+            }
+
+            fn visit_u64<E: serde::de::Error>(self, v: u64) -> Result<Self::Value, E> {
+                Err(E::custom(format!(
+                    "config values must be quoted strings: write \"{v}\" instead of {v}"
+                )))
+            }
+
+            fn visit_f64<E: serde::de::Error>(self, v: f64) -> Result<Self::Value, E> {
+                Err(E::custom(format!(
+                    "config values must be quoted strings: write \"{v}\" instead of {v}"
+                )))
+            }
+
+            fn visit_bool<E: serde::de::Error>(self, v: bool) -> Result<Self::Value, E> {
+                let suggestion = if v { "on" } else { "off" };
+                Err(E::custom(format!(
+                    "config values must be quoted strings: write \"{suggestion}\" (or \"{v}\") instead of {v}"
+                )))
+            }
+        }
+
+        deserializer.deserialize_any(ConfigValueVisitor)
+    }
+}
+
+/// Validate a PostgreSQL configuration parameter name: one or more
+/// letter/underscore-led identifier segments separated by dots (custom GUCs
+/// like `app.tenant` are dot-qualified).
+pub fn is_valid_config_parameter_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.split('.').all(|segment| {
+            let mut chars = segment.chars();
+            matches!(chars.next(), Some(c) if c.is_ascii_alphabetic() || c == '_')
+                && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+        })
 }
 
 /// Source for a role password. Passwords are never stored in YAML manifests.
@@ -571,6 +664,7 @@ pub fn expand_manifest(manifest: &PolicyManifest) -> Result<ExpandedManifest, Ma
                 )),
                 password: None,
                 password_valid_until: None,
+                config: BTreeMap::new(),
             });
 
             // Expand profile grants — fill in schema
@@ -686,6 +780,39 @@ pub fn expand_manifest(manifest: &PolicyManifest) -> Result<ExpandedManifest, Ma
                 role: role.name.clone(),
                 value: value.clone(),
             });
+        }
+    }
+
+    // Validate: config parameter names must be well-formed. A `role` setting
+    // whose target is declared in this manifest must be backed by a declared
+    // membership, otherwise PostgreSQL rejects the setting at login time
+    // ("permission denied to set role"). Targets not declared here may be
+    // externally managed, so we only enforce what we can see.
+    for role in &roles {
+        for (parameter, value) in &role.config {
+            if !is_valid_config_parameter_name(parameter) {
+                return Err(ManifestError::InvalidConfigParameter {
+                    role: role.name.clone(),
+                    parameter: parameter.clone(),
+                });
+            }
+            if parameter.eq_ignore_ascii_case("role") {
+                let target = value.0.as_str();
+                let target_declared = desired_role_names.contains(target);
+                let membership_declared = memberships.iter().any(|membership| {
+                    membership.role == target
+                        && membership
+                            .members
+                            .iter()
+                            .any(|member| member.name == role.name)
+                });
+                if target_declared && !membership_declared {
+                    return Err(ManifestError::SetRoleWithoutMembership {
+                        role: role.name.clone(),
+                        target: target.to_string(),
+                    });
+                }
+            }
         }
     }
 
@@ -821,6 +948,136 @@ roles:
         assert_eq!(manifest.roles.len(), 1);
         assert_eq!(manifest.roles[0].name, "test-role");
         assert!(manifest.roles[0].login.is_none());
+    }
+
+    #[test]
+    fn parse_role_config_accepts_strings() {
+        let yaml = r#"
+roles:
+  - name: blue
+    login: true
+    config:
+      role: combined
+      statement_timeout: "30000"
+      jit: "off"
+"#;
+        let manifest = parse_manifest(yaml).unwrap();
+        let config = &manifest.roles[0].config;
+        assert_eq!(config["role"].0, "combined");
+        assert_eq!(config["statement_timeout"].0, "30000");
+        assert_eq!(config["jit"].0, "off");
+    }
+
+    #[test]
+    fn parse_role_config_rejects_unquoted_number() {
+        // The CRD schema types config values as strings, so the CLI enforces
+        // the same rule — the same manifest must be valid in both paths.
+        let yaml = r#"
+roles:
+  - name: blue
+    config:
+      statement_timeout: 30000
+"#;
+        let err = parse_manifest(yaml).unwrap_err();
+        assert!(
+            err.to_string().contains("write \"30000\" instead of 30000"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn parse_role_config_rejects_unquoted_boolean() {
+        let yaml = r#"
+roles:
+  - name: blue
+    config:
+      jit: false
+"#;
+        let err = parse_manifest(yaml).unwrap_err();
+        assert!(
+            err.to_string().contains("write \"off\""),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn expand_rejects_invalid_config_parameter_name() {
+        let yaml = r#"
+roles:
+  - name: blue
+    config:
+      "bad name; DROP TABLE": x
+"#;
+        let manifest = parse_manifest(yaml).unwrap();
+        let err = expand_manifest(&manifest).unwrap_err();
+        assert!(matches!(err, ManifestError::InvalidConfigParameter { .. }));
+    }
+
+    #[test]
+    fn expand_rejects_set_role_without_declared_membership() {
+        let yaml = r#"
+roles:
+  - name: blue
+    login: true
+    config:
+      role: combined
+  - name: combined
+"#;
+        let manifest = parse_manifest(yaml).unwrap();
+        let err = expand_manifest(&manifest).unwrap_err();
+        assert!(matches!(
+            err,
+            ManifestError::SetRoleWithoutMembership { role, target }
+                if role == "blue" && target == "combined"
+        ));
+    }
+
+    #[test]
+    fn expand_accepts_set_role_with_declared_membership() {
+        let yaml = r#"
+roles:
+  - name: blue
+    login: true
+    config:
+      role: combined
+  - name: combined
+
+memberships:
+  - role: combined
+    members:
+      - name: blue
+"#;
+        let manifest = parse_manifest(yaml).unwrap();
+        assert!(expand_manifest(&manifest).is_ok());
+    }
+
+    #[test]
+    fn expand_accepts_set_role_to_undeclared_target() {
+        // Target role not declared in the manifest — assumed externally
+        // managed, so no membership can be verified.
+        let yaml = r#"
+roles:
+  - name: blue
+    login: true
+    config:
+      role: external_combined
+"#;
+        let manifest = parse_manifest(yaml).unwrap();
+        assert!(expand_manifest(&manifest).is_ok());
+    }
+
+    #[test]
+    fn config_parameter_name_validation() {
+        assert!(is_valid_config_parameter_name("role"));
+        assert!(is_valid_config_parameter_name("search_path"));
+        assert!(is_valid_config_parameter_name("app.tenant"));
+        assert!(is_valid_config_parameter_name("_x.y2"));
+        assert!(!is_valid_config_parameter_name(""));
+        assert!(!is_valid_config_parameter_name("2bad"));
+        assert!(!is_valid_config_parameter_name("bad name"));
+        assert!(!is_valid_config_parameter_name("bad;name"));
+        assert!(!is_valid_config_parameter_name("trailing."));
+        assert!(!is_valid_config_parameter_name(".leading"));
     }
 
     #[test]

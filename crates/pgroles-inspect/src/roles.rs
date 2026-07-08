@@ -20,6 +20,10 @@ pub struct RoleRow {
     pub comment: Option<String>,
     /// Password expiration from pg_roles.rolvaliduntil (NULL if no expiration).
     pub rolvaliduntil: Option<String>,
+    /// Cluster-wide role config defaults from pg_roles.rolconfig, as
+    /// `parameter=value` strings (NULL if none). Per-database settings
+    /// (`ALTER ROLE ... IN DATABASE`) do not appear here.
+    pub rolconfig: Option<Vec<String>>,
 }
 
 impl RoleRow {
@@ -36,8 +40,34 @@ impl RoleRow {
             connection_limit: self.rolconnlimit,
             comment: self.comment.clone(),
             password_valid_until: self.rolvaliduntil.clone(),
+            config: self
+                .rolconfig
+                .as_deref()
+                .unwrap_or_default()
+                .iter()
+                .filter_map(|entry| parse_rolconfig_entry(entry))
+                .collect(),
         }
     }
+}
+
+/// Parse one `pg_roles.rolconfig` entry (`parameter=value`) into a
+/// `(parameter, value)` pair.
+///
+/// PostgreSQL serializes `GUC_LIST_QUOTE` parameters (search_path, ...) with
+/// each list element individually quoted as needed (e.g.
+/// `search_path="$user", public`). Those values are canonicalized element-wise
+/// so they compare equal to the manifest's desired value, which passes through
+/// the same canonicalization. All other parameters are stored verbatim.
+fn parse_rolconfig_entry(entry: &str) -> Option<(String, String)> {
+    let (parameter, raw_value) = entry.split_once('=')?;
+    let parameter = parameter.to_ascii_lowercase();
+    let value = if pgroles_core::guc::is_list_quote_parameter(&parameter) {
+        pgroles_core::guc::canonicalize_list_guc_value(raw_value)
+    } else {
+        raw_value.to_string()
+    };
+    Some((parameter, value))
 }
 
 /// Fetch all non-system roles from the database.
@@ -73,7 +103,8 @@ pub async fn fetch_roles(
                     d.description AS comment,
                     CASE WHEN r.rolvaliduntil IS NOT NULL
                          THEN to_char(r.rolvaliduntil AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"')
-                         ELSE NULL END AS rolvaliduntil
+                         ELSE NULL END AS rolvaliduntil,
+                    r.rolconfig
                 FROM pg_roles r
                 LEFT JOIN pg_shdescription d
                     ON d.objoid = r.oid
@@ -102,7 +133,8 @@ pub async fn fetch_roles(
                     d.description AS comment,
                     CASE WHEN r.rolvaliduntil IS NOT NULL
                          THEN to_char(r.rolvaliduntil AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"')
-                         ELSE NULL END AS rolvaliduntil
+                         ELSE NULL END AS rolvaliduntil,
+                    r.rolconfig
                 FROM pg_roles r
                 LEFT JOIN pg_shdescription d
                     ON d.objoid = r.oid
@@ -140,9 +172,21 @@ mod tests {
             rolconnlimit: 12,
             comment: Some("analytics login".to_string()),
             rolvaliduntil: Some("2026-12-31T00:00:00Z".to_string()),
+            rolconfig: Some(vec![
+                "role=combined".to_string(),
+                "search_path=\"$user\", public".to_string(),
+            ]),
         };
 
         let state = row.to_role_state();
+        assert_eq!(
+            state.config.get("role").map(String::as_str),
+            Some("combined")
+        );
+        assert_eq!(
+            state.config.get("search_path").map(String::as_str),
+            Some("\"$user\", public")
+        );
         assert!(state.login);
         assert!(!state.superuser);
         assert!(!state.inherit);
@@ -203,6 +247,141 @@ mod tests {
         fn drop(&mut self) {
             execute_sql(&self.sql);
         }
+    }
+
+    #[test]
+    fn parse_rolconfig_entry_splits_on_first_equals() {
+        // GUC values may themselves contain '=' — only the first one is the
+        // parameter/value separator. app.motd is not a list parameter, so
+        // its value is kept verbatim.
+        assert_eq!(
+            parse_rolconfig_entry("app.motd=a=b"),
+            Some(("app.motd".to_string(), "a=b".to_string()))
+        );
+        assert_eq!(parse_rolconfig_entry("no_separator"), None);
+    }
+
+    #[test]
+    fn parse_rolconfig_entry_keeps_non_list_values_verbatim() {
+        // Non-list parameters are stored verbatim by PostgreSQL — quotes are
+        // part of the value, not serialization.
+        assert_eq!(
+            parse_rolconfig_entry(r#"app.motd="not unwrapped""#),
+            Some(("app.motd".to_string(), r#""not unwrapped""#.to_string()))
+        );
+    }
+
+    #[test]
+    fn parse_rolconfig_entry_canonicalizes_list_parameters() {
+        // PostgreSQL serializes GUC_LIST_QUOTE parameters with per-element
+        // quoting; parsing canonicalizes so manifest values compare equal.
+        assert_eq!(
+            parse_rolconfig_entry(r#"search_path="$user", public"#),
+            Some(("search_path".to_string(), r#""$user", public"#.to_string()))
+        );
+        // A single element containing a comma (the single-literal footgun)
+        // stays one quoted element — distinct from a two-element list.
+        assert_eq!(
+            parse_rolconfig_entry(r#"search_path="app, public""#),
+            Some(("search_path".to_string(), r#""app, public""#.to_string()))
+        );
+    }
+
+    #[test]
+    fn parse_rolconfig_entry_lowercases_parameter_names() {
+        assert_eq!(
+            parse_rolconfig_entry("Role=combined"),
+            Some(("role".to_string(), "combined".to_string()))
+        );
+    }
+
+    #[test]
+    #[ignore]
+    fn fetch_roles_reads_role_config_defaults() {
+        let login = unique_name("config_login");
+        let group = unique_name("config_group");
+        let _cleanup = TestDbCleanup::new(format!(
+            r#"
+            DROP ROLE IF EXISTS "{login}";
+            DROP ROLE IF EXISTS "{group}";
+            "#
+        ));
+
+        // search_path is a GUC_LIST_QUOTE parameter: PostgreSQL stores each
+        // element individually quoted as needed (`search_path="$user", public`),
+        // which exercises the element-wise canonicalization.
+        execute_sql(&format!(
+            r#"
+            DROP ROLE IF EXISTS "{login}";
+            DROP ROLE IF EXISTS "{group}";
+            CREATE ROLE "{group}" NOLOGIN;
+            CREATE ROLE "{login}" LOGIN;
+            GRANT "{group}" TO "{login}";
+            ALTER ROLE "{login}" SET "role" = '{group}';
+            ALTER ROLE "{login}" SET "search_path" = '$user', 'public';
+            ALTER ROLE "{login}" SET "app.tenant" = 'acme';
+            "#
+        ));
+
+        let roles = with_runtime(async {
+            let pool = PgPool::connect(&database_url())
+                .await
+                .expect("failed to connect to live test database");
+            fetch_roles(&pool, Some(&[login.as_str()]))
+                .await
+                .expect("failed to fetch scoped roles")
+        });
+
+        assert_eq!(roles.len(), 1);
+        let config = &roles[0].to_role_state().config;
+        assert_eq!(config.get("role").map(String::as_str), Some(group.as_str()));
+        assert_eq!(
+            config.get("search_path").map(String::as_str),
+            Some("\"$user\", public")
+        );
+        assert_eq!(config.get("app.tenant").map(String::as_str), Some("acme"));
+    }
+
+    #[test]
+    #[ignore]
+    fn fetch_roles_ignores_per_database_config() {
+        let login = unique_name("config_dbscoped");
+        let _cleanup = TestDbCleanup::new(format!(r#"DROP ROLE IF EXISTS "{login}";"#));
+
+        execute_sql(&format!(
+            r#"
+            DROP ROLE IF EXISTS "{login}";
+            CREATE ROLE "{login}" LOGIN;
+            "#
+        ));
+
+        let roles = with_runtime(async {
+            use sqlx::Executor;
+
+            let pool = PgPool::connect(&database_url())
+                .await
+                .expect("failed to connect to live test database");
+            let (dbname,): (String,) = sqlx::query_as("SELECT current_database()")
+                .fetch_one(&pool)
+                .await
+                .expect("failed to read current database name");
+            pool.execute(
+                format!(r#"ALTER ROLE "{login}" IN DATABASE "{dbname}" SET "work_mem" = '64MB';"#)
+                    .as_str(),
+            )
+            .await
+            .expect("failed to set per-database config");
+
+            fetch_roles(&pool, Some(&[login.as_str()]))
+                .await
+                .expect("failed to fetch scoped roles")
+        });
+
+        assert_eq!(roles.len(), 1);
+        assert!(
+            roles[0].to_role_state().config.is_empty(),
+            "per-database settings must not appear as managed cluster-wide config"
+        );
     }
 
     #[test]

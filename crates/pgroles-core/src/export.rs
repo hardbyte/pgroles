@@ -70,6 +70,16 @@ pub fn role_graph_to_manifest(graph: &RoleGraph) -> PolicyManifest {
                 comment: state.comment.clone(),
                 password: None, // Passwords are never exported (cannot be read from DB)
                 password_valid_until: state.password_valid_until.clone(),
+                config: state
+                    .config
+                    .iter()
+                    .map(|(parameter, value)| {
+                        (
+                            parameter.clone(),
+                            crate::manifest::ConfigValue(value.clone()),
+                        )
+                    })
+                    .collect(),
             }
         })
         .collect();

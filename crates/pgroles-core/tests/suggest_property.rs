@@ -178,6 +178,7 @@ fn random_manifest(rng: &mut Rng) -> PolicyManifest {
                 comment: None,
                 password: None,
                 password_valid_until: None,
+                config: Default::default(),
             });
             for (ot, name, privs) in &kind.grant_templates {
                 let object = match ot {

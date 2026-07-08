@@ -2347,6 +2347,7 @@ mod tests {
                     comment: None,
                     password: None,
                     password_valid_until: None,
+                    config: Default::default(),
                 }],
                 grants: Vec::new(),
                 default_privileges: Vec::new(),
@@ -2429,6 +2430,7 @@ mod tests {
                             generate: None,
                         }),
                         password_valid_until: None,
+                        config: Default::default(),
                     },
                     RoleSpec {
                         name: "reporter".to_string(),
@@ -2450,6 +2452,7 @@ mod tests {
                             generate: None,
                         }),
                         password_valid_until: None,
+                        config: Default::default(),
                     },
                 ],
                 grants: Vec::new(),

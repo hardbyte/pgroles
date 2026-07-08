@@ -172,7 +172,7 @@ Without `-f` or `--bundle`, `inspect` shows all non-system roles and visible pri
 
 ## generate
 
-Generate a YAML manifest from the current database state. This is the primary tool for brownfield adoption — it introspects all non-system roles, their grants, default privileges, and memberships, then emits a flat manifest (no profiles) that faithfully reproduces the current state.
+Generate a YAML manifest from the current database state. This is the primary tool for brownfield adoption — it introspects all non-system roles, their attributes and config defaults, grants, default privileges, and memberships, then emits a flat manifest (no profiles) that faithfully reproduces the current state.
 
 ```shell
 pgroles generate --database-url postgres://localhost/mydb
