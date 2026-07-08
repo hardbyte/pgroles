@@ -1703,6 +1703,71 @@ memberships:
     }
 
     #[test]
+    fn filter_additive_keeps_config_alters_for_roles_created_in_same_plan() {
+        // Config for a new role is emitted as a follow-up AlterRole with only
+        // SetConfig attributes. It is part of the creation, so additive mode
+        // must keep it — otherwise additive-created roles would silently lose
+        // their declared config.
+        let changes = vec![
+            Change::CreateRole {
+                name: "blue".to_string(),
+                state: RoleState::default(),
+            },
+            Change::AlterRole {
+                name: "blue".to_string(),
+                attributes: vec![RoleAttribute::SetConfig(
+                    "role".to_string(),
+                    "combined".to_string(),
+                )],
+            },
+        ];
+
+        let filtered = filter_changes(changes, ReconciliationMode::Additive);
+        assert_eq!(filtered.len(), 2);
+        assert!(matches!(&filtered[1], Change::AlterRole { name, .. } if name == "blue"));
+    }
+
+    #[test]
+    fn filter_additive_drops_config_alters_for_pre_existing_roles() {
+        // No CreateRole for "blue" in this plan — the role pre-exists, so
+        // additive mode must not mutate its config.
+        let changes = vec![Change::AlterRole {
+            name: "blue".to_string(),
+            attributes: vec![
+                RoleAttribute::SetConfig("role".to_string(), "combined".to_string()),
+                RoleAttribute::ResetConfig("statement_timeout".to_string()),
+            ],
+        }];
+
+        let filtered = filter_changes(changes, ReconciliationMode::Additive);
+        assert!(filtered.is_empty());
+    }
+
+    #[test]
+    fn filter_additive_drops_mixed_attribute_and_config_alters_even_for_created_roles() {
+        // The diff engine only emits pure-SetConfig follow-ups for created
+        // roles; anything mixing attribute rewrites stays filtered so the
+        // exemption cannot widen additive mode's alter surface.
+        let changes = vec![
+            Change::CreateRole {
+                name: "blue".to_string(),
+                state: RoleState::default(),
+            },
+            Change::AlterRole {
+                name: "blue".to_string(),
+                attributes: vec![
+                    RoleAttribute::Login(true),
+                    RoleAttribute::SetConfig("role".to_string(), "combined".to_string()),
+                ],
+            },
+        ];
+
+        let filtered = filter_changes(changes, ReconciliationMode::Additive);
+        assert_eq!(filtered.len(), 1);
+        assert!(matches!(&filtered[0], Change::CreateRole { .. }));
+    }
+
+    #[test]
     fn filter_additive_skips_owner_bound_follow_ups_when_transfer_is_skipped() {
         let changes = vec![
             Change::AlterSchemaOwner {
