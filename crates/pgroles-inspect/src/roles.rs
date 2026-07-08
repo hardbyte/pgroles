@@ -248,6 +248,122 @@ mod tests {
     }
 
     #[test]
+    fn parse_rolconfig_entry_splits_on_first_equals() {
+        // GUC values may themselves contain '=' — only the first one is the
+        // parameter/value separator.
+        assert_eq!(
+            parse_rolconfig_entry("search_path=a=b"),
+            Some(("search_path".to_string(), "a=b".to_string()))
+        );
+        assert_eq!(parse_rolconfig_entry("no_separator"), None);
+    }
+
+    #[test]
+    fn parse_rolconfig_entry_unescapes_doubled_quotes() {
+        assert_eq!(
+            parse_rolconfig_entry(r#"app.motd="say ""hi"", ok""#),
+            Some(("app.motd".to_string(), r#"say "hi", ok"#.to_string()))
+        );
+    }
+
+    #[test]
+    fn parse_rolconfig_entry_lowercases_parameter_names() {
+        assert_eq!(
+            parse_rolconfig_entry("Role=combined"),
+            Some(("role".to_string(), "combined".to_string()))
+        );
+    }
+
+    #[test]
+    #[ignore]
+    fn fetch_roles_reads_role_config_defaults() {
+        let login = unique_name("config_login");
+        let group = unique_name("config_group");
+        let _cleanup = TestDbCleanup::new(format!(
+            r#"
+            DROP ROLE IF EXISTS "{login}";
+            DROP ROLE IF EXISTS "{group}";
+            "#
+        ));
+
+        // search_path is set from a single string literal — PostgreSQL stores
+        // it double-quoted in rolconfig (`search_path="app, public"`), which
+        // exercises the quote-stripping normalization.
+        execute_sql(&format!(
+            r#"
+            DROP ROLE IF EXISTS "{login}";
+            DROP ROLE IF EXISTS "{group}";
+            CREATE ROLE "{group}" NOLOGIN;
+            CREATE ROLE "{login}" LOGIN;
+            GRANT "{group}" TO "{login}";
+            ALTER ROLE "{login}" SET "role" = '{group}';
+            ALTER ROLE "{login}" SET "search_path" = 'app, public';
+            ALTER ROLE "{login}" SET "app.tenant" = 'acme';
+            "#
+        ));
+
+        let roles = with_runtime(async {
+            let pool = PgPool::connect(&database_url())
+                .await
+                .expect("failed to connect to live test database");
+            fetch_roles(&pool, Some(&[login.as_str()]))
+                .await
+                .expect("failed to fetch scoped roles")
+        });
+
+        assert_eq!(roles.len(), 1);
+        let config = &roles[0].to_role_state().config;
+        assert_eq!(config.get("role").map(String::as_str), Some(group.as_str()));
+        assert_eq!(
+            config.get("search_path").map(String::as_str),
+            Some("app, public")
+        );
+        assert_eq!(config.get("app.tenant").map(String::as_str), Some("acme"));
+    }
+
+    #[test]
+    #[ignore]
+    fn fetch_roles_ignores_per_database_config() {
+        let login = unique_name("config_dbscoped");
+        let _cleanup = TestDbCleanup::new(format!(r#"DROP ROLE IF EXISTS "{login}";"#));
+
+        execute_sql(&format!(
+            r#"
+            DROP ROLE IF EXISTS "{login}";
+            CREATE ROLE "{login}" LOGIN;
+            "#
+        ));
+
+        let roles = with_runtime(async {
+            use sqlx::Executor;
+
+            let pool = PgPool::connect(&database_url())
+                .await
+                .expect("failed to connect to live test database");
+            let (dbname,): (String,) = sqlx::query_as("SELECT current_database()")
+                .fetch_one(&pool)
+                .await
+                .expect("failed to read current database name");
+            pool.execute(
+                format!(r#"ALTER ROLE "{login}" IN DATABASE "{dbname}" SET "work_mem" = '64MB';"#)
+                    .as_str(),
+            )
+            .await
+            .expect("failed to set per-database config");
+
+            fetch_roles(&pool, Some(&[login.as_str()]))
+                .await
+                .expect("failed to fetch scoped roles")
+        });
+
+        assert_eq!(roles.len(), 1);
+        assert!(
+            roles[0].to_role_state().config.is_empty(),
+            "per-database settings must not appear as managed cluster-wide config"
+        );
+    }
+
+    #[test]
     #[ignore]
     fn fetch_roles_scopes_to_managed_names() {
         let managed = unique_name("managed_role");
