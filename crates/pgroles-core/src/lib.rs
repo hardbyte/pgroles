@@ -1,6 +1,7 @@
 pub mod composition;
 pub mod diff;
 pub mod export;
+pub mod guc;
 pub mod manifest;
 pub mod model;
 pub mod ownership;

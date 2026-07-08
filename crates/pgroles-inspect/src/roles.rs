@@ -54,18 +54,20 @@ impl RoleRow {
 /// Parse one `pg_roles.rolconfig` entry (`parameter=value`) into a
 /// `(parameter, value)` pair.
 ///
-/// PostgreSQL wraps list-typed values that were set from a single string
-/// literal in double quotes (e.g. `search_path="app, public"`); we strip one
-/// level of outer quotes so the stored form compares equal to the manifest
-/// value pgroles applied.
+/// PostgreSQL serializes `GUC_LIST_QUOTE` parameters (search_path, ...) with
+/// each list element individually quoted as needed (e.g.
+/// `search_path="$user", public`). Those values are canonicalized element-wise
+/// so they compare equal to the manifest's desired value, which passes through
+/// the same canonicalization. All other parameters are stored verbatim.
 fn parse_rolconfig_entry(entry: &str) -> Option<(String, String)> {
     let (parameter, raw_value) = entry.split_once('=')?;
-    let value = raw_value
-        .strip_prefix('"')
-        .and_then(|v| v.strip_suffix('"'))
-        .map(|v| v.replace("\"\"", "\""))
-        .unwrap_or_else(|| raw_value.to_string());
-    Some((parameter.to_ascii_lowercase(), value))
+    let parameter = parameter.to_ascii_lowercase();
+    let value = if pgroles_core::guc::is_list_quote_parameter(&parameter) {
+        pgroles_core::guc::canonicalize_list_guc_value(raw_value)
+    } else {
+        raw_value.to_string()
+    };
+    Some((parameter, value))
 }
 
 /// Fetch all non-system roles from the database.
@@ -172,7 +174,7 @@ mod tests {
             rolvaliduntil: Some("2026-12-31T00:00:00Z".to_string()),
             rolconfig: Some(vec![
                 "role=combined".to_string(),
-                "search_path=\"app, public\"".to_string(),
+                "search_path=\"$user\", public".to_string(),
             ]),
         };
 
@@ -183,7 +185,7 @@ mod tests {
         );
         assert_eq!(
             state.config.get("search_path").map(String::as_str),
-            Some("app, public")
+            Some("\"$user\", public")
         );
         assert!(state.login);
         assert!(!state.superuser);
@@ -250,19 +252,38 @@ mod tests {
     #[test]
     fn parse_rolconfig_entry_splits_on_first_equals() {
         // GUC values may themselves contain '=' — only the first one is the
-        // parameter/value separator.
+        // parameter/value separator. app.motd is not a list parameter, so
+        // its value is kept verbatim.
         assert_eq!(
-            parse_rolconfig_entry("search_path=a=b"),
-            Some(("search_path".to_string(), "a=b".to_string()))
+            parse_rolconfig_entry("app.motd=a=b"),
+            Some(("app.motd".to_string(), "a=b".to_string()))
         );
         assert_eq!(parse_rolconfig_entry("no_separator"), None);
     }
 
     #[test]
-    fn parse_rolconfig_entry_unescapes_doubled_quotes() {
+    fn parse_rolconfig_entry_keeps_non_list_values_verbatim() {
+        // Non-list parameters are stored verbatim by PostgreSQL — quotes are
+        // part of the value, not serialization.
         assert_eq!(
-            parse_rolconfig_entry(r#"app.motd="say ""hi"", ok""#),
-            Some(("app.motd".to_string(), r#"say "hi", ok"#.to_string()))
+            parse_rolconfig_entry(r#"app.motd="not unwrapped""#),
+            Some(("app.motd".to_string(), r#""not unwrapped""#.to_string()))
+        );
+    }
+
+    #[test]
+    fn parse_rolconfig_entry_canonicalizes_list_parameters() {
+        // PostgreSQL serializes GUC_LIST_QUOTE parameters with per-element
+        // quoting; parsing canonicalizes so manifest values compare equal.
+        assert_eq!(
+            parse_rolconfig_entry(r#"search_path="$user", public"#),
+            Some(("search_path".to_string(), r#""$user", public"#.to_string()))
+        );
+        // A single element containing a comma (the single-literal footgun)
+        // stays one quoted element — distinct from a two-element list.
+        assert_eq!(
+            parse_rolconfig_entry(r#"search_path="app, public""#),
+            Some(("search_path".to_string(), r#""app, public""#.to_string()))
         );
     }
 
@@ -286,9 +307,9 @@ mod tests {
             "#
         ));
 
-        // search_path is set from a single string literal — PostgreSQL stores
-        // it double-quoted in rolconfig (`search_path="app, public"`), which
-        // exercises the quote-stripping normalization.
+        // search_path is a GUC_LIST_QUOTE parameter: PostgreSQL stores each
+        // element individually quoted as needed (`search_path="$user", public`),
+        // which exercises the element-wise canonicalization.
         execute_sql(&format!(
             r#"
             DROP ROLE IF EXISTS "{login}";
@@ -297,7 +318,7 @@ mod tests {
             CREATE ROLE "{login}" LOGIN;
             GRANT "{group}" TO "{login}";
             ALTER ROLE "{login}" SET "role" = '{group}';
-            ALTER ROLE "{login}" SET "search_path" = 'app, public';
+            ALTER ROLE "{login}" SET "search_path" = '$user', 'public';
             ALTER ROLE "{login}" SET "app.tenant" = 'acme';
             "#
         ));
@@ -316,7 +337,7 @@ mod tests {
         assert_eq!(config.get("role").map(String::as_str), Some(group.as_str()));
         assert_eq!(
             config.get("search_path").map(String::as_str),
-            Some("app, public")
+            Some("\"$user\", public")
         );
         assert_eq!(config.get("app.tenant").map(String::as_str), Some("acme"));
     }

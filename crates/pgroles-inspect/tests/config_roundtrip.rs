@@ -73,8 +73,9 @@ fn role_config_converges_and_detects_drift() {
         roles: vec![blue.clone(), green.clone(), combined.clone()],
     };
 
-    // The issue-132 blue/green pattern, plus a list-valued setting written
-    // in the form PostgreSQL re-quotes on storage.
+    // The issue-132 blue/green pattern, plus a multi-element search_path with
+    // an element PostgreSQL quotes on storage ("$user") — exercising the
+    // element-wise GUC list handling end to end.
     let yaml = format!(
         r#"
 roles:
@@ -83,7 +84,7 @@ roles:
     login: true
     config:
       role: {combined}
-      search_path: "app, public"
+      search_path: '"$user", public'
   - name: {green}
     login: true
     config:
@@ -112,7 +113,26 @@ memberships:
         let changes = diff(&current, &desired);
         assert!(!changes.is_empty(), "fresh plan should not be empty");
         let statements: Vec<String> = changes.iter().flat_map(render_statements).collect();
+        assert!(
+            statements
+                .iter()
+                .any(|s| s
+                    == &format!(r#"ALTER ROLE "{blue}" SET "search_path" = '$user', 'public';"#)),
+            "list GUCs must render one literal per element, got: {statements:?}"
+        );
         execute_all(&pool, &statements).await;
+
+        // The applied search_path must be a real two-element path, not one
+        // schema literally named `$user, public`.
+        let (stored,): (String,) = sqlx::query_as(
+            "SELECT s FROM pg_roles r, unnest(r.rolconfig) AS s
+             WHERE r.rolname = $1 AND s LIKE 'search_path=%'",
+        )
+        .bind(&blue)
+        .fetch_one(&pool)
+        .await
+        .expect("failed to read stored search_path");
+        assert_eq!(stored, r#"search_path="$user", public"#);
 
         // Converged: a re-inspect must produce an empty plan. This is the
         // no-flapping property — if rolconfig normalization ever disagrees

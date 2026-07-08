@@ -195,6 +195,8 @@ Per-database settings (`ALTER ROLE ... IN DATABASE ... SET`) are not managed and
 
 {% callout type="note" title="Value normalization" %}
 Values are applied as string literals and read back from `pg_roles.rolconfig`. PostgreSQL stores most values verbatim, so writing the same form you want stored (e.g. `30s` or `30000`, but not both interchangeably) keeps the plan empty once converged.
+
+List-valued parameters (`search_path`, `temp_tablespaces`, and the `*_preload_libraries` family) are handled element-wise: pgroles splits the value on commas (double-quote elements that contain commas or uppercase characters, e.g. `search_path: '"$user", public'`), applies one SQL literal per element, and normalizes quoting and spacing when comparing — so `"$user",public` and `"$user", public` are the same value.
 {% /callout %}
 
 ## grants

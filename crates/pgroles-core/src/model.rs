@@ -75,10 +75,20 @@ impl RoleState {
             password_valid_until: definition.password_valid_until.clone(),
             // GUC names are case-insensitive; normalize to lowercase so the
             // desired state compares cleanly against pg_roles.rolconfig.
+            // List-quoted parameters (search_path, ...) are canonicalized
+            // element-wise so quoting and spacing differences don't diff.
             config: definition
                 .config
                 .iter()
-                .map(|(name, value)| (name.to_ascii_lowercase(), value.0.clone()))
+                .map(|(name, value)| {
+                    let name = name.to_ascii_lowercase();
+                    let value = if crate::guc::is_list_quote_parameter(&name) {
+                        crate::guc::canonicalize_list_guc_value(&value.0)
+                    } else {
+                        value.0.clone()
+                    };
+                    (name, value)
+                })
                 .collect(),
         }
     }

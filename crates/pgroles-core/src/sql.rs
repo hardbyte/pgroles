@@ -333,15 +333,32 @@ fn render_alter_role(name: &str, attributes: &[RoleAttribute]) -> Vec<String> {
 /// Render `ALTER ROLE ... SET parameter = value`.
 ///
 /// The parameter name is identifier-quoted (dotted custom GUC names like
-/// `app.tenant` quote as a single unit, which PostgreSQL accepts) and the
-/// value is always rendered as a string literal — PostgreSQL coerces it to
-/// the parameter's type and canonicalizes list values itself.
+/// `app.tenant` quote as a single unit, which PostgreSQL accepts). List-quoted
+/// parameters (search_path, ...) are rendered as one string literal per list
+/// element — `SET search_path = 'a', 'b'` — because a single literal
+/// `'a, b'` would be stored as ONE element literally named `a, b`. All other
+/// values render as a single string literal; PostgreSQL coerces it to the
+/// parameter's type.
 fn render_set_config(name: &str, parameter: &str, value: &str) -> String {
+    let rendered_value = if crate::guc::is_list_quote_parameter(parameter) {
+        let elements = crate::guc::split_guc_list(value).unwrap_or_default();
+        if elements.is_empty() {
+            quote_literal("")
+        } else {
+            elements
+                .iter()
+                .map(|element| quote_literal(element))
+                .collect::<Vec<_>>()
+                .join(", ")
+        }
+    } else {
+        quote_literal(value)
+    };
     format!(
         "ALTER ROLE {} SET {} = {};",
         quote_ident(name),
         quote_ident(parameter),
-        quote_literal(value)
+        rendered_value
     )
 }
 
@@ -826,8 +843,42 @@ mod tests {
             statements,
             vec![
                 "ALTER ROLE \"blue\" LOGIN;".to_string(),
-                "ALTER ROLE \"blue\" SET \"search_path\" = 'app, public';".to_string(),
+                // List-quoted GUCs render one literal per element — a single
+                // 'app, public' literal would store ONE schema named "app, public".
+                "ALTER ROLE \"blue\" SET \"search_path\" = 'app', 'public';".to_string(),
             ]
+        );
+    }
+
+    #[test]
+    fn render_set_config_splits_list_guc_elements() {
+        let change = Change::AlterRole {
+            name: "blue".to_string(),
+            attributes: vec![RoleAttribute::SetConfig(
+                "search_path".to_string(),
+                "\"$user\", public".to_string(),
+            )],
+        };
+        let statements = render_statements(&change);
+        assert_eq!(
+            statements,
+            vec!["ALTER ROLE \"blue\" SET \"search_path\" = '$user', 'public';".to_string()]
+        );
+    }
+
+    #[test]
+    fn render_set_config_keeps_non_list_values_as_single_literal() {
+        let change = Change::AlterRole {
+            name: "blue".to_string(),
+            attributes: vec![RoleAttribute::SetConfig(
+                "app.motd".to_string(),
+                "hello, world".to_string(),
+            )],
+        };
+        let statements = render_statements(&change);
+        assert_eq!(
+            statements,
+            vec!["ALTER ROLE \"blue\" SET \"app.motd\" = 'hello, world';".to_string()]
         );
     }
 
