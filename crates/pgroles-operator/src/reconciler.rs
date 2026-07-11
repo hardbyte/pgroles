@@ -933,10 +933,32 @@ async fn apply_under_lock(
             );
     let inspection = pgroles_inspect::inspect_with_diagnostics(pool, &inspect_config).await?;
     ctx.observability.record_inspection(&inspection.stats);
-    if !inspection.diagnostics.is_empty() {
-        return Err(ReconcileError::UnsatisfiableWildcardGrant(
-            inspection.diagnostics.to_string(),
-        ));
+    // Unsatisfiable wildcard grants mean the desired state cannot be reliably
+    // computed, so they block reconciliation.
+    if !inspection
+        .diagnostics
+        .unsatisfiable_wildcard_grants
+        .is_empty()
+    {
+        let message = inspection
+            .diagnostics
+            .unsatisfiable_wildcard_grants
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+        return Err(ReconcileError::UnsatisfiableWildcardGrant(message));
+    }
+    // Column-level grants are advisory only — pgroles doesn't manage them, but
+    // reconciliation should still proceed. Log a warning instead of failing.
+    for diagnostic in &inspection.diagnostics.column_level_grants {
+        tracing::warn!(
+            schema = %diagnostic.schema,
+            relation = %diagnostic.relation,
+            grantee = %diagnostic.grantee,
+            columns = ?diagnostic.columns,
+            "detected column-level grant pgroles does not manage"
+        );
     }
     let current = inspection.graph;
 

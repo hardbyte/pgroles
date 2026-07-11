@@ -9,7 +9,7 @@ What pgroles does not cover, so you know where the edges of the declared-state m
 
 ## Column-level grants
 
-`GRANT SELECT (col) ON table` is invisible to pgroles. Column-level grants are not inspected, not diffed, not revoked, and `pgroles generate` does not export them — manifests only describe table-level access. If a column-level grant exists in the database, pgroles will not report it and will not touch it; there is no error, it simply never appears. Detection and warning for column-level grants is planned but not yet implemented.
+`GRANT SELECT (col) ON table` remains unmanaged by pgroles: column-level grants are not diffed, not revoked, and `pgroles generate` does not export them — manifests only describe table-level access. pgroles does, however, detect column-level grants inside managed schemas during `diff` and `apply`: if any are found, it prints a warning (schema, table, grantee, affected columns, and privileges) so the gap is visible instead of silent. The warning does not block `diff`/`apply` and the grants themselves are still not managed — you must review and, if needed, revoke them manually.
 
 ## Per-database role settings
 
