@@ -193,6 +193,10 @@ The `role: <group>` setting is the standard fix for blue/green credential rotati
 
 Per-database settings (`ALTER ROLE ... IN DATABASE ... SET`) are not managed and are left untouched.
 
+{% callout type="warning" title="Behind a transaction-mode pooler" %}
+Role config, including `config.role`, is applied by PostgreSQL when a session starts. Behind a transaction-mode pooler (e.g. PgBouncer), client connections share a smaller pool of actual server connections, so config attaches to the pooled server session, not to an individual client. For the blue/green rotation pattern this is fine, since both credentials converge on the same `SET ROLE` target regardless of which pooled connection picks them up. It does mean per-client expectations — a distinct `application_name` per client, for example — do not hold. Pooler reset queries (`server_reset_query`, `DISCARD ALL`) do not remove these role-level defaults either: the `ALTER ROLE ... SET` value *is* the session's default, so `RESET` restores it rather than clearing it.
+{% /callout %}
+
 {% callout type="note" title="Value normalization" %}
 Values are applied as string literals and read back from `pg_roles.rolconfig`. PostgreSQL stores most values verbatim, so writing the same form you want stored (e.g. `30s` or `30000`, but not both interchangeably) keeps the plan empty once converged.
 

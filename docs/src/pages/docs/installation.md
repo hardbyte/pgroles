@@ -5,9 +5,8 @@ description: How to install the pgroles CLI tool.
 
 ## Compatibility
 
-- **PostgreSQL 16+**: Full support including `GRANT ... WITH INHERIT`/`WITH ADMIN` syntax
-- **PostgreSQL 14–15**: Supported with automatic fallback to legacy grant syntax (`WITH ADMIN OPTION`)
-- CI integration tests run against PostgreSQL **16, 17, and 18**
+- **PostgreSQL 16, 17, 18**: Supported and tested in CI, including `GRANT ... WITH INHERIT`/`WITH ADMIN` syntax
+- **PostgreSQL 14–15**: Not part of the CI matrix. The legacy grant syntax fallback (`WITH ADMIN OPTION`) still exists in the code, but it is best-effort and untested — treat it as unsupported until it has its own CI coverage
 - pgroles detects the server version at runtime and adapts SQL generation accordingly
 
 ## From source
