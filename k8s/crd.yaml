@@ -505,6 +505,14 @@
                     "additionalProperties": {
                       "description": "A reusable privilege profile (CRD-compatible version).\n\nThis mirrors `pgroles_core::manifest::Profile` but derives `JsonSchema`.",
                       "properties": {
+                        "config": {
+                          "additionalProperties": {
+                            "description": "A role configuration parameter value.\n\nValues are always strings — quote numbers and booleans (e.g.\n`statement_timeout: \"30000\"`, `jit: \"off\"`). The Kubernetes CRD schema\ntypes config values as strings, and the CLI enforces the same rule so a\nmanifest means the same thing whether it is applied with `pgroles` or\n`kubectl`. PostgreSQL coerces the string to the parameter's type.",
+                            "type": "string"
+                          },
+                          "description": "Role-level configuration parameter defaults for generated roles,\napplied via `ALTER ROLE ... SET parameter = value`. Values support the\n`{schema}` and `{profile}` placeholders, substituted per `schema x\nprofile` expansion (e.g. `search_path: \"{schema}\"`).",
+                          "type": "object"
+                        },
                         "default_privileges": {
                           "default": [],
                           "items": {

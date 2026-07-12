@@ -513,6 +513,43 @@ mod tests {
     }
 
     #[test]
+    fn profile_config_flows_through_to_generated_role_state() {
+        // The generated role's `config` comes entirely from `expand_manifest`
+        // substituting the profile's config — `RoleState::from_definition`
+        // and `RoleGraph::from_expanded` need no changes to support it, since
+        // generated roles are ordinary `RoleDefinition`s by the time they
+        // reach this layer. This test is the proof, not an assumption.
+        let yaml = r#"
+profiles:
+  editor:
+    login: true
+    config:
+      search_path: "{schema}"
+      statement_timeout: "30s"
+
+schemas:
+  - name: inventory
+    profiles: [editor]
+"#;
+        let manifest = parse_manifest(yaml).unwrap();
+        let expanded = expand_manifest(&manifest).unwrap();
+        let graph = RoleGraph::from_expanded(&expanded, None).unwrap();
+
+        let role = graph
+            .roles
+            .get("inventory-editor")
+            .expect("generated role should be present");
+        assert_eq!(
+            role.config.get("search_path").map(String::as_str),
+            Some("inventory")
+        );
+        assert_eq!(
+            role.config.get("statement_timeout").map(String::as_str),
+            Some("30s")
+        );
+    }
+
+    #[test]
     fn from_definition_lowercases_config_parameter_names() {
         let yaml = r#"
 roles:

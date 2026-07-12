@@ -247,8 +247,18 @@ pub fn suggest_profiles(input: &PolicyManifest, opts: &SuggestOptions) -> Sugges
     for role_def in &input.roles {
         let role_name = &role_def.name;
 
-        // Profiles can only express `login` and `inherit`. Any other
-        // explicitly-set attribute disqualifies the role.
+        // The suggester only promotes `login` and `inherit` into a profile.
+        // Any other explicitly-set attribute disqualifies the role.
+        //
+        // `config` is deliberately excluded even though profiles can express
+        // it: clustering would require comparing config maps modulo
+        // `{schema}`/`{profile}` substitution (a role's `search_path:
+        // inventory` and another's `search_path: checkout` are the "same"
+        // profile-relative value, but nothing else in a config map tells us
+        // which literal segments are schema-derived vs. genuinely distinct).
+        // Getting that wrong silently changes what gets applied, so a
+        // config-carrying role always stays flat — the caller can add
+        // `config` to a suggested profile by hand once it exists.
         //
         // Comments are treated as user-set documentation *unless* they match
         // pgroles' own auto-generated annotation pattern (which `pgroles
@@ -266,6 +276,7 @@ pub fn suggest_profiles(input: &PolicyManifest, opts: &SuggestOptions) -> Sugges
             || role_def.connection_limit.is_some()
             || role_def.password.is_some()
             || role_def.password_valid_until.is_some()
+            || !role_def.config.is_empty()
             || has_user_comment
         {
             skipped.push(SkipReason::UniqueAttributes {
@@ -1035,6 +1046,10 @@ fn build_profile(
         inherit,
         grants: profile_grants,
         default_privileges: profile_defaults,
+        // The suggester never clusters config-carrying roles into a profile
+        // (see the `role_def.config` check in the eligibility loop above) —
+        // profiles it builds never need to express `config`.
+        config: BTreeMap::new(),
     }
 }
 
@@ -2623,5 +2638,83 @@ grants:
         assert!(!is_valid_identifier("_reader"));
         assert!(!is_valid_identifier("read.only"));
         assert!(!is_valid_identifier("read only"));
+    }
+
+    #[test]
+    fn config_carrying_role_stays_flat_and_keeps_its_config() {
+        // Two roles with an otherwise-identical, cluster-eligible shape would
+        // normally be promoted into a profile — but one of them carries
+        // `config`, which profiles can express yet the suggester never
+        // clusters on (see the comment in the eligibility loop). It must stay
+        // flat, and — this is the property that matters — its `config` must
+        // not be lost anywhere along the way: round-tripping through
+        // `suggest` -> `expand` must show the exact same config on the
+        // (still flat) generated role.
+        let m = parse(
+            r#"
+schemas:
+  - name: inventory
+    owner: o
+  - name: checkout
+    owner: o
+roles:
+  - name: inventory-reader
+    login: true
+    config:
+      search_path: inventory
+      statement_timeout: "30s"
+  - name: checkout-reader
+    login: true
+grants:
+  - role: inventory-reader
+    privileges: [SELECT]
+    object: { type: table, schema: inventory, name: "*" }
+  - role: checkout-reader
+    privileges: [SELECT]
+    object: { type: table, schema: checkout, name: "*" }
+"#,
+        );
+
+        let report = suggest_profiles(&m, &SuggestOptions::default());
+        assert!(report.round_trip_ok, "skipped: {:?}", report.skipped);
+
+        // No cluster forms: inventory-reader is disqualified by `config`, and
+        // checkout-reader is then a sole-schema role with no partner.
+        assert!(
+            report.profiles.is_empty(),
+            "expected no profiles, got: {:?}",
+            report.profiles
+        );
+        assert!(report.skipped.iter().any(
+            |s| matches!(s, SkipReason::UniqueAttributes { role } if role == "inventory-reader")
+        ));
+
+        // Both roles remain flat in the suggested manifest, config intact.
+        let role = report
+            .manifest
+            .roles
+            .iter()
+            .find(|r| r.name == "inventory-reader")
+            .expect("inventory-reader should remain a flat role");
+        assert_eq!(role.config["search_path"].0, "inventory");
+        assert_eq!(role.config["statement_timeout"].0, "30s");
+
+        // And the expanded RoleGraph — what actually gets applied — carries
+        // the same config through, matching the original manifest's graph.
+        let original_expanded = expand_manifest(&m).unwrap();
+        let original_graph =
+            RoleGraph::from_expanded(&original_expanded, m.default_owner.as_deref()).unwrap();
+        let new_expanded = expand_manifest(&report.manifest).unwrap();
+        let new_graph =
+            RoleGraph::from_expanded(&new_expanded, report.manifest.default_owner.as_deref())
+                .unwrap();
+        assert_eq!(
+            original_graph.roles["inventory-reader"].config,
+            new_graph.roles["inventory-reader"].config
+        );
+        assert_eq!(
+            new_graph.roles["inventory-reader"].config["search_path"],
+            "inventory"
+        );
     }
 }

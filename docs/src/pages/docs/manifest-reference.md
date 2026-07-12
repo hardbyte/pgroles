@@ -92,6 +92,7 @@ profiles:
 | `inherit` | bool | `true` | Inherit attribute for generated roles |
 | `grants` | list[grant template] | `[]` | Grants expanded into each bound schema |
 | `default_privileges` | list[default privilege template] | `[]` | Default privileges expanded into each bound schema |
+| `config` | map | `{}` | Role-level configuration defaults for generated roles (`ALTER ROLE ... SET`); values support `{schema}`/`{profile}` placeholders — see [role configuration defaults](#role-configuration-defaults) |
 
 The generated role attributes apply only to roles created from `schema x profile` expansion. One-off roles under `roles:` still declare their own attributes directly.
 
@@ -192,6 +193,8 @@ Settings are compared against the cluster-wide entries in `pg_roles.rolconfig`. 
 The `role: <group>` setting is the standard fix for blue/green credential rotation: both login roles switch to a shared group role at connect time, so objects created by either credential are owned by the group and remain fully accessible after rotation. When the target of a `role:` setting is declared in the same manifest, pgroles validates that a matching membership is declared too — without membership, PostgreSQL rejects the setting at login.
 
 Per-database settings (`ALTER ROLE ... IN DATABASE ... SET`) are not managed and are left untouched.
+
+Profiles can declare `config` too — values support `{schema}`/`{profile}` placeholders, substituted per `schema x profile` expansion; see [profiles](/docs/profiles/#role-configuration-defaults-on-profiles).
 
 {% callout type="warning" title="Behind a transaction-mode pooler" %}
 Role config, including `config.role`, is applied by PostgreSQL when a session starts. Behind a transaction-mode pooler (e.g. PgBouncer), client connections share a smaller pool of actual server connections, so config attaches to the pooled server session, not to an individual client. For the blue/green rotation pattern this is fine, since both credentials converge on the same `SET ROLE` target regardless of which pooled connection picks them up. It does mean per-client expectations — a distinct `application_name` per client, for example — do not hold. Pooler reset queries (`server_reset_query`, `DISCARD ALL`) do not remove these role-level defaults either: the `ALTER ROLE ... SET` value *is* the session's default, so `RESET` restores it rather than clearing it.

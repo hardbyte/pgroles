@@ -124,6 +124,34 @@ By default, profile-generated roles have `login: false` (NOLOGIN) and `inherit: 
 
 This is especially useful for IAM-style patterns where a generated role should not be directly usable as a login role, or where you want generated roles to stay `NOINHERIT` until explicitly assumed.
 
+## Role configuration defaults on profiles
+
+Profiles can declare `config`, the same role-level session defaults (`ALTER ROLE ... SET`) described in [role configuration defaults](/docs/manifest-reference/#role-configuration-defaults) — applied to every role the profile generates. Values support the `{schema}` and `{profile}` placeholders (the same two `role_pattern` supports), substituted per `schema x profile` expansion:
+
+```yaml
+profiles:
+  editor:
+    login: true
+    config:
+      search_path: "{schema}"
+      statement_timeout: "30s"
+    grants:
+      - privileges: [USAGE]
+        object: { type: schema }
+
+schemas:
+  - name: inventory
+    profiles: [editor]
+```
+
+This generates role `inventory-editor` with `search_path: inventory` and `statement_timeout: 30s` — a per-schema `search_path` default is the most common use, so a role connecting through the profile lands in its own schema without qualifying every object.
+
+As with role-level `config`, values are always strings — quote numbers and booleans. Placeholders are only substituted in values, never in keys: keys are literal PostgreSQL parameter names, and a manifest that writes `{schema}` as a key (instead of a value) fails the same parameter-name validation as any other malformed key.
+
+{% callout title="Suggest and profile config" %}
+`pgroles generate --suggest-profiles` never clusters a `config`-carrying role into a profile — it stays flat instead. Clustering would require comparing config maps modulo `{schema}`/`{profile}` substitution, and getting that wrong would silently change what gets applied. Add `config` to a suggested profile by hand once one exists.
+{% /callout %}
+
 ## Owner overrides
 
 Each schema binding can override the `default_owner` for its default privileges and, when declared, the schema owner itself:

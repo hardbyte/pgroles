@@ -240,6 +240,19 @@ pub struct Profile {
 
     #[serde(default)]
     pub default_privileges: Vec<DefaultPrivilegeGrant>,
+
+    /// Role-level configuration parameter defaults for generated roles,
+    /// applied via `ALTER ROLE ... SET parameter = value`. Values support the
+    /// `{schema}` and `{profile}` placeholders (the same two `role_pattern`
+    /// supports), substituted per `schema x profile` expansion — e.g.
+    /// `search_path: "{schema}"` becomes `search_path: inventory` on the role
+    /// generated for the `inventory` schema. Keys are literal PostgreSQL
+    /// parameter names; placeholders are not substituted in keys (a `{schema}`
+    /// key is rejected by [`is_valid_config_parameter_name`], same as any
+    /// other invalid parameter name). Values are always strings — see
+    /// [`ConfigValue`].
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub config: BTreeMap<String, ConfigValue>,
 }
 
 /// A grant template within a profile (schema is filled in during expansion).
@@ -298,6 +311,15 @@ impl std::fmt::Display for SchemaBindingFacet {
 
 pub(crate) fn default_role_pattern() -> String {
     "{schema}-{profile}".to_string()
+}
+
+/// Substitute the `{schema}` and `{profile}` placeholders in a profile
+/// `config` value — the same two placeholders `role_pattern` supports.
+/// Values without either placeholder are returned unchanged.
+fn substitute_placeholders(value: &str, schema: &str, profile: &str) -> String {
+    value
+        .replace("{schema}", schema)
+        .replace("{profile}", profile)
 }
 
 fn is_false(value: &bool) -> bool {
@@ -646,6 +668,21 @@ pub fn expand_manifest(manifest: &PolicyManifest) -> Result<ExpandedManifest, Ma
                 .replace("{schema}", &schema_binding.name)
                 .replace("{profile}", profile_name);
 
+            // Expand profile config — substitute {schema}/{profile} in VALUES
+            // only. Keys are literal PostgreSQL parameter names; a `{schema}`
+            // or `{profile}` key is not a valid identifier and is rejected by
+            // the parameter-name validation below, which is the desired
+            // outcome (placeholders only make sense in values).
+            let config: BTreeMap<String, ConfigValue> = profile
+                .config
+                .iter()
+                .map(|(parameter, value)| {
+                    let substituted =
+                        substitute_placeholders(&value.0, &schema_binding.name, profile_name);
+                    (parameter.clone(), ConfigValue(substituted))
+                })
+                .collect();
+
             // Create role definition
             roles.push(RoleDefinition {
                 name: role_name.clone(),
@@ -664,7 +701,7 @@ pub fn expand_manifest(manifest: &PolicyManifest) -> Result<ExpandedManifest, Ma
                 )),
                 password: None,
                 password_valid_until: None,
-                config: BTreeMap::new(),
+                config,
             });
 
             // Expand profile grants — fill in schema
@@ -1821,6 +1858,145 @@ spec:
         assert_eq!(manifest.schemas.len(), 1);
         assert_eq!(manifest.memberships.len(), 2);
         assert_eq!(manifest.profiles.len(), 2);
+    }
+
+    #[test]
+    fn profile_config_substitutes_schema_and_profile_placeholders_in_values() {
+        let yaml = r#"
+profiles:
+  editor:
+    login: true
+    config:
+      search_path: "{schema}"
+      statement_timeout: "30s"
+      app.profile_name: "{profile}"
+      app.combo: "{schema}-{profile}-{schema}"
+      app.literal: "no placeholders here"
+
+schemas:
+  - name: inventory
+    profiles: [editor]
+"#;
+        let manifest = parse_manifest(yaml).unwrap();
+        let expanded = expand_manifest(&manifest).unwrap();
+
+        assert_eq!(expanded.roles.len(), 1);
+        let role = &expanded.roles[0];
+        assert_eq!(role.name, "inventory-editor");
+        assert_eq!(role.config["search_path"].0, "inventory");
+        assert_eq!(role.config["statement_timeout"].0, "30s");
+        assert_eq!(role.config["app.profile_name"].0, "editor");
+        assert_eq!(role.config["app.combo"].0, "inventory-editor-inventory");
+        assert_eq!(role.config["app.literal"].0, "no placeholders here");
+    }
+
+    #[test]
+    fn profile_config_empty_when_not_declared() {
+        let yaml = r#"
+profiles:
+  editor:
+    login: true
+
+schemas:
+  - name: inventory
+    profiles: [editor]
+"#;
+        let manifest = parse_manifest(yaml).unwrap();
+        let expanded = expand_manifest(&manifest).unwrap();
+        assert!(expanded.roles[0].config.is_empty());
+    }
+
+    #[test]
+    fn profile_config_rejects_invalid_parameter_name() {
+        // {schema} substitution only applies to values, never to keys — a
+        // literal `{schema}` key is not a valid PostgreSQL parameter name and
+        // is rejected the same way any other malformed key would be.
+        let yaml = r#"
+profiles:
+  editor:
+    config:
+      "{schema}": inventory
+
+schemas:
+  - name: inventory
+    profiles: [editor]
+"#;
+        let manifest = parse_manifest(yaml).unwrap();
+        let err = expand_manifest(&manifest).unwrap_err();
+        assert!(matches!(err, ManifestError::InvalidConfigParameter { .. }));
+    }
+
+    #[test]
+    fn profile_config_rejects_unquoted_number() {
+        let yaml = r#"
+profiles:
+  editor:
+    config:
+      statement_timeout: 30000
+
+schemas:
+  - name: inventory
+    profiles: [editor]
+"#;
+        let err = parse_manifest(yaml).unwrap_err();
+        assert!(
+            err.to_string().contains("write \"30000\" instead of 30000"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn profile_config_role_membership_validation_fires() {
+        // A profile `config: { role: <group> }` pointing at a manifest role
+        // without a declared membership must fail the same way a hand-written
+        // role's `config.role` would — the cross-check applies to generated
+        // roles because they land in the same `roles` vec before validation.
+        let yaml = r#"
+profiles:
+  editor:
+    login: true
+    config:
+      role: combined
+
+schemas:
+  - name: inventory
+    profiles: [editor]
+
+roles:
+  - name: combined
+"#;
+        let manifest = parse_manifest(yaml).unwrap();
+        let err = expand_manifest(&manifest).unwrap_err();
+        assert!(matches!(
+            err,
+            ManifestError::SetRoleWithoutMembership { role, target }
+                if role == "inventory-editor" && target == "combined"
+        ));
+    }
+
+    #[test]
+    fn profile_config_role_membership_validation_passes_with_declared_membership() {
+        let yaml = r#"
+profiles:
+  editor:
+    login: true
+    config:
+      role: combined
+
+schemas:
+  - name: inventory
+    profiles: [editor]
+
+roles:
+  - name: combined
+
+memberships:
+  - role: combined
+    members:
+      - name: inventory-editor
+"#;
+        let manifest = parse_manifest(yaml).unwrap();
+        assert!(expand_manifest(&manifest).is_ok());
     }
 
     #[test]

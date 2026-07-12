@@ -535,6 +535,13 @@ pub struct ProfileSpec {
 
     #[serde(default)]
     pub default_privileges: Vec<DefaultPrivilegeGrantSpec>,
+
+    /// Role-level configuration parameter defaults for generated roles,
+    /// applied via `ALTER ROLE ... SET parameter = value`. Values support the
+    /// `{schema}` and `{profile}` placeholders, substituted per `schema x
+    /// profile` expansion (e.g. `search_path: "{schema}"`).
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub config: std::collections::BTreeMap<String, pgroles_core::manifest::ConfigValue>,
 }
 
 /// Grant template within a profile.
@@ -1437,6 +1444,7 @@ impl PostgresPolicySpec {
                             on_type: dp.on_type,
                         })
                         .collect(),
+                    config: spec.config.clone(),
                 };
                 (name.clone(), profile)
             })
@@ -1793,6 +1801,7 @@ mod tests {
                     inherit: Some(false),
                     grants: vec![],
                     default_privileges: vec![],
+                    config: Default::default(),
                 },
             )]),
             schemas: vec![],
@@ -1851,6 +1860,7 @@ mod tests {
                 inherit: None,
                 grants: vec![],
                 default_privileges: vec![],
+                config: Default::default(),
             },
         );
 

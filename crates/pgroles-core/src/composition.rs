@@ -714,6 +714,7 @@ roles:
                         inherit: None,
                         grants: vec![],
                         default_privileges: vec![],
+                        config: BTreeMap::new(),
                     },
                 )]),
                 ..SharedPolicy::default()
