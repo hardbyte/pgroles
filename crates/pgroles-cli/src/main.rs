@@ -1568,18 +1568,7 @@ async fn inspect_current_for_plan_with_config(
         .context("failed to inspect database state")?;
     // Unsatisfiable wildcard grants mean the desired state cannot be reliably
     // computed, so they block diff/apply from proceeding.
-    if !inspection
-        .diagnostics
-        .unsatisfiable_wildcard_grants
-        .is_empty()
-    {
-        let message = inspection
-            .diagnostics
-            .unsatisfiable_wildcard_grants
-            .iter()
-            .map(ToString::to_string)
-            .collect::<Vec<_>>()
-            .join("\n");
+    if let Some(message) = inspection.diagnostics.blocking_message() {
         anyhow::bail!("{message}");
     }
     // Column-level grants are advisory only — pgroles doesn't manage them, but

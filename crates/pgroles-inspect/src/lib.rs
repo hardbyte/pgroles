@@ -66,8 +66,32 @@ impl InspectionDiagnostics {
     pub fn is_empty(&self) -> bool {
         self.unsatisfiable_wildcard_grants.is_empty() && self.column_level_grants.is_empty()
     }
+
+    /// Render the blocking diagnostics (unsatisfiable wildcard grants) as the
+    /// error message `diff`/`apply` and the operator fail with, one per line.
+    /// Returns `None` when nothing blocks reconciliation. Advisory
+    /// diagnostics ([`column_level_grants`](Self::column_level_grants)) are
+    /// deliberately excluded — callers surface those as warnings separately.
+    pub fn blocking_message(&self) -> Option<String> {
+        if self.unsatisfiable_wildcard_grants.is_empty() {
+            return None;
+        }
+        Some(
+            self.unsatisfiable_wildcard_grants
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join("\n"),
+        )
+    }
 }
 
+/// Combined rendering of all diagnostics, blocking and advisory alike.
+///
+/// NOTE: production paths do NOT use this impl — the CLI and operator render
+/// [`InspectionDiagnostics::blocking_message`] for the failure path and
+/// iterate `column_level_grants` for the warning path separately, so severity
+/// stays visible. This impl exists for logging/debugging convenience.
 impl std::fmt::Display for InspectionDiagnostics {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let mut wrote_any = false;
@@ -142,13 +166,19 @@ pub struct ColumnLevelGrantDiagnostic {
     /// The grantee role name, or the literal string `"PUBLIC"` for grants to
     /// the PUBLIC pseudo-role (ACL grantee OID 0).
     pub grantee: String,
-    pub columns: std::collections::BTreeSet<String>,
+    /// Up to [`COLUMN_LEVEL_GRANT_EXAMPLE_LIMIT`] affected column names,
+    /// sorted; the overflow count lives in `skipped_columns`. Capped at
+    /// construction (like `UnsatisfiableWildcardGrant::examples`) so a wide
+    /// table doesn't keep thousands of names resident per diagnostic.
+    pub columns: Vec<String>,
+    /// Number of additional affected columns beyond `columns`.
+    pub skipped_columns: usize,
     pub privileges: std::collections::BTreeSet<Privilege>,
 }
 
-/// Maximum number of column names listed by [`ColumnLevelGrantDiagnostic`]'s
-/// `Display` impl before the remainder is collapsed into a "+N more" suffix.
-const COLUMN_LEVEL_GRANT_DISPLAY_LIMIT: usize = 8;
+/// Maximum number of column names carried by a [`ColumnLevelGrantDiagnostic`];
+/// the remainder is summarized as `skipped_columns` at aggregation time.
+pub(crate) const COLUMN_LEVEL_GRANT_EXAMPLE_LIMIT: usize = 8;
 
 impl std::fmt::Display for ColumnLevelGrantDiagnostic {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -158,19 +188,9 @@ impl std::fmt::Display for ColumnLevelGrantDiagnostic {
             .map(ToString::to_string)
             .collect::<Vec<_>>()
             .join(", ");
-        let total_columns = self.columns.len();
-        let mut columns = self
-            .columns
-            .iter()
-            .take(COLUMN_LEVEL_GRANT_DISPLAY_LIMIT)
-            .cloned()
-            .collect::<Vec<_>>()
-            .join(", ");
-        if total_columns > COLUMN_LEVEL_GRANT_DISPLAY_LIMIT {
-            columns.push_str(&format!(
-                ", … (+{} more)",
-                total_columns - COLUMN_LEVEL_GRANT_DISPLAY_LIMIT
-            ));
+        let mut columns = self.columns.join(", ");
+        if self.skipped_columns > 0 {
+            columns.push_str(&format!(", … (+{} more)", self.skipped_columns));
         }
         write!(
             f,
@@ -925,6 +945,7 @@ roles:
             relation: "widgets".to_string(),
             grantee: grantee.to_string(),
             columns: columns.iter().map(|c| c.to_string()).collect(),
+            skipped_columns: 0,
             privileges: BTreeSet::from([Privilege::Select]),
         }
     }
@@ -952,15 +973,14 @@ roles:
     }
 
     #[test]
-    fn column_level_grant_display_caps_long_column_lists() {
-        let columns: Vec<String> = (0..12).map(|i| format!("col_{i}")).collect();
-        let column_refs: Vec<&str> = columns.iter().map(String::as_str).collect();
-        let diagnostic = sample_column_level_grant("analytics", &column_refs);
+    fn column_level_grant_display_summarizes_skipped_columns() {
+        // Capping happens at aggregation time (see privileges.rs tests);
+        // Display just renders the carried examples plus the overflow count.
+        let mut diagnostic = sample_column_level_grant("analytics", &["col_a", "col_b"]);
+        diagnostic.skipped_columns = 4;
 
         let rendered = diagnostic.to_string();
-
-        assert_eq!(diagnostic.columns.len(), 12);
-        assert!(rendered.contains("+4 more"));
+        assert!(rendered.contains("col_a, col_b, … (+4 more)"));
     }
 
     #[test]

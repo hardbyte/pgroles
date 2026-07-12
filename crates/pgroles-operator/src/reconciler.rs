@@ -935,18 +935,7 @@ async fn apply_under_lock(
     ctx.observability.record_inspection(&inspection.stats);
     // Unsatisfiable wildcard grants mean the desired state cannot be reliably
     // computed, so they block reconciliation.
-    if !inspection
-        .diagnostics
-        .unsatisfiable_wildcard_grants
-        .is_empty()
-    {
-        let message = inspection
-            .diagnostics
-            .unsatisfiable_wildcard_grants
-            .iter()
-            .map(ToString::to_string)
-            .collect::<Vec<_>>()
-            .join("\n");
+    if let Some(message) = inspection.diagnostics.blocking_message() {
         return Err(ReconcileError::UnsatisfiableWildcardGrant(message));
     }
     // Column-level grants are advisory only — pgroles doesn't manage them, but

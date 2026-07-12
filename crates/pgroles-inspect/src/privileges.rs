@@ -1307,9 +1307,11 @@ struct ColumnAclRow {
 /// column-level grant in a managed schema is an audit signal regardless of
 /// who holds it.
 ///
-/// Scoped to relation kinds that can carry column ACLs and that pgroles
-/// otherwise inspects: ordinary/partitioned tables, views, and materialized
-/// views.
+/// Scoped to relation kinds that can carry column ACLs: ordinary/partitioned
+/// tables, views, materialized views, and foreign tables. Foreign tables are
+/// included even though pgroles does not otherwise inspect them — a
+/// column-level grant on an FDW-backed table is exactly the kind of sensitive
+/// access this detector exists to surface.
 pub async fn fetch_column_level_grants(
     pool: &PgPool,
     privilege_schemas: &[&str],
@@ -1331,7 +1333,7 @@ pub async fn fetch_column_level_grants(
         JOIN pg_attribute a ON a.attrelid = c.oid AND NOT a.attisdropped AND a.attnum > 0
         CROSS JOIN LATERAL aclexplode(a.attacl) AS acl
         WHERE a.attacl IS NOT NULL
-          AND c.relkind IN ('r', 'p', 'v', 'm')
+          AND c.relkind IN ('r', 'p', 'v', 'm', 'f')
           AND n.nspname = ANY($1)
         ORDER BY n.nspname, c.relname, grantee_name, a.attname
         "#,
@@ -1347,34 +1349,54 @@ pub async fn fetch_column_level_grants(
 /// `(schema, relation, grantee)`, collecting the affected columns and
 /// privilege types. A `BTreeMap` key drives iteration order so the resulting
 /// `Vec` is deterministic regardless of row order.
+///
+/// Column lists are capped at construction (mirroring the
+/// `UnsatisfiableWildcardGrant` `examples`/`skipped_count` pattern): only the
+/// first [`crate::COLUMN_LEVEL_GRANT_EXAMPLE_LIMIT`] column names (sorted) are
+/// kept, with the overflow recorded in `skipped_columns`, so a wide table
+/// with thousands of column grants doesn't hold every name in memory.
 fn aggregate_column_acl_rows(rows: Vec<ColumnAclRow>) -> Vec<ColumnLevelGrantDiagnostic> {
-    let mut aggregated: BTreeMap<(String, String, String), ColumnLevelGrantDiagnostic> =
-        BTreeMap::new();
+    struct Accumulator {
+        columns: BTreeSet<String>,
+        privileges: BTreeSet<Privilege>,
+    }
+
+    let mut aggregated: BTreeMap<(String, String, String), Accumulator> = BTreeMap::new();
 
     for row in rows {
         let Some(privilege) = acl_char_to_privilege(&row.privilege_type) else {
             continue;
         };
 
-        let key = (
-            row.schema_name.clone(),
-            row.relation_name.clone(),
-            row.grantee_name.clone(),
-        );
         let entry = aggregated
-            .entry(key)
-            .or_insert_with(|| ColumnLevelGrantDiagnostic {
-                schema: row.schema_name.clone(),
-                relation: row.relation_name.clone(),
-                grantee: row.grantee_name.clone(),
+            .entry((row.schema_name, row.relation_name, row.grantee_name))
+            .or_insert_with(|| Accumulator {
                 columns: BTreeSet::new(),
                 privileges: BTreeSet::new(),
             });
-        entry.columns.insert(row.column_name.clone());
+        entry.columns.insert(row.column_name);
         entry.privileges.insert(privilege);
     }
 
-    aggregated.into_values().collect()
+    aggregated
+        .into_iter()
+        .map(|((schema, relation, grantee), acc)| {
+            let total = acc.columns.len();
+            let columns: Vec<String> = acc
+                .columns
+                .into_iter()
+                .take(crate::COLUMN_LEVEL_GRANT_EXAMPLE_LIMIT)
+                .collect();
+            ColumnLevelGrantDiagnostic {
+                schema,
+                relation,
+                grantee,
+                skipped_columns: total - columns.len(),
+                columns,
+                privileges: acc.privileges,
+            }
+        })
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -1951,6 +1973,25 @@ mod tests {
     }
 
     #[test]
+    fn aggregate_column_acl_rows_caps_columns_and_counts_overflow() {
+        let rows: Vec<ColumnAclRow> = (0..12)
+            .map(|i| column_acl_row("app", "wide", "reader", "r", &format!("col_{i:02}")))
+            .collect();
+
+        let diagnostics = aggregate_column_acl_rows(rows);
+        assert_eq!(diagnostics.len(), 1);
+        let diagnostic = &diagnostics[0];
+        assert_eq!(
+            diagnostic.columns.len(),
+            crate::COLUMN_LEVEL_GRANT_EXAMPLE_LIMIT
+        );
+        assert_eq!(diagnostic.skipped_columns, 4);
+        // Examples are the lexicographically first columns (BTreeSet order).
+        assert_eq!(diagnostic.columns[0], "col_00");
+        assert_eq!(diagnostic.columns[7], "col_07");
+    }
+
+    #[test]
     fn aggregate_column_acl_rows_groups_by_schema_relation_grantee() {
         let rows = vec![
             column_acl_row("app", "widgets", "reader", "r", "name"),
@@ -1971,7 +2012,7 @@ mod tests {
         assert_eq!(reader.relation, "widgets");
         assert_eq!(
             reader.columns,
-            BTreeSet::from(["name".to_string(), "secret".to_string()])
+            vec!["name".to_string(), "secret".to_string()]
         );
         assert_eq!(
             reader.privileges,
@@ -1982,7 +2023,7 @@ mod tests {
             .iter()
             .find(|d| d.grantee == "PUBLIC")
             .expect("PUBLIC diagnostic present");
-        assert_eq!(public.columns, BTreeSet::from(["id".to_string()]));
+        assert_eq!(public.columns, vec!["id".to_string()]);
         assert_eq!(public.privileges, BTreeSet::from([Privilege::Select]));
     }
 
@@ -2126,7 +2167,7 @@ mod tests {
         assert_eq!(diagnostic.schema, schema);
         assert_eq!(diagnostic.relation, "widgets");
         assert_eq!(diagnostic.grantee, role);
-        assert_eq!(diagnostic.columns, BTreeSet::from(["secret".to_string()]));
+        assert_eq!(diagnostic.columns, vec!["secret".to_string()]);
         assert_eq!(diagnostic.privileges, BTreeSet::from([Privilege::Select]));
     }
 
@@ -2207,7 +2248,7 @@ mod tests {
         assert_eq!(inspection.diagnostics.column_level_grants.len(), 1);
         let diagnostic = &inspection.diagnostics.column_level_grants[0];
         assert_eq!(diagnostic.grantee, "PUBLIC");
-        assert_eq!(diagnostic.columns, BTreeSet::from(["secret".to_string()]));
+        assert_eq!(diagnostic.columns, vec!["secret".to_string()]);
     }
 
     #[test]
