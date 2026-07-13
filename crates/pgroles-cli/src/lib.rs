@@ -491,10 +491,16 @@ fn is_strippable(path: &[String], value: &serde_yaml::Value) -> bool {
             // is empty after defaults are removed.
             matches!(path, [field] if field == "profiles")
         }
-        Value::String(s) => match key {
-            Some("role_pattern") => s == DEFAULT_ROLE_PATTERN,
-            _ => false,
-        },
+        Value::String(s) => {
+            // Only strip `role_pattern` at its actual manifest position
+            // (`schemas[i].role_pattern`). Matching on the leaf key alone
+            // would also strip a role/profile *config parameter* that happens
+            // to be named `role_pattern` with a value equal to the default
+            // pattern string — config maps carry arbitrary user-chosen
+            // PostgreSQL parameter names and must round-trip verbatim.
+            matches!(path, [first, last] if first == "schemas" && last == "role_pattern")
+                && s == DEFAULT_ROLE_PATTERN
+        }
         _ => false,
     }
 }
@@ -1312,6 +1318,57 @@ roles:
             reparsed.expanded.memberships.len(),
             validated.composed.expanded.memberships.len()
         );
+
+        // Role config maps must survive the render round trip verbatim —
+        // guards against default-stripping ever reaching inside `config`.
+        use std::collections::BTreeMap;
+        let config_by_role = |expanded: &pgroles_core::manifest::ExpandedManifest| {
+            expanded
+                .roles
+                .iter()
+                .map(|r| (r.name.clone(), r.config.clone()))
+                .collect::<BTreeMap<_, _>>()
+        };
+        assert_eq!(
+            config_by_role(&reparsed.expanded),
+            config_by_role(&validated.composed.expanded)
+        );
+    }
+
+    #[test]
+    fn render_preserves_config_parameter_named_role_pattern() {
+        // A config parameter is an arbitrary user-chosen PostgreSQL setting
+        // name. One literally named `role_pattern` whose value equals the
+        // default role pattern string must NOT be stripped by the renderer's
+        // default-removal pass — only `schemas[i].role_pattern` is a
+        // strippable manifest default.
+        let yaml = r#"
+schemas:
+  - name: inventory
+    profiles: []
+    role_pattern: "{schema}-{profile}"
+
+roles:
+  - name: app
+    config:
+      role_pattern: "{schema}-{profile}"
+"#;
+        let value: serde_yaml::Value = serde_yaml::from_str(yaml).unwrap();
+        let stripped = strip_manifest_defaults(value);
+        let out = serde_yaml::to_string(&stripped).unwrap();
+
+        // The schema-binding default is stripped...
+        assert_eq!(
+            out.matches("role_pattern").count(),
+            1,
+            "expected exactly the config entry to survive, got:\n{out}"
+        );
+        // ...while the config entry survives with its value intact.
+        let reparsed: serde_yaml::Value = serde_yaml::from_str(&out).unwrap();
+        let config_value = reparsed["roles"][0]["config"]["role_pattern"]
+            .as_str()
+            .expect("config.role_pattern must survive rendering");
+        assert_eq!(config_value, "{schema}-{profile}");
     }
 
     #[test]

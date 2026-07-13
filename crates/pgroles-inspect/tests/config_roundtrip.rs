@@ -62,9 +62,11 @@ impl Drop for RoleCleanup {
     }
 }
 
-/// Like `RoleCleanup`, but also drops a schema (roles first, since the schema
-/// grants would otherwise depend on them — though `DROP SCHEMA ... CASCADE`
-/// would clean that up regardless).
+/// Like `RoleCleanup`, but also drops schemas. Schemas are dropped FIRST:
+/// `DROP ROLE` fails (via `pg_shdepend`) while the role still holds grants on
+/// a surviving schema, whereas `DROP SCHEMA ... CASCADE` clears those
+/// dependent ACL entries, letting the subsequent role drops succeed even if a
+/// future test grants schema privileges to its roles.
 struct RoleAndSchemaCleanup {
     roles: Vec<String>,
     schemas: Vec<String>,
@@ -78,14 +80,14 @@ impl Drop for RoleAndSchemaCleanup {
             let pool = PgPool::connect(&database_url())
                 .await
                 .expect("failed to connect for cleanup");
-            for role in roles {
-                let _ = pool
-                    .execute(format!(r#"DROP ROLE IF EXISTS "{role}";"#).as_str())
-                    .await;
-            }
             for schema in schemas {
                 let _ = pool
                     .execute(format!(r#"DROP SCHEMA IF EXISTS "{schema}" CASCADE;"#).as_str())
+                    .await;
+            }
+            for role in roles {
+                let _ = pool
+                    .execute(format!(r#"DROP ROLE IF EXISTS "{role}";"#).as_str())
                     .await;
             }
         });
