@@ -14,6 +14,17 @@
 //! shaped to stay inside the region where the contract is meant to hold (see
 //! the notes below).
 //!
+//! **Scope**: this pure harness is the fast, every-push *logic* check — it can
+//! catch engine bugs but not shared misconceptions, because the interpreter
+//! and the engine were written from the same reading of PostgreSQL semantics
+//! (e.g. the GUC list-value bug, where `SET search_path = 'a, b'` stored ONE
+//! schema literally named `a, b`, was invisible to any model-based test). The
+//! authoritative convergence oracle is the DB-backed property suite in
+//! `pgroles-inspect/tests/diff_property_live.rs`, which replays generated
+//! cases against a real PostgreSQL server and differentially validates this
+//! interpreter's semantics (a synced copy of [`apply_changes`]) against the
+//! re-inspected live state.
+//!
 //! Like `suggest_property.rs`, this uses a tiny seeded xorshift64* PRNG so the
 //! tests are reproducible with no extra dependencies. Every failure prints the
 //! `seed` value; re-run a single case by feeding that seed to `Rng::new` in the
