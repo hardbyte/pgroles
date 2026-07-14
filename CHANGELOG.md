@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Schema owner transfers no longer strip the incoming owner's privileges when a stale explicit grant exists.** `ALTER SCHEMA ... OWNER TO z` merges z's pre-existing explicit ACL entry into the new owner entry, so a same-plan `REVOKE` against that stale grant removed the *new owner's* USAGE — leaving the owner unable to resolve its own schema until the next reconcile. The diff engine now suppresses schema revokes whose grantee is that schema's incoming owner in the same plan; the state converges in a single pass. Proven by the live property suite, which previously had to exclude this shape. (#140)
+
 ### Added
 
 - **Profiles can now declare `config` defaults for the roles they generate, with `{schema}`/`{profile}` placeholder substitution in values.** The same role-level `ALTER ROLE ... SET` config introduced below is now available on `profiles[].config`, so a per-schema `search_path` default (`config: { search_path: "{schema}" }`) can be declared once and expanded across every `schema x profile` binding instead of repeated per generated role. Placeholders substitute only in values — keys stay literal PostgreSQL parameter names, and the `config.role` membership cross-check applies to generated roles the same as hand-written ones. `pgroles generate --suggest-profiles` never clusters a `config`-carrying role into a profile, keeping it flat instead, since collapsing config maps modulo placeholder substitution risks silently changing what gets applied.
