@@ -403,6 +403,33 @@ pub fn diff(current: &RoleGraph, desired: &RoleGraph) -> Vec<Change> {
 
     diff_memberships(current, desired, &mut add_members, &mut remove_members);
 
+    // A schema-owner transfer absorbs the incoming owner's pre-existing
+    // explicit ACL entry into the new owner entry (`ALTER SCHEMA ... OWNER TO
+    // z` merges `z=U/old` into `z=UC/z`). A revoke planned against that stale
+    // explicit grant would therefore strip the NEW OWNER's privilege — the
+    // single-pass convergence bug in issue #140. Suppress schema revokes whose
+    // grantee is the schema's incoming owner in this same plan; the follow-up
+    // inspection folds the owner's privileges into `SchemaState`, so the
+    // suppressed revoke's target no longer exists as an explicit grant.
+    let incoming_owners: BTreeSet<(&str, &str)> = schema_changes
+        .iter()
+        .filter_map(|change| match change {
+            Change::AlterSchemaOwner { name, owner } => Some((name.as_str(), owner.as_str())),
+            _ => None,
+        })
+        .collect();
+    if !incoming_owners.is_empty() {
+        revokes.retain(|change| match change {
+            Change::Revoke {
+                role,
+                object_type: ObjectType::Schema,
+                name: Some(schema_name),
+                ..
+            } => !incoming_owners.contains(&(schema_name.as_str(), role.as_str())),
+            _ => true,
+        });
+    }
+
     // ----- Assemble in dependency order -----
     let mut changes = Vec::new();
     changes.extend(creates);
@@ -970,6 +997,79 @@ mod tests {
             }
             other => panic!("expected AlterRole, got: {other:?}"),
         }
+    }
+
+    #[test]
+    fn owner_transfer_suppresses_revoke_of_incoming_owners_stale_grant() {
+        // Issue #140: a stale explicit schema grant to the role that becomes
+        // the schema's owner in the same plan must NOT be revoked — the
+        // transfer absorbs the grantee's ACL entry into the owner entry, so
+        // the revoke would strip the NEW OWNER's privilege.
+        let mut current = empty_graph();
+        for role in ["w", "z", "bystander"] {
+            current.roles.insert(role.to_string(), RoleState::default());
+        }
+        current.schemas.insert(
+            "s".to_string(),
+            SchemaState {
+                owner: Some("w".to_string()),
+                owner_privileges: default_schema_owner_privileges("w"),
+            },
+        );
+        for grantee in ["z", "bystander"] {
+            current.grants.insert(
+                GrantKey {
+                    role: grantee.to_string(),
+                    object_type: ObjectType::Schema,
+                    schema: None,
+                    name: Some("s".to_string()),
+                },
+                GrantState {
+                    privileges: [Privilege::Usage].into_iter().collect(),
+                },
+            );
+        }
+
+        let mut desired = empty_graph();
+        for role in ["w", "z", "bystander"] {
+            desired.roles.insert(role.to_string(), RoleState::default());
+        }
+        desired.schemas.insert(
+            "s".to_string(),
+            SchemaState {
+                owner: Some("z".to_string()),
+                owner_privileges: default_schema_owner_privileges("z"),
+            },
+        );
+
+        let changes = diff(&current, &desired);
+
+        assert!(
+            changes.iter().any(|c| matches!(
+                c,
+                Change::AlterSchemaOwner { name, owner } if name == "s" && owner == "z"
+            )),
+            "expected owner transfer in plan: {changes:?}"
+        );
+        // The incoming owner's stale grant is absorbed by the transfer, not
+        // revoked...
+        assert!(
+            !changes.iter().any(|c| matches!(
+                c,
+                Change::Revoke { role, object_type: ObjectType::Schema, name: Some(n), .. }
+                    if role == "z" && n == "s"
+            )),
+            "revoke against incoming owner must be suppressed: {changes:?}"
+        );
+        // ...while unrelated revokes on the same schema still happen.
+        assert!(
+            changes.iter().any(|c| matches!(
+                c,
+                Change::Revoke { role, object_type: ObjectType::Schema, name: Some(n), .. }
+                    if role == "bystander" && n == "s"
+            )),
+            "bystander's stale grant must still be revoked: {changes:?}"
+        );
     }
 
     #[test]

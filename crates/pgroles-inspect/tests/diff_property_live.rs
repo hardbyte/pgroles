@@ -696,34 +696,30 @@ fn derive_current(rng: &mut Rng, desired: &RoleGraph, names: &Names) -> RoleGrap
     c
 }
 
-/// Enforce the cross-graph boundary documented in the header: a schema-level
-/// grant whose grantee owns that schema in *either* graph cannot round-trip
-/// (inspection folds owner privileges into `SchemaState`).
+/// Enforce the per-graph round-trip boundary documented in the header: a
+/// schema-level grant whose grantee owns that schema *in the same graph*
+/// cannot round-trip, because inspection folds the owner's privileges into
+/// `SchemaState` instead of reporting an explicit grant row — a desired-side
+/// grant-to-owner would re-plan forever, and a current-side one is not a
+/// reachable inspected state.
 ///
-/// EXCLUDED-WITH-COMMENT — suspected single-pass convergence bug in the diff
-/// engine, verified against PostgreSQL 16.13 and left for the maintainer to
-/// decide (this suite must stay green):
-///   current:  schema s owner=w, owner_privileges={CREATE,USAGE};
-///             grant (z, SCHEMA s) = {USAGE}       (z is not yet the owner)
-///   desired:  schema s owner=z, owner_privileges={CREATE,USAGE}; no grants
-///   plan:     AlterSchemaOwner(s → z), then Revoke(USAGE ON s FROM z)
-/// `ALTER SCHEMA ... OWNER TO z` merges z's explicit ACL entry into the new
-/// owner entry (`{z=UC/z}`), so the plan's later REVOKE strips the *owner's*
-/// USAGE (`{z=C/z}`). EnsureSchemaOwnerPrivileges is not emitted in the same
-/// plan because it is computed from the pre-transfer owner's (complete)
-/// privileges — the state only self-heals on the NEXT reconcile. Single-pass
-/// convergence is violated. Generating this shape would fail assertion 1, so
-/// both graphs are sanitized against the union of owners.
+/// The CROSS-graph shape — a stale grant in `current` to a role that becomes
+/// the schema's owner in `desired` (issue #140) — is deliberately generatable:
+/// the diff engine now suppresses the revoke that the same-plan owner
+/// transfer would otherwise turn into a strip of the new owner's USAGE, and
+/// this suite proves that fix against real PostgreSQL.
 fn strip_owner_schema_grants(current: &mut RoleGraph, desired: &mut RoleGraph) {
-    let mut owners: BTreeSet<(String, String)> = BTreeSet::new();
-    for graph in [&*current, &*desired] {
-        for (schema, state) in &graph.schemas {
-            if let Some(owner) = &state.owner {
-                owners.insert((schema.clone(), owner.clone()));
-            }
-        }
-    }
     for graph in [current, desired] {
+        let owners: BTreeSet<(String, String)> = graph
+            .schemas
+            .iter()
+            .filter_map(|(schema, state)| {
+                state
+                    .owner
+                    .as_ref()
+                    .map(|owner| (schema.clone(), owner.clone()))
+            })
+            .collect();
         graph.grants.retain(|key, _| {
             !(key.object_type == ObjectType::Schema
                 && key
@@ -859,6 +855,19 @@ fn apply_changes(graph: &RoleGraph, changes: &[Change]) -> RoleGraph {
                     .get_mut(name)
                     .unwrap_or_else(|| panic!("AlterSchemaOwner on absent schema {name:?}"));
                 state.owner = Some(owner.clone());
+                // PostgreSQL's ALTER SCHEMA ... OWNER TO merges any explicit
+                // ACL entry the incoming owner held into the (full) owner
+                // entry, and inspection folds owner privileges into
+                // SchemaState rather than reporting an explicit grant row —
+                // mirror both (see issue #140).
+                state.owner_privileges =
+                    [Privilege::Create, Privilege::Usage].into_iter().collect();
+                g.grants.remove(&GrantKey {
+                    role: owner.clone(),
+                    object_type: ObjectType::Schema,
+                    schema: None,
+                    name: Some(name.clone()),
+                });
             }
             Change::EnsureSchemaOwnerPrivileges {
                 name, privileges, ..
@@ -1223,4 +1232,87 @@ fn live_convergence_matches_desired_and_interpreter() {
             started.elapsed()
         );
     }
+}
+
+/// Targeted live regression for issue #140: a stale explicit schema grant to
+/// the role that becomes the schema's owner in the same plan. Before the fix,
+/// the plan's `REVOKE ... FROM z` landed after `ALTER SCHEMA ... OWNER TO z`
+/// had merged z's ACL entry into the owner entry, stripping the new owner's
+/// USAGE until the next reconcile. The plan must now converge in one pass and
+/// leave the owner with USAGE on its own schema.
+#[test]
+#[ignore]
+fn issue_140_owner_transfer_with_stale_owner_grant_converges_single_pass() {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("system clock before unix epoch")
+        .as_nanos();
+    let w = format!("i140_w_{nanos}");
+    let z = format!("i140_z_{nanos}");
+    let s = format!("i140_s_{nanos}");
+
+    let mut desired = RoleGraph::default();
+    desired.roles.insert(w.clone(), RoleState::default());
+    desired.roles.insert(z.clone(), RoleState::default());
+    desired.schemas.insert(
+        s.clone(),
+        SchemaState {
+            owner: Some(z.clone()),
+            owner_privileges: default_schema_owner_privileges(&z),
+        },
+    );
+
+    let config = inspect_config(&[w.clone(), z.clone()], std::slice::from_ref(&s));
+
+    let _cleanup = SeedCleanup {
+        roles: vec![w.clone(), z.clone()],
+        schemas: vec![s.clone()],
+    };
+
+    with_runtime(async {
+        let pool = PgPool::connect(&database_url())
+            .await
+            .expect("failed to connect to live test database");
+
+        // Bootstrap the exact issue-140 current state via raw SQL.
+        for statement in [
+            format!(r#"CREATE ROLE "{w}";"#),
+            format!(r#"CREATE ROLE "{z}";"#),
+            format!(r#"CREATE SCHEMA "{s}" AUTHORIZATION "{w}";"#),
+            format!(r#"GRANT USAGE ON SCHEMA "{s}" TO "{z}";"#),
+        ] {
+            execute_sql(&pool, &statement, 140, "bootstrap").await;
+        }
+
+        let inspected = inspect(&pool, &config).await.expect("inspect failed");
+        let changes = diff(&inspected, &desired);
+        assert!(
+            changes
+                .iter()
+                .any(|c| matches!(c, Change::AlterSchemaOwner { name, owner } if *name == s && *owner == z)),
+            "plan must transfer ownership, got: {changes:?}"
+        );
+        execute_changes(&pool, &changes, 140, "converge").await;
+
+        // The new owner must still hold USAGE on its own schema — the bug
+        // stripped it here.
+        let (has_usage,): (bool,) = sqlx::query_as("SELECT has_schema_privilege($1, $2, 'USAGE')")
+            .bind(&z)
+            .bind(&s)
+            .fetch_one(&pool)
+            .await
+            .expect("failed to check schema privilege");
+        assert!(
+            has_usage,
+            "issue #140 regression: new owner lost USAGE on its own schema"
+        );
+
+        // Single-pass convergence: the re-diff must be empty.
+        let re_inspected = inspect(&pool, &config).await.expect("re-inspect failed");
+        let residual = diff(&re_inspected, &desired);
+        assert!(
+            residual.is_empty(),
+            "expected single-pass convergence, residual plan: {residual:?}"
+        );
+    });
 }

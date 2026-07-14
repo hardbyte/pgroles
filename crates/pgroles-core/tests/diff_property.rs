@@ -575,6 +575,19 @@ fn apply_changes(graph: &RoleGraph, changes: &[Change]) -> RoleGraph {
                     .get_mut(name)
                     .unwrap_or_else(|| panic!("AlterSchemaOwner on absent schema {name:?}"));
                 state.owner = Some(owner.clone());
+                // PostgreSQL's ALTER SCHEMA ... OWNER TO merges any explicit
+                // ACL entry the incoming owner held into the (full) owner
+                // entry, and inspection folds owner privileges into
+                // SchemaState rather than reporting an explicit grant row —
+                // mirror both (see issue #140).
+                state.owner_privileges =
+                    [Privilege::Create, Privilege::Usage].into_iter().collect();
+                g.grants.remove(&GrantKey {
+                    role: owner.clone(),
+                    object_type: ObjectType::Schema,
+                    schema: None,
+                    name: Some(name.clone()),
+                });
             }
             Change::EnsureSchemaOwnerPrivileges {
                 name, privileges, ..
