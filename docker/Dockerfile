@@ -35,7 +35,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
 # ---------------------------------------------------------------------------
 # Stage 2: Runtime — CLI
 # ---------------------------------------------------------------------------
-FROM cgr.dev/chainguard/static@sha256:d6a97eb401cbc7c6d48be76ad81d7899b94303580859d396b52b67bc84ea7345 AS cli
+FROM cgr.dev/chainguard/static@sha256:60582b2ae6074f641094af0f370d4ab241aab271858a66223dcde7eee9f51638 AS cli
 
 COPY --from=builder-cli /out/pgroles /usr/local/bin/pgroles
 
@@ -46,7 +46,7 @@ ENTRYPOINT ["pgroles"]
 # ---------------------------------------------------------------------------
 # Stage 3: Runtime — Operator
 # ---------------------------------------------------------------------------
-FROM cgr.dev/chainguard/static@sha256:d6a97eb401cbc7c6d48be76ad81d7899b94303580859d396b52b67bc84ea7345 AS operator
+FROM cgr.dev/chainguard/static@sha256:60582b2ae6074f641094af0f370d4ab241aab271858a66223dcde7eee9f51638 AS operator
 
 COPY --from=builder-operator /out/pgroles-operator /usr/local/bin/pgroles-operator
 
