@@ -11,7 +11,7 @@
 
 use sqlx::{Executor, PgPool};
 
-use pgroles_core::diff::diff;
+use pgroles_core::diff::{Change, diff};
 use pgroles_core::manifest::{expand_manifest, parse_manifest};
 use pgroles_core::model::RoleGraph;
 use pgroles_core::sql::render_statements;
@@ -53,6 +53,38 @@ impl Drop for RoleCleanup {
             let pool = PgPool::connect(&database_url())
                 .await
                 .expect("failed to connect for cleanup");
+            for role in roles {
+                let _ = pool
+                    .execute(format!(r#"DROP ROLE IF EXISTS "{role}";"#).as_str())
+                    .await;
+            }
+        });
+    }
+}
+
+/// Like `RoleCleanup`, but also drops schemas. Schemas are dropped FIRST:
+/// `DROP ROLE` fails (via `pg_shdepend`) while the role still holds grants on
+/// a surviving schema, whereas `DROP SCHEMA ... CASCADE` clears those
+/// dependent ACL entries, letting the subsequent role drops succeed even if a
+/// future test grants schema privileges to its roles.
+struct RoleAndSchemaCleanup {
+    roles: Vec<String>,
+    schemas: Vec<String>,
+}
+
+impl Drop for RoleAndSchemaCleanup {
+    fn drop(&mut self) {
+        let roles = self.roles.clone();
+        let schemas = self.schemas.clone();
+        with_runtime(async move {
+            let pool = PgPool::connect(&database_url())
+                .await
+                .expect("failed to connect for cleanup");
+            for schema in schemas {
+                let _ = pool
+                    .execute(format!(r#"DROP SCHEMA IF EXISTS "{schema}" CASCADE;"#).as_str())
+                    .await;
+            }
             for role in roles {
                 let _ = pool
                     .execute(format!(r#"DROP ROLE IF EXISTS "{role}";"#).as_str())
@@ -177,6 +209,96 @@ memberships:
         assert!(
             changes.is_empty(),
             "expected re-converged state, got: {changes:?}"
+        );
+    });
+}
+
+/// Live round-trip for profile-level `config`, exercising the `{schema}`
+/// placeholder end to end: a profile bound to one schema generates a role
+/// whose `search_path` is the schema's literal name. Also declares the
+/// schema itself so the plan includes `CreateSchema`, proving that path
+/// isn't specific to hand-written roles either.
+#[test]
+#[ignore]
+fn profile_config_placeholder_round_trips() {
+    let suffix = unique_suffix();
+    let schema = format!("cfgprof_{suffix}");
+    let role = format!("{schema}-editor");
+    let _cleanup = RoleAndSchemaCleanup {
+        roles: vec![role.clone()],
+        schemas: vec![schema.clone()],
+    };
+
+    let yaml = format!(
+        r#"
+schemas:
+  - name: {schema}
+    profiles: [editor]
+
+profiles:
+  editor:
+    login: true
+    config:
+      search_path: "{{schema}}"
+      statement_timeout: "30s"
+"#
+    );
+
+    let manifest = parse_manifest(&yaml).expect("manifest should parse");
+    let expanded = expand_manifest(&manifest).expect("manifest should expand");
+    let desired = RoleGraph::from_expanded(&expanded, None).expect("graph should build");
+    let config = InspectConfig::from_expanded(&expanded, false);
+
+    // The `{schema}` placeholder must have been substituted with the literal
+    // schema name before we ever hit the database.
+    assert_eq!(
+        desired.roles[&role]
+            .config
+            .get("search_path")
+            .map(String::as_str),
+        Some(schema.as_str())
+    );
+
+    with_runtime(async {
+        let pool = PgPool::connect(&database_url())
+            .await
+            .expect("failed to connect to live test database");
+
+        // Fresh state: plan creates the schema, the role, and its config.
+        let current = inspect(&pool, &config).await.expect("inspect failed");
+        let changes = diff(&current, &desired);
+        assert!(!changes.is_empty(), "fresh plan should not be empty");
+        assert!(
+            changes
+                .iter()
+                .any(|c| matches!(c, Change::CreateSchema { name, .. } if name == &schema)),
+            "expected a CreateSchema change, got: {changes:?}"
+        );
+        let statements: Vec<String> = changes.iter().flat_map(render_statements).collect();
+        assert!(
+            statements
+                .iter()
+                .any(|s| s == &format!(r#"ALTER ROLE "{role}" SET "search_path" = '{schema}';"#)),
+            "expected the substituted search_path to be applied, got: {statements:?}"
+        );
+        execute_all(&pool, &statements).await;
+
+        // Converged: re-inspecting must produce an empty plan.
+        let current = inspect(&pool, &config).await.expect("inspect failed");
+        let changes = diff(&current, &desired);
+        assert!(
+            changes.is_empty(),
+            "expected converged state, got: {changes:?}"
+        );
+
+        // Sanity: the role really carries the substituted value, not the
+        // literal placeholder text.
+        assert_eq!(
+            current.roles[&role]
+                .config
+                .get("search_path")
+                .map(String::as_str),
+            Some(schema.as_str())
         );
     });
 }

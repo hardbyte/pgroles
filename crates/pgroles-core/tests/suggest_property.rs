@@ -164,6 +164,20 @@ fn random_manifest(rng: &mut Rng) -> PolicyManifest {
             if roles.iter().any(|r| r.name == role_name) {
                 continue;
             }
+            // ~1 in 6 roles carries a config map so the fuzz corpus exercises
+            // the suggester's config-disqualification path (config-carrying
+            // roles must stay flat and keep their config through the
+            // suggest → expand round trip).
+            let config = if rng.usize(6) == 0 {
+                [(
+                    "app.tenant".to_string(),
+                    pgroles_core::manifest::ConfigValue(format!("t_{role_name}")),
+                )]
+                .into_iter()
+                .collect()
+            } else {
+                Default::default()
+            };
             roles.push(RoleDefinition {
                 name: role_name.clone(),
                 external: false,
@@ -178,7 +192,7 @@ fn random_manifest(rng: &mut Rng) -> PolicyManifest {
                 comment: None,
                 password: None,
                 password_valid_until: None,
-                config: Default::default(),
+                config,
             });
             for (ot, name, privs) in &kind.grant_templates {
                 let object = match ot {
