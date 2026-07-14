@@ -24,6 +24,7 @@ const navigation = [
         title: 'User Guide',
         links: [
             {title: 'Installation', href: '/docs/installation'},
+            {title: 'Executor privileges', href: '/docs/executor-privileges'},
             {title: 'Manifest guide', href: '/docs/manifest-format'},
             {title: 'Profiles & schemas', href: '/docs/profiles'},
             {title: 'Grants & privileges', href: '/docs/grants'},
@@ -50,6 +51,7 @@ const navigation = [
             {title: 'CLI commands', href: '/docs/cli'},
             {title: 'Architecture', href: '/docs/architecture'},
             {title: 'Manifest reference', href: '/docs/manifest-reference'},
+            {title: 'Limitations', href: '/docs/limitations'},
         ],
     },
 ]

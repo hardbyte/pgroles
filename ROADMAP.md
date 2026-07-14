@@ -20,7 +20,7 @@ pgroles already provides:
 - managed-provider detection for RDS, Aurora, Cloud SQL, AlloyDB, and Azure Database for PostgreSQL
 - password management for login roles with redacted output and `VALID UNTIL`
 - safety preflight for destructive role retirement workflows
-- PostgreSQL-version-aware SQL generation (PG 14+)
+- PostgreSQL-version-aware SQL generation (PostgreSQL 16+ tested in CI; PG 14–15 legacy fallback syntax is best-effort and untested)
 - a production-focused Kubernetes operator with:
   - plan mode
   - per-database serialization
@@ -41,7 +41,7 @@ pgroles already provides:
 | Profile/template system | No | No | **Yes** (profiles × schemas) |
 | Role retirement lifecycle | No | No | **Yes** (reassign/drop/terminate) |
 | Brownfield `generate` | Yes | N/A | **Yes** |
-| PG version adaptation | No | Broken | **Yes** (PG 14+ via `SqlContext`) |
+| PG version adaptation | No | Broken | **Yes** (16+ tested via `SqlContext`; 14–15 best-effort) |
 | K8s operator | No | No | **Yes** (`v1alpha1` CRD) |
 | Transactional apply | No | No | **Yes** |
 | Safety preflight checks | No | No | **Yes** (owned objects, sessions, blockers) |
