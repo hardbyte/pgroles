@@ -19,8 +19,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use sqlx::PgPool;
 
 use crate::{
-    UnsatisfiableWildcardGrant, UnsatisfiableWildcardObject, WildcardGrantPattern,
-    WildcardInspectionStats,
+    ColumnLevelGrantDiagnostic, UnsatisfiableWildcardGrant, UnsatisfiableWildcardObject,
+    WildcardGrantPattern, WildcardInspectionStats,
 };
 use pgroles_core::manifest::{ObjectType, Privilege};
 use pgroles_core::model::{GrantKey, GrantState};
@@ -1283,6 +1283,122 @@ pub async fn fetch_database_privileges(
     Ok(grants)
 }
 
+/// A raw column-level ACL row returned by `fetch_column_level_grants`.
+#[derive(Debug, Clone, sqlx::FromRow)]
+struct ColumnAclRow {
+    schema_name: String,
+    relation_name: String,
+    /// The grantee role name, or the literal `"PUBLIC"` for grants to the
+    /// PUBLIC pseudo-role (ACL grantee OID 0) — rendered explicitly in SQL
+    /// since `pg_get_userbyid(0)` returns `"unknown (OID=0)"`, not `PUBLIC`.
+    grantee_name: String,
+    privilege_type: String,
+    column_name: String,
+}
+
+/// Detect column-level ACL entries (`GRANT ... (column) ON table TO role`) on
+/// relations inside the given schemas.
+///
+/// pgroles never manages column-level privileges — it only inspects
+/// `pg_class.relacl` (table/view/etc.-level grants), never
+/// `pg_attribute.attacl`. This function exists purely for detection: it
+/// aggregates any column-level ACL entries found so callers can surface an
+/// advisory diagnostic. It does not filter by grantee role, since any
+/// column-level grant in a managed schema is an audit signal regardless of
+/// who holds it.
+///
+/// Scoped to relation kinds that can carry column ACLs: ordinary/partitioned
+/// tables, views, materialized views, and foreign tables. Foreign tables are
+/// included even though pgroles does not otherwise inspect them — a
+/// column-level grant on an FDW-backed table is exactly the kind of sensitive
+/// access this detector exists to surface.
+pub async fn fetch_column_level_grants(
+    pool: &PgPool,
+    privilege_schemas: &[&str],
+) -> Result<Vec<ColumnLevelGrantDiagnostic>, sqlx::Error> {
+    if privilege_schemas.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let rows = sqlx::query_as::<_, ColumnAclRow>(
+        r#"
+        SELECT
+            n.nspname::text AS schema_name,
+            c.relname::text AS relation_name,
+            CASE WHEN acl.grantee = 0 THEN 'PUBLIC' ELSE pg_get_userbyid(acl.grantee) END AS grantee_name,
+            acl.privilege_type,
+            a.attname::text AS column_name
+        FROM pg_class c
+        JOIN pg_namespace n ON n.oid = c.relnamespace
+        JOIN pg_attribute a ON a.attrelid = c.oid AND NOT a.attisdropped AND a.attnum > 0
+        CROSS JOIN LATERAL aclexplode(a.attacl) AS acl
+        WHERE a.attacl IS NOT NULL
+          AND c.relkind IN ('r', 'p', 'v', 'm', 'f')
+          AND n.nspname = ANY($1)
+        ORDER BY n.nspname, c.relname, grantee_name, a.attname
+        "#,
+    )
+    .bind(privilege_schemas)
+    .fetch_all(pool)
+    .await?;
+
+    Ok(aggregate_column_acl_rows(rows))
+}
+
+/// Aggregate raw column-ACL rows into one [`ColumnLevelGrantDiagnostic`] per
+/// `(schema, relation, grantee)`, collecting the affected columns and
+/// privilege types. A `BTreeMap` key drives iteration order so the resulting
+/// `Vec` is deterministic regardless of row order.
+///
+/// Column lists are capped at construction (mirroring the
+/// `UnsatisfiableWildcardGrant` `examples`/`skipped_count` pattern): only the
+/// first [`crate::COLUMN_LEVEL_GRANT_EXAMPLE_LIMIT`] column names (sorted) are
+/// kept, with the overflow recorded in `skipped_columns`, so a wide table
+/// with thousands of column grants doesn't hold every name in memory.
+fn aggregate_column_acl_rows(rows: Vec<ColumnAclRow>) -> Vec<ColumnLevelGrantDiagnostic> {
+    struct Accumulator {
+        columns: BTreeSet<String>,
+        privileges: BTreeSet<Privilege>,
+    }
+
+    let mut aggregated: BTreeMap<(String, String, String), Accumulator> = BTreeMap::new();
+
+    for row in rows {
+        let Some(privilege) = acl_char_to_privilege(&row.privilege_type) else {
+            continue;
+        };
+
+        let entry = aggregated
+            .entry((row.schema_name, row.relation_name, row.grantee_name))
+            .or_insert_with(|| Accumulator {
+                columns: BTreeSet::new(),
+                privileges: BTreeSet::new(),
+            });
+        entry.columns.insert(row.column_name);
+        entry.privileges.insert(privilege);
+    }
+
+    aggregated
+        .into_iter()
+        .map(|((schema, relation, grantee), acc)| {
+            let total = acc.columns.len();
+            let columns: Vec<String> = acc
+                .columns
+                .into_iter()
+                .take(crate::COLUMN_LEVEL_GRANT_EXAMPLE_LIMIT)
+                .collect();
+            ColumnLevelGrantDiagnostic {
+                schema,
+                relation,
+                grantee,
+                skipped_columns: total - columns.len(),
+                columns,
+                privileges: acc.privileges,
+            }
+        })
+        .collect()
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -1838,5 +1954,315 @@ mod tests {
             }),
             "existing sequence inventory should prevent vacuous wildcard synthesis"
         );
+    }
+
+    fn column_acl_row(
+        schema: &str,
+        relation: &str,
+        grantee: &str,
+        privilege: &str,
+        column: &str,
+    ) -> ColumnAclRow {
+        ColumnAclRow {
+            schema_name: schema.to_string(),
+            relation_name: relation.to_string(),
+            grantee_name: grantee.to_string(),
+            privilege_type: privilege.to_string(),
+            column_name: column.to_string(),
+        }
+    }
+
+    #[test]
+    fn aggregate_column_acl_rows_caps_columns_and_counts_overflow() {
+        let rows: Vec<ColumnAclRow> = (0..12)
+            .map(|i| column_acl_row("app", "wide", "reader", "r", &format!("col_{i:02}")))
+            .collect();
+
+        let diagnostics = aggregate_column_acl_rows(rows);
+        assert_eq!(diagnostics.len(), 1);
+        let diagnostic = &diagnostics[0];
+        assert_eq!(
+            diagnostic.columns.len(),
+            crate::COLUMN_LEVEL_GRANT_EXAMPLE_LIMIT
+        );
+        assert_eq!(diagnostic.skipped_columns, 4);
+        // Examples are the lexicographically first columns (BTreeSet order).
+        assert_eq!(diagnostic.columns[0], "col_00");
+        assert_eq!(diagnostic.columns[7], "col_07");
+    }
+
+    #[test]
+    fn aggregate_column_acl_rows_groups_by_schema_relation_grantee() {
+        let rows = vec![
+            column_acl_row("app", "widgets", "reader", "r", "name"),
+            column_acl_row("app", "widgets", "reader", "r", "secret"),
+            column_acl_row("app", "widgets", "reader", "w", "secret"),
+            column_acl_row("app", "widgets", "PUBLIC", "r", "id"),
+        ];
+
+        let diagnostics = aggregate_column_acl_rows(rows);
+
+        assert_eq!(diagnostics.len(), 2);
+
+        let reader = diagnostics
+            .iter()
+            .find(|d| d.grantee == "reader")
+            .expect("reader diagnostic present");
+        assert_eq!(reader.schema, "app");
+        assert_eq!(reader.relation, "widgets");
+        assert_eq!(
+            reader.columns,
+            vec!["name".to_string(), "secret".to_string()]
+        );
+        assert_eq!(
+            reader.privileges,
+            BTreeSet::from([Privilege::Select, Privilege::Update])
+        );
+
+        let public = diagnostics
+            .iter()
+            .find(|d| d.grantee == "PUBLIC")
+            .expect("PUBLIC diagnostic present");
+        assert_eq!(public.columns, vec!["id".to_string()]);
+        assert_eq!(public.privileges, BTreeSet::from([Privilege::Select]));
+    }
+
+    #[test]
+    fn aggregate_column_acl_rows_separates_different_relations_and_schemas() {
+        let rows = vec![
+            column_acl_row("app", "widgets", "reader", "r", "name"),
+            column_acl_row("app", "orders", "reader", "r", "name"),
+            column_acl_row("audit", "widgets", "reader", "r", "name"),
+        ];
+
+        let diagnostics = aggregate_column_acl_rows(rows);
+
+        assert_eq!(diagnostics.len(), 3);
+    }
+
+    #[test]
+    fn aggregate_column_acl_rows_ignores_unknown_privilege_characters() {
+        let rows = vec![column_acl_row("app", "widgets", "reader", "Z", "name")];
+
+        let diagnostics = aggregate_column_acl_rows(rows);
+
+        assert!(diagnostics.is_empty());
+    }
+
+    #[test]
+    fn aggregate_column_acl_rows_is_deterministic_regardless_of_input_order() {
+        let ordered = vec![
+            column_acl_row("app", "widgets", "reader", "r", "name"),
+            column_acl_row("app", "widgets", "writer", "a", "name"),
+        ];
+        let mut reversed = ordered.clone();
+        reversed.reverse();
+
+        let ordered_result = aggregate_column_acl_rows(ordered);
+        let reversed_result = aggregate_column_acl_rows(reversed);
+
+        let ordered_grantees: Vec<&str> =
+            ordered_result.iter().map(|d| d.grantee.as_str()).collect();
+        let reversed_grantees: Vec<&str> =
+            reversed_result.iter().map(|d| d.grantee.as_str()).collect();
+        assert_eq!(ordered_grantees, reversed_grantees);
+        assert_eq!(ordered_grantees, vec!["reader", "writer"]);
+    }
+
+    // -----------------------------------------------------------------------
+    // Live database tests (`cargo test -- --include-ignored`)
+    // -----------------------------------------------------------------------
+
+    fn with_runtime<T>(future: impl std::future::Future<Output = T>) -> T {
+        tokio::runtime::Runtime::new()
+            .expect("failed to create tokio runtime")
+            .block_on(future)
+    }
+
+    fn database_url() -> String {
+        std::env::var("DATABASE_URL").expect("DATABASE_URL must be set for live DB tests")
+    }
+
+    fn unique_name(prefix: &str) -> String {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock before unix epoch")
+            .as_nanos();
+        format!("{prefix}_{nanos}")
+    }
+
+    fn execute_sql(sql: &str) {
+        use sqlx::Executor;
+
+        with_runtime(async {
+            let pool = PgPool::connect(&database_url())
+                .await
+                .expect("failed to connect to live test database");
+            pool.execute(sql)
+                .await
+                .expect("failed to execute setup SQL");
+        });
+    }
+
+    struct TestDbCleanup {
+        sql: String,
+    }
+
+    impl TestDbCleanup {
+        fn new(sql: String) -> Self {
+            Self { sql }
+        }
+    }
+
+    impl Drop for TestDbCleanup {
+        fn drop(&mut self) {
+            execute_sql(&self.sql);
+        }
+    }
+
+    fn live_config(schema: &str, role: &str) -> crate::InspectConfig {
+        crate::InspectConfig {
+            managed_roles: vec![role.to_string()],
+            managed_schemas: vec![],
+            privilege_schemas: vec![schema.to_string()],
+            include_database_privileges: false,
+            wildcard_grants: vec![],
+        }
+    }
+
+    #[test]
+    #[ignore]
+    fn inspect_with_diagnostics_detects_column_level_grant() {
+        let schema = unique_name("colgrant_schema");
+        let role = unique_name("colgrant_role");
+        let _cleanup = TestDbCleanup::new(format!(
+            r#"
+            DROP SCHEMA IF EXISTS "{schema}" CASCADE;
+            DROP ROLE IF EXISTS "{role}";
+            "#
+        ));
+
+        execute_sql(&format!(
+            r#"
+            DROP SCHEMA IF EXISTS "{schema}" CASCADE;
+            DROP ROLE IF EXISTS "{role}";
+            CREATE SCHEMA "{schema}";
+            CREATE ROLE "{role}" NOLOGIN;
+            CREATE TABLE "{schema}".widgets (id serial primary key, name text, secret text);
+            GRANT SELECT (secret) ON "{schema}".widgets TO "{role}";
+            "#
+        ));
+
+        let inspection = with_runtime(async {
+            let pool = PgPool::connect(&database_url())
+                .await
+                .expect("failed to connect to live test database");
+            crate::inspect_with_diagnostics(&pool, &live_config(&schema, &role))
+                .await
+                .expect("inspection should succeed")
+        });
+
+        assert_eq!(inspection.diagnostics.column_level_grants.len(), 1);
+        let diagnostic = &inspection.diagnostics.column_level_grants[0];
+        assert_eq!(diagnostic.schema, schema);
+        assert_eq!(diagnostic.relation, "widgets");
+        assert_eq!(diagnostic.grantee, role);
+        assert_eq!(diagnostic.columns, vec!["secret".to_string()]);
+        assert_eq!(diagnostic.privileges, BTreeSet::from([Privilege::Select]));
+    }
+
+    #[test]
+    #[ignore]
+    fn inspect_with_diagnostics_ignores_plain_table_level_grant() {
+        let schema = unique_name("colgrant_schema");
+        let role = unique_name("colgrant_role");
+        let _cleanup = TestDbCleanup::new(format!(
+            r#"
+            DROP SCHEMA IF EXISTS "{schema}" CASCADE;
+            DROP ROLE IF EXISTS "{role}";
+            "#
+        ));
+
+        execute_sql(&format!(
+            r#"
+            DROP SCHEMA IF EXISTS "{schema}" CASCADE;
+            DROP ROLE IF EXISTS "{role}";
+            CREATE SCHEMA "{schema}";
+            CREATE ROLE "{role}" NOLOGIN;
+            CREATE TABLE "{schema}".widgets (id serial primary key, name text, secret text);
+            GRANT SELECT ON "{schema}".widgets TO "{role}";
+            "#
+        ));
+
+        let inspection = with_runtime(async {
+            let pool = PgPool::connect(&database_url())
+                .await
+                .expect("failed to connect to live test database");
+            crate::inspect_with_diagnostics(&pool, &live_config(&schema, &role))
+                .await
+                .expect("inspection should succeed")
+        });
+
+        assert!(
+            inspection.diagnostics.column_level_grants.is_empty(),
+            "a plain table-level grant must not be reported as a column-level grant"
+        );
+    }
+
+    #[test]
+    #[ignore]
+    fn inspect_with_diagnostics_renders_public_grantee_for_column_grant() {
+        let schema = unique_name("colgrant_schema");
+        let role = unique_name("colgrant_role");
+        let _cleanup = TestDbCleanup::new(format!(
+            r#"
+            DROP SCHEMA IF EXISTS "{schema}" CASCADE;
+            DROP ROLE IF EXISTS "{role}";
+            "#
+        ));
+
+        execute_sql(&format!(
+            r#"
+            DROP SCHEMA IF EXISTS "{schema}" CASCADE;
+            DROP ROLE IF EXISTS "{role}";
+            CREATE SCHEMA "{schema}";
+            CREATE ROLE "{role}" NOLOGIN;
+            CREATE TABLE "{schema}".widgets (id serial primary key, name text, secret text);
+            GRANT SELECT (secret) ON "{schema}".widgets TO PUBLIC;
+            "#
+        ));
+
+        // The role isn't the grantee here (PUBLIC is), but InspectConfig
+        // still needs at least one managed role to build valid query
+        // parameters; column-level grant detection does not filter by
+        // grantee role, so PUBLIC is detected regardless.
+        let inspection = with_runtime(async {
+            let pool = PgPool::connect(&database_url())
+                .await
+                .expect("failed to connect to live test database");
+            crate::inspect_with_diagnostics(&pool, &live_config(&schema, &role))
+                .await
+                .expect("inspection should succeed")
+        });
+
+        assert_eq!(inspection.diagnostics.column_level_grants.len(), 1);
+        let diagnostic = &inspection.diagnostics.column_level_grants[0];
+        assert_eq!(diagnostic.grantee, "PUBLIC");
+        assert_eq!(diagnostic.columns, vec!["secret".to_string()]);
+    }
+
+    #[test]
+    #[ignore]
+    fn fetch_column_level_grants_returns_empty_for_no_privilege_schemas() {
+        let result = with_runtime(async {
+            let pool = PgPool::connect(&database_url())
+                .await
+                .expect("failed to connect to live test database");
+            fetch_column_level_grants(&pool, &[])
+                .await
+                .expect("fetch should succeed with no schemas")
+        });
+
+        assert!(result.is_empty());
     }
 }

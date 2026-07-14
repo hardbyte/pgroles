@@ -1566,8 +1566,15 @@ async fn inspect_current_for_plan_with_config(
     let inspection = pgroles_inspect::inspect_with_diagnostics(pool, config)
         .await
         .context("failed to inspect database state")?;
-    if !inspection.diagnostics.is_empty() {
-        anyhow::bail!("{}", inspection.diagnostics);
+    // Unsatisfiable wildcard grants mean the desired state cannot be reliably
+    // computed, so they block diff/apply from proceeding.
+    if let Some(message) = inspection.diagnostics.blocking_message() {
+        anyhow::bail!("{message}");
+    }
+    // Column-level grants are advisory only — pgroles doesn't manage them, but
+    // diff/apply should still proceed. Warn instead of failing.
+    for diagnostic in &inspection.diagnostics.column_level_grants {
+        eprintln!("Warning: {diagnostic}");
     }
     Ok(inspection.graph)
 }

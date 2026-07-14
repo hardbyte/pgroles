@@ -29,7 +29,8 @@ pub use cloud::{CloudProvider, PrivilegeLevel, detect_privilege_level};
 pub use defaults::fetch_default_privileges;
 pub use memberships::fetch_memberships;
 pub use privileges::{
-    fetch_database_privileges, fetch_object_inventory, fetch_privileges, fetch_relation_inventory,
+    fetch_column_level_grants, fetch_database_privileges, fetch_object_inventory, fetch_privileges,
+    fetch_relation_inventory,
 };
 pub use public_grants::{PublicGrants, fetch_public_grants, format_public_grants};
 pub use roles::fetch_roles;
@@ -51,21 +52,62 @@ pub enum InspectError {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct InspectionDiagnostics {
     pub unsatisfiable_wildcard_grants: Vec<UnsatisfiableWildcardGrant>,
+    /// Column-level ACL entries (`GRANT ... (column) ON table TO role`) found
+    /// on relations inside managed schemas. pgroles does not manage
+    /// column-level privileges — these are surfaced as an advisory warning
+    /// during `diff`/`apply`, not a blocking error: unlike
+    /// [`unsatisfiable_wildcard_grants`](Self::unsatisfiable_wildcard_grants),
+    /// their presence never stops inspection or reconciliation from
+    /// proceeding.
+    pub column_level_grants: Vec<ColumnLevelGrantDiagnostic>,
 }
 
 impl InspectionDiagnostics {
     pub fn is_empty(&self) -> bool {
-        self.unsatisfiable_wildcard_grants.is_empty()
+        self.unsatisfiable_wildcard_grants.is_empty() && self.column_level_grants.is_empty()
+    }
+
+    /// Render the blocking diagnostics (unsatisfiable wildcard grants) as the
+    /// error message `diff`/`apply` and the operator fail with, one per line.
+    /// Returns `None` when nothing blocks reconciliation. Advisory
+    /// diagnostics ([`column_level_grants`](Self::column_level_grants)) are
+    /// deliberately excluded — callers surface those as warnings separately.
+    pub fn blocking_message(&self) -> Option<String> {
+        if self.unsatisfiable_wildcard_grants.is_empty() {
+            return None;
+        }
+        Some(
+            self.unsatisfiable_wildcard_grants
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join("\n"),
+        )
     }
 }
 
+/// Combined rendering of all diagnostics, blocking and advisory alike.
+///
+/// NOTE: production paths do NOT use this impl — the CLI and operator render
+/// [`InspectionDiagnostics::blocking_message`] for the failure path and
+/// iterate `column_level_grants` for the warning path separately, so severity
+/// stays visible. This impl exists for logging/debugging convenience.
 impl std::fmt::Display for InspectionDiagnostics {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        for (index, diagnostic) in self.unsatisfiable_wildcard_grants.iter().enumerate() {
-            if index > 0 {
+        let mut wrote_any = false;
+        for diagnostic in &self.unsatisfiable_wildcard_grants {
+            if wrote_any {
                 writeln!(f)?;
             }
             write!(f, "{diagnostic}")?;
+            wrote_any = true;
+        }
+        for diagnostic in &self.column_level_grants {
+            if wrote_any {
+                writeln!(f)?;
+            }
+            write!(f, "{diagnostic}")?;
+            wrote_any = true;
         }
         Ok(())
     }
@@ -107,6 +149,57 @@ impl std::fmt::Display for UnsatisfiableWildcardGrant {
             write!(f, " (examples: {examples})")?;
         }
         Ok(())
+    }
+}
+
+/// A column-level grant detected on a relation inside a managed schema,
+/// aggregated by `(schema, relation, grantee)`.
+///
+/// pgroles only manages table/view/etc.-level ACLs (`pg_class.relacl`); it
+/// never reads or writes `pg_attribute.attacl`. When column-level grants
+/// exist, the manifest is not the whole truth for that relation — this
+/// diagnostic surfaces that gap without attempting to manage it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ColumnLevelGrantDiagnostic {
+    pub schema: String,
+    pub relation: String,
+    /// The grantee role name, or the literal string `"PUBLIC"` for grants to
+    /// the PUBLIC pseudo-role (ACL grantee OID 0).
+    pub grantee: String,
+    /// Up to [`COLUMN_LEVEL_GRANT_EXAMPLE_LIMIT`] affected column names,
+    /// sorted; the overflow count lives in `skipped_columns`. Capped at
+    /// construction (like `UnsatisfiableWildcardGrant::examples`) so a wide
+    /// table doesn't keep thousands of names resident per diagnostic.
+    pub columns: Vec<String>,
+    /// Number of additional affected columns beyond `columns`.
+    pub skipped_columns: usize,
+    pub privileges: std::collections::BTreeSet<Privilege>,
+}
+
+/// Maximum number of column names carried by a [`ColumnLevelGrantDiagnostic`];
+/// the remainder is summarized as `skipped_columns` at aggregation time.
+pub(crate) const COLUMN_LEVEL_GRANT_EXAMPLE_LIMIT: usize = 8;
+
+impl std::fmt::Display for ColumnLevelGrantDiagnostic {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let privileges = self
+            .privileges
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(", ");
+        let mut columns = self.columns.join(", ");
+        if self.skipped_columns > 0 {
+            columns.push_str(&format!(", … (+{} more)", self.skipped_columns));
+        }
+        write!(
+            f,
+            "ColumnLevelGrant: \"{}\".\"{}\" has column-level grant(s) [{privileges}] to \"{}\" \
+             on column(s) [{columns}]; pgroles does not manage column-level privileges — they are \
+             not diffed, revoked, or included in `generate` output. See \
+             https://hardbyte.github.io/pgroles/docs/limitations/ for details.",
+            self.schema, self.relation, self.grantee
+        )
     }
 }
 
@@ -530,6 +623,21 @@ pub async fn inspect_with_diagnostics(
         remove_redundant_schema_owner_grants(&mut graph);
         stats.grants = graph.grants.len();
         debug!(found = graph.grants.len(), "privilege grants inspected");
+
+        debug!(
+            schemas = ?privilege_schema_refs,
+            "inspecting column-level grants via pg_attribute.attacl"
+        );
+        let phase_started_at = Instant::now();
+        diagnostics.column_level_grants =
+            privileges::fetch_column_level_grants(pool, &privilege_schema_refs).await?;
+        stats.record_phase("column_level_grants", phase_started_at.elapsed());
+        if !diagnostics.column_level_grants.is_empty() {
+            debug!(
+                found = diagnostics.column_level_grants.len(),
+                "column-level grants detected (unmanaged)"
+            );
+        }
     }
 
     // --- Database-level privileges ---
@@ -829,5 +937,100 @@ roles:
                 .keys()
                 .all(|key| key.role == "inventory_reader")
         );
+    }
+
+    fn sample_column_level_grant(grantee: &str, columns: &[&str]) -> ColumnLevelGrantDiagnostic {
+        ColumnLevelGrantDiagnostic {
+            schema: "inventory".to_string(),
+            relation: "widgets".to_string(),
+            grantee: grantee.to_string(),
+            columns: columns.iter().map(|c| c.to_string()).collect(),
+            skipped_columns: 0,
+            privileges: BTreeSet::from([Privilege::Select]),
+        }
+    }
+
+    #[test]
+    fn column_level_grant_display_names_schema_relation_and_grantee() {
+        let diagnostic = sample_column_level_grant("analytics", &["secret"]);
+        let rendered = diagnostic.to_string();
+
+        assert!(rendered.contains("ColumnLevelGrant"));
+        assert!(rendered.contains("\"inventory\".\"widgets\""));
+        assert!(rendered.contains("\"analytics\""));
+        assert!(rendered.contains("SELECT"));
+        assert!(rendered.contains("secret"));
+        assert!(rendered.contains("does not manage column-level privileges"));
+        assert!(rendered.contains("https://hardbyte.github.io/pgroles/docs/limitations/"));
+    }
+
+    #[test]
+    fn column_level_grant_display_renders_public_grantee_explicitly() {
+        let diagnostic = sample_column_level_grant("PUBLIC", &["secret"]);
+        let rendered = diagnostic.to_string();
+
+        assert!(rendered.contains("\"PUBLIC\""));
+    }
+
+    #[test]
+    fn column_level_grant_display_summarizes_skipped_columns() {
+        // Capping happens at aggregation time (see privileges.rs tests);
+        // Display just renders the carried examples plus the overflow count.
+        let mut diagnostic = sample_column_level_grant("analytics", &["col_a", "col_b"]);
+        diagnostic.skipped_columns = 4;
+
+        let rendered = diagnostic.to_string();
+        assert!(rendered.contains("col_a, col_b, … (+4 more)"));
+    }
+
+    #[test]
+    fn inspection_diagnostics_is_empty_requires_both_fields_empty() {
+        let mut diagnostics = InspectionDiagnostics::default();
+        assert!(diagnostics.is_empty());
+
+        diagnostics
+            .column_level_grants
+            .push(sample_column_level_grant("analytics", &["secret"]));
+        assert!(!diagnostics.is_empty());
+    }
+
+    #[test]
+    fn inspection_diagnostics_display_includes_column_level_grants() {
+        let mut diagnostics = InspectionDiagnostics::default();
+        diagnostics
+            .column_level_grants
+            .push(sample_column_level_grant("analytics", &["secret"]));
+
+        let rendered = diagnostics.to_string();
+        assert!(rendered.contains("ColumnLevelGrant"));
+    }
+
+    #[test]
+    fn inspection_diagnostics_display_joins_wildcard_and_column_level_diagnostics() {
+        let mut diagnostics = InspectionDiagnostics::default();
+        diagnostics
+            .unsatisfiable_wildcard_grants
+            .push(UnsatisfiableWildcardGrant {
+                role: "reader".to_string(),
+                object_type: ObjectType::Table,
+                schema: "inventory".to_string(),
+                privileges: BTreeSet::from([Privilege::Select]),
+                executor: "app_owner".to_string(),
+                skipped_count: 1,
+                examples: vec![],
+            });
+        diagnostics
+            .column_level_grants
+            .push(sample_column_level_grant("analytics", &["secret"]));
+
+        let rendered = diagnostics.to_string();
+        let wildcard_pos = rendered.find("UnsatisfiableWildcardGrant").unwrap();
+        let column_pos = rendered.find("ColumnLevelGrant").unwrap();
+        assert!(
+            wildcard_pos < column_pos,
+            "wildcard diagnostics should render before column-level diagnostics"
+        );
+        // Both diagnostics must be on their own line.
+        assert_eq!(rendered.lines().count(), 2);
     }
 }
