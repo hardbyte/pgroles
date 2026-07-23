@@ -66,6 +66,37 @@ GRANT some_preexisting_role TO pgroles_executor WITH ADMIN TRUE;
 
 Steps 1–2 cover a greenfield executor. Steps 3–4 are additive, per-role grants you add as you bring existing roles under pgroles management.
 
+## Granting on objects owned by other roles
+
+pgroles applies a policy as a single role — the role the CLI connects as, or the role the operator switches to via `connection.params.setRole`. That one role must hold **everything** the policy needs, because only one `SET ROLE` is issued per connection and role *attributes* do not transfer through membership. Two requirements that look similar are easy to conflate:
+
+- **`CREATEROLE` is an attribute.** It must be set directly on the executor (`ALTER ROLE x CREATEROLE`). Being a *member* of a role that has `CREATEROLE` does not let the executor create roles without a further `SET ROLE`, which pgroles never issues.
+- **Granting on an object** requires the executor to own it or be a **member of the owning role** (inheriting the owner's implicit grant option). `ADMIN OPTION` is a different privilege and does not help here.
+
+When a wildcard grant such as `SELECT ON table * IN SCHEMA app` matches objects the executor does not own and cannot reach through membership in their owner, pgroles reports the blocker rather than silently under-applying the grant:
+
+```
+UnsatisfiableWildcardGrant: cannot fully satisfy wildcard grant SELECT ON table *
+IN SCHEMA "app" TO "app-viewer" as executor "pgroles_executor"; 1 matching
+object(s) are missing the desired privilege and are not grantable
+(examples: "legacy_table" owned by "legacy_owner" missing [SELECT])
+```
+
+The message names the executor and the blocking owner. The fix is to make the executor a member of that owner, so it inherits the owner's grant option:
+
+```sql
+GRANT legacy_owner TO pgroles_executor;   -- run once by an admin
+```
+
+On PostgreSQL 16+ that `GRANT` requires `ADMIN OPTION` on `legacy_owner` (or superuser); on 13–15 the executor's own `CREATEROLE` is enough. Grant membership only for owners whose objects fall inside a wildcard's scope. Because the executor inherits everything those owners can do, treat each added owner as a real widening of what the executor can touch. On managed providers the obvious admin role often *cannot* be used this way; see [Google Cloud SQL](/docs/google-cloud-sql#granting-on-objects-owned-by-other-roles).
+
+A membership has one natural owner: whoever manages the *group* role. pgroles reconciles a role's member list only when that role — the group being granted — is a managed, non-external role, so decide per owner where the grant lives:
+
+- **Owner managed outside pgroles** (a provider or legacy role — a replication role, a cloud-internal role, a loader you have not adopted): mark it `external: true`. pgroles then leaves its member list alone, and your IaC or bootstrap SQL owns the `GRANT owner TO executor` grant.
+- **Owner managed by pgroles**: declare the executor's membership in the manifest and let pgroles own it. Bootstrap the initial grant once (as an admin) so the membership already exists and pgroles never has to change it.
+
+Either way, the grant lives in exactly one place. Declaring it in both your IaC and the manifest — where pgroles reconciliation then fights your IaC to assert it — is the anti-pattern to avoid.
+
 ## Cloud providers
 
 None of RDS, Cloud SQL, AlloyDB, or Azure Database for PostgreSQL expose true superuser. The bootstrap above is run by the provider's admin user instead — `rds_superuser` member on RDS/Aurora, `cloudsqlsuperuser` member on Cloud SQL, `alloydbsuperuser` member on AlloyDB. See the [AWS RDS & Aurora](/docs/aws-rds) and [Google Cloud SQL](/docs/google-cloud-sql) pages for the specific attributes those admin roles lack and how pgroles adapts around them.

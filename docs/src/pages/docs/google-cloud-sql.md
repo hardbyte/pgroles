@@ -101,6 +101,44 @@ Use `external: true` for Cloud SQL IAM users and groups that are created through
 Changes to Cloud Identity group membership take about 15 minutes to propagate. However, changes to the group's database privileges take effect immediately.
 {% /callout %}
 
+## Granting on objects owned by other roles
+
+On Cloud SQL, object owners you did not create — `cloudsqlexternalsync` (Datastream), roles created by other tooling, legacy loaders — are typically already **members of `cloudsqlsuperuser`**. That creates a trap when a pgroles [wildcard grant](/docs/executor-privileges#granting-on-objects-owned-by-other-roles) needs to touch their objects.
+
+The instinct is to make `cloudsqlsuperuser` (the role pgroles usually runs as) a member of each owner so it can grant on their behalf. **PostgreSQL rejects this** — the owners are already members of `cloudsqlsuperuser`, and role membership must be acyclic:
+
+```
+ERROR: role "legacy_owner" is a member of role "cloudsqlsuperuser"
+```
+
+Because pgroles issues a single `SET ROLE` per connection, you cannot switch owners mid-run to work around it. Instead, run pgroles as a **dedicated delegated-admin role** that sits *below* the owners in the membership graph. A fresh role has no incoming memberships, so granting it membership in the owners is cycle-free:
+
+```sql
+-- Run once as the postgres / cloudsqlsuperuser admin user.
+CREATE ROLE pgroles_executor WITH NOLOGIN CREATEROLE;   -- attribute set directly
+GRANT cloudsqlsuperuser TO pgroles_executor;            -- keep the capabilities pgroles relies on
+GRANT legacy_owner      TO pgroles_executor;            -- one GRANT per in-scope object owner
+GRANT other_owner       TO pgroles_executor;
+-- let the login identity assume it:
+GRANT pgroles_executor TO "pgroles-operator@my-project.iam";
+```
+
+Then point the operator at it:
+
+```yaml
+spec:
+  connection:
+    params:
+      setRole: pgroles_executor
+```
+
+Notes:
+
+- **All current Cloud SQL PostgreSQL majors are 16+**, so each `GRANT owner TO pgroles_executor` needs `ADMIN OPTION` on that owner — run the bootstrap as `postgres`. Confirm it actually succeeds for provider-managed roles like `cloudsqlexternalsync`, which the platform may refuse to let you grant at all.
+- **`CREATEROLE` is set directly**, not inherited from `cloudsqlsuperuser` — attributes never transfer through membership, and without it pgroles cannot create the roles your profiles declare.
+- **Give each `GRANT owner TO pgroles_executor` a single source of truth**, matched to who manages the owner role. For provider- or legacy-owned roles you do not manage with pgroles — Datastream's `cloudsqlexternalsync`, cloud-internal roles, a loader you have not adopted — mark them `external: true`; pgroles then ignores their member lists and the IaC-managed grant is never treated as drift. For roles pgroles does manage, declare the executor's membership in the manifest and let pgroles own it; bootstrap the grant once (as `postgres`) so the membership already exists. Either way, do not manage the same grant in both places. pgroles keys the external filter on the *group* role, so marking the executor external — or leaving it undeclared — does **not** suppress the drift.
+- This is a *delegated-admin* role, not least-privilege: with `CREATEROLE` plus `cloudsqlsuperuser` membership it is highly privileged. Its value is a single, auditable, reversible entry point — drop the role or revoke the memberships to undo it.
+
 ## Kubernetes operator on GKE
 
 ```shell
