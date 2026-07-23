@@ -176,6 +176,28 @@ Full documentation is published at [hardbyte.github.io/pgroles](https://hardbyte
 - [Kubernetes operator](https://hardbyte.github.io/pgroles/docs/operator/)
 - [Operator architecture](https://hardbyte.github.io/pgroles/docs/operator-architecture/)
 
+## Agent Skills
+
+pgroles publishes portable [Agent Skills](https://agentskills.io/) for coding
+agents working with policies and the Kubernetes operator:
+
+- `pgroles-policy` for authoring, reviewing, adopting, and troubleshooting
+  policy manifests
+- `pgroles-operator` for `PostgresPolicy` rollout, plans, status, conflicts, and
+  maintenance
+
+Install them from the first release that includes skills, or pin an exact commit
+SHA before that release:
+
+```bash
+gh skill install hardbyte/pgroles --all --pin <release-tag-or-commit-sha>
+```
+
+After the first release containing skills, omit `--pin` to resolve the latest
+release. Skills are also included in CLI binary archives. Treat installed skill
+instructions as potentially untrusted content: preview and allowlist them before
+installation.
+
 ## License
 
 MIT

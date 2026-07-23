@@ -250,6 +250,7 @@ jobs:
           mkdir -p "${ARCHIVE}"
           cp "target/${{ matrix.target }}/release/${{ matrix.binary }}" "${ARCHIVE}/"
           cp README.md LICENSE* "${ARCHIVE}/" 2>/dev/null || true
+          cp -R skills "${ARCHIVE}/"
           tar czf "${ARCHIVE}.tar.gz" "${ARCHIVE}"
           echo "ARCHIVE=${ARCHIVE}.tar.gz" >> "$GITHUB_ENV"
 

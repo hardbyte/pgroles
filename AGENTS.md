@@ -80,6 +80,19 @@ Five jobs in `.github/workflows/ci.yml`:
 
 The heavier fairness/load coverage lives in `.github/workflows/operator-fairness-load.yml` and runs on a nightly schedule when `main` has changed.
 
+## Agent Skills
+
+- Canonical public skills live under `skills/<name>/SKILL.md` and follow the
+  Agent Skills specification.
+- Keep product workflows and version-specific semantics in skills. Keep
+  always-on repository contribution rules in this file.
+- Validate every skill with
+  `uvx --from skills-ref==0.1.1 agentskills validate skills/<name>`.
+- Skills ship in tagged source archives and CLI binary archives. Do not copy
+  them into crates, runtime images, Kubernetes resources, or Helm templates.
+- Update affected skills when behavior or public workflows change; avoid
+  duplicating canonical skill content elsewhere.
+
 ## Release and Containers
 
 - Published container images are multi-arch for `linux/amd64` and `linux/arm64`.
