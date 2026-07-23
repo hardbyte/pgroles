@@ -44,6 +44,8 @@ jobs:
       - name: CRD drift check
         run: scripts/check-crd-drift.sh
 
+      - uses: astral-sh/setup-uv@v9.0.0
+
       - name: Validate Agent Skills
         run: |
           test -f skills/pgroles-policy/SKILL.md
@@ -54,7 +56,7 @@ jobs:
             > /tmp/pgroles-agent-skills
           test -s /tmp/pgroles-agent-skills
           while IFS= read -r -d '' skill_file; do
-            pipx run --spec skills-ref==0.1.1 \
+            uvx --from skills-ref==0.1.1 \
               agentskills validate "$(dirname "$skill_file")"
           done < /tmp/pgroles-agent-skills
 

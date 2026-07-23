@@ -186,16 +186,17 @@ agents working with policies and the Kubernetes operator:
 - `pgroles-operator` for `PostgresPolicy` rollout, plans, status, conflicts, and
   maintenance
 
-Install them from this repository with a compatible skill client, for example:
+Install them from the first release that includes skills, or pin an exact commit
+SHA before that release:
 
 ```bash
-gh skill install hardbyte/pgroles --all --pin main
+gh skill install hardbyte/pgroles --all --pin <release-tag-or-commit-sha>
 ```
 
-After the first release containing skills, omit `--pin main` to resolve the
-latest release or pin a release tag explicitly. Skills are also included in CLI
-binary archives. Treat dependency-supplied instructions as trusted code: preview
-and allowlist them before installation.
+After the first release containing skills, omit `--pin` to resolve the latest
+release. Skills are also included in CLI binary archives. Treat installed skill
+instructions as potentially untrusted content: preview and allowlist them before
+installation.
 
 ## License
 
