@@ -1106,9 +1106,8 @@ fn format_timestamp_compact() -> String {
     format!("{year:04}{month:02}{day:02}-{hours:02}{minutes:02}{seconds:02}")
 }
 
-/// Sanitize a string for use as a Kubernetes label value.
-///
-/// Label values must be <= 63 chars and match `[a-z0-9A-Z._-]*`.
+/// Sanitize a string for use as a Kubernetes label value: <= 63 chars,
+/// alphanumerics/`.`/`-`/`_` only, starting and ending with an alphanumeric.
 fn sanitize_label_value(value: &str) -> String {
     let sanitized: String = value
         .chars()
@@ -1121,7 +1120,10 @@ fn sanitize_label_value(value: &str) -> String {
         })
         .take(63)
         .collect();
+    // Truncation may land on a separator; trim so the value starts/ends alphanumeric.
     sanitized
+        .trim_matches(|c: char| !c.is_ascii_alphanumeric())
+        .to_string()
 }
 
 /// Current time as Unix epoch seconds (for dedup window checks).
@@ -1700,6 +1702,36 @@ mod tests {
         let long_value = "a".repeat(100);
         let sanitized = sanitize_label_value(&long_value);
         assert!(sanitized.len() <= 63);
+    }
+
+    #[test]
+    fn sanitize_label_value_is_always_a_valid_label() {
+        // (input, expected)
+        let cases: [(String, String); 5] = [
+            // already valid
+            ("orders-service".into(), "orders-service".into()),
+            // leading/trailing separators get trimmed
+            (
+                "_params_literal_appdb_".into(),
+                "params_literal_appdb".into(),
+            ),
+            // only separators -> empty (empty is a valid label)
+            ("___".into(), "".into()),
+            // exactly 63 valid chars -> no change
+            ("a".repeat(63), "a".repeat(63)),
+            // 64 chars and char 63 is a separator -> cut to 63 ends with '_' -> trimmed to 62
+            (format!("{}_x", "a".repeat(62)), "a".repeat(62)),
+        ];
+
+        for (input, expected) in &cases {
+            let got = sanitize_label_value(input);
+            assert_eq!(&got, expected, "sanitize({input:?})");
+            assert!(got.len() <= 63);
+            if !got.is_empty() {
+                assert!(got.chars().next().unwrap().is_ascii_alphanumeric());
+                assert!(got.chars().last().unwrap().is_ascii_alphanumeric());
+            }
+        }
     }
 
     #[test]
