@@ -1,0 +1,35 @@
+# A policy name at the 63-character limit, with dots and dashes throughout.
+#
+# 63 characters is the maximum a `pgroles.io/policy` label value can hold, so
+# this name round-trips into the label without truncation. The dots make it a
+# multi-label DNS subdomain, which is where derived resource names used to break:
+# truncating the name for a plan resource could leave a trailing `.`, and the
+# appended `-plan-...` then started a new DNS label with `-`.
+#
+# Manual approval is used so the operator creates a PostgresPolicyPlan and its
+# SQL ConfigMap, exercising both the labels it writes and the selectors that
+# read them back.
+apiVersion: pgroles.io/v1alpha1
+kind: PostgresPolicy
+metadata:
+  name: a.very-long-policy.name-with-dots.and-dashes.at-the-limit.xxxxx
+  namespace: default
+spec:
+  connection:
+    secretRef:
+      name: postgres-credentials
+  interval: "5m"
+  mode: apply
+  approval: manual
+
+  roles:
+    - name: hostile_name_preview_user
+      login: true
+      comment: "Preview-only role for the identifier-boundary scenario"
+
+  grants:
+    - role: hostile_name_preview_user
+      privileges: [CONNECT]
+      object:
+        type: database
+        name: postgres
