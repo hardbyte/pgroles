@@ -14,6 +14,7 @@ use k8s_openapi::ByteString;
 use k8s_openapi::api::core::v1::ConfigMap;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference;
 use kube::api::{Api, DeleteParams, ListParams, Patch, PatchParams, PostParams};
+use kube::core::labels::{Expression, Selector};
 use kube::{Client, Resource, ResourceExt};
 use sha2::{Digest, Sha256};
 use tracing::info;
@@ -24,6 +25,7 @@ use crate::crd::{
     PolicyPlanRef, PostgresPolicy, PostgresPolicyPlan, PostgresPolicyPlanSpec,
     PostgresPolicyPlanStatus, SqlCompression, SqlRef,
 };
+use crate::k8s_names::{LabelValue, truncate_name_prefix};
 use crate::reconciler::ReconcileError;
 
 /// Result of plan creation — distinguishes genuinely new plans from
@@ -211,9 +213,9 @@ pub async fn create_or_update_plan(
     let plans_api: Api<PostgresPolicyPlan> = Api::namespaced(client.clone(), &namespace);
 
     // 4. List existing plans for this policy.
-    let label_selector = format!("{LABEL_POLICY}={}", sanitize_label_value(&policy_name));
+    let selector = policy_selector(&policy_name);
     let existing_plans = plans_api
-        .list(&ListParams::default().labels(&label_selector))
+        .list(&ListParams::default().labels_from(&selector))
         .await?;
 
     // 5. Check for duplicate pending plan with same hash.
@@ -820,9 +822,9 @@ pub async fn cleanup_old_plans(
     let max_plans = max_plans.unwrap_or(DEFAULT_MAX_PLANS);
 
     let plans_api: Api<PostgresPolicyPlan> = Api::namespaced(client.clone(), &namespace);
-    let label_selector = format!("{LABEL_POLICY}={}", sanitize_label_value(&policy_name));
+    let selector = policy_selector(&policy_name);
     let existing_plans = plans_api
-        .list(&ListParams::default().labels(&label_selector))
+        .list(&ListParams::default().labels_from(&selector))
         .await?;
     let now_ts = now_epoch_secs();
 
@@ -914,9 +916,9 @@ async fn cleanup_orphan_sql_configmaps(
     now_ts: i64,
 ) -> Result<(), ReconcileError> {
     let configmaps_api: Api<ConfigMap> = Api::namespaced(client.clone(), namespace);
-    let label_selector = format!("{LABEL_POLICY}={}", sanitize_label_value(policy_name));
+    let selector = policy_selector(policy_name);
     let configmaps = configmaps_api
-        .list(&ListParams::default().labels(&label_selector))
+        .list(&ListParams::default().labels_from(&selector))
         .await?;
     let known_plan_labels: BTreeSet<String> = existing_plans
         .iter()
@@ -1077,17 +1079,12 @@ fn generate_plan_name(policy_name: &str, sql_hash: &str) -> String {
     let suffix = &sql_hash[..12.min(sql_hash.len())];
     // Kubernetes names must be <= 253 chars and DNS-compatible.
     // Reserve 4 chars for the potential "-sql" ConfigMap suffix.
-    let max_name_len = 253 - 4; // 249
+    let max_name_len = crate::k8s_names::MAX_RESOURCE_NAME_LENGTH - 4; // 249
     let max_prefix_len = max_name_len - "-plan-".len() - timestamp.len() - "-".len() - suffix.len();
-    let prefix = if policy_name.len() > max_prefix_len {
-        policy_name
-            .char_indices()
-            .take_while(|(idx, ch)| idx + ch.len_utf8() <= max_prefix_len)
-            .map(|(_, ch)| ch)
-            .collect::<String>()
-    } else {
-        policy_name.to_string()
-    };
+    // Truncation can land on a `.` or `-`; appending `-plan-...` after a
+    // trailing `.` would start a new DNS label with `-`, which the API server
+    // rejects, so `truncate_name_prefix` trims the separators the cut exposes.
+    let prefix = truncate_name_prefix(policy_name, max_prefix_len);
     format!("{prefix}-plan-{timestamp}-{suffix}")
 }
 
@@ -1108,20 +1105,16 @@ fn format_timestamp_compact() -> String {
 
 /// Sanitize a string for use as a Kubernetes label value.
 ///
-/// Label values must be <= 63 chars and match `[a-z0-9A-Z._-]*`.
+/// See [`crate::k8s_names::LabelValue::sanitize`] for the rules. This is the
+/// single builder for every label value the operator writes, and is also used
+/// to build the selectors that read them back, so writes and lookups agree.
 fn sanitize_label_value(value: &str) -> String {
-    let sanitized: String = value
-        .chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '_' {
-                c
-            } else {
-                '_'
-            }
-        })
-        .take(63)
-        .collect();
-    sanitized
+    LabelValue::sanitize(value).into_string()
+}
+
+/// Label selector matching every object owned by `policy_name`.
+fn policy_selector(policy_name: &str) -> Selector {
+    Expression::Equal(LABEL_POLICY.to_string(), sanitize_label_value(policy_name)).into()
 }
 
 /// Current time as Unix epoch seconds (for dedup window checks).
@@ -1258,9 +1251,9 @@ pub async fn get_current_actionable_plan(
     let policy_name = policy.name_any();
 
     let plans_api: Api<PostgresPolicyPlan> = Api::namespaced(client.clone(), &namespace);
-    let label_selector = format!("{LABEL_POLICY}={}", sanitize_label_value(&policy_name));
+    let selector = policy_selector(&policy_name);
     let existing_plans = plans_api
-        .list(&ListParams::default().labels(&label_selector))
+        .list(&ListParams::default().labels_from(&selector))
         .await?;
 
     // Find the most recent actionable plan (Pending or Approved, by creation time).
@@ -1293,9 +1286,9 @@ pub async fn get_plan_by_phase(
     let policy_name = policy.name_any();
 
     let plans_api: Api<PostgresPolicyPlan> = Api::namespaced(client.clone(), &namespace);
-    let label_selector = format!("{LABEL_POLICY}={}", sanitize_label_value(&policy_name));
+    let selector = policy_selector(&policy_name);
     let existing_plans = plans_api
-        .list(&ListParams::default().labels(&label_selector))
+        .list(&ListParams::default().labels_from(&selector))
         .await?;
 
     let mut matching_plans: Vec<PostgresPolicyPlan> = existing_plans

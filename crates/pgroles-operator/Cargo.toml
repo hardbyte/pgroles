@@ -50,3 +50,6 @@ path = "src/main.rs"
 [[bin]]
 name = "crdgen"
 path = "src/bin/crdgen.rs"
+
+[dev-dependencies]
+proptest = "1.11.0"
