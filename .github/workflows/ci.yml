@@ -15,6 +15,40 @@ env:
 
 jobs:
   # ---------------------------------------------------------------------------
+  # Job 0: Decide whether this run needs the expensive suite.
+  #
+  # In a stacked pull request the top entry contains the full changeset, so the
+  # integration matrix, Docker/example smoke tests, and kind-based E2E jobs only
+  # need to run there — once per stack rather than once per entry. Lint and unit
+  # tests stay ungated so every entry still gets fast feedback.
+  #
+  # Deliberately fail-safe: `stack` is null for pushes and for ordinary
+  # non-stacked pull requests, and anything we cannot positively identify as a
+  # non-top stack entry runs the full suite.
+  # ---------------------------------------------------------------------------
+  stack-gate:
+    name: Stack Gate
+    runs-on: ubuntu-latest
+    outputs:
+      run_heavy: ${{ steps.decide.outputs.run_heavy }}
+    steps:
+      - id: decide
+        env:
+          IS_TOP_OR_UNSTACKED: >-
+            ${{ github.event.pull_request.stack == null
+                || github.event.pull_request.stack.position == github.event.pull_request.stack.size }}
+          STACK_POSITION: ${{ github.event.pull_request.stack.position }}
+          STACK_SIZE: ${{ github.event.pull_request.stack.size }}
+        run: |
+          echo "run_heavy=$IS_TOP_OR_UNSTACKED" >> "$GITHUB_OUTPUT"
+          if [ "$IS_TOP_OR_UNSTACKED" = "true" ]; then
+            echo "Running the full suite (not a non-top stack entry)."
+          else
+            echo "::notice::Skipping the expensive suite: stack entry" \
+              "$STACK_POSITION of $STACK_SIZE. The top entry runs it for the whole stack."
+          fi
+
+  # ---------------------------------------------------------------------------
   # Job 1: Lint — clippy, rustfmt, CRD drift check
   # ---------------------------------------------------------------------------
   lint:
@@ -81,6 +115,8 @@ jobs:
   # ---------------------------------------------------------------------------
   integration-test:
     name: Integration Tests (PG${{ matrix.pg_version }})
+    needs: stack-gate
+    if: needs.stack-gate.outputs.run_heavy == 'true'
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -116,6 +152,8 @@ jobs:
   # ---------------------------------------------------------------------------
   docker-smoke:
     name: Docker Smoke Tests
+    needs: stack-gate
+    if: needs.stack-gate.outputs.run_heavy == 'true'
     runs-on: ubuntu-latest
     services:
       postgres:
@@ -180,6 +218,8 @@ jobs:
   # ---------------------------------------------------------------------------
   example-smoke:
     name: Example Smoke Tests
+    needs: stack-gate
+    if: needs.stack-gate.outputs.run_heavy == 'true'
     runs-on: ubuntu-latest
     services:
       postgres:
@@ -216,6 +256,8 @@ jobs:
   # ---------------------------------------------------------------------------
   e2e-operator:
     name: "E2E: Operator Scenarios"
+    needs: stack-gate
+    if: needs.stack-gate.outputs.run_heavy == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
@@ -330,9 +372,10 @@ jobs:
             || { echo "::error::rejection did not carry the CEL rule message"; exit 1; }
           echo "hostile-identifiers: overlong policy name rejected at admission"
 
-          # A dotted name exactly at the limit must reconcile, and the plan plus
-          # its SQL ConfigMap must be discoverable by the label the operator
-          # writes — proving writes and selector lookups agree at the boundary.
+          # A dotted name exactly at the limit must reconcile, and its plan must
+          # be discoverable by the label the operator writes — proving writes and
+          # selector lookups agree at the boundary. The plan SQL stays inline at
+          # this size, so no ConfigMap is created; that path is unit-tested.
           limit_name="a.very-long-policy.name-with-dots.and-dashes.at-the-limit.xxxxx"
           kubectl apply -f k8s/samples/max-length-name-policy.yaml
           wait_for_ready_status_reason "$limit_name" True Planned
@@ -462,6 +505,8 @@ jobs:
   # ---------------------------------------------------------------------------
   e2e-load:
     name: "E2E: Load Tests"
+    needs: stack-gate
+    if: needs.stack-gate.outputs.run_heavy == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
@@ -524,6 +569,8 @@ jobs:
   # ---------------------------------------------------------------------------
   e2e-plans:
     name: "E2E: Plan Lifecycle"
+    needs: stack-gate
+    if: needs.stack-gate.outputs.run_heavy == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
