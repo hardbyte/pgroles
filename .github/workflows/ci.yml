@@ -40,6 +40,26 @@ jobs:
           STACK_POSITION: ${{ github.event.pull_request.stack.position }}
           STACK_SIZE: ${{ github.event.pull_request.stack.size }}
         run: |
+          # Stacked pull requests are in public preview, so assert the metadata
+          # semantics this gate depends on: `position` is documented as 1-based
+          # with 1 at the bottom, and the top entry is `position == size`. If
+          # that ever changes, `position == size` would silently be false for the
+          # real top entry and the whole stack could merge without the expensive
+          # suite ever running. Fail loudly instead of skipping wrongly.
+          if [ -n "$STACK_POSITION" ] || [ -n "$STACK_SIZE" ]; then
+            if [ -z "$STACK_POSITION" ] || [ -z "$STACK_SIZE" ]; then
+              echo "::error::stack metadata is partially populated" \
+                "(position='$STACK_POSITION' size='$STACK_SIZE'); refusing to gate on it"
+              exit 1
+            fi
+            if [ "$STACK_POSITION" -lt 1 ] || [ "$STACK_POSITION" -gt "$STACK_SIZE" ]; then
+              echo "::error::stack position $STACK_POSITION outside the documented" \
+                "1..$STACK_SIZE range; the top-of-stack test in this workflow is no" \
+                "longer valid and must be revisited"
+              exit 1
+            fi
+          fi
+
           echo "run_heavy=$IS_TOP_OR_UNSTACKED" >> "$GITHUB_OUTPUT"
           if [ "$IS_TOP_OR_UNSTACKED" = "true" ]; then
             echo "Running the full suite (not a non-top stack entry)."

@@ -350,6 +350,16 @@ pub async fn create_or_update_plan(
             Ok(plan) => (plan, true),
             Err(kube::Error::Api(api_err)) if api_err.code == 409 => {
                 let existing = plans_api.get(&plan_name).await?;
+                // The name collided, which is normally our own retry. Confirm
+                // ownership before patching anyone's status: plan names embed a
+                // 215-byte-truncated policy prefix, so two policies sharing that
+                // prefix can in principle collide, and this is otherwise the one
+                // mutation site the owner-UID discipline does not cover.
+                if !is_owned_by_policy(&existing, policy) {
+                    return Err(ReconcileError::PlanSqlStorage(format!(
+                        "plan {plan_name} already exists and is owned by another policy"
+                    )));
+                }
                 if !should_patch_existing_plan_status(&existing) {
                     return Ok(PlanCreationResult::Deduplicated(existing.name_any()));
                 }

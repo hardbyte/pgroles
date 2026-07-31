@@ -38,3 +38,12 @@ PostgreSQL does not expose password hashes for comparison, so pgroles cannot det
 ## Databases themselves
 
 pgroles grants privileges *on* a database (`CONNECT`, `CREATE`, `TEMPORARY`) but does not create, drop, or rename databases, and does not manage database ownership (`ALTER DATABASE ... OWNER TO`). Provision the database itself with your migration tooling or infrastructure-as-code before pointing a pgroles manifest at it.
+
+## Policy names are limited to 63 characters
+
+A `PostgresPolicy` name must be at most 63 characters. The operator links a policy to its plans and plan-SQL ConfigMaps through the `pgroles.io/policy` label, and Kubernetes caps label values at 63 characters, so a longer name could not be represented without truncation. The CRD rejects longer names at admission with an explanatory message.
+
+Two upgrade notes if you are adopting this on an existing installation:
+
+- **A policy created before this limit existed keeps its long name until you next write to it.** On Kubernetes 1.30 and later, [validation ratcheting](https://kubernetes.io/docs/tasks/extend-kubernetes/custom-resources/custom-resource-definitions/#validation-ratcheting) allows updates that leave the offending name unchanged, so such a policy keeps reconciling normally. On Kubernetes versions before 1.30 there is no ratcheting, and *every* write is rejected — including the operator's own status updates — so the policy stops making progress with no status change to explain it. Rename affected policies (delete and recreate under a shorter name) before upgrading on those clusters. `kubectl get pgr -A -o name | awk 'length($0) > 67'` lists candidates.
+- **Deleting a policy with `--cascade=orphan` now leaks its plans.** Plans and plan-SQL ConfigMaps are matched to their policy by owner UID rather than by name, so orphaned objects are no longer re-adopted by a recreated policy of the same name. Because `--cascade=orphan` also strips the owner references that garbage collection relies on, those objects persist until deleted by hand. Prefer the default cascading delete; if you have already orphaned some, delete leftover `pgplan` objects and `*-sql` ConfigMaps explicitly.
