@@ -61,43 +61,14 @@ pub fn generated_secret_key(spec: &GeneratePasswordSpec) -> String {
 }
 
 fn default_generated_secret_name(policy_name: &str, role_name: &str) -> String {
-    let policy = sanitize_secret_name_segment(policy_name, "policy");
-    let role = sanitize_secret_name_segment(role_name, "role");
+    let policy = crate::k8s_names::sanitize_dns_label_segment(policy_name, "policy");
+    let role = crate::k8s_names::sanitize_dns_label_segment(role_name, "role");
     let name = format!("{policy}-pgr-{role}");
     let truncated = crate::k8s_names::truncate_name_prefix(&name, MAX_SECRET_NAME_LENGTH);
     if truncated.is_empty() {
         "pgroles-generated-password".to_string()
     } else {
         truncated.to_string()
-    }
-}
-
-fn sanitize_secret_name_segment(input: &str, fallback: &str) -> String {
-    let mut result = String::new();
-    let mut last_was_dash = false;
-
-    for ch in input.chars() {
-        let normalized = ch.to_ascii_lowercase();
-        if normalized.is_ascii_lowercase() || normalized.is_ascii_digit() {
-            result.push(normalized);
-            last_was_dash = false;
-        } else if !last_was_dash {
-            result.push('-');
-            last_was_dash = true;
-        }
-    }
-
-    while matches!(result.as_bytes().first(), Some(b'-')) {
-        result.remove(0);
-    }
-    while matches!(result.as_bytes().last(), Some(b'-')) {
-        result.pop();
-    }
-
-    if result.is_empty() {
-        fallback.to_string()
-    } else {
-        result
     }
 }
 

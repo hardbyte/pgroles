@@ -1566,6 +1566,59 @@ mod tests {
         assert!(name.ends_with("-abcdef012345"));
     }
 
+    /// The plan-SQL ConfigMap derives its name by appending `-sql` to the plan
+    /// name and carries three label values, all from user-controlled input.
+    /// `generate_plan_name` reserves exactly 4 bytes for that suffix, so a
+    /// boundary-length policy name is where the reservation would be wrong.
+    ///
+    /// Covered here rather than end-to-end because the plan SQL only spills to a
+    /// ConfigMap above `MAX_INLINE_SQL_BYTES`; forcing that in a cluster would
+    /// mean generating 16 KiB of SQL to re-verify string composition.
+    #[test]
+    fn plan_sql_configmap_identifiers_are_valid_at_the_name_limit() {
+        use crate::k8s_names::{is_valid_label_value, is_valid_resource_name};
+
+        let hash = "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789";
+        // A hostile database identity: NUL separators and `=` from identity_key.
+        let identity = format!(
+            "prod/params\0literal={}\0literal=appdb\05432",
+            "h".repeat(80)
+        );
+
+        for policy_name in [
+            "orders".to_string(),
+            "a.very-long-policy.name-with-dots.and-dashes.at-the-limit.xxxxx".to_string(),
+            format!("{}.{}", "a".repeat(214), "b".repeat(38)),
+            "a".repeat(253),
+        ] {
+            let plan_name = generate_plan_name(&policy_name, hash);
+            let configmap_name = format!("{plan_name}-sql");
+
+            assert!(
+                is_valid_resource_name(&configmap_name),
+                "invalid ConfigMap name for policy {policy_name:?}: {configmap_name}"
+            );
+            assert!(
+                configmap_name.len() <= crate::k8s_names::MAX_RESOURCE_NAME_LENGTH,
+                "ConfigMap name over the limit: {} bytes",
+                configmap_name.len()
+            );
+            // Round-trips back to the plan name the labels are keyed on.
+            assert_eq!(configmap_plan_name(&configmap_name), plan_name);
+
+            for label in [
+                sanitize_label_value(&policy_name),
+                sanitize_label_value(&identity),
+                plan_label_value(&plan_name),
+            ] {
+                assert!(
+                    is_valid_label_value(&label),
+                    "invalid label value {label:?} for policy {policy_name:?}"
+                );
+            }
+        }
+    }
+
     #[test]
     fn plan_label_value_is_stable_and_label_safe_for_long_names() {
         let plan_name = "very-long-policy-name-".repeat(20);

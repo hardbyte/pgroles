@@ -15,7 +15,7 @@ use proptest::prelude::*;
 
 use pgroles_operator::k8s_names::{
     LabelValue, MAX_LABEL_VALUE_LENGTH, MAX_RESOURCE_NAME_LENGTH, is_valid_label_value,
-    is_valid_resource_name, truncate_name_prefix,
+    is_valid_resource_name, sanitize_dns_label_segment, truncate_name_prefix,
 };
 
 /// The label-value rule as the API server states it:
@@ -164,6 +164,49 @@ proptest! {
                 is_resource_name_per_apiserver(&composed)
             );
         }
+    }
+
+    /// A sanitised segment must always be a usable DNS label on its own: the
+    /// fallback guarantees it is never empty, so a composed name can never grow
+    /// an empty label.
+    #[test]
+    fn sanitized_segments_are_valid_dns_labels(input in hostile_input()) {
+        let segment = sanitize_dns_label_segment(&input, "fallback");
+
+        prop_assert!(!segment.is_empty());
+        prop_assert!(
+            is_resource_name_per_apiserver(&segment),
+            "segment {:?} from {:?} is not a valid DNS label",
+            segment,
+            input
+        );
+        // A single label contains no dots, so it stays one label when composed.
+        prop_assert!(!segment.contains('.'));
+    }
+
+    /// The real composition in `default_generated_secret_name`: two sanitised
+    /// segments joined by `-pgr-` and truncated to the resource-name limit must
+    /// always be a name the API server accepts.
+    #[test]
+    fn composed_generated_secret_names_are_valid(
+        policy in hostile_input(),
+        role in hostile_input(),
+    ) {
+        let policy_segment = sanitize_dns_label_segment(&policy, "policy");
+        let role_segment = sanitize_dns_label_segment(&role, "role");
+        let composed = format!("{policy_segment}-pgr-{role_segment}");
+        let truncated = truncate_name_prefix(&composed, MAX_RESOURCE_NAME_LENGTH);
+
+        prop_assert!(!truncated.is_empty());
+        prop_assert!(
+            is_resource_name_per_apiserver(truncated),
+            "composed secret name {:?} is invalid",
+            truncated
+        );
+        prop_assert_eq!(
+            is_valid_resource_name(truncated),
+            is_resource_name_per_apiserver(truncated)
+        );
     }
 
     /// The module's resource-name validator must agree with the restated rule

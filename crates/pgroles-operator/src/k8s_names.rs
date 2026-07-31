@@ -110,6 +110,38 @@ pub fn truncate_name_prefix(prefix: &str, max_bytes: usize) -> &str {
     prefix[..cut].trim_end_matches(['.', '-'])
 }
 
+/// Derive a single RFC 1123 DNS label from arbitrary input, for use as one
+/// segment of a composed resource name.
+///
+/// Input is lowercased; every run of characters outside `[a-z0-9]` collapses to
+/// a single `-`; leading and trailing `-` are dropped. `fallback` is returned if
+/// nothing survives, so the result is always a usable segment.
+///
+/// Like [`LabelValue::sanitize`] this is lossy and **not injective** — callers
+/// composing several segments must not treat the result as an identity.
+pub fn sanitize_dns_label_segment(input: &str, fallback: &str) -> String {
+    let mut result = String::with_capacity(input.len());
+    let mut last_was_dash = false;
+
+    for ch in input.chars() {
+        let normalized = ch.to_ascii_lowercase();
+        if normalized.is_ascii_lowercase() || normalized.is_ascii_digit() {
+            result.push(normalized);
+            last_was_dash = false;
+        } else if !last_was_dash && !result.is_empty() {
+            result.push('-');
+            last_was_dash = true;
+        }
+    }
+
+    let trimmed = result.trim_matches('-');
+    if trimmed.is_empty() {
+        fallback.to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
 /// A validated Kubernetes label value.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct LabelValue(String);
