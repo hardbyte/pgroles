@@ -6,9 +6,13 @@
 # truncating the name for a plan resource could leave a trailing `.`, and the
 # appended `-plan-...` then started a new DNS label with `-`.
 #
-# Manual approval is used so the operator creates a PostgresPolicyPlan and its
-# SQL ConfigMap, exercising both the labels it writes and the selectors that
-# read them back.
+# Manual approval is used so the operator creates a PostgresPolicyPlan,
+# exercising both the labels it writes and the selectors that read them back.
+#
+# The plan SQL stays inline at this size, so no plan-SQL ConfigMap is created
+# here — that identifier path is covered by the
+# `plan_sql_configmap_identifiers_are_valid_at_the_name_limit` unit test rather
+# than by generating 16 KiB of SQL in a cluster.
 apiVersion: pgroles.io/v1alpha1
 kind: PostgresPolicy
 metadata:
