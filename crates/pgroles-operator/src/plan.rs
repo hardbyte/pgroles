@@ -214,9 +214,13 @@ pub async fn create_or_update_plan(
 
     // 4. List existing plans for this policy.
     let selector = policy_selector(&policy_name);
-    let existing_plans = plans_api
+    // The label narrows server-side; owner UID is the exact filter.
+    let existing_plans: Vec<PostgresPolicyPlan> = plans_api
         .list(&ListParams::default().labels_from(&selector))
-        .await?;
+        .await?
+        .into_iter()
+        .filter(|plan| is_owned_by_policy(plan, policy))
+        .collect();
 
     // 5. Check for duplicate pending plan with same hash.
     for plan in &existing_plans {
@@ -823,9 +827,12 @@ pub async fn cleanup_old_plans(
 
     let plans_api: Api<PostgresPolicyPlan> = Api::namespaced(client.clone(), &namespace);
     let selector = policy_selector(&policy_name);
-    let existing_plans = plans_api
+    let existing_plans: Vec<PostgresPolicyPlan> = plans_api
         .list(&ListParams::default().labels_from(&selector))
-        .await?;
+        .await?
+        .into_iter()
+        .filter(|plan| is_owned_by_policy(plan, policy))
+        .collect();
     let now_ts = now_epoch_secs();
 
     for plan in existing_plans
@@ -895,8 +902,9 @@ pub async fn cleanup_old_plans(
     cleanup_orphan_sql_configmaps(
         client,
         &namespace,
+        policy,
         &policy_name,
-        &existing_plans.items,
+        &existing_plans,
         now_ts,
     )
     .await?;
@@ -911,15 +919,22 @@ pub async fn cleanup_old_plans(
 async fn cleanup_orphan_sql_configmaps(
     client: &Client,
     namespace: &str,
+    policy: &PostgresPolicy,
     policy_name: &str,
     existing_plans: &[PostgresPolicyPlan],
     now_ts: i64,
 ) -> Result<(), ReconcileError> {
     let configmaps_api: Api<ConfigMap> = Api::namespaced(client.clone(), namespace);
     let selector = policy_selector(policy_name);
-    let configmaps = configmaps_api
+    // Filtering by owner UID here is what makes this loop safe: `existing_plans`
+    // is already restricted to this policy, so a colliding policy's ConfigMap
+    // would otherwise have an unknown plan label and be deleted as an orphan.
+    let configmaps: Vec<ConfigMap> = configmaps_api
         .list(&ListParams::default().labels_from(&selector))
-        .await?;
+        .await?
+        .into_iter()
+        .filter(|configmap| is_owned_by_policy(configmap, policy))
+        .collect();
     let known_plan_labels: BTreeSet<String> = existing_plans
         .iter()
         .map(|plan| plan_label_value(&plan.name_any()))
@@ -1113,8 +1128,38 @@ fn sanitize_label_value(value: &str) -> String {
 }
 
 /// Label selector matching every object owned by `policy_name`.
+///
+/// This narrows server-side but is **not** an identity: the label value is
+/// truncated at 63 characters, so two policies sharing a 63-character prefix
+/// select each other's objects. Always pair it with [`is_owned_by_policy`].
 fn policy_selector(policy_name: &str) -> Selector {
     Expression::Equal(LABEL_POLICY.to_string(), sanitize_label_value(policy_name)).into()
+}
+
+/// Is `resource` owned by `policy`, by controller-owner UID?
+///
+/// The exact ownership test. The `pgroles.io/policy` label is lossy, and a
+/// truncated collision would otherwise let one policy adopt, supersede,
+/// deduplicate against, or **delete** another policy's plans and plan-SQL
+/// ConfigMaps. A UID is unique per object and per object lifetime, so this also
+/// stops a same-named replacement policy from inheriting a deleted one's
+/// objects.
+///
+/// Objects the operator did not create carry no matching owner reference and are
+/// excluded, which is the safe direction for the deletion paths.
+fn is_owned_by_policy<K: Resource>(resource: &K, policy: &PostgresPolicy) -> bool {
+    let Some(policy_uid) = policy.metadata.uid.as_deref() else {
+        // A policy with no UID cannot own anything; refuse to match rather than
+        // treat an empty UID as a wildcard.
+        return false;
+    };
+    resource
+        .meta()
+        .owner_references
+        .as_deref()
+        .unwrap_or_default()
+        .iter()
+        .any(|owner| owner.uid == policy_uid && owner.controller.unwrap_or(false))
 }
 
 /// Current time as Unix epoch seconds (for dedup window checks).
@@ -1252,9 +1297,12 @@ pub async fn get_current_actionable_plan(
 
     let plans_api: Api<PostgresPolicyPlan> = Api::namespaced(client.clone(), &namespace);
     let selector = policy_selector(&policy_name);
-    let existing_plans = plans_api
+    let existing_plans: Vec<PostgresPolicyPlan> = plans_api
         .list(&ListParams::default().labels_from(&selector))
-        .await?;
+        .await?
+        .into_iter()
+        .filter(|plan| is_owned_by_policy(plan, policy))
+        .collect();
 
     // Find the most recent actionable plan (Pending or Approved, by creation time).
     let mut pending_plans: Vec<PostgresPolicyPlan> = existing_plans
@@ -1287,9 +1335,12 @@ pub async fn get_plan_by_phase(
 
     let plans_api: Api<PostgresPolicyPlan> = Api::namespaced(client.clone(), &namespace);
     let selector = policy_selector(&policy_name);
-    let existing_plans = plans_api
+    let existing_plans: Vec<PostgresPolicyPlan> = plans_api
         .list(&ListParams::default().labels_from(&selector))
-        .await?;
+        .await?
+        .into_iter()
+        .filter(|plan| is_owned_by_policy(plan, policy))
+        .collect();
 
     let mut matching_plans: Vec<PostgresPolicyPlan> = existing_plans
         .into_iter()
@@ -1445,6 +1496,134 @@ mod tests {
     use base64::Engine as _;
     use flate2::read::GzDecoder;
     use std::io::Read;
+
+    /// A minimal spec — the ownership tests only care about metadata.
+    fn test_policy_spec() -> crate::crd::PostgresPolicySpec {
+        crate::crd::PostgresPolicySpec {
+            connection: crate::crd::ConnectionSpec {
+                secret_ref: Some(crate::crd::SecretReference {
+                    name: "db-credentials".to_string(),
+                }),
+                secret_key: Some("DATABASE_URL".to_string()),
+                params: None,
+            },
+            interval: "5m".to_string(),
+            suspend: false,
+            mode: crate::crd::PolicyMode::Apply,
+            reconciliation_mode: CrdReconciliationMode::default(),
+            default_owner: None,
+            profiles: Default::default(),
+            schemas: Vec::new(),
+            roles: Vec::new(),
+            grants: Vec::new(),
+            default_privileges: Vec::new(),
+            memberships: Vec::new(),
+            retirements: Vec::new(),
+            approval: None,
+        }
+    }
+
+    /// A policy with a known UID, for the ownership tests.
+    fn policy_with_uid(name: &str, uid: &str) -> PostgresPolicy {
+        let mut policy = PostgresPolicy::new(name, test_policy_spec());
+        policy.metadata.namespace = Some("default".to_string());
+        policy.metadata.uid = Some(uid.to_string());
+        policy
+    }
+
+    /// Two policies whose names share a 63-character prefix collapse to the same
+    /// `pgroles.io/policy` label, so the selector cannot tell them apart. Only
+    /// the owner UID can — and the selector result drives deletion.
+    #[test]
+    fn colliding_label_values_are_separated_by_owner_uid() {
+        let prefix = "a".repeat(63);
+        let first = policy_with_uid(&format!("{prefix}-one"), "uid-one");
+        let second = policy_with_uid(&format!("{prefix}-two"), "uid-two");
+
+        // Precondition: the labels really are indistinguishable.
+        assert_eq!(
+            sanitize_label_value(&first.name_any()),
+            sanitize_label_value(&second.name_any()),
+        );
+
+        let mut plan = test_plan("plan-1", PlanPhase::Pending, None);
+        plan.metadata.owner_references = Some(vec![build_owner_reference(&first)]);
+
+        assert!(is_owned_by_policy(&plan, &first));
+        assert!(
+            !is_owned_by_policy(&plan, &second),
+            "a colliding policy must not claim another policy's plan"
+        );
+    }
+
+    #[test]
+    fn ownership_requires_a_controller_owner_reference() {
+        let policy = policy_with_uid("orders", "uid-orders");
+
+        // No owner references at all — e.g. an object the operator did not create.
+        let plan = test_plan("plan-1", PlanPhase::Pending, None);
+        assert!(!is_owned_by_policy(&plan, &policy));
+
+        // Right UID, but not marked as the controller.
+        let mut non_controller = build_owner_reference(&policy);
+        non_controller.controller = Some(false);
+        let mut plan = test_plan("plan-2", PlanPhase::Pending, None);
+        plan.metadata.owner_references = Some(vec![non_controller]);
+        assert!(!is_owned_by_policy(&plan, &policy));
+    }
+
+    /// An empty UID must never act as a wildcard: a policy the API server has
+    /// not assigned a UID to owns nothing.
+    #[test]
+    fn policy_without_uid_owns_nothing() {
+        let mut policy = PostgresPolicy::new("orders", test_policy_spec());
+        policy.metadata.namespace = Some("default".to_string());
+        policy.metadata.uid = None;
+
+        let mut plan = test_plan("plan-1", PlanPhase::Pending, None);
+        // `build_owner_reference` defaults a missing UID to the empty string.
+        plan.metadata.owner_references = Some(vec![build_owner_reference(&policy)]);
+
+        assert!(!is_owned_by_policy(&plan, &policy));
+    }
+
+    /// A replacement policy with the same name is a different object, so it must
+    /// not inherit the deleted one's plans.
+    #[test]
+    fn recreated_policy_does_not_inherit_previous_plans() {
+        let original = policy_with_uid("orders", "uid-original");
+        let recreated = policy_with_uid("orders", "uid-recreated");
+
+        let mut plan = test_plan("plan-1", PlanPhase::Applied, None);
+        plan.metadata.owner_references = Some(vec![build_owner_reference(&original)]);
+
+        assert!(is_owned_by_policy(&plan, &original));
+        assert!(!is_owned_by_policy(&plan, &recreated));
+    }
+
+    /// The ConfigMap cleanup path filters the same way, which is what stops it
+    /// deleting a colliding policy's SQL ConfigMap as an "orphan".
+    #[test]
+    fn configmap_ownership_uses_owner_uid() {
+        let prefix = "a".repeat(63);
+        let mine = policy_with_uid(&format!("{prefix}-one"), "uid-one");
+        let theirs = policy_with_uid(&format!("{prefix}-two"), "uid-two");
+
+        let configmap = ConfigMap {
+            metadata: k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta {
+                name: Some("plan-1-sql".to_string()),
+                owner_references: Some(vec![build_owner_reference(&theirs)]),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        assert!(is_owned_by_policy(&configmap, &theirs));
+        assert!(
+            !is_owned_by_policy(&configmap, &mine),
+            "cleanup must not treat another policy's ConfigMap as its own"
+        );
+    }
 
     fn test_plan(
         name: &str,
