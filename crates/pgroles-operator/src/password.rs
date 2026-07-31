@@ -19,8 +19,9 @@ pub const MIN_PASSWORD_LENGTH: u32 = 16;
 /// Maximum allowed password length.
 pub const MAX_PASSWORD_LENGTH: u32 = 128;
 
-/// Maximum length for a Kubernetes Secret name.
-pub const MAX_SECRET_NAME_LENGTH: usize = 253;
+/// Maximum length for a Kubernetes Secret name. A Secret name is an RFC 1123
+/// DNS subdomain like any other resource name.
+pub const MAX_SECRET_NAME_LENGTH: usize = crate::k8s_names::MAX_RESOURCE_NAME_LENGTH;
 
 /// Fixed key used to store the SCRAM verifier in generated Secrets.
 pub const GENERATED_VERIFIER_KEY: &str = "verifier";
@@ -62,19 +63,12 @@ pub fn generated_secret_key(spec: &GeneratePasswordSpec) -> String {
 fn default_generated_secret_name(policy_name: &str, role_name: &str) -> String {
     let policy = sanitize_secret_name_segment(policy_name, "policy");
     let role = sanitize_secret_name_segment(role_name, "role");
-    let mut name = format!("{policy}-pgr-{role}");
-    if name.len() <= MAX_SECRET_NAME_LENGTH {
-        return name;
-    }
-
-    name.truncate(MAX_SECRET_NAME_LENGTH);
-    while matches!(name.as_bytes().last(), Some(b'-')) {
-        name.pop();
-    }
-    if name.is_empty() {
+    let name = format!("{policy}-pgr-{role}");
+    let truncated = crate::k8s_names::truncate_name_prefix(&name, MAX_SECRET_NAME_LENGTH);
+    if truncated.is_empty() {
         "pgroles-generated-password".to_string()
     } else {
-        name
+        truncated.to_string()
     }
 }
 

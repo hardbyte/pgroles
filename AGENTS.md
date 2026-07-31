@@ -61,6 +61,7 @@ diff(current, desired) → Vec<Change> → sql::render_all_with_context() → SQ
 - **pgroles-inspect** — Async database introspection via `sqlx`/`pg_catalog`. Version detection, cloud provider detection (RDS, Cloud SQL, AlloyDB, Azure), drop-role safety preflight.
 - **pgroles-cli** — Binary crate. Thin orchestration over core + inspect. Subcommands: `validate`, `diff`/`plan`, `apply`, `inspect`, `generate`.
 - **pgroles-operator** — Kubernetes operator. Reconciles `PostgresPolicy` CRDs (`pgroles.io/v1alpha1`). Has a `crdgen` binary for generating `k8s/crd.yaml`.
+  - Kubernetes identifiers: every name and label value derived from user input goes through `k8s_names`. Do not hand-roll truncation or character filtering elsewhere — a cut that lands on a separator yields a value the API server rejects, which surfaces as a policy that silently stops reconciling. Invariants are enforced by property tests in `tests/identifier_properties.rs`.
   - Health endpoints: `/livez`, `/readyz`
   - Reconciliation modes: `apply`, `plan`
   - Metrics/telemetry: prefer OTLP export via OpenTelemetry Collector; do not add a built-in Prometheus scrape endpoint by default unless the change explicitly requires it.
