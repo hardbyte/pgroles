@@ -1114,15 +1114,21 @@ fn sanitize_label_value(value: &str) -> String {
         .map(|c| {
             if c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '_' {
                 c
+    let sanitized: String = value
+        .trim_start_matches(|c: char| !c.is_ascii_alphanumeric())
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '_' {
+                c
             } else {
                 '_'
             }
         })
         .take(63)
         .collect();
-    // Truncation may land on a separator; trim so the value starts/ends alphanumeric.
+    // Truncation may land on a separator; trim so the value ends alphanumeric.
     sanitized
-        .trim_matches(|c: char| !c.is_ascii_alphanumeric())
+        .trim_end_matches(|c: char| !c.is_ascii_alphanumeric())
         .to_string()
 }
 
