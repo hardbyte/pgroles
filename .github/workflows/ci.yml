@@ -52,7 +52,24 @@ jobs:
                 "(position='$STACK_POSITION' size='$STACK_SIZE'); refusing to gate on it"
               exit 1
             fi
-            if [ "$STACK_POSITION" -lt 1 ] || [ "$STACK_POSITION" -gt "$STACK_SIZE" ]; then
+            # Validate before comparing. `[ non-numeric -lt 1 ]` writes
+            # "integer expression expected" to stderr and evaluates *false*,
+            # which does not trip `bash -e` inside an `if` condition — so an
+            # unchecked comparison would let the step continue and skip the
+            # expensive suite, the exact failure this guard exists to prevent.
+            for value in "$STACK_POSITION" "$STACK_SIZE"; do
+              case "$value" in
+                ''|*[!0-9]*)
+                  echo "::error::stack metadata is not a non-negative integer" \
+                    "(position='$STACK_POSITION' size='$STACK_SIZE');" \
+                    "refusing to gate on it"
+                  exit 1
+                  ;;
+              esac
+            done
+            # 10# forces decimal, so a zero-padded value is never read as octal.
+            if [ "$((10#$STACK_POSITION))" -lt 1 ] \
+              || [ "$((10#$STACK_POSITION))" -gt "$((10#$STACK_SIZE))" ]; then
               echo "::error::stack position $STACK_POSITION outside the documented" \
                 "1..$STACK_SIZE range; the top-of-stack test in this workflow is no" \
                 "longer valid and must be revisited"
