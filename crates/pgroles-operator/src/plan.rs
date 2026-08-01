@@ -356,6 +356,13 @@ pub async fn create_or_update_plan(
                 // prefix can in principle collide, and this is otherwise the one
                 // mutation site the owner-UID discipline does not cover.
                 if !is_owned_by_policy(&existing, policy) {
+                    // Our SQL ConfigMap was already created, so clean it up as
+                    // the other error arm does. The orphan reaper would collect
+                    // it eventually — it carries our UID — but leaving it is a
+                    // pointless transient orphan.
+                    if let Some(configmap_name) = sql_configmap_name.as_deref() {
+                        delete_configmap_best_effort(client, &namespace, configmap_name).await;
+                    }
                     return Err(ReconcileError::PlanSqlStorage(format!(
                         "plan {plan_name} already exists and is owned by another policy"
                     )));
