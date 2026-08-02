@@ -1,22 +1,18 @@
-# A policy name at the 63-character limit, with dots and dashes throughout.
+# A policy name at Kubernetes' 253-character DNS-subdomain limit.
 #
-# 63 characters is the maximum a `pgroles.io/policy` label value can hold, so
-# this name round-trips into the label without truncation. The dots make it a
-# multi-label DNS subdomain, which is where derived resource names used to break:
-# truncating the name for a plan resource could leave a trailing `.`, and the
-# appended `-plan-...` then started a new DNS label with `-`.
+# The 215th byte is a dot, exactly where the operator truncates the policy-name
+# prefix when deriving a plan name. Without trimming the newly exposed dot, the
+# appended `-plan-...` starts a DNS label with `-` and the API server rejects it.
+# The policy label is deliberately truncated; controller-owner UID is the exact
+# identity used to find the plan again.
 #
 # Manual approval is used so the operator creates a PostgresPolicyPlan,
 # exercising both the labels it writes and the selectors that read them back.
 #
-# The plan SQL stays inline at this size, so no plan-SQL ConfigMap is created
-# here — that identifier path is covered by the
-# `plan_sql_configmap_identifiers_are_valid_at_the_name_limit` unit test rather
-# than by generating 16 KiB of SQL in a cluster.
 apiVersion: pgroles.io/v1alpha1
 kind: PostgresPolicy
 metadata:
-  name: a.very-long-policy.name-with-dots.and-dashes.at-the-limit.xxxxx
+  name: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb.ccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc.dddddddddddddddddddddd.eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee
   namespace: default
 spec:
   connection:
@@ -29,7 +25,7 @@ spec:
   roles:
     - name: hostile_name_preview_user
       login: true
-      comment: "Preview-only role for the identifier-boundary scenario"
+      comment: "Preview-only role for the maximum-length identifier scenario"
 
   grants:
     - role: hostile_name_preview_user

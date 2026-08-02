@@ -357,55 +357,41 @@ jobs:
           echo "params-mode: credential rotation recovery works"
 
           # ----------------------------------------------------------------
-          # Hostile identifiers: the API server is the oracle for every name
+          # Long dotted identifier: the API server is the oracle for every name
           # and label value the operator derives from a policy name.
           # ----------------------------------------------------------------
-          # A name one character over the label limit must be rejected at
-          # admission by the CRD's CEL rule, with our message.
-          overlong_output="$(kubectl apply -f k8s/samples/overlong-name-policy.yaml 2>&1 || true)"
-          echo "$overlong_output"
-          if kubectl get pgr a.very-long-policy.name-with-dots.and-dashes.at-the-limit.xxxxxy >/dev/null 2>&1; then
-            echo "::error::overlong policy name was admitted; the CEL validation rule is not enforced"
-            exit 1
-          fi
-          echo "$overlong_output" | grep -q "at most 63 characters" \
-            || { echo "::error::rejection did not carry the CEL rule message"; exit 1; }
-          echo "hostile-identifiers: overlong policy name rejected at admission"
-
-          # A dotted name exactly at the limit must reconcile, and its plan must
-          # be discoverable by the label the operator writes — proving writes and
-          # selector lookups agree at the boundary. The plan SQL stays inline at
-          # this size, so no ConfigMap is created; that path is unit-tested.
-          limit_name="a.very-long-policy.name-with-dots.and-dashes.at-the-limit.xxxxx"
+          # This is the maximum legal 253-byte DNS subdomain. Its 215th byte is
+          # a dot, exactly where generate_plan_name truncates its prefix. The
+          # operator must trim that exposed separator, create a legal plan, and
+          # find it again even though the policy label is necessarily lossy.
+          limit_name="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb.ccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc.dddddddddddddddddddddd.eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
           kubectl apply -f k8s/samples/max-length-name-policy.yaml
           wait_for_ready_status_reason "$limit_name" True Planned
 
-          plans="$(kubectl get postgrespolicyplan -l "pgroles.io/policy=$limit_name" \
-            -o jsonpath='{.items[*].metadata.name}')"
-          [ -n "$plans" ] \
-            || { echo "::error::no plan found via pgroles.io/policy=$limit_name"; exit 1; }
-          echo "hostile-identifiers: plan(s) found by label selector: $plans"
+          plan="$(wait_for_current_plan_ref "$limit_name")"
+          policy_uid="$(kubectl get pgr "$limit_name" -o jsonpath='{.metadata.uid}')"
+          plan_owner_uid="$(kubectl get pgplan "$plan" \
+            -o jsonpath='{.metadata.ownerReferences[?(@.controller==true)].uid}')"
+          [ "$plan_owner_uid" = "$policy_uid" ] \
+            || { echo "::error::long-name plan is not owned by its policy UID"; exit 1; }
 
-          # Every derived plan name must be a name the API server accepted, and
-          # every label value it wrote must satisfy the label rules.
-          for plan in $plans; do
-            case "$plan" in
-              -*|*-|*.|.*|*..*) echo "::error::invalid plan name: $plan"; exit 1 ;;
-            esac
-            policy_label="$(kubectl get postgrespolicyplan "$plan" \
-              -o jsonpath='{.metadata.labels.pgroles\.io/policy}')"
-            [ "${#policy_label}" -le 63 ] \
-              || { echo "::error::policy label over 63 chars on $plan"; exit 1; }
-            case "$policy_label" in
-              *[!a-zA-Z0-9]) echo "::error::policy label ends non-alphanumeric: $policy_label"; exit 1 ;;
-            esac
-            identity_label="$(kubectl get postgrespolicyplan "$plan" \
-              -o jsonpath='{.metadata.labels.pgroles\.io/database-identity}')"
-            case "$identity_label" in
-              *[!a-zA-Z0-9]) echo "::error::identity label ends non-alphanumeric: $identity_label"; exit 1 ;;
-            esac
-          done
-          echo "hostile-identifiers: derived names and label values are valid"
+          # The API server accepting the objects is the definitive syntax check;
+          # retain explicit assertions so a future fixture change cannot make
+          # this boundary case vacuous.
+          test "${#limit_name}" -eq 253
+          case "$plan" in
+            -*|*-|*.|.*|*..*) echo "::error::invalid plan name: $plan"; exit 1 ;;
+          esac
+          policy_label="$(kubectl get pgplan "$plan" \
+            -o jsonpath='{.metadata.labels.pgroles\.io/policy}')"
+          test "${#policy_label}" -eq 63 \
+            || { echo "::error::expected a truncated 63-byte policy label"; exit 1; }
+          identity_label="$(kubectl get pgplan "$plan" \
+            -o jsonpath='{.metadata.labels.pgroles\.io/database-identity}')"
+          case "$identity_label" in
+            *[!a-zA-Z0-9]) echo "::error::identity label ends non-alphanumeric: $identity_label"; exit 1 ;;
+          esac
+          echo "long-identifier: 253-byte dotted policy reconciled with valid derived identifiers"
 
           kubectl delete pgr "$limit_name" --wait=true
 
