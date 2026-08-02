@@ -22,12 +22,14 @@ cargo test --workspace -- --include-ignored
 # Run a single test
 cargo test -p pgroles-core --lib diff::tests::diff_creates_new_roles -- --exact
 
-# CRD drift check (CI enforces both committed CRD copies match crdgen output)
+# CRD drift check (CI enforces all four committed CRD copies match crdgen output)
 scripts/check-crd-drift.sh
 
-# Regenerate CRD after modifying crd.rs
-cargo run --bin crdgen > k8s/crd.yaml
-cp k8s/crd.yaml charts/pgroles-operator/crds/postgrespolicies.pgroles.io.yaml
+# Regenerate CRDs after modifying crd.rs (writes both CRDs; the four committed
+# copies must match, which is what check-crd-drift.sh compares)
+cargo run --bin crdgen -- --output-dir charts/pgroles-operator/crds/
+cp charts/pgroles-operator/crds/postgrespolicies.pgroles.io.yaml k8s/crd.yaml
+cp charts/pgroles-operator/crds/postgrespolicyplans.pgroles.io.yaml k8s/postgrespolicyplan-crd.yaml
 ```
 
 ### Local PostgreSQL for integration tests
@@ -60,7 +62,8 @@ diff(current, desired) → Vec<Change> → sql::render_all_with_context() → SQ
 - **pgroles-core** — Pure library, no IO. Manifest parsing, profile expansion, diff engine, SQL rendering, manifest export. All collections use `BTreeMap`/`BTreeSet` for deterministic output.
 - **pgroles-inspect** — Async database introspection via `sqlx`/`pg_catalog`. Version detection, cloud provider detection (RDS, Cloud SQL, AlloyDB, Azure), drop-role safety preflight.
 - **pgroles-cli** — Binary crate. Thin orchestration over core + inspect. Subcommands: `validate`, `diff`/`plan`, `apply`, `inspect`, `generate`.
-- **pgroles-operator** — Kubernetes operator. Reconciles `PostgresPolicy` CRDs (`pgroles.io/v1alpha1`). Has a `crdgen` binary for generating `k8s/crd.yaml`.
+- **pgroles-operator** — Kubernetes operator. Reconciles `PostgresPolicy` CRDs (`pgroles.io/v1alpha1`). Has a `crdgen` binary for generating the CRD YAML.
+  - Kubernetes identifiers: every name and label value derived from user input goes through `k8s_names`. Do not hand-roll truncation or character filtering elsewhere — a cut that lands on a separator yields a value the API server rejects, which surfaces as a policy that silently stops reconciling. Invariants are enforced by property tests in `tests/identifier_properties.rs`.
   - Health endpoints: `/livez`, `/readyz`
   - Reconciliation modes: `apply`, `plan`
   - Metrics/telemetry: prefer OTLP export via OpenTelemetry Collector; do not add a built-in Prometheus scrape endpoint by default unless the change explicitly requires it.

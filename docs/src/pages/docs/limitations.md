@@ -38,3 +38,7 @@ PostgreSQL does not expose password hashes for comparison, so pgroles cannot det
 ## Databases themselves
 
 pgroles grants privileges *on* a database (`CONNECT`, `CREATE`, `TEMPORARY`) but does not create, drop, or rename databases, and does not manage database ownership (`ALTER DATABASE ... OWNER TO`). Provision the database itself with your migration tooling or infrastructure-as-code before pointing a pgroles manifest at it.
+
+## Orphaning policies leaks plan resources
+
+Deleting a policy with `--cascade=orphan` leaves its plans and plan-SQL ConfigMaps behind. These resources are matched to their policy by owner UID rather than by name, so they are not re-adopted by a recreated policy of the same name. Because orphan deletion strips the owner references that garbage collection relies on, they persist until deleted by hand. Prefer the default cascading delete; if you have already orphaned some, delete leftover `pgplan` objects and `*-sql` ConfigMaps explicitly.

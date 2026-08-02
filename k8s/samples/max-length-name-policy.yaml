@@ -1,0 +1,35 @@
+# A policy name at Kubernetes' 253-character DNS-subdomain limit.
+#
+# The 215th byte is a dot, exactly where the operator truncates the policy-name
+# prefix when deriving a plan name. Without trimming the newly exposed dot, the
+# appended `-plan-...` starts a DNS label with `-` and the API server rejects it.
+# The policy label is deliberately truncated; controller-owner UID is the exact
+# identity used to find the plan again.
+#
+# Manual approval is used so the operator creates a PostgresPolicyPlan,
+# exercising both the labels it writes and the selectors that read them back.
+#
+apiVersion: pgroles.io/v1alpha1
+kind: PostgresPolicy
+metadata:
+  name: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb.ccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc.dddddddddddddddddddddd.eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee
+  namespace: default
+spec:
+  connection:
+    secretRef:
+      name: postgres-credentials
+  interval: "5m"
+  mode: apply
+  approval: manual
+
+  roles:
+    - name: hostile_name_preview_user
+      login: true
+      comment: "Role for the maximum-length identifier scenario; created once the plan is approved"
+
+  grants:
+    - role: hostile_name_preview_user
+      privileges: [CONNECT]
+      object:
+        type: database
+        name: postgres

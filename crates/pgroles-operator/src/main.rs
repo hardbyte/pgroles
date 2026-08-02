@@ -15,9 +15,7 @@ use kube::{Api, Client, Resource, ResourceExt};
 use tracing::info;
 
 use pgroles_operator::context::OperatorContext;
-use pgroles_operator::crd::{
-    LABEL_POLICY, PostgresPolicy, PostgresPolicyPlan, REQUESTED_RECONCILE_ANNOTATION,
-};
+use pgroles_operator::crd::{PostgresPolicy, PostgresPolicyPlan, REQUESTED_RECONCILE_ANNOTATION};
 use pgroles_operator::observability::{OperatorObservability, serve_health};
 use pgroles_operator::reconciler::{error_policy, reconcile};
 
@@ -157,29 +155,31 @@ async fn main() -> anyhow::Result<()> {
     .filter_map(|plan| async move { plan.ok() })
     .flat_map(move |plan| {
         let policy_store = plan_policy_store.clone();
-        // Look up the parent policy name from the plan's label.
-        let plan_ns = plan.namespace();
-        let parent_policy_name = plan
+        // Map the plan back to its parent by controller-owner UID.
+        //
+        // This used to compare the plan's `pgroles.io/policy` label against
+        // `metadata.name`, but that label is truncated at the 63-character label
+        // limit while a policy name may be up to 253. For any longer name the
+        // comparison never matched, so plan status changes silently stopped
+        // waking the policy reconciler. The UID is exact at any name length.
+        let parent_policy_uid = plan
             .metadata
-            .labels
-            .as_ref()
-            .and_then(|labels| labels.get(LABEL_POLICY))
-            .cloned();
+            .owner_references
+            .as_deref()
+            .unwrap_or_default()
+            .iter()
+            .find(|owner| owner.controller.unwrap_or(false))
+            .map(|owner| owner.uid.clone());
 
-        let refs: Vec<ObjectRef<PostgresPolicy>> =
-            if let (Some(ns), Some(policy_name)) = (plan_ns, parent_policy_name) {
-                policy_store
-                    .state()
-                    .into_iter()
-                    .filter(|policy| {
-                        policy.namespace().as_deref() == Some(ns.as_str())
-                            && policy.name_any() == policy_name
-                    })
-                    .map(|policy| ObjectRef::from_obj(policy.as_ref()))
-                    .collect()
-            } else {
-                Vec::new()
-            };
+        let refs: Vec<ObjectRef<PostgresPolicy>> = match parent_policy_uid {
+            Some(uid) if !uid.is_empty() => policy_store
+                .state()
+                .into_iter()
+                .filter(|policy| policy.metadata.uid.as_deref() == Some(uid.as_str()))
+                .map(|policy| ObjectRef::from_obj(policy.as_ref()))
+                .collect(),
+            _ => Vec::new(),
+        };
         stream::iter(refs)
     });
 

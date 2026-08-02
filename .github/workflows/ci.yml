@@ -15,6 +15,77 @@ env:
 
 jobs:
   # ---------------------------------------------------------------------------
+  # Job 0: Decide whether this run needs the expensive suite.
+  #
+  # In a stacked pull request the top entry contains the full changeset, so the
+  # integration matrix, Docker/example smoke tests, and kind-based E2E jobs only
+  # need to run there — once per stack rather than once per entry. Lint and unit
+  # tests stay ungated so every entry still gets fast feedback.
+  #
+  # Deliberately fail-safe: `stack` is null for pushes and for ordinary
+  # non-stacked pull requests, and anything we cannot positively identify as a
+  # non-top stack entry runs the full suite.
+  # ---------------------------------------------------------------------------
+  stack-gate:
+    name: Stack Gate
+    runs-on: ubuntu-latest
+    outputs:
+      run_heavy: ${{ steps.decide.outputs.run_heavy }}
+    steps:
+      - id: decide
+        env:
+          IS_TOP_OR_UNSTACKED: >-
+            ${{ github.event.pull_request.stack == null
+                || github.event.pull_request.stack.position == github.event.pull_request.stack.size }}
+          STACK_POSITION: ${{ github.event.pull_request.stack.position }}
+          STACK_SIZE: ${{ github.event.pull_request.stack.size }}
+        run: |
+          # Stacked pull requests are in public preview, so assert the metadata
+          # semantics this gate depends on: `position` is documented as 1-based
+          # with 1 at the bottom, and the top entry is `position == size`. If
+          # that ever changes, `position == size` would silently be false for the
+          # real top entry and the whole stack could merge without the expensive
+          # suite ever running. Fail loudly instead of skipping wrongly.
+          if [ -n "$STACK_POSITION" ] || [ -n "$STACK_SIZE" ]; then
+            if [ -z "$STACK_POSITION" ] || [ -z "$STACK_SIZE" ]; then
+              echo "::error::stack metadata is partially populated" \
+                "(position='$STACK_POSITION' size='$STACK_SIZE'); refusing to gate on it"
+              exit 1
+            fi
+            # Validate before comparing. `[ non-numeric -lt 1 ]` writes
+            # "integer expression expected" to stderr and evaluates *false*,
+            # which does not trip `bash -e` inside an `if` condition — so an
+            # unchecked comparison would let the step continue and skip the
+            # expensive suite, the exact failure this guard exists to prevent.
+            for value in "$STACK_POSITION" "$STACK_SIZE"; do
+              case "$value" in
+                ''|*[!0-9]*)
+                  echo "::error::stack metadata is not a non-negative integer" \
+                    "(position='$STACK_POSITION' size='$STACK_SIZE');" \
+                    "refusing to gate on it"
+                  exit 1
+                  ;;
+              esac
+            done
+            # 10# forces decimal, so a zero-padded value is never read as octal.
+            if [ "$((10#$STACK_POSITION))" -lt 1 ] \
+              || [ "$((10#$STACK_POSITION))" -gt "$((10#$STACK_SIZE))" ]; then
+              echo "::error::stack position $STACK_POSITION outside the documented" \
+                "1..$STACK_SIZE range; the top-of-stack test in this workflow is no" \
+                "longer valid and must be revisited"
+              exit 1
+            fi
+          fi
+
+          echo "run_heavy=$IS_TOP_OR_UNSTACKED" >> "$GITHUB_OUTPUT"
+          if [ "$IS_TOP_OR_UNSTACKED" = "true" ]; then
+            echo "Running the full suite (not a non-top stack entry)."
+          else
+            echo "::notice::Skipping the expensive suite: stack entry" \
+              "$STACK_POSITION of $STACK_SIZE. The top entry runs it for the whole stack."
+          fi
+
+  # ---------------------------------------------------------------------------
   # Job 1: Lint — clippy, rustfmt, CRD drift check
   # ---------------------------------------------------------------------------
   lint:
@@ -81,6 +152,8 @@ jobs:
   # ---------------------------------------------------------------------------
   integration-test:
     name: Integration Tests (PG${{ matrix.pg_version }})
+    needs: stack-gate
+    if: needs.stack-gate.outputs.run_heavy == 'true'
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -116,6 +189,8 @@ jobs:
   # ---------------------------------------------------------------------------
   docker-smoke:
     name: Docker Smoke Tests
+    needs: stack-gate
+    if: needs.stack-gate.outputs.run_heavy == 'true'
     runs-on: ubuntu-latest
     services:
       postgres:
@@ -180,6 +255,8 @@ jobs:
   # ---------------------------------------------------------------------------
   example-smoke:
     name: Example Smoke Tests
+    needs: stack-gate
+    if: needs.stack-gate.outputs.run_heavy == 'true'
     runs-on: ubuntu-latest
     services:
       postgres:
@@ -216,6 +293,8 @@ jobs:
   # ---------------------------------------------------------------------------
   e2e-operator:
     name: "E2E: Operator Scenarios"
+    needs: stack-gate
+    if: needs.stack-gate.outputs.run_heavy == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
@@ -315,6 +394,55 @@ jobs:
           echo "params-mode: credential rotation recovery works"
 
           # ----------------------------------------------------------------
+          # Long dotted identifier: the API server is the oracle for every name
+          # and label value the operator derives from a policy name.
+          # ----------------------------------------------------------------
+          # This is the maximum legal 253-byte DNS subdomain. Its 215th byte is
+          # a dot, exactly where generate_plan_name truncates its prefix. The
+          # operator must trim that exposed separator, create a legal plan, and
+          # find it again even though the policy label is necessarily lossy.
+          kubectl apply -f k8s/samples/max-length-name-policy.yaml
+          # Read the name back from the applied object rather than repeating the
+          # literal, so renaming the fixture cannot leave this waiting forever on
+          # a policy that was never created.
+          limit_name="$(kubectl get -f k8s/samples/max-length-name-policy.yaml \
+            -o jsonpath='{.metadata.name}')"
+          [ -n "$limit_name" ] \
+            || { echo "::error::could not read the max-length policy name"; exit 1; }
+          wait_for_ready_status_reason "$limit_name" True Planned
+
+          plan="$(wait_for_current_plan_ref "$limit_name")"
+          policy_uid="$(kubectl get pgr "$limit_name" -o jsonpath='{.metadata.uid}')"
+          plan_owner_uid="$(kubectl get pgplan "$plan" \
+            -o jsonpath='{.metadata.ownerReferences[?(@.controller==true)].uid}')"
+          # jsonpath prints nothing when the path matches nothing, so require a
+          # value before comparing: two empty strings must not read as a match.
+          [ -n "$policy_uid" ] && [ -n "$plan_owner_uid" ] \
+            || { echo "::error::missing policy or plan owner UID"; exit 1; }
+          [ "$plan_owner_uid" = "$policy_uid" ] \
+            || { echo "::error::long-name plan is not owned by its policy UID"; exit 1; }
+
+          # The API server accepting the objects is the definitive syntax check;
+          # retain explicit assertions so a future fixture change cannot make
+          # this boundary case vacuous.
+          test "${#limit_name}" -eq 253
+          case "$plan" in
+            -*|*-|*.|.*|*..*) echo "::error::invalid plan name: $plan"; exit 1 ;;
+          esac
+          policy_label="$(kubectl get pgplan "$plan" \
+            -o jsonpath='{.metadata.labels.pgroles\.io/policy}')"
+          test "${#policy_label}" -eq 63 \
+            || { echo "::error::expected a truncated 63-byte policy label"; exit 1; }
+          identity_label="$(kubectl get pgplan "$plan" \
+            -o jsonpath='{.metadata.labels.pgroles\.io/database-identity}')"
+          case "$identity_label" in
+            *[!a-zA-Z0-9]) echo "::error::identity label ends non-alphanumeric: $identity_label"; exit 1 ;;
+          esac
+          echo "long-identifier: 253-byte dotted policy reconciled with valid derived identifiers"
+
+          kubectl delete pgr "$limit_name" --wait=true
+
+          # ----------------------------------------------------------------
           # Password lifecycle (#46): create with Secret, verify, rotate
           # ----------------------------------------------------------------
           upsert_secret role-passwords password-user='e2e_initial_pw!'
@@ -410,6 +538,8 @@ jobs:
   # ---------------------------------------------------------------------------
   e2e-load:
     name: "E2E: Load Tests"
+    needs: stack-gate
+    if: needs.stack-gate.outputs.run_heavy == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
@@ -472,6 +602,8 @@ jobs:
   # ---------------------------------------------------------------------------
   e2e-plans:
     name: "E2E: Plan Lifecycle"
+    needs: stack-gate
+    if: needs.stack-gate.outputs.run_heavy == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
@@ -753,7 +885,106 @@ jobs:
           pg_query "DROP SCHEMA IF EXISTS schema_alpha CASCADE; DROP SCHEMA IF EXISTS schema_beta CASCADE;"
 
           # ================================================================
-          # Group G: Operator restart with pending plan
+          # Group G: UID isolation for colliding policy labels
+          # ================================================================
+
+          echo "--- Test: Colliding policy labels stay UID-isolated ---"
+          collision_prefix="zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz"
+          collision_a="${collision_prefix}.one"
+          collision_b="${collision_prefix}.two"
+
+          # Both names are valid DNS subdomains, but LabelValue::sanitize
+          # truncates both to the same 63-byte server-side prefilter.
+          test "${#collision_prefix}" -eq 63
+          kubectl apply -f - <<EOF
+          apiVersion: pgroles.io/v1alpha1
+          kind: PostgresPolicy
+          metadata:
+            name: ${collision_a}
+            namespace: default
+          spec:
+            connection:
+              secretRef:
+                name: postgres-credentials
+            interval: "30s"
+            mode: apply
+            approval: manual
+            roles:
+              - name: collision_uid_user_one
+                login: true
+          ---
+          apiVersion: pgroles.io/v1alpha1
+          kind: PostgresPolicy
+          metadata:
+            name: ${collision_b}
+            namespace: default
+          spec:
+            connection:
+              secretRef:
+                name: postgres-credentials
+            interval: "30s"
+            mode: apply
+            approval: manual
+            roles:
+              - name: collision_uid_user_two
+                login: true
+          EOF
+
+          wait_for_ready_status_reason "$collision_a" True Planned
+          plan_a=$(wait_for_current_plan_ref "$collision_a")
+          wait_for_ready_status_reason "$collision_b" True Planned
+          plan_b=$(wait_for_current_plan_ref "$collision_b")
+          test "$plan_a" != "$plan_b" \
+            || { echo "::error::colliding policies selected the same plan"; exit 1; }
+
+          label_a="$(kubectl get pgplan "$plan_a" -o jsonpath='{.metadata.labels.pgroles\.io/policy}')"
+          label_b="$(kubectl get pgplan "$plan_b" -o jsonpath='{.metadata.labels.pgroles\.io/policy}')"
+          test "$label_a" = "$label_b" \
+            || { echo "::error::fixture does not produce a policy-label collision"; exit 1; }
+
+          uid_a="$(kubectl get pgr "$collision_a" -o jsonpath='{.metadata.uid}')"
+          uid_b="$(kubectl get pgr "$collision_b" -o jsonpath='{.metadata.uid}')"
+          owner_a="$(kubectl get pgplan "$plan_a" -o jsonpath='{.metadata.ownerReferences[?(@.controller==true)].uid}')"
+          owner_b="$(kubectl get pgplan "$plan_b" -o jsonpath='{.metadata.ownerReferences[?(@.controller==true)].uid}')"
+          # An unmatched jsonpath yields an empty string, and "" = "" would pass
+          # the comparison below while proving nothing. Demand real UIDs first.
+          for uid in "$uid_a" "$uid_b" "$owner_a" "$owner_b"; do
+            [ -n "$uid" ] \
+              || { echo "::error::missing policy or plan owner UID in collision scenario"; exit 1; }
+          done
+          test "$owner_a" = "$uid_a" && test "$owner_b" = "$uid_b" \
+            || { echo "::error::plans are not separated by policy owner UID"; exit 1; }
+
+          # B is the newer pending plan and shares A's label. Approving A proves
+          # A's actionable-plan lookup does not accidentally select B.
+          approve_plan "$plan_a"
+          wait_for_plan_phase "$plan_a" Applied
+          assert_role_exists collision_uid_user_one
+          test "$(kubectl get pgplan "$plan_b" -o jsonpath='{.status.phase}')" = "Pending" \
+            || { echo "::error::approving A mutated B's plan"; exit 1; }
+          assert_role_absent collision_uid_user_two
+
+          # Owner-reference cleanup must remove only A's plan despite the label
+          # collision. B must remain independently discoverable and actionable.
+          kubectl delete pgr "$collision_a" --wait=true
+          kubectl wait --for=delete "pgplan/${plan_a}" --timeout=30s || {
+            echo "::error::plan $plan_a should have been garbage collected"
+            exit 1
+          }
+          test "$(kubectl get pgr "$collision_b" -o jsonpath='{.status.current_plan_ref.name}')" = "$plan_b" \
+            || { echo "::error::deleting A disturbed B's current plan lookup"; exit 1; }
+          test "$(kubectl get pgplan "$plan_b" -o jsonpath='{.status.phase}')" = "Pending" \
+            || { echo "::error::deleting A removed or changed B's plan"; exit 1; }
+
+          approve_plan "$plan_b"
+          wait_for_plan_phase "$plan_b" Applied
+          assert_role_exists collision_uid_user_two
+
+          kubectl delete pgr "$collision_b" --wait=true
+          pg_query "DROP ROLE IF EXISTS collision_uid_user_one; DROP ROLE IF EXISTS collision_uid_user_two;"
+
+          # ================================================================
+          # Group H: Operator restart with pending plan
           # ================================================================
 
           echo "--- Test: Operator restart with pending plan ---"

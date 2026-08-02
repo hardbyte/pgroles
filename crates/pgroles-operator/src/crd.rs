@@ -772,24 +772,12 @@ pub(crate) fn is_valid_set_role_identifier(s: &str) -> bool {
     bytes.all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'$' || b == b'-')
 }
 
-/// Validate a Kubernetes Secret name per RFC 1123 DNS subdomain rules:
-/// lowercase alpha start, alphanumeric end, body allows lowercase alpha,
-/// digits, `-`, and `.`.
+/// Validate a Kubernetes Secret name per RFC 1123 DNS subdomain rules.
+///
+/// Delegates to [`crate::k8s_names::is_valid_resource_name`] so Secret names
+/// are held to the same rules as every other resource name the operator builds.
 fn is_valid_secret_name(name: &str) -> bool {
-    if name.is_empty() || name.len() > crate::password::MAX_SECRET_NAME_LENGTH {
-        return false;
-    }
-    let bytes = name.as_bytes();
-    // RFC 1123: must start with a lowercase letter.
-    if !bytes[0].is_ascii_lowercase() {
-        return false;
-    }
-    if !bytes[bytes.len() - 1].is_ascii_lowercase() && !bytes[bytes.len() - 1].is_ascii_digit() {
-        return false;
-    }
-    bytes
-        .iter()
-        .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || *b == b'-' || *b == b'.')
+    crate::k8s_names::is_valid_resource_name(name)
 }
 
 fn is_valid_secret_key(key: &str) -> bool {
