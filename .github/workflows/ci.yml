@@ -875,7 +875,100 @@ jobs:
           pg_query "DROP SCHEMA IF EXISTS schema_alpha CASCADE; DROP SCHEMA IF EXISTS schema_beta CASCADE;"
 
           # ================================================================
-          # Group G: Operator restart with pending plan
+          # Group G: UID isolation for colliding policy labels
+          # ================================================================
+
+          echo "--- Test: Colliding policy labels stay UID-isolated ---"
+          collision_prefix="zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz"
+          collision_a="${collision_prefix}.one"
+          collision_b="${collision_prefix}.two"
+
+          # Both names are valid DNS subdomains, but LabelValue::sanitize
+          # truncates both to the same 63-byte server-side prefilter.
+          test "${#collision_prefix}" -eq 63
+          kubectl apply -f - <<EOF
+          apiVersion: pgroles.io/v1alpha1
+          kind: PostgresPolicy
+          metadata:
+            name: ${collision_a}
+            namespace: default
+          spec:
+            connection:
+              secretRef:
+                name: postgres-credentials
+            interval: "30s"
+            mode: apply
+            approval: manual
+            roles:
+              - name: collision_uid_user_one
+                login: true
+          ---
+          apiVersion: pgroles.io/v1alpha1
+          kind: PostgresPolicy
+          metadata:
+            name: ${collision_b}
+            namespace: default
+          spec:
+            connection:
+              secretRef:
+                name: postgres-credentials
+            interval: "30s"
+            mode: apply
+            approval: manual
+            roles:
+              - name: collision_uid_user_two
+                login: true
+          EOF
+
+          wait_for_ready_status_reason "$collision_a" True Planned
+          plan_a=$(wait_for_current_plan_ref "$collision_a")
+          wait_for_ready_status_reason "$collision_b" True Planned
+          plan_b=$(wait_for_current_plan_ref "$collision_b")
+          test "$plan_a" != "$plan_b" \
+            || { echo "::error::colliding policies selected the same plan"; exit 1; }
+
+          label_a="$(kubectl get pgplan "$plan_a" -o jsonpath='{.metadata.labels.pgroles\.io/policy}')"
+          label_b="$(kubectl get pgplan "$plan_b" -o jsonpath='{.metadata.labels.pgroles\.io/policy}')"
+          test "$label_a" = "$label_b" \
+            || { echo "::error::fixture does not produce a policy-label collision"; exit 1; }
+
+          uid_a="$(kubectl get pgr "$collision_a" -o jsonpath='{.metadata.uid}')"
+          uid_b="$(kubectl get pgr "$collision_b" -o jsonpath='{.metadata.uid}')"
+          owner_a="$(kubectl get pgplan "$plan_a" -o jsonpath='{.metadata.ownerReferences[?(@.controller==true)].uid}')"
+          owner_b="$(kubectl get pgplan "$plan_b" -o jsonpath='{.metadata.ownerReferences[?(@.controller==true)].uid}')"
+          test "$owner_a" = "$uid_a" && test "$owner_b" = "$uid_b" \
+            || { echo "::error::plans are not separated by policy owner UID"; exit 1; }
+
+          # B is the newer pending plan and shares A's label. Approving A proves
+          # A's actionable-plan lookup does not accidentally select B.
+          approve_plan "$plan_a"
+          wait_for_plan_phase "$plan_a" Applied
+          assert_role_exists collision_uid_user_one
+          test "$(kubectl get pgplan "$plan_b" -o jsonpath='{.status.phase}')" = "Pending" \
+            || { echo "::error::approving A mutated B's plan"; exit 1; }
+          assert_role_absent collision_uid_user_two
+
+          # Owner-reference cleanup must remove only A's plan despite the label
+          # collision. B must remain independently discoverable and actionable.
+          kubectl delete pgr "$collision_a" --wait=true
+          kubectl wait --for=delete "pgplan/${plan_a}" --timeout=30s || {
+            echo "::error::plan $plan_a should have been garbage collected"
+            exit 1
+          }
+          test "$(kubectl get pgr "$collision_b" -o jsonpath='{.status.current_plan_ref.name}')" = "$plan_b" \
+            || { echo "::error::deleting A disturbed B's current plan lookup"; exit 1; }
+          test "$(kubectl get pgplan "$plan_b" -o jsonpath='{.status.phase}')" = "Pending" \
+            || { echo "::error::deleting A removed or changed B's plan"; exit 1; }
+
+          approve_plan "$plan_b"
+          wait_for_plan_phase "$plan_b" Applied
+          assert_role_exists collision_uid_user_two
+
+          kubectl delete pgr "$collision_b" --wait=true
+          pg_query "DROP ROLE IF EXISTS collision_uid_user_one; DROP ROLE IF EXISTS collision_uid_user_two;"
+
+          # ================================================================
+          # Group H: Operator restart with pending plan
           # ================================================================
 
           echo "--- Test: Operator restart with pending plan ---"
