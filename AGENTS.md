@@ -22,7 +22,7 @@ cargo test --workspace -- --include-ignored
 # Run a single test
 cargo test -p pgroles-core --lib diff::tests::diff_creates_new_roles -- --exact
 
-# CRD drift check (CI enforces both committed CRD copies match crdgen output)
+# CRD drift check (CI enforces all four committed CRD copies match crdgen output)
 scripts/check-crd-drift.sh
 
 # Regenerate CRDs after modifying crd.rs (writes both CRDs; the four committed

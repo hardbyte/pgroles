@@ -401,14 +401,24 @@ jobs:
           # a dot, exactly where generate_plan_name truncates its prefix. The
           # operator must trim that exposed separator, create a legal plan, and
           # find it again even though the policy label is necessarily lossy.
-          limit_name="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb.ccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc.dddddddddddddddddddddd.eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
           kubectl apply -f k8s/samples/max-length-name-policy.yaml
+          # Read the name back from the applied object rather than repeating the
+          # literal, so renaming the fixture cannot leave this waiting forever on
+          # a policy that was never created.
+          limit_name="$(kubectl get -f k8s/samples/max-length-name-policy.yaml \
+            -o jsonpath='{.metadata.name}')"
+          [ -n "$limit_name" ] \
+            || { echo "::error::could not read the max-length policy name"; exit 1; }
           wait_for_ready_status_reason "$limit_name" True Planned
 
           plan="$(wait_for_current_plan_ref "$limit_name")"
           policy_uid="$(kubectl get pgr "$limit_name" -o jsonpath='{.metadata.uid}')"
           plan_owner_uid="$(kubectl get pgplan "$plan" \
             -o jsonpath='{.metadata.ownerReferences[?(@.controller==true)].uid}')"
+          # jsonpath prints nothing when the path matches nothing, so require a
+          # value before comparing: two empty strings must not read as a match.
+          [ -n "$policy_uid" ] && [ -n "$plan_owner_uid" ] \
+            || { echo "::error::missing policy or plan owner UID"; exit 1; }
           [ "$plan_owner_uid" = "$policy_uid" ] \
             || { echo "::error::long-name plan is not owned by its policy UID"; exit 1; }
 
@@ -936,6 +946,12 @@ jobs:
           uid_b="$(kubectl get pgr "$collision_b" -o jsonpath='{.metadata.uid}')"
           owner_a="$(kubectl get pgplan "$plan_a" -o jsonpath='{.metadata.ownerReferences[?(@.controller==true)].uid}')"
           owner_b="$(kubectl get pgplan "$plan_b" -o jsonpath='{.metadata.ownerReferences[?(@.controller==true)].uid}')"
+          # An unmatched jsonpath yields an empty string, and "" = "" would pass
+          # the comparison below while proving nothing. Demand real UIDs first.
+          for uid in "$uid_a" "$uid_b" "$owner_a" "$owner_b"; do
+            [ -n "$uid" ] \
+              || { echo "::error::missing policy or plan owner UID in collision scenario"; exit 1; }
+          done
           test "$owner_a" = "$uid_a" && test "$owner_b" = "$uid_b" \
             || { echo "::error::plans are not separated by policy owner UID"; exit 1; }
 

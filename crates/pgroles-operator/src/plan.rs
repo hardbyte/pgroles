@@ -356,13 +356,12 @@ pub async fn create_or_update_plan(
                 // prefix can in principle collide, and this is otherwise the one
                 // mutation site the owner-UID discipline does not cover.
                 if !is_owned_by_policy(&existing, policy) {
-                    // Our SQL ConfigMap was already created, so clean it up as
-                    // the other error arm does. The orphan reaper would collect
-                    // it eventually — it carries our UID — but leaving it is a
-                    // pointless transient orphan.
-                    if let Some(configmap_name) = sql_configmap_name.as_deref() {
-                        delete_configmap_best_effort(client, &namespace, configmap_name).await;
-                    }
+                    // Roll back only the ConfigMap this reconcile created. The
+                    // orphan reaper would collect it eventually — it carries our
+                    // UID — but leaving it is a pointless transient orphan. One
+                    // we merely adopted belongs to an earlier reconcile.
+                    rollback_plan_sql_configmap(client, &namespace, sql_configmap_name.as_ref())
+                        .await;
                     return Err(ReconcileError::PlanSqlStorage(format!(
                         "plan {plan_name} already exists and is owned by another policy"
                     )));
@@ -373,9 +372,7 @@ pub async fn create_or_update_plan(
                 (existing, false)
             }
             Err(err) => {
-                if let Some(configmap_name) = sql_configmap_name.as_deref() {
-                    delete_configmap_best_effort(client, &namespace, configmap_name).await;
-                }
+                rollback_plan_sql_configmap(client, &namespace, sql_configmap_name.as_ref()).await;
                 return Err(err.into());
             }
         };
@@ -436,9 +433,7 @@ pub async fn create_or_update_plan(
         if created_new_plan {
             delete_plan_best_effort(&plans_api, &plan_name).await;
         }
-        if let Some(configmap_name) = sql_configmap_name.as_deref() {
-            delete_configmap_best_effort(client, &namespace, configmap_name).await;
-        }
+        rollback_plan_sql_configmap(client, &namespace, sql_configmap_name.as_ref()).await;
         return Err(err.into());
     }
 
@@ -641,6 +636,18 @@ fn truncate_utf8(text: &str, max_bytes: usize, marker: &str) -> String {
     truncated
 }
 
+/// A plan's SQL ConfigMap, and whether *this* reconcile is the one that created
+/// it.
+///
+/// Rollback may only delete a ConfigMap this invocation created. One adopted
+/// from a 409 was written by an earlier reconcile and may already back a plan
+/// that is pending approval; deleting it would leave that plan unapplyable.
+/// This mirrors the `created_new_plan` guard already used for the plan itself.
+struct PlanSqlConfigMap {
+    name: String,
+    created: bool,
+}
+
 async fn create_plan_sql_configmap(
     client: &Client,
     policy: &PostgresPolicy,
@@ -648,7 +655,7 @@ async fn create_plan_sql_configmap(
     policy_name: &str,
     database_identity: &str,
     prepared_sql: &PreparedPlanSql,
-) -> Result<Option<String>, ReconcileError> {
+) -> Result<Option<PlanSqlConfigMap>, ReconcileError> {
     let PlanSqlArtifact::CompressedConfigMap {
         configmap_name,
         key: _,
@@ -671,11 +678,28 @@ async fn create_plan_sql_configmap(
         .create(&PostParams::default(), &configmap)
         .await
     {
-        Ok(_) => Ok(Some(configmap_name.clone())),
+        Ok(_) => Ok(Some(PlanSqlConfigMap {
+            name: configmap_name.clone(),
+            created: true,
+        })),
         Err(kube::Error::Api(api_err)) if api_err.code == 409 => {
             let existing = configmaps_api.get(configmap_name).await?;
+            // Ownership first, hash second. The ConfigMap name embeds a
+            // truncated plan name, so two policies sharing that prefix can
+            // collide here, and identical SQL makes the hash check agree —
+            // adopting would then share one artifact between two policies,
+            // whose lifetime is tied to the *other* policy's garbage
+            // collection.
+            if is_owned_by_another_policy(&existing, policy) {
+                return Err(ReconcileError::PlanSqlStorage(format!(
+                    "plan SQL ConfigMap {configmap_name} is owned by another policy"
+                )));
+            }
             validate_existing_sql_configmap(&existing, prepared_sql)?;
-            Ok(Some(configmap_name.clone()))
+            Ok(Some(PlanSqlConfigMap {
+                name: configmap_name.clone(),
+                created: false,
+            }))
         }
         Err(err) => Err(err.into()),
     }
@@ -1039,6 +1063,22 @@ async fn delete_plan_best_effort(plans_api: &Api<PostgresPolicyPlan>, plan_name:
     }
 }
 
+/// Undo this reconcile's plan-SQL ConfigMap write, if there was one.
+///
+/// A no-op for a ConfigMap that already existed and was adopted: that one backs
+/// an earlier plan, and deleting it on our failure path would break it.
+async fn rollback_plan_sql_configmap(
+    client: &Client,
+    namespace: &str,
+    configmap: Option<&PlanSqlConfigMap>,
+) {
+    if let Some(configmap) = configmap
+        && configmap.created
+    {
+        delete_configmap_best_effort(client, namespace, &configmap.name).await;
+    }
+}
+
 async fn delete_configmap_best_effort(client: &Client, namespace: &str, configmap_name: &str) {
     let configmaps_api: Api<ConfigMap> = Api::namespaced(client.clone(), namespace);
     if let Err(err) = configmaps_api
@@ -1177,6 +1217,26 @@ fn is_owned_by_policy<K: Resource>(resource: &K, policy: &PostgresPolicy) -> boo
         .unwrap_or_default()
         .iter()
         .any(|owner| owner.uid == policy_uid && owner.controller.unwrap_or(false))
+}
+
+/// Does `resource` carry a controller owner that is *not* `policy`?
+///
+/// Deliberately not `!is_owned_by_policy`. An object with no controller owner at
+/// all — an orphan left behind by `--cascade=orphan` — belongs to nobody, so it
+/// stays adoptable and this returns false. Only a live claim by a *different*
+/// policy blocks adoption.
+///
+/// Fails closed: a policy with no UID cannot prove ownership of anything, so
+/// every owned object counts as another's.
+fn is_owned_by_another_policy<K: Resource>(resource: &K, policy: &PostgresPolicy) -> bool {
+    let policy_uid = policy.metadata.uid.as_deref();
+    resource
+        .meta()
+        .owner_references
+        .as_deref()
+        .unwrap_or_default()
+        .iter()
+        .any(|owner| owner.controller.unwrap_or(false) && Some(owner.uid.as_str()) != policy_uid)
 }
 
 /// Current time as Unix epoch seconds (for dedup window checks).
@@ -1571,6 +1631,51 @@ mod tests {
             !is_owned_by_policy(&plan, &second),
             "a colliding policy must not claim another policy's plan"
         );
+    }
+
+    /// The adoption gate is narrower than `!is_owned_by_policy`: it blocks only
+    /// a live claim by a *different* policy. An unowned orphan stays adoptable,
+    /// so recovering from a `--cascade=orphan` delete still works.
+    #[test]
+    fn only_a_rival_controller_owner_blocks_adoption() {
+        let mine = policy_with_uid("orders", "uid-mine");
+        let theirs = policy_with_uid("orders-other", "uid-theirs");
+
+        let mut ours = test_plan("plan-1", PlanPhase::Pending, None);
+        ours.metadata.owner_references = Some(vec![build_owner_reference(&mine)]);
+        assert!(!is_owned_by_another_policy(&ours, &mine));
+
+        let mut rival = test_plan("plan-2", PlanPhase::Pending, None);
+        rival.metadata.owner_references = Some(vec![build_owner_reference(&theirs)]);
+        assert!(is_owned_by_another_policy(&rival, &mine));
+
+        // An orphan belongs to nobody, so it does not block us.
+        let orphan = test_plan("plan-3", PlanPhase::Pending, None);
+        assert!(!is_owned_by_another_policy(&orphan, &mine));
+
+        // A non-controller owner reference is not a claim either.
+        let mut non_controller = build_owner_reference(&theirs);
+        non_controller.controller = Some(false);
+        let mut referenced = test_plan("plan-4", PlanPhase::Pending, None);
+        referenced.metadata.owner_references = Some(vec![non_controller]);
+        assert!(!is_owned_by_another_policy(&referenced, &mine));
+    }
+
+    /// Fail closed: without a UID we cannot prove anything is ours, so every
+    /// claimed object must count as someone else's.
+    #[test]
+    fn a_policy_without_a_uid_can_adopt_nothing_owned() {
+        let mut no_uid = policy_with_uid("orders", "uid-orders");
+        no_uid.metadata.uid = None;
+        let owner = policy_with_uid("orders", "uid-orders");
+
+        let mut claimed = test_plan("plan-1", PlanPhase::Pending, None);
+        claimed.metadata.owner_references = Some(vec![build_owner_reference(&owner)]);
+        assert!(is_owned_by_another_policy(&claimed, &no_uid));
+
+        // ...but an orphan is still nobody's.
+        let orphan = test_plan("plan-2", PlanPhase::Pending, None);
+        assert!(!is_owned_by_another_policy(&orphan, &no_uid));
     }
 
     #[test]

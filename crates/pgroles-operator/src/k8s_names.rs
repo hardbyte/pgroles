@@ -119,7 +119,15 @@ pub fn truncate_name_prefix(prefix: &str, max_bytes: usize) -> &str {
 ///
 /// Like [`LabelValue::sanitize`] this is lossy and **not injective** — callers
 /// composing several segments must not treat the result as an identity.
+///
+/// `fallback` is returned verbatim and is the one value this function cannot
+/// make safe, so it must already be a valid DNS 1123 label. Debug builds assert
+/// it; callers pass literals.
 pub fn sanitize_dns_label_segment(input: &str, fallback: &str) -> String {
+    debug_assert!(
+        is_dns1123_label(fallback),
+        "fallback {fallback:?} is not a valid DNS label"
+    );
     let mut result = String::with_capacity(input.len());
     let mut last_was_dash = false;
 

@@ -25,7 +25,7 @@ spec:
   roles:
     - name: hostile_name_preview_user
       login: true
-      comment: "Preview-only role for the maximum-length identifier scenario"
+      comment: "Role for the maximum-length identifier scenario; created once the plan is approved"
 
   grants:
     - role: hostile_name_preview_user
