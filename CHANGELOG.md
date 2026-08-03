@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.0] - 2026-08-02
+
 ### Fixed
 
 - **Policy names longer than 63 characters no longer break plan creation, plan lookup, and cleanup.** Kubernetes caps label values at 63 bytes but allows resource names up to 253, and the operator conflated the two rules. Three defects followed. A sanitized label value truncated at the cap could land on a separator and be rejected outright, so the plan ConfigMap failed to write and the policy stopped reconciling (thanks @aarons-afk for the report and original fix, #146). `generate_plan_name` cut the policy-name prefix without trimming an exposed `.` or `-`, so the appended `-plan-…` began a new DNS label with a separator and the API server refused the plan. And `is_valid_secret_name` rejected `generatePassword.secretName` values beginning with a digit, which Kubernetes permits. All three rules now come from one module (`k8s_names`) that restates them once, with property tests over a hostile alphabet — including multi-byte UTF-8, which an earlier fix attempt silently truncated mid-character.

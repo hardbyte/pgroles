@@ -5,8 +5,8 @@ description: >-
   Define roles, memberships, grants, and default privileges in YAML
   and let the operator converge your database to the desired state.
 type: application
-version: 0.7.8
-appVersion: "0.7.8"
+version: 0.8.0
+appVersion: "0.8.0"
 icon: https://raw.githubusercontent.com/hardbyte/pgroles/main/docs/public/logo.svg
 sources:
   - https://github.com/hardbyte/pgroles
@@ -16,10 +16,14 @@ maintainers:
     url: https://hardbyte.nz
 annotations:
   artifacthub.io/changes: |
+    - kind: fixed
+      description: 'Policy names longer than 63 characters no longer break plan creation, lookup, or cleanup. Kubernetes caps label values at 63 bytes but allows resource names up to 253, and the operator conflated the two rules.'
+    - kind: fixed
+      description: 'Plans and plan-SQL ConfigMaps are matched to their policy by controller-owner UID rather than by a truncated label, so two policies sharing a 63-byte name prefix no longer cross-approve or cross-delete each other resources.'
     - kind: added
-      description: 'PostgresPolicy roles can now be marked external: true so provider-managed roles remain referenceable without pgroles creating, altering, dropping, password-managing, or pruning memberships granted from them.'
+      description: 'Roles and profiles can declare config defaults managed with ALTER ROLE ... SET, including {schema} and {profile} placeholder substitution on profiles[].config.'
     - kind: added
-      description: 'PostgresPolicy resources now support immediate reconcile requests through the reconcile.pgroles.io/requestedAt annotation; pgroles reconcile can set it and optionally wait for status.lastHandledReconcileAt.'
+      description: 'diff and apply now detect and warn about column-level grants in managed schemas, closing a silent audit hole in authoritative mode.'
   artifacthub.io/category: database
   artifacthub.io/operator: "true"
   artifacthub.io/prerelease: "false"
