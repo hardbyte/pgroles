@@ -1,6 +1,8 @@
 //! Shared operator context — database pool cache, metrics, and configuration.
 
 use std::collections::HashMap;
+use std::fmt::Write;
+use std::str::FromStr;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
@@ -8,7 +10,8 @@ use futures::future::{BoxFuture, FutureExt};
 use kube::runtime::events::Recorder;
 use serde::{Deserialize, Serialize};
 
-use sqlx::postgres::{PgPool, PgPoolOptions};
+use sha2::{Digest, Sha256};
+use sqlx::postgres::{PgConnectOptions, PgPool, PgPoolOptions};
 use tokio::sync::{Mutex, RwLock};
 
 use crate::crd::{ConnectionAuth, ConnectionSpec, SecretKeySelector};
@@ -464,6 +467,78 @@ impl OperatorContext {
             .database_url)
     }
 
+    /// Resolve a stable, non-secret fingerprint of the database target.
+    ///
+    /// Credentials and connection options are deliberately excluded so that
+    /// password and token rotation do not invalidate active access. Host,
+    /// port, or database changes do invalidate it, preventing cleanup from
+    /// revoking an identically named role in a different database.
+    pub async fn resolve_database_target_fingerprint(
+        &self,
+        namespace: &str,
+        connection: &ConnectionSpec,
+    ) -> Result<String, ContextError> {
+        let (host, port, database) = if let Some(ref secret_ref) = connection.secret_ref {
+            let database_url = self
+                .fetch_secret_value(
+                    namespace,
+                    &secret_ref.name,
+                    connection.effective_secret_key(),
+                )
+                .await?;
+            database_target_from_url(&database_url)
+                .map_err(|detail| ContextError::InvalidDatabaseUrl { detail })?
+        } else if let Some(ref params) = connection.params {
+            let host = self
+                .resolve_param(namespace, &params.host, &params.host_secret)
+                .await?
+                .ok_or_else(|| ContextError::EmptyResolvedValue {
+                    field: "host".to_string(),
+                })?;
+            let port = match self
+                .resolve_param(
+                    namespace,
+                    &params.port.map(|port| port.to_string()),
+                    &params.port_secret,
+                )
+                .await?
+            {
+                Some(value) => {
+                    value
+                        .parse::<u16>()
+                        .map_err(|_| ContextError::InvalidResolvedPort {
+                            value: value.clone(),
+                        })?
+                }
+                None => 5432,
+            };
+            let database = self
+                .resolve_param(namespace, &params.dbname, &params.dbname_secret)
+                .await?
+                .ok_or_else(|| ContextError::EmptyResolvedValue {
+                    field: "dbname".to_string(),
+                })?;
+            (host.to_ascii_lowercase(), port, database)
+        } else {
+            return Err(ContextError::SecretMissing {
+                name: "connection".to_string(),
+                key: "neither secretRef nor params is set".to_string(),
+            });
+        };
+
+        if host.trim().is_empty() {
+            return Err(ContextError::EmptyResolvedValue {
+                field: "host".to_string(),
+            });
+        }
+        if database.trim().is_empty() {
+            return Err(ContextError::EmptyResolvedValue {
+                field: "dbname".to_string(),
+            });
+        }
+        Ok(database_target_fingerprint(&host, port, &database))
+    }
+
     async fn resolve_connection_url_with_metadata(
         &self,
         namespace: &str,
@@ -759,6 +834,29 @@ impl OperatorContext {
     }
 }
 
+fn database_target_from_url(database_url: &str) -> Result<(String, u16, String), String> {
+    let options = PgConnectOptions::from_str(database_url).map_err(|source| source.to_string())?;
+    Ok((
+        options.get_host().to_ascii_lowercase(),
+        options.get_port(),
+        options
+            .get_database()
+            .unwrap_or_else(|| options.get_username())
+            .to_string(),
+    ))
+}
+
+fn database_target_fingerprint(host: &str, port: u16, database: &str) -> String {
+    let digest = Sha256::digest(format!("{}\0{port}\0{database}", host.to_ascii_lowercase()));
+    let mut fingerprint = String::with_capacity(7 + digest.len() * 2);
+    fingerprint.push_str("sha256:");
+    for byte in digest {
+        write!(&mut fingerprint, "{byte:02x}")
+            .expect("writing a database target fingerprint cannot fail");
+    }
+    fingerprint
+}
+
 /// Errors from operator context operations.
 #[derive(Debug, thiserror::Error)]
 pub enum ContextError {
@@ -780,6 +878,12 @@ pub enum ContextError {
 
     #[error("connection param \"{field}\" resolved to an empty or whitespace-only value")]
     EmptyResolvedValue { field: String },
+
+    #[error("connection URL is invalid: {detail}")]
+    InvalidDatabaseUrl { detail: String },
+
+    #[error("connection port resolved to invalid value \"{value}\"")]
+    InvalidResolvedPort { value: String },
 
     #[error(
         "connection param sslMode resolved to invalid value \"{value}\" (expected one of: disable, allow, prefer, require, verify-ca, verify-full)"
@@ -827,6 +931,36 @@ impl ContextError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn database_target_fingerprint_excludes_credentials_and_options() {
+        let first = database_target_from_url(
+            "postgresql://alice:first@DB.EXAMPLE:6432/inventory?sslmode=require",
+        )
+        .expect("first URL");
+        let second = database_target_from_url(
+            "postgresql://bob:second@db.example:6432/inventory?application_name=test",
+        )
+        .expect("second URL");
+
+        assert_eq!(
+            database_target_fingerprint(&first.0, first.1, &first.2),
+            database_target_fingerprint(&second.0, second.1, &second.2)
+        );
+    }
+
+    #[test]
+    fn database_target_fingerprint_changes_on_retarget() {
+        let original = database_target_fingerprint("db.example", 5432, "inventory");
+        assert_ne!(
+            original,
+            database_target_fingerprint("db.example", 5432, "billing")
+        );
+        assert_ne!(
+            original,
+            database_target_fingerprint("other.example", 5432, "inventory")
+        );
+    }
 
     #[test]
     fn build_set_role_stmt_quotes_identifier() {

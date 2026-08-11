@@ -1137,11 +1137,15 @@ pub const EPHEMERAL_MEMBERSHIP_SEMANTICS_V1: &str =
 #[serde(rename_all = "camelCase")]
 pub struct EphemeralAccessPolicySpec {
     pub postgres_policy_ref: LocalObjectReference,
+    #[schemars(length(min = 1))]
     pub memberships: Vec<EphemeralMembership>,
+    #[schemars(regex(pattern = r"^([0-9]+[smh])+$"))]
     pub maximum_duration: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(regex(pattern = r"^([0-9]+[smh])+$"))]
     pub default_duration: Option<String>,
     #[serde(rename = "pendingRequestTTL", default = "default_pending_request_ttl")]
+    #[schemars(regex(pattern = r"^([0-9]+[smh])+$"))]
     pub pending_request_ttl: String,
     pub justification: EphemeralJustificationPolicy,
     pub approval: EphemeralApprovalPolicy,
@@ -1219,6 +1223,7 @@ pub struct EphemeralAccessRequestSpec {
     pub access_policy_ref: LocalObjectReference,
     pub subject: EphemeralAccessSubject,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(regex(pattern = r"^([0-9]+[smh])+$"))]
     pub requested_duration: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub justification: Option<String>,
@@ -1249,6 +1254,7 @@ pub struct EphemeralAccessRequestStatus {
     #[serde(default)]
     pub phase: EphemeralAccessRequestPhase,
     #[serde(default)]
+    #[schemars(length(max = 8))]
     pub conditions: Vec<EphemeralAccessCondition>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resolved_access: Option<ResolvedEphemeralAccess>,
@@ -1313,6 +1319,9 @@ pub struct ResolvedEphemeralAccess {
     pub access_policy_generation: i64,
     pub target_policy_uid: String,
     pub target_policy_generation: i64,
+    /// SHA-256 fingerprint of resolved host, port, and database name. It binds
+    /// activation and revocation to one database without persisting secrets.
+    pub target_database_fingerprint: String,
     pub granted_duration: String,
     pub bundle_encoding: String,
     pub bundle_hash: String,
@@ -1332,6 +1341,7 @@ pub struct ResolvedEphemeralMembership {
 struct CanonicalEphemeralBundle<'a> {
     bundle_encoding: &'a str,
     membership_semantics: &'a str,
+    target_database_fingerprint: &'a str,
     memberships: &'a [ResolvedEphemeralMembership],
 }
 
@@ -1342,6 +1352,7 @@ impl ResolvedEphemeralAccess {
         serde_json::to_vec(&CanonicalEphemeralBundle {
             bundle_encoding: EPHEMERAL_BUNDLE_ENCODING_V1,
             membership_semantics: EPHEMERAL_MEMBERSHIP_SEMANTICS_V1,
+            target_database_fingerprint: &self.target_database_fingerprint,
             memberships: &memberships,
         })
         .expect("canonical ephemeral bundle is serializable")
@@ -4332,6 +4343,7 @@ retirements:
             access_policy_generation: 1,
             target_policy_uid: "target-uid".into(),
             target_policy_generation: 2,
+            target_database_fingerprint: "sha256:database".into(),
             granted_duration: "1800s".into(),
             bundle_encoding: EPHEMERAL_BUNDLE_ENCODING_V1.into(),
             bundle_hash: String::new(),
@@ -4381,12 +4393,26 @@ retirements:
     }
 
     #[test]
+    fn ephemeral_bundle_hash_covers_database_target() {
+        let original = resolved_bundle(Vec::new());
+        let mut retargeted = original.clone();
+        retargeted.target_database_fingerprint = "sha256:other-database".into();
+
+        assert_ne!(
+            original.compute_bundle_hash(),
+            retargeted.compute_bundle_hash()
+        );
+    }
+
+    #[test]
     fn ephemeral_request_crd_contains_immutability_rules() {
         let json = serde_json::to_string(&EphemeralAccessRequest::crd())
             .expect("request CRD should serialize");
         assert!(json.contains("request spec is immutable"));
         assert!(json.contains("resolvedAccess is write-once"));
         assert!(json.contains("approval decisions are terminal"));
+        assert!(json.contains(r#""maxItems":8"#));
+        assert!(json.contains(r#""pattern":"^([0-9]+[smh])+$""#));
     }
 
     #[test]
@@ -4396,5 +4422,7 @@ retirements:
         assert!(json.contains("postgresPolicyRef"));
         assert!(json.contains("maximumDuration"));
         assert!(json.contains("Accepted"));
+        assert!(json.contains(r#""minItems":1"#));
+        assert!(json.contains(r#""pattern":"^([0-9]+[smh])+$""#));
     }
 }

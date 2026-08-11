@@ -97,6 +97,7 @@ impl ReconcileOutcome {
 enum RetryClass {
     Slow,
     LockContention,
+    CleanupPending,
     Transient,
 }
 
@@ -268,6 +269,15 @@ fn retry_action(resource: &PostgresPolicy, error: &finalizer::Error<ReconcileErr
             );
             Action::requeue(delay)
         }
+        RetryClass::CleanupPending => {
+            let delay = Duration::from_secs(10);
+            tracing::info!(
+                delay_secs = delay.as_secs(),
+                error = %error,
+                "waiting for ephemeral access finalizers"
+            );
+            Action::requeue(delay)
+        }
         RetryClass::Transient => {
             let attempts = next_transient_failure_count(resource);
             let delay = transient_backoff_delay(attempts);
@@ -348,6 +358,9 @@ fn retry_class(error: &finalizer::Error<ReconcileError>) -> RetryClass {
         finalizer::Error::ApplyFailed(reconcile_error) => {
             retry_class_for_reconcile_error(reconcile_error)
         }
+        finalizer::Error::CleanupFailed(ReconcileError::PendingEphemeralAccessCleanup(_)) => {
+            RetryClass::CleanupPending
+        }
         finalizer::Error::CleanupFailed(_)
         | finalizer::Error::AddFinalizer(_)
         | finalizer::Error::RemoveFinalizer(_)
@@ -359,6 +372,7 @@ fn retry_class(error: &finalizer::Error<ReconcileError>) -> RetryClass {
 fn retry_class_for_reconcile_error(error: &ReconcileError) -> RetryClass {
     match error {
         ReconcileError::LockContention(_, _) => RetryClass::LockContention,
+        ReconcileError::PendingEphemeralAccessCleanup(_) => RetryClass::CleanupPending,
         ReconcileError::ManifestExpansion(_)
         | ReconcileError::InvalidInterval(_, _)
         | ReconcileError::InvalidSpec(_)
@@ -369,7 +383,6 @@ fn retry_class_for_reconcile_error(error: &ReconcileError) -> RetryClass {
         | ReconcileError::EmptyPasswordSecret { .. }
         | ReconcileError::NoNamespace
         | ReconcileError::PlanSqlStorage(_) => RetryClass::Slow,
-        ReconcileError::PendingEphemeralAccessCleanup(_) => RetryClass::Transient,
         ReconcileError::PasswordGeneration(err) => {
             if err.is_transient() {
                 RetryClass::Transient
@@ -399,6 +412,8 @@ fn retry_class_for_reconcile_error(error: &ReconcileError) -> RetryClass {
             // a permission/config issue, not a transient connectivity blip.
             ContextError::SetRoleFailed { .. } => RetryClass::Slow,
             ContextError::EmptyResolvedValue { .. }
+            | ContextError::InvalidDatabaseUrl { .. }
+            | ContextError::InvalidResolvedPort { .. }
             | ContextError::InvalidResolvedSslMode { .. } => RetryClass::Slow,
         },
         ReconcileError::Inspect(error) => {
@@ -2181,6 +2196,8 @@ impl ReconcileError {
                 ContextError::DatabaseConnect { .. } => "DatabaseConnectionFailed",
                 ContextError::SetRoleFailed { .. } => "SetRoleFailed",
                 ContextError::EmptyResolvedValue { .. } => "InvalidConnectionParams",
+                ContextError::InvalidDatabaseUrl { .. }
+                | ContextError::InvalidResolvedPort { .. } => "InvalidConnectionParams",
                 ContextError::InvalidResolvedSslMode { .. } => "InvalidConnectionParams",
             },
             ReconcileError::Inspect(error) => match error {
@@ -3676,6 +3693,18 @@ mod tests {
         assert!(
             (40..=60).any(|secs| action == Action::requeue(Duration::from_secs(secs))),
             "expected transient retry between 40s and 60s, got {action:?}"
+        );
+    }
+
+    #[test]
+    fn cleanup_pending_keeps_finalizer_and_uses_bounded_retry() {
+        let resource = test_policy("2s", 0);
+        let error =
+            finalizer::Error::CleanupFailed(ReconcileError::PendingEphemeralAccessCleanup(1));
+        assert_eq!(retry_class(&error), RetryClass::CleanupPending);
+        assert_eq!(
+            retry_action(&resource, &error),
+            Action::requeue(Duration::from_secs(10))
         );
     }
 

@@ -67,6 +67,7 @@
                   },
                   "defaultDuration": {
                     "nullable": true,
+                    "pattern": "^([0-9]+[smh])+$",
                     "type": "string"
                   },
                   "description": {
@@ -89,6 +90,7 @@
                     "type": "object"
                   },
                   "maximumDuration": {
+                    "pattern": "^([0-9]+[smh])+$",
                     "type": "string"
                   },
                   "memberships": {
@@ -107,10 +109,12 @@
                       ],
                       "type": "object"
                     },
+                    "minItems": 1,
                     "type": "array"
                   },
                   "pendingRequestTTL": {
                     "default": "15m",
+                    "pattern": "^([0-9]+[smh])+$",
                     "type": "string"
                   },
                   "postgresPolicyRef": {

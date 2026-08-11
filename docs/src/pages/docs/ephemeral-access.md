@@ -42,7 +42,14 @@ spec:
 The target must be a same-namespace `PostgresPolicy` in `mode: apply`. Roles are
 concrete names from its expanded graph. The subject already exists; pgroles does
 not create a login identity for a request. Membership never carries `ADMIN
-OPTION`.
+OPTION`. Durations are one or more integer/unit pairs using `s`, `m`, or `h`
+(for example `45s` or `1h30m`); unitless values are rejected.
+
+PostgreSQL 16 and later can enforce `inherit` per membership. On PostgreSQL 15,
+the requested value must match the subject role's server-wide `INHERIT`
+attribute; the request fails before SQL when it does not. This prevents a
+set-role-only (`inherit: false`) bundle from becoming implicitly inherited on
+servers that cannot encode that option on `GRANT ROLE`.
 
 ```yaml
 apiVersion: pgroles.io/v1alpha1
@@ -61,7 +68,12 @@ spec:
 
 The request spec is immutable. The operator resolves concrete memberships into
 write-once `status.resolvedAccess`, including the target and access-policy UIDs,
-a versioned canonical bundle hash, and the granted duration.
+a non-secret fingerprint of the resolved host/port/database, a versioned
+canonical bundle hash, and the granted duration. The fingerprint is part of the
+approved bundle. Credential rotation is allowed, but changing the resolved
+host, port, or database blocks activation, durable reconciliation, and
+revocation until the original target is restored. This fail-closed rule avoids
+revoking an identically named role in a different database.
 
 ## Secure `Required` approval with Kyverno
 
@@ -72,10 +84,11 @@ contract.
 
 The recommended secure installation is in
 `k8s/security/ephemeral-access-kyverno.yaml`. Kyverno's CEL
-`ValidatingPolicy` resources enforce decision integrity and finalizer
-ownership. Because that CEL environment does not expose Kubernetes'
+`ValidatingPolicy` enforces decision integrity. Because that CEL environment
+does not expose Kubernetes'
 `authorizer`, a narrowly scoped Kyverno `ClusterPolicy` performs documented
-`SubjectAccessReview` API calls for the logical verbs. Together they:
+`SubjectAccessReview` API calls for the logical verbs and enforces ownership of
+operator-managed lifecycle status and finalizers. Together they:
 
 - require the logical `use` verb on an access policy to create a request;
 - require the logical `approve` verb to change `Approved` or `Denied`;

@@ -72,6 +72,7 @@
                   },
                   "requestedDuration": {
                     "nullable": true,
+                    "pattern": "^([0-9]+[smh])+$",
                     "type": "string"
                   },
                   "subject": {
@@ -146,6 +147,7 @@
                       ],
                       "type": "object"
                     },
+                    "maxItems": 8,
                     "type": "array"
                   },
                   "endedAt": {
@@ -218,6 +220,10 @@
                         },
                         "type": "array"
                       },
+                      "targetDatabaseFingerprint": {
+                        "description": "SHA-256 fingerprint of resolved host, port, and database name. It binds\nactivation and revocation to one database without persisting secrets.",
+                        "type": "string"
+                      },
                       "targetPolicyGeneration": {
                         "format": "int64",
                         "type": "integer"
@@ -233,6 +239,7 @@
                       "bundleHash",
                       "grantedDuration",
                       "memberships",
+                      "targetDatabaseFingerprint",
                       "targetPolicyGeneration",
                       "targetPolicyUid"
                     ],

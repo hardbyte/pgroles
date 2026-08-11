@@ -3,6 +3,14 @@ set -euo pipefail
 
 secure_mode="${1:-false}"
 source scripts/e2e-helpers.sh
+session_output=""
+
+cleanup() {
+  if [ -n "$session_output" ]; then
+    rm -f "$session_output"
+  fi
+}
+trap cleanup EXIT
 
 wait_request_phase() {
   local request="$1" expected="$2" attempts="${3:-60}"
@@ -128,6 +136,10 @@ append_decision() {
   local bundle_hash granted_duration patch
   bundle_hash="$(kubectl get pgear "$request" -o jsonpath='{.status.resolvedAccess.bundleHash}')"
   granted_duration="$(kubectl get pgear "$request" -o jsonpath='{.status.resolvedAccess.grantedDuration}')"
+  if [ -z "$bundle_hash" ] || [ -z "$granted_duration" ]; then
+    echo "::error::request $request has no resolved bundle to attest" >&2
+    return 1
+  fi
   patch="[{\"op\":\"add\",\"path\":\"/status/conditions/-\",\"value\":{\"type\":\"${decision}\",\"status\":\"True\",\"reason\":\"E2E${decision}\",\"bundleHash\":\"${bundle_hash}\",\"grantedDuration\":\"${granted_duration}\"}}]"
   kubectl --as="$identity" patch pgear "$request" --subresource=status --type=json -p "$patch"
 }
@@ -183,7 +195,7 @@ assert_membership ephemeral_e2e_editor ephemeral_e2e_subject 1
 assert_membership ephemeral_e2e_auditor ephemeral_e2e_subject 1
 
 request_uid="$(kubectl get pgear ephemeral-auto-expiry -o jsonpath='{.metadata.uid}')"
-plan_owner_uid="$(kubectl get pgplan -o json | jq -r --arg uid "$request_uid" '.items[] | select(.spec.origin.uid == $uid and .spec.scope.operation == "Activate") | .metadata.ownerReferences[] | select(.controller == true) | .uid' | head -1)"
+plan_owner_uid="$(kubectl get pgplan -o json | jq -r --arg uid "$request_uid" '[.items[] | select(.spec.origin.uid == $uid and .spec.scope.operation == "Activate") | .metadata.ownerReferences[] | select(.controller == true) | .uid][0] // ""')"
 test "$plan_owner_uid" = "$request_uid"
 
 if kubectl patch pgear ephemeral-auto-expiry --subresource=status --type=merge \
@@ -195,6 +207,23 @@ fi
 wait_request_phase ephemeral-auto-expiry Ended
 assert_membership ephemeral_e2e_editor ephemeral_e2e_subject 0
 assert_membership ephemeral_e2e_auditor ephemeral_e2e_subject 0
+
+echo "Connection retargeting fails closed and cleanup resumes after restoration"
+create_request ephemeral-retarget-guard ephemeral-e2e-automatic 1m
+wait_request_phase ephemeral-retarget-guard Active
+assert_membership ephemeral_e2e_editor ephemeral_e2e_subject 1
+original_database_url="$(kubectl get secret postgres-credentials -o jsonpath='{.data.DATABASE_URL}' | base64 --decode)"
+retargeted_database_url='postgres://postgres:devpassword@postgres.default.svc.cluster.local:5432/loadtest'
+kubectl patch secret postgres-credentials --type=merge \
+  -p "$(jq -nc --arg url "$retargeted_database_url" '{stringData:{DATABASE_URL:$url}}')"
+kubectl delete pgear ephemeral-retarget-guard --wait=false
+sleep 6
+kubectl get pgear ephemeral-retarget-guard >/dev/null
+assert_membership ephemeral_e2e_editor ephemeral_e2e_subject 1
+kubectl patch secret postgres-credentials --type=merge \
+  -p "$(jq -nc --arg url "$original_database_url" '{stringData:{DATABASE_URL:$url}}')"
+kubectl wait --for=delete pgear/ephemeral-retarget-guard --timeout=90s
+assert_membership ephemeral_e2e_editor ephemeral_e2e_subject 0
 
 echo "Applying recovery after absolute expiry revokes instead of re-granting"
 create_request ephemeral-expired-recovery ephemeral-e2e-automatic 1m
@@ -486,6 +515,7 @@ grep -Fq 'before=ephemeral_e2e_editor' "$session_output"
 grep -Fq 'during=ephemeral_e2e_editor' "$session_output"
 grep -Fq 'permission denied to set role "ephemeral_e2e_editor"' "$session_output"
 rm -f "$session_output"
+session_output=""
 if kubectl exec postgres-0 -- env PGPASSWORD=ephemeral-session-password \
   psql -X -v ON_ERROR_STOP=1 -h 127.0.0.1 -U ephemeral_e2e_session_user -d postgres \
   -c 'SET ROLE ephemeral_e2e_editor;'; then

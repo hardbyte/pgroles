@@ -1052,6 +1052,8 @@ jobs:
             cluster: pgroles-e2e-ephemeral-secure
     steps:
       - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
 
       - uses: ./.github/actions/setup-e2e
         with:
@@ -1070,10 +1072,20 @@ jobs:
           echo "3dcd43eaf11f0719084217148cd0c82a8fa49faa9b1a783ea5bea2cf84041bda  /tmp/kyverno-install.yaml" \
             | sha256sum -c -
           kubectl create -f /tmp/kyverno-install.yaml
-          kubectl -n kyverno wait --for=condition=Available deployment --all --timeout=240s
+          kubectl wait --for=condition=Established \
+            crd/clusterpolicies.kyverno.io \
+            crd/validatingpolicies.policies.kyverno.io \
+            --timeout=120s
+          kubectl -n kyverno wait --for=condition=Available \
+            deployment/kyverno-admission-controller \
+            deployment/kyverno-background-controller \
+            deployment/kyverno-cleanup-controller \
+            deployment/kyverno-reports-controller \
+            --timeout=240s
           kubectl apply -f k8s/security/ephemeral-access-kyverno.yaml
-          kubectl get validatingpolicies.policies.kyverno.io
-          sleep 10
+          kubectl wait --for=jsonpath='{.status.conditionStatus.ready}'=true \
+            validatingpolicy/pgroles-ephemeral-access-decision-integrity \
+            --timeout=120s
 
       - name: Run ephemeral access lifecycle E2E
         run: scripts/e2e-ephemeral-access.sh "${{ matrix.secure }}"

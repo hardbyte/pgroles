@@ -17,11 +17,12 @@ use crate::context::{ContextError, OperatorContext};
 use crate::crd::{
     ChangeSummary, DatabaseIdentity, EPHEMERAL_BUNDLE_ENCODING_V1, EphemeralAccessCondition,
     EphemeralAccessPolicy, EphemeralAccessPolicyStatus, EphemeralAccessRequest,
-    EphemeralAccessRequestPhase, EphemeralAccessRequestStatus, EphemeralApprovalMode, PlanOrigin,
-    PlanPhase, PlanScope, PolicyCondition, PolicyMode, PolicyPlanRef, PostgresPolicy,
+    EphemeralAccessRequestPhase, EphemeralAccessRequestStatus, EphemeralApprovalMode, LABEL_POLICY,
+    PlanOrigin, PlanPhase, PlanScope, PolicyCondition, PolicyMode, PolicyPlanRef, PostgresPolicy,
     PostgresPolicyPlan, PostgresPolicyPlanSpec, PostgresPolicyPlanStatus, ResolvedEphemeralAccess,
     ResolvedEphemeralMembership, ScopedPlanOperation,
 };
+use crate::k8s_names::LabelValue;
 use crate::reconciler::ReconcileError;
 
 const ACCESS_POLICY_FINALIZER: &str = "ephemeralaccesspolicy.pgroles.io/finalizer";
@@ -456,13 +457,9 @@ fn parse_duration(value: &str) -> Result<Duration, EphemeralError> {
             .ok_or_else(|| EphemeralError::Invalid("duration is too large".to_string()))?;
     }
     if !number.is_empty() {
-        total = total
-            .checked_add(
-                number
-                    .parse()
-                    .map_err(|_| EphemeralError::Invalid(format!("invalid duration {value:?}")))?,
-            )
-            .ok_or_else(|| EphemeralError::Invalid("duration is too large".to_string()))?;
+        return Err(EphemeralError::Invalid(format!(
+            "duration {value:?} must end in s, m, or h"
+        )));
     }
     if total == 0 {
         return Err(EphemeralError::Invalid(
@@ -487,16 +484,12 @@ fn now_epoch_secs() -> u64 {
         .as_secs()
 }
 
-fn timestamp_from_epoch(seconds: u64) -> String {
-    let days = seconds / 86_400;
-    let remaining = seconds % 86_400;
-    let (year, month, day) = crate::crd::days_to_date(days);
-    format!(
-        "{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}Z",
-        remaining / 3600,
-        (remaining % 3600) / 60,
-        remaining % 60
-    )
+fn timestamp_from_epoch(seconds: u64) -> Result<String, EphemeralError> {
+    let seconds = i64::try_from(seconds)
+        .map_err(|_| EphemeralError::Invalid("timestamp exceeds the supported range".into()))?;
+    jiff::Timestamp::from_second(seconds)
+        .map(|timestamp| timestamp.to_string())
+        .map_err(|error| EphemeralError::Invalid(format!("invalid timestamp: {error}")))
 }
 
 fn parse_timestamp(value: &str) -> Option<u64> {
@@ -593,7 +586,7 @@ async fn reconcile_access_request_apply(
         }
         status.resolved_access = Some(resolved.clone());
         status.last_error = None;
-        status.approval_expires_at = Some(timestamp_from_epoch(approval_deadline));
+        status.approval_expires_at = Some(timestamp_from_epoch(approval_deadline)?);
         status.phase = match mode {
             EphemeralApprovalMode::Automatic => EphemeralAccessRequestPhase::Applying,
             EphemeralApprovalMode::Required => EphemeralAccessRequestPhase::PendingApproval,
@@ -648,7 +641,11 @@ async fn reconcile_access_request_apply(
                 && request_has_scoped_activation_plan(&ctx.kube_client, request, &resolved, true)
                     .await?)
         {
-            apply_scoped_memberships(request, ctx, &resolved, ScopedPlanOperation::Revoke).await?;
+            status.retained_memberships =
+                apply_scoped_memberships(request, ctx, &resolved, ScopedPlanOperation::Revoke)
+                    .await?;
+            ctx.observability
+                .record_ephemeral_retained_memberships(status.retained_memberships.len());
             status.ended_at = Some(crate::crd::now_rfc3339());
         }
         transition_request(
@@ -685,8 +682,11 @@ async fn reconcile_access_request_apply(
                 && request_has_scoped_activation_plan(&ctx.kube_client, request, &resolved, true)
                     .await?
             {
-                apply_scoped_memberships(request, ctx, &resolved, ScopedPlanOperation::Revoke)
-                    .await?;
+                status.retained_memberships =
+                    apply_scoped_memberships(request, ctx, &resolved, ScopedPlanOperation::Revoke)
+                        .await?;
+                ctx.observability
+                    .record_ephemeral_retained_memberships(status.retained_memberships.len());
                 status.ended_at = Some(crate::crd::now_rfc3339());
             }
             transition_request(
@@ -812,7 +812,11 @@ async fn reconcile_access_request_apply(
                     } else {
                         EphemeralAccessRequestPhase::Cancelled
                     },
-                    "ExpiredBeforeActivation",
+                    if activation_started {
+                        "ExpiredDuringActivation"
+                    } else {
+                        "ExpiredBeforeActivation"
+                    },
                 )
                 .await?;
                 return Ok(Action::await_change());
@@ -908,8 +912,11 @@ fn persist_activation_deadline(
     }
     let now = now_epoch_secs();
     let duration = parse_duration(&resolved.granted_duration)?;
-    status.activated_at = Some(timestamp_from_epoch(now));
-    status.expires_at = Some(timestamp_from_epoch(now + duration.as_secs()));
+    let expiry = now.checked_add(duration.as_secs()).ok_or_else(|| {
+        EphemeralError::Invalid("access expiry exceeds the supported range".to_string())
+    })?;
+    status.activated_at = Some(timestamp_from_epoch(now)?);
+    status.expires_at = Some(timestamp_from_epoch(expiry)?);
     Ok(())
 }
 
@@ -1024,6 +1031,10 @@ async fn resolve_request(
         ));
     }
 
+    let target_database_fingerprint = ctx
+        .resolve_database_target_fingerprint(&namespace, &target.spec.connection)
+        .await
+        .map_err(Box::new)?;
     let memberships = policy
         .spec
         .memberships
@@ -1039,6 +1050,7 @@ async fn resolve_request(
         access_policy_generation: policy.metadata.generation.unwrap_or(0),
         target_policy_uid: target.uid().unwrap_or_default(),
         target_policy_generation: target.metadata.generation.unwrap_or(0),
+        target_database_fingerprint,
         granted_duration: format_duration(requested),
         bundle_encoding: EPHEMERAL_BUNDLE_ENCODING_V1.to_string(),
         bundle_hash: String::new(),
@@ -1224,18 +1236,22 @@ async fn reconcile_access_request_cleanup(
         }
         let activation_started =
             request_has_scoped_activation_plan(&ctx.kube_client, request, resolved, true).await?;
-        if activation_started {
-            apply_scoped_memberships(request, ctx, resolved, ScopedPlanOperation::Revoke).await?;
+        let retained = if activation_started {
+            apply_scoped_memberships(request, ctx, resolved, ScopedPlanOperation::Revoke).await?
         } else {
             tracing::warn!(
                 request = %request.name_any(),
                 request_uid = %request.uid().unwrap_or_default(),
                 "request cleanup skipped SQL because no request-owned activation plan exists"
             );
-        }
+            Vec::new()
+        };
+        ctx.observability
+            .record_ephemeral_retained_memberships(retained.len());
         let mut ended = status.clone();
         ended.phase = EphemeralAccessRequestPhase::Revoked;
         ended.ended_at = Some(crate::crd::now_rfc3339());
+        ended.retained_memberships = retained;
         // Deletion is the initial early-revocation API. This phase is emitted
         // to the durable audit stream but deliberately is not persisted to an
         // object whose finalizer is about to be removed.
@@ -1263,16 +1279,39 @@ pub async fn compose_effective_graph(
     desired: &mut pgroles_core::model::RoleGraph,
 ) -> Result<BTreeSet<String>, ReconcileError> {
     let namespace = policy.namespace().ok_or(ReconcileError::NoNamespace)?;
-    let policy_uid = policy.uid().unwrap_or_default();
     let requests: Api<EphemeralAccessRequest> =
         Api::namespaced(ctx.kube_client.clone(), &namespace);
-    let plans: Api<PostgresPolicyPlan> = Api::namespaced(ctx.kube_client.clone(), &namespace);
-    let scoped_plans = plans.list(&ListParams::default()).await?;
+    let requests = requests.list(&ListParams::default()).await?;
+    let scoped_plans = list_scoped_plans(&ctx.kube_client, &namespace, &policy.name_any()).await?;
+    let target_database_fingerprint = ctx
+        .resolve_database_target_fingerprint(&namespace, &policy.spec.connection)
+        .await
+        .map_err(Box::new)?;
+    compose_effective_graph_from_resources(
+        ctx,
+        policy,
+        desired,
+        &requests.items,
+        &scoped_plans,
+        &target_database_fingerprint,
+    )
+    .await
+}
+
+async fn compose_effective_graph_from_resources(
+    ctx: &OperatorContext,
+    policy: &PostgresPolicy,
+    desired: &mut pgroles_core::model::RoleGraph,
+    requests: &[EphemeralAccessRequest],
+    scoped_plans: &[PostgresPolicyPlan],
+    target_database_fingerprint: &str,
+) -> Result<BTreeSet<String>, ReconcileError> {
+    let policy_uid = policy.uid().unwrap_or_default();
     let mut additional_roles = BTreeSet::new();
     let mut overlays: BTreeMap<MembershipKey, pgroles_core::model::MembershipEdge> =
         BTreeMap::new();
 
-    for request in requests.list(&ListParams::default()).await? {
+    for request in requests {
         let Some(status) = request.status.as_ref() else {
             continue;
         };
@@ -1290,14 +1329,20 @@ pub async fn compose_effective_graph(
         // this exact bundle for this request UID. Require it for both Applying
         // and Active so a forged phase/snapshot can never enter the graph.
         if !scoped_plans
-            .items
             .iter()
-            .any(|plan| plan_authorizes_activation(plan, &request, resolved, true))
+            .any(|plan| plan_authorizes_activation(plan, request, resolved, true))
         {
             continue;
         }
         if resolved.target_policy_uid != policy_uid || !resolved.has_valid_bundle_hash() {
             continue;
+        }
+        if resolved.target_database_fingerprint != target_database_fingerprint {
+            return Err(ReconcileError::InvalidSpec(format!(
+                "active ephemeral request {} ({}) targets a different resolved database; restore the original target before reconciliation",
+                request.name_any(),
+                request.uid().unwrap_or_default(),
+            )));
         }
         for membership in &resolved.memberships {
             let missing_granted_role = !desired.roles.contains_key(&membership.role);
@@ -1312,7 +1357,7 @@ pub async fn compose_effective_graph(
                 ctx.observability.record_ephemeral_role_retirement_blocked();
                 set_role_retirement_blocked(
                     &ctx.kube_client,
-                    &request,
+                    request,
                     resolved,
                     membership,
                     relationship,
@@ -1364,6 +1409,19 @@ pub async fn compose_effective_graph(
     clear_role_retirement_blocked(&ctx.kube_client, policy).await?;
     desired.memberships.extend(overlays.into_values());
     Ok(additional_roles)
+}
+
+async fn list_scoped_plans(
+    client: &kube::Client,
+    namespace: &str,
+    target_policy_name: &str,
+) -> Result<Vec<PostgresPolicyPlan>, kube::Error> {
+    let plans: Api<PostgresPolicyPlan> = Api::namespaced(client.clone(), namespace);
+    let label_value = LabelValue::sanitize(target_policy_name).into_string();
+    Ok(plans
+        .list(&ListParams::default().labels(&format!("{LABEL_POLICY}={label_value}")))
+        .await?
+        .items)
 }
 
 async fn set_role_retirement_blocked(
@@ -1489,6 +1547,16 @@ async fn apply_scoped_memberships(
             "target policy UID no longer matches resolved access".to_string(),
         ));
     }
+    let target_database_fingerprint = ctx
+        .resolve_database_target_fingerprint(&namespace, &target.spec.connection)
+        .await
+        .map_err(Box::new)?;
+    if target_database_fingerprint != resolved.target_database_fingerprint {
+        return Err(EphemeralError::Invalid(
+            "target database changed after request resolution; restore the original host, port, and database before activation or revocation"
+                .to_string(),
+        ));
+    }
     let identity = DatabaseIdentity::from_connection(&namespace, &target.spec.connection);
     let pool = ctx
         .get_or_create_pool(&namespace, &target.spec.connection)
@@ -1519,12 +1587,21 @@ async fn apply_scoped_memberships(
         resolved,
         operation,
         &target,
-        &pool,
-        identity.as_str(),
+        ScopedDatabase {
+            pool: &pool,
+            lock_identity: identity.as_str(),
+            target_fingerprint: &target_database_fingerprint,
+        },
     )
     .await;
     advisory_lock.release().await;
     result
+}
+
+struct ScopedDatabase<'a> {
+    pool: &'a sqlx::PgPool,
+    lock_identity: &'a str,
+    target_fingerprint: &'a str,
 }
 
 async fn apply_scoped_memberships_under_lock(
@@ -1533,8 +1610,7 @@ async fn apply_scoped_memberships_under_lock(
     resolved: &ResolvedEphemeralAccess,
     operation: ScopedPlanOperation,
     target: &PostgresPolicy,
-    pool: &sqlx::PgPool,
-    database_identity: &str,
+    database: ScopedDatabase<'_>,
 ) -> Result<Vec<ResolvedEphemeralMembership>, EphemeralError> {
     let manifest = target.spec.to_policy_manifest();
     let expanded =
@@ -1543,7 +1619,23 @@ async fn apply_scoped_memberships_under_lock(
         pgroles_core::model::RoleGraph::from_expanded(&expanded, manifest.default_owner.as_deref())
             .map_err(ReconcileError::from)?;
     let durable_memberships = durable.memberships.clone();
-    let mut additional_roles = compose_effective_graph(ctx, target, &mut durable).await?;
+    let namespace = target.namespace().ok_or(ReconcileError::NoNamespace)?;
+    // Keep Kubernetes API calls bounded while the database locks are held:
+    // one request LIST and one server-side narrowed plan LIST feed every
+    // ownership and provenance check below.
+    let requests_api: Api<EphemeralAccessRequest> =
+        Api::namespaced(ctx.kube_client.clone(), &namespace);
+    let requests = requests_api.list(&ListParams::default()).await?;
+    let scoped_plans = list_scoped_plans(&ctx.kube_client, &namespace, &target.name_any()).await?;
+    let mut additional_roles = compose_effective_graph_from_resources(
+        ctx,
+        target,
+        &mut durable,
+        &requests.items,
+        &scoped_plans,
+        database.target_fingerprint,
+    )
+    .await?;
     for membership in &resolved.memberships {
         additional_roles.insert(membership.role.clone());
         additional_roles.insert(membership.member.clone());
@@ -1555,7 +1647,7 @@ async fn apply_scoped_memberships_under_lock(
     let inspect_config =
         pgroles_inspect::InspectConfig::from_expanded(&expanded, has_database_grants)
             .with_additional_roles(additional_roles);
-    let inspection = pgroles_inspect::inspect_with_diagnostics(pool, &inspect_config)
+    let inspection = pgroles_inspect::inspect_with_diagnostics(database.pool, &inspect_config)
         .await
         .map_err(ReconcileError::from)?;
     let current = inspection.graph;
@@ -1570,14 +1662,15 @@ async fn apply_scoped_memberships_under_lock(
         .iter()
         .map(|edge| (graph_membership_key(edge), edge))
         .collect();
-    let other_owners = active_owner_keys(
-        &ctx.kube_client,
+    let other_owners = active_owner_keys_from_resources(
         target,
+        &requests.items,
+        &scoped_plans,
         Some(request.uid().unwrap_or_default().as_str()),
-    )
-    .await?;
-    let request_has_activation_plan =
-        request_has_scoped_activation_plan(&ctx.kube_client, request, resolved, true).await?;
+    );
+    let request_has_activation_plan = scoped_plans
+        .iter()
+        .any(|plan| plan_authorizes_activation(plan, request, resolved, true));
 
     let mut changes = Vec::new();
     let mut retained = Vec::new();
@@ -1658,7 +1751,10 @@ async fn apply_scoped_memberships_under_lock(
         }
     }
 
-    let sql_context = crate::reconciler::detect_sql_context(pool, &inspect_config).await?;
+    let sql_context = crate::reconciler::detect_sql_context(database.pool, &inspect_config).await?;
+    if operation == ScopedPlanOperation::Activate {
+        validate_membership_semantics(&sql_context, &current, resolved)?;
+    }
     let plan = create_scoped_plan(
         request,
         ctx,
@@ -1666,7 +1762,7 @@ async fn apply_scoped_memberships_under_lock(
         resolved,
         operation,
         ScopedPlanExecution {
-            database_identity,
+            database_identity: database.lock_identity,
             changes: &changes,
             sql_context: &sql_context,
         },
@@ -1679,7 +1775,7 @@ async fn apply_scoped_memberships_under_lock(
     {
         return Ok(retained);
     }
-    match crate::plan::execute_changes_in_transaction(pool, &changes, &sql_context).await {
+    match crate::plan::execute_changes_in_transaction(database.pool, &changes, &sql_context).await {
         Ok(statements) => {
             finish_scoped_plan(ctx, &plan, PlanPhase::Applied, None).await?;
             tracing::info!(
@@ -1698,18 +1794,15 @@ async fn apply_scoped_memberships_under_lock(
     Ok(retained)
 }
 
-async fn active_owner_keys(
-    client: &kube::Client,
+fn active_owner_keys_from_resources(
     target: &PostgresPolicy,
+    requests: &[EphemeralAccessRequest],
+    scoped_plans: &[PostgresPolicyPlan],
     exclude_request_uid: Option<&str>,
-) -> Result<BTreeSet<MembershipKey>, kube::Error> {
-    let namespace = target.namespace().unwrap_or_else(|| "default".to_string());
+) -> BTreeSet<MembershipKey> {
     let target_uid = target.uid().unwrap_or_default();
-    let requests: Api<EphemeralAccessRequest> = Api::namespaced(client.clone(), &namespace);
-    let plans: Api<PostgresPolicyPlan> = Api::namespaced(client.clone(), &namespace);
-    let scoped_plans = plans.list(&ListParams::default()).await?;
     let mut keys = BTreeSet::new();
-    for request in requests.list(&ListParams::default()).await? {
+    for request in requests {
         if exclude_request_uid.is_some_and(|uid| request.uid().as_deref() == Some(uid)) {
             continue;
         }
@@ -1726,9 +1819,8 @@ async fn active_owner_keys(
             continue;
         };
         if !scoped_plans
-            .items
             .iter()
-            .any(|plan| plan_authorizes_activation(plan, &request, resolved, true))
+            .any(|plan| plan_authorizes_activation(plan, request, resolved, true))
         {
             continue;
         }
@@ -1736,7 +1828,35 @@ async fn active_owner_keys(
             keys.extend(resolved.memberships.iter().map(membership_key));
         }
     }
-    Ok(keys)
+    keys
+}
+
+fn validate_membership_semantics(
+    sql_context: &pgroles_core::sql::SqlContext,
+    current: &pgroles_core::model::RoleGraph,
+    resolved: &ResolvedEphemeralAccess,
+) -> Result<(), EphemeralError> {
+    if sql_context.supports_grant_with_options() {
+        return Ok(());
+    }
+    for membership in &resolved.memberships {
+        let subject = current.roles.get(&membership.member).ok_or_else(|| {
+            EphemeralError::Invalid(format!(
+                "subject role {} is not present in PostgreSQL",
+                membership.member
+            ))
+        })?;
+        if subject.inherit != membership.inherit {
+            return Err(EphemeralError::Invalid(format!(
+                "PostgreSQL {} cannot encode per-membership INHERIT {}; subject role {} has global INHERIT {}",
+                sql_context.pg_major_version,
+                membership.inherit,
+                membership.member,
+                subject.inherit,
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn plan_authorizes_activation(
@@ -1863,6 +1983,10 @@ async fn create_scoped_plan(
     );
     plan.metadata.namespace = Some(namespace.clone());
     plan.metadata.owner_references = request.controller_owner_ref(&()).map(|owner| vec![owner]);
+    plan.metadata.labels = Some(BTreeMap::from([(
+        LABEL_POLICY.to_string(),
+        LabelValue::sanitize(&target.name_any()).into_string(),
+    )]));
     let initial_status = PostgresPolicyPlanStatus {
         phase: PlanPhase::Applying,
         conditions: vec![PolicyCondition {
@@ -2011,6 +2135,7 @@ mod tests {
         assert!(parse_duration("5d").is_err());
         assert!(parse_duration("").is_err());
         assert!(parse_duration("18446744073709551615h").is_err());
+        assert!(parse_duration("30").is_err());
     }
 
     #[test]
@@ -2039,8 +2164,73 @@ mod tests {
 
     #[test]
     fn timestamp_round_trips_epoch_seconds() {
-        let timestamp = timestamp_from_epoch(1_735_689_845);
+        let timestamp = timestamp_from_epoch(1_735_689_845).expect("valid timestamp");
         assert_eq!(parse_timestamp(&timestamp), Some(1_735_689_845));
+    }
+
+    fn membership_semantics_fixture(inherit: bool) -> ResolvedEphemeralAccess {
+        ResolvedEphemeralAccess {
+            access_policy_uid: "access-uid".into(),
+            access_policy_generation: 1,
+            target_policy_uid: "target-uid".into(),
+            target_policy_generation: 1,
+            target_database_fingerprint: "sha256:database".into(),
+            granted_duration: "30s".into(),
+            bundle_encoding: crate::crd::EPHEMERAL_BUNDLE_ENCODING_V1.into(),
+            bundle_hash: String::new(),
+            memberships: vec![ResolvedEphemeralMembership {
+                role: "editor".into(),
+                member: "alice".into(),
+                inherit,
+            }],
+        }
+    }
+
+    #[test]
+    fn postgres_15_rejects_unrepresentable_membership_inherit() {
+        let mut current = pgroles_core::model::RoleGraph::default();
+        current.roles.insert(
+            "alice".into(),
+            pgroles_core::model::RoleState {
+                inherit: true,
+                ..Default::default()
+            },
+        );
+        let resolved = membership_semantics_fixture(false);
+        let context = pgroles_core::sql::SqlContext::from_version_num(150_000);
+
+        let error = validate_membership_semantics(&context, &current, &resolved)
+            .expect_err("PG15 cannot represent per-membership NOINHERIT");
+        assert!(error.to_string().contains("global INHERIT true"));
+    }
+
+    #[test]
+    fn postgres_15_accepts_matching_global_inherit_and_pg16_accepts_either() {
+        let mut current = pgroles_core::model::RoleGraph::default();
+        current.roles.insert(
+            "alice".into(),
+            pgroles_core::model::RoleState {
+                inherit: false,
+                ..Default::default()
+            },
+        );
+        let noinherit = membership_semantics_fixture(false);
+        assert!(
+            validate_membership_semantics(
+                &pgroles_core::sql::SqlContext::from_version_num(150_000),
+                &current,
+                &noinherit,
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_membership_semantics(
+                &pgroles_core::sql::SqlContext::from_version_num(160_000),
+                &current,
+                &membership_semantics_fixture(true),
+            )
+            .is_ok()
+        );
     }
 
     #[test]
@@ -2092,6 +2282,7 @@ mod tests {
             access_policy_generation: 1,
             target_policy_uid: "target-uid".into(),
             target_policy_generation: 1,
+            target_database_fingerprint: "sha256:database".into(),
             granted_duration: "1800s".into(),
             bundle_encoding: crate::crd::EPHEMERAL_BUNDLE_ENCODING_V1.into(),
             bundle_hash: "sha256:bundle".into(),
