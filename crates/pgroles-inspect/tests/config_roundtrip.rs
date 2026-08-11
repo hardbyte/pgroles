@@ -14,8 +14,8 @@ use sqlx::{Executor, PgPool};
 use pgroles_core::diff::{Change, diff};
 use pgroles_core::manifest::{expand_manifest, parse_manifest};
 use pgroles_core::model::RoleGraph;
-use pgroles_core::sql::render_statements;
-use pgroles_inspect::{InspectConfig, inspect};
+use pgroles_core::sql::{SqlContext, render_statements_with_context};
+use pgroles_inspect::{InspectConfig, detect_pg_version, inspect};
 
 fn database_url() -> String {
     std::env::var("DATABASE_URL").expect("DATABASE_URL must be set for live DB tests")
@@ -139,12 +139,19 @@ memberships:
         let pool = PgPool::connect(&database_url())
             .await
             .expect("failed to connect to live test database");
+        let version = detect_pg_version(&pool)
+            .await
+            .expect("failed to detect PostgreSQL version");
+        let sql_context = SqlContext::from_version_num(version.version_num);
 
         // Fresh state: plan creates everything, including config alters.
         let current = inspect(&pool, &config).await.expect("inspect failed");
         let changes = diff(&current, &desired);
         assert!(!changes.is_empty(), "fresh plan should not be empty");
-        let statements: Vec<String> = changes.iter().flat_map(render_statements).collect();
+        let statements: Vec<String> = changes
+            .iter()
+            .flat_map(|change| render_statements_with_context(change, &sql_context))
+            .collect();
         assert!(
             statements
                 .iter()
@@ -188,7 +195,10 @@ memberships:
 
         let current = inspect(&pool, &config).await.expect("inspect failed");
         let changes = diff(&current, &desired);
-        let statements: Vec<String> = changes.iter().flat_map(render_statements).collect();
+        let statements: Vec<String> = changes
+            .iter()
+            .flat_map(|change| render_statements_with_context(change, &sql_context))
+            .collect();
         assert!(
             statements
                 .iter()
@@ -263,6 +273,10 @@ profiles:
         let pool = PgPool::connect(&database_url())
             .await
             .expect("failed to connect to live test database");
+        let version = detect_pg_version(&pool)
+            .await
+            .expect("failed to detect PostgreSQL version");
+        let sql_context = SqlContext::from_version_num(version.version_num);
 
         // Fresh state: plan creates the schema, the role, and its config.
         let current = inspect(&pool, &config).await.expect("inspect failed");
@@ -274,7 +288,10 @@ profiles:
                 .any(|c| matches!(c, Change::CreateSchema { name, .. } if name == &schema)),
             "expected a CreateSchema change, got: {changes:?}"
         );
-        let statements: Vec<String> = changes.iter().flat_map(render_statements).collect();
+        let statements: Vec<String> = changes
+            .iter()
+            .flat_map(|change| render_statements_with_context(change, &sql_context))
+            .collect();
         assert!(
             statements
                 .iter()
