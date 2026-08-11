@@ -1082,7 +1082,36 @@ jobs:
             deployment/kyverno-cleanup-controller \
             deployment/kyverno-reports-controller \
             --timeout=240s
-          kubectl apply -f k8s/security/ephemeral-access-kyverno.yaml
+          # A Deployment can become Available just before the admission
+          # process starts serving its policy webhooks. Applying the policy is
+          # the end-to-end readiness probe, so retry only transient webhook
+          # startup failures and fail immediately for a malformed policy.
+          policy_apply_log="$(mktemp)"
+          trap 'rm -f "$policy_apply_log"' EXIT
+          policy_applied=false
+          for attempt in $(seq 1 30); do
+            if kubectl apply -f k8s/security/ephemeral-access-kyverno.yaml \
+              >"$policy_apply_log" 2>&1; then
+              cat "$policy_apply_log"
+              policy_applied=true
+              break
+            fi
+            cat "$policy_apply_log"
+            if ! grep -Eq \
+              'failed calling webhook|no endpoints available|connection refused|context deadline exceeded' \
+              "$policy_apply_log"; then
+              exit 1
+            fi
+            if [ "$attempt" -eq 30 ]; then
+              break
+            fi
+            echo "Kyverno admission webhook is not serving yet (attempt $attempt/30)"
+            sleep 2
+          done
+          if [ "$policy_applied" != true ]; then
+            echo "::error::Kyverno admission webhook did not become ready"
+            exit 1
+          fi
           kubectl wait --for=jsonpath='{.status.conditionStatus.ready}'=true \
             validatingpolicy/pgroles-ephemeral-access-decision-integrity \
             --timeout=120s
