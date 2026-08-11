@@ -1,0 +1,99 @@
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: ephemeral-requester
+  namespace: default
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: ephemeral-approver
+  namespace: default
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: ephemeral-status-writer
+  namespace: default
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: ephemeral-untrusted-requester
+  namespace: default
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: pgroles-ephemeral-status-writer-e2e
+rules:
+  - apiGroups: [pgroles.io]
+    resources: [ephemeralaccessrequests, ephemeralaccessrequests/status]
+    verbs: [get, list, watch, patch, update]
+  - apiGroups: [pgroles.io]
+    resources: [ephemeralaccesspolicies]
+    verbs: [get]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: pgroles-ephemeral-untrusted-requester-e2e
+rules:
+  - apiGroups: [pgroles.io]
+    resources: [ephemeralaccessrequests]
+    verbs: [get, create, delete]
+  - apiGroups: [pgroles.io]
+    resources: [ephemeralaccesspolicies]
+    verbs: [get]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: pgroles-ephemeral-requester-e2e
+subjects:
+  - kind: ServiceAccount
+    name: ephemeral-requester
+    namespace: default
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: pgroles-ephemeral-access-requester
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: pgroles-ephemeral-approver-e2e
+subjects:
+  - kind: ServiceAccount
+    name: ephemeral-approver
+    namespace: default
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: pgroles-ephemeral-access-approver
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: pgroles-ephemeral-status-writer-e2e
+subjects:
+  - kind: ServiceAccount
+    name: ephemeral-status-writer
+    namespace: default
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: pgroles-ephemeral-status-writer-e2e
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: pgroles-ephemeral-untrusted-requester-e2e
+subjects:
+  - kind: ServiceAccount
+    name: ephemeral-untrusted-requester
+    namespace: default
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: pgroles-ephemeral-untrusted-requester-e2e

@@ -1032,3 +1032,60 @@ jobs:
       - name: Cleanup
         if: always()
         run: kind delete cluster --name pgroles-e2e-plans
+
+  # ---------------------------------------------------------------------------
+  # Job 7: Ephemeral access — lifecycle plus secure Kyverno admission boundary
+  # ---------------------------------------------------------------------------
+  e2e-ephemeral-access:
+    name: Ephemeral Access E2E (${{ matrix.secure == 'true' && 'Kyverno' || 'trusted-writer' }})
+    needs: stack-gate
+    if: needs.stack-gate.outputs.run_heavy == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - secure: "false"
+            cluster: pgroles-e2e-ephemeral-trusted
+          - secure: "true"
+            cluster: pgroles-e2e-ephemeral-secure
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: ./.github/actions/setup-e2e
+        with:
+          cluster-name: ${{ matrix.cluster }}
+
+      - name: Install ephemeral access test identities
+        run: |
+          kubectl apply -f k8s/security/ephemeral-access-rbac.yaml
+          kubectl apply -f k8s/security/ephemeral-access-e2e-rbac.yaml
+
+      - name: Install Kyverno secure admission boundary
+        if: matrix.secure == 'true'
+        run: |
+          curl -fsSL -o /tmp/kyverno-install.yaml \
+            https://github.com/kyverno/kyverno/releases/download/v1.18.2/install.yaml
+          echo "3dcd43eaf11f0719084217148cd0c82a8fa49faa9b1a783ea5bea2cf84041bda  /tmp/kyverno-install.yaml" \
+            | sha256sum -c -
+          kubectl create -f /tmp/kyverno-install.yaml
+          kubectl -n kyverno wait --for=condition=Available deployment --all --timeout=240s
+          kubectl apply -f k8s/security/ephemeral-access-kyverno.yaml
+          kubectl get validatingpolicies.policies.kyverno.io
+          sleep 10
+
+      - name: Run ephemeral access lifecycle E2E
+        run: scripts/e2e-ephemeral-access.sh "${{ matrix.secure }}"
+
+      - name: Diagnostics
+        if: failure()
+        run: |
+          kubectl get pgr,pgeap,pgear,pgplan -A -o wide || true
+          kubectl -n pgroles-system logs deployment/pgroles-operator --tail=500 || true
+          kubectl -n pgroles-system logs deployment/otel-collector --tail=500 || true
+          kubectl -n kyverno logs deployment/kyverno-admission-controller --tail=300 || true
+
+      - name: Cleanup
+        if: always()
+        run: kind delete cluster --name "${{ matrix.cluster }}"

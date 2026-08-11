@@ -22,6 +22,18 @@ rules:
   - apiGroups: ["pgroles.io"]
     resources: ["postgrespolicyplans/status"]
     verbs: ["get", "patch", "update"]
+  # Reconcile ephemeral access definitions and runtime requests. Approval is
+  # intentionally absent: secure deployments authorize decision-condition
+  # mutations through admission policy, not this controller role.
+  - apiGroups: ["pgroles.io"]
+    resources: ["ephemeralaccesspolicies", "ephemeralaccessrequests"]
+    verbs: ["get", "list", "watch", "patch", "update", "delete"]
+  - apiGroups: ["pgroles.io"]
+    resources: ["ephemeralaccesspolicies/status", "ephemeralaccessrequests/status"]
+    verbs: ["get", "patch", "update"]
+  - apiGroups: ["pgroles.io"]
+    resources: ["ephemeralaccesspolicies/finalizers", "ephemeralaccessrequests/finalizers"]
+    verbs: ["update"]
   # Read Secrets for database connection strings and password references;
   # create/update Secrets for operator-generated passwords.
   - apiGroups: [""]

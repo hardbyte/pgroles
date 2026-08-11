@@ -82,6 +82,27 @@
                     "description": "Database identity string for disambiguation in multi-db setups.",
                     "type": "string"
                   },
+                  "origin": {
+                    "description": "Origin of this plan. Omitted for ordinary durable reconciliation plans.",
+                    "nullable": true,
+                    "properties": {
+                      "kind": {
+                        "type": "string"
+                      },
+                      "name": {
+                        "type": "string"
+                      },
+                      "uid": {
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "kind",
+                      "name",
+                      "uid"
+                    ],
+                    "type": "object"
+                  },
                   "ownedRoles": {
                     "default": [],
                     "description": "Roles that this plan covers.",
@@ -123,6 +144,31 @@
                       "adopt"
                     ],
                     "type": "string"
+                  },
+                  "scope": {
+                    "description": "Narrow execution scope for a non-durable plan.",
+                    "nullable": true,
+                    "properties": {
+                      "bundleHash": {
+                        "type": "string"
+                      },
+                      "kind": {
+                        "type": "string"
+                      },
+                      "operation": {
+                        "enum": [
+                          "Activate",
+                          "Revoke"
+                        ],
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "bundleHash",
+                      "kind",
+                      "operation"
+                    ],
+                    "type": "object"
                   }
                 },
                 "required": [

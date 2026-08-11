@@ -14,6 +14,7 @@ use opentelemetry::KeyValue;
 use opentelemetry::metrics::{Counter, Histogram, Meter, MeterProvider, UpDownCounter};
 use opentelemetry_otlp::{MetricExporter, Protocol, WithExportConfig};
 use opentelemetry_sdk::Resource;
+use opentelemetry_sdk::logs::SdkLoggerProvider;
 use opentelemetry_sdk::metrics::{PeriodicReader, SdkMeterProvider};
 use tokio::net::TcpListener;
 
@@ -23,6 +24,7 @@ const SERVICE_NAME: &str = "pgroles-operator";
 pub struct OperatorObservability {
     ready: Arc<AtomicBool>,
     metrics: Option<Arc<Metrics>>,
+    logger_provider: Option<SdkLoggerProvider>,
 }
 
 struct Metrics {
@@ -54,7 +56,13 @@ impl OperatorObservability {
         Ok(Self {
             ready: Arc::new(AtomicBool::new(false)),
             metrics: init_metrics_from_env()?,
+            logger_provider: None,
         })
+    }
+
+    pub fn with_logger_provider(mut self, provider: Option<SdkLoggerProvider>) -> Self {
+        self.logger_provider = provider;
+        self
     }
 
     pub fn mark_ready(&self) {
@@ -200,6 +208,9 @@ impl OperatorObservability {
         if let Some(metrics) = &self.metrics {
             metrics.provider.shutdown()?;
         }
+        if let Some(provider) = &self.logger_provider {
+            provider.shutdown()?;
+        }
         Ok(())
     }
 }
@@ -268,6 +279,38 @@ fn init_metrics_from_env() -> anyhow::Result<Option<Arc<Metrics>>> {
 
     let meter = provider.meter(SERVICE_NAME);
     Ok(Some(Arc::new(Metrics::new(provider, meter))))
+}
+
+/// Build the OTLP log provider before the global tracing subscriber is
+/// installed. The caller attaches an `OpenTelemetryTracingBridge` layer and
+/// stores the provider in `OperatorObservability` for graceful shutdown.
+pub fn init_log_provider_from_env() -> anyhow::Result<Option<SdkLoggerProvider>> {
+    let logs_exporter = std::env::var("OTEL_LOGS_EXPORTER").ok();
+    if matches!(logs_exporter.as_deref(), Some("none")) {
+        return Ok(None);
+    }
+    let endpoint_configured = std::env::var_os("OTEL_EXPORTER_OTLP_ENDPOINT").is_some()
+        || std::env::var_os("OTEL_EXPORTER_OTLP_LOGS_ENDPOINT").is_some();
+    if !endpoint_configured && !matches!(logs_exporter.as_deref(), Some("otlp")) {
+        return Ok(None);
+    }
+
+    let exporter = opentelemetry_otlp::LogExporter::builder()
+        .with_tonic()
+        .with_protocol(Protocol::Grpc)
+        .build()?;
+    let provider = SdkLoggerProvider::builder()
+        .with_resource(
+            Resource::builder_empty()
+                .with_attributes([
+                    KeyValue::new("service.name", SERVICE_NAME),
+                    KeyValue::new("service.version", env!("CARGO_PKG_VERSION")),
+                ])
+                .build(),
+        )
+        .with_batch_exporter(exporter)
+        .build();
+    Ok(Some(provider))
 }
 
 fn otel_metrics_enabled() -> bool {
@@ -394,6 +437,7 @@ mod tests {
         let observability = OperatorObservability {
             ready: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             metrics: Some(Arc::new(Metrics::new(provider.clone(), meter))),
+            logger_provider: None,
         };
 
         (observability, provider, exporter)

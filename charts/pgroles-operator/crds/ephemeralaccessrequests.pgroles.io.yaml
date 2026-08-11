@@ -1,0 +1,297 @@
+{
+  "apiVersion": "apiextensions.k8s.io/v1",
+  "kind": "CustomResourceDefinition",
+  "metadata": {
+    "name": "ephemeralaccessrequests.pgroles.io"
+  },
+  "spec": {
+    "group": "pgroles.io",
+    "names": {
+      "categories": [
+        "pgroles"
+      ],
+      "kind": "EphemeralAccessRequest",
+      "plural": "ephemeralaccessrequests",
+      "shortNames": [
+        "pgear"
+      ],
+      "singular": "ephemeralaccessrequest"
+    },
+    "scope": "Namespaced",
+    "versions": [
+      {
+        "additionalPrinterColumns": [
+          {
+            "jsonPath": ".spec.accessPolicyRef.name",
+            "name": "Access Policy",
+            "type": "string"
+          },
+          {
+            "jsonPath": ".spec.subject.role",
+            "name": "Subject",
+            "type": "string"
+          },
+          {
+            "jsonPath": ".status.phase",
+            "name": "Phase",
+            "type": "string"
+          },
+          {
+            "jsonPath": ".status.expiresAt",
+            "name": "Expires",
+            "type": "date"
+          },
+          {
+            "jsonPath": ".metadata.creationTimestamp",
+            "name": "Age",
+            "type": "date"
+          }
+        ],
+        "name": "v1alpha1",
+        "schema": {
+          "openAPIV3Schema": {
+            "description": "Auto-generated derived type for EphemeralAccessRequestSpec via `CustomResource`",
+            "properties": {
+              "spec": {
+                "description": "One immutable runtime request for a bounded access bundle.",
+                "properties": {
+                  "accessPolicyRef": {
+                    "properties": {
+                      "name": {
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "name"
+                    ],
+                    "type": "object"
+                  },
+                  "justification": {
+                    "nullable": true,
+                    "type": "string"
+                  },
+                  "requestedDuration": {
+                    "nullable": true,
+                    "type": "string"
+                  },
+                  "subject": {
+                    "properties": {
+                      "role": {
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "role"
+                    ],
+                    "type": "object"
+                  }
+                },
+                "required": [
+                  "accessPolicyRef",
+                  "subject"
+                ],
+                "type": "object",
+                "x-kubernetes-validations": [
+                  {
+                    "message": "request spec is immutable",
+                    "rule": "self == oldSelf"
+                  }
+                ]
+              },
+              "status": {
+                "nullable": true,
+                "properties": {
+                  "activatedAt": {
+                    "nullable": true,
+                    "type": "string"
+                  },
+                  "approvalExpiresAt": {
+                    "nullable": true,
+                    "type": "string"
+                  },
+                  "conditions": {
+                    "default": [],
+                    "items": {
+                      "properties": {
+                        "bundleHash": {
+                          "nullable": true,
+                          "type": "string"
+                        },
+                        "grantedDuration": {
+                          "nullable": true,
+                          "type": "string"
+                        },
+                        "lastTransitionTime": {
+                          "nullable": true,
+                          "type": "string"
+                        },
+                        "message": {
+                          "nullable": true,
+                          "type": "string"
+                        },
+                        "reason": {
+                          "nullable": true,
+                          "type": "string"
+                        },
+                        "status": {
+                          "type": "string"
+                        },
+                        "type": {
+                          "type": "string"
+                        }
+                      },
+                      "required": [
+                        "status",
+                        "type"
+                      ],
+                      "type": "object"
+                    },
+                    "type": "array"
+                  },
+                  "endedAt": {
+                    "nullable": true,
+                    "type": "string"
+                  },
+                  "expiresAt": {
+                    "nullable": true,
+                    "type": "string"
+                  },
+                  "lastError": {
+                    "nullable": true,
+                    "type": "string"
+                  },
+                  "phase": {
+                    "default": "Pending",
+                    "enum": [
+                      "Pending",
+                      "PendingApproval",
+                      "Applying",
+                      "Active",
+                      "Revoking",
+                      "Ended",
+                      "Revoked",
+                      "Cancelled",
+                      "Denied",
+                      "ApprovalExpired",
+                      "Failed"
+                    ],
+                    "type": "string"
+                  },
+                  "resolvedAccess": {
+                    "nullable": true,
+                    "properties": {
+                      "accessPolicyGeneration": {
+                        "format": "int64",
+                        "type": "integer"
+                      },
+                      "accessPolicyUid": {
+                        "type": "string"
+                      },
+                      "bundleEncoding": {
+                        "type": "string"
+                      },
+                      "bundleHash": {
+                        "type": "string"
+                      },
+                      "grantedDuration": {
+                        "type": "string"
+                      },
+                      "memberships": {
+                        "items": {
+                          "properties": {
+                            "inherit": {
+                              "type": "boolean"
+                            },
+                            "member": {
+                              "type": "string"
+                            },
+                            "role": {
+                              "type": "string"
+                            }
+                          },
+                          "required": [
+                            "inherit",
+                            "member",
+                            "role"
+                          ],
+                          "type": "object"
+                        },
+                        "type": "array"
+                      },
+                      "targetPolicyGeneration": {
+                        "format": "int64",
+                        "type": "integer"
+                      },
+                      "targetPolicyUid": {
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "accessPolicyGeneration",
+                      "accessPolicyUid",
+                      "bundleEncoding",
+                      "bundleHash",
+                      "grantedDuration",
+                      "memberships",
+                      "targetPolicyGeneration",
+                      "targetPolicyUid"
+                    ],
+                    "type": "object"
+                  },
+                  "retainedMemberships": {
+                    "default": [],
+                    "items": {
+                      "properties": {
+                        "inherit": {
+                          "type": "boolean"
+                        },
+                        "member": {
+                          "type": "string"
+                        },
+                        "role": {
+                          "type": "string"
+                        }
+                      },
+                      "required": [
+                        "inherit",
+                        "member",
+                        "role"
+                      ],
+                      "type": "object"
+                    },
+                    "type": "array"
+                  }
+                },
+                "type": "object",
+                "x-kubernetes-validations": [
+                  {
+                    "message": "resolvedAccess is write-once",
+                    "rule": "!has(oldSelf.resolvedAccess) || (has(self.resolvedAccess) && self.resolvedAccess == oldSelf.resolvedAccess)"
+                  },
+                  {
+                    "message": "Approved=True and Denied=True are mutually exclusive",
+                    "rule": "!(self.conditions.exists(c, c.type == 'Approved' && c.status == 'True') && self.conditions.exists(c, c.type == 'Denied' && c.status == 'True'))"
+                  },
+                  {
+                    "message": "approval decisions are terminal",
+                    "rule": "oldSelf.conditions.filter(c, (c.type == 'Approved' || c.type == 'Denied') && c.status == 'True').size() == 0 || self.conditions.filter(c, (c.type == 'Approved' || c.type == 'Denied') && c.status == 'True') == oldSelf.conditions.filter(c, (c.type == 'Approved' || c.type == 'Denied') && c.status == 'True')"
+                  }
+                ]
+              }
+            },
+            "required": [
+              "spec"
+            ],
+            "title": "EphemeralAccessRequest",
+            "type": "object"
+          }
+        },
+        "served": true,
+        "storage": true,
+        "subresources": {
+          "status": {}
+        }
+      }
+    ]
+  }
+}

@@ -29,6 +29,8 @@ runs:
       run: |
         kubectl apply -f k8s/crd.yaml
         kubectl apply -f k8s/postgrespolicyplan-crd.yaml
+        kubectl apply -f k8s/ephemeralaccesspolicy-crd.yaml
+        kubectl apply -f k8s/ephemeralaccessrequest-crd.yaml
 
     - name: Deploy dev PostgreSQL
       shell: bash

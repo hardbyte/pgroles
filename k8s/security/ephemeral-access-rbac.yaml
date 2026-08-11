@@ -1,0 +1,26 @@
+# Bind these logical verbs to deployment-specific requester and approver
+# identities. They are consumed by the recommended Kyverno ValidatingPolicies;
+# the Kubernetes API does not invoke them for ordinary CRD operations.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: pgroles-ephemeral-access-requester
+rules:
+  - apiGroups: [pgroles.io]
+    resources: [ephemeralaccesspolicies]
+    verbs: [get, list, use]
+  - apiGroups: [pgroles.io]
+    resources: [ephemeralaccessrequests]
+    verbs: [get, list, watch, create, delete]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: pgroles-ephemeral-access-approver
+rules:
+  - apiGroups: [pgroles.io]
+    resources: [ephemeralaccesspolicies]
+    verbs: [get, list, approve]
+  - apiGroups: [pgroles.io]
+    resources: [ephemeralaccessrequests, ephemeralaccessrequests/status]
+    verbs: [get, list, watch, patch, update]

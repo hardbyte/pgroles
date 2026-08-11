@@ -1,0 +1,214 @@
+{
+  "apiVersion": "apiextensions.k8s.io/v1",
+  "kind": "CustomResourceDefinition",
+  "metadata": {
+    "name": "ephemeralaccesspolicies.pgroles.io"
+  },
+  "spec": {
+    "group": "pgroles.io",
+    "names": {
+      "categories": [
+        "pgroles"
+      ],
+      "kind": "EphemeralAccessPolicy",
+      "plural": "ephemeralaccesspolicies",
+      "shortNames": [
+        "pgeap"
+      ],
+      "singular": "ephemeralaccesspolicy"
+    },
+    "scope": "Namespaced",
+    "versions": [
+      {
+        "additionalPrinterColumns": [
+          {
+            "jsonPath": ".spec.postgresPolicyRef.name",
+            "name": "Target",
+            "type": "string"
+          },
+          {
+            "jsonPath": ".status.conditions[?(@.type==\"Accepted\")].status",
+            "name": "Accepted",
+            "type": "string"
+          },
+          {
+            "jsonPath": ".spec.suspend",
+            "name": "Suspended",
+            "type": "boolean"
+          },
+          {
+            "jsonPath": ".metadata.creationTimestamp",
+            "name": "Age",
+            "type": "date"
+          }
+        ],
+        "name": "v1alpha1",
+        "schema": {
+          "openAPIV3Schema": {
+            "description": "Auto-generated derived type for EphemeralAccessPolicySpec via `CustomResource`",
+            "properties": {
+              "spec": {
+                "description": "A GitOps-managed bundle of PostgreSQL memberships that may be requested.",
+                "properties": {
+                  "approval": {
+                    "properties": {
+                      "mode": {
+                        "enum": [
+                          "Automatic",
+                          "Required"
+                        ],
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "mode"
+                    ],
+                    "type": "object"
+                  },
+                  "defaultDuration": {
+                    "nullable": true,
+                    "type": "string"
+                  },
+                  "description": {
+                    "nullable": true,
+                    "type": "string"
+                  },
+                  "displayName": {
+                    "nullable": true,
+                    "type": "string"
+                  },
+                  "justification": {
+                    "properties": {
+                      "required": {
+                        "type": "boolean"
+                      }
+                    },
+                    "required": [
+                      "required"
+                    ],
+                    "type": "object"
+                  },
+                  "maximumDuration": {
+                    "type": "string"
+                  },
+                  "memberships": {
+                    "items": {
+                      "properties": {
+                        "inherit": {
+                          "type": "boolean"
+                        },
+                        "role": {
+                          "type": "string"
+                        }
+                      },
+                      "required": [
+                        "inherit",
+                        "role"
+                      ],
+                      "type": "object"
+                    },
+                    "type": "array"
+                  },
+                  "pendingRequestTTL": {
+                    "default": "15m",
+                    "type": "string"
+                  },
+                  "postgresPolicyRef": {
+                    "properties": {
+                      "name": {
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "name"
+                    ],
+                    "type": "object"
+                  },
+                  "suspend": {
+                    "default": false,
+                    "type": "boolean"
+                  }
+                },
+                "required": [
+                  "approval",
+                  "justification",
+                  "maximumDuration",
+                  "memberships",
+                  "postgresPolicyRef"
+                ],
+                "type": "object"
+              },
+              "status": {
+                "nullable": true,
+                "properties": {
+                  "conditions": {
+                    "default": [],
+                    "items": {
+                      "properties": {
+                        "bundleHash": {
+                          "nullable": true,
+                          "type": "string"
+                        },
+                        "grantedDuration": {
+                          "nullable": true,
+                          "type": "string"
+                        },
+                        "lastTransitionTime": {
+                          "nullable": true,
+                          "type": "string"
+                        },
+                        "message": {
+                          "nullable": true,
+                          "type": "string"
+                        },
+                        "reason": {
+                          "nullable": true,
+                          "type": "string"
+                        },
+                        "status": {
+                          "type": "string"
+                        },
+                        "type": {
+                          "type": "string"
+                        }
+                      },
+                      "required": [
+                        "status",
+                        "type"
+                      ],
+                      "type": "object"
+                    },
+                    "type": "array"
+                  },
+                  "observedGeneration": {
+                    "format": "int64",
+                    "nullable": true,
+                    "type": "integer"
+                  },
+                  "resolvedRoles": {
+                    "default": [],
+                    "items": {
+                      "type": "string"
+                    },
+                    "type": "array"
+                  }
+                },
+                "type": "object"
+              }
+            },
+            "required": [
+              "spec"
+            ],
+            "title": "EphemeralAccessPolicy",
+            "type": "object"
+          }
+        },
+        "served": true,
+        "storage": true,
+        "subresources": {
+          "status": {}
+        }
+      }
+    ]
+  }
+}

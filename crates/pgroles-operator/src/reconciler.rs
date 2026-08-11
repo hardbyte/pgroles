@@ -124,6 +124,9 @@ pub enum ReconcileError {
     #[error("resource has no namespace")]
     NoNamespace,
 
+    #[error("waiting for {0} attached ephemeral access policy/policies to be deleted")]
+    PendingEphemeralAccessCleanup(usize),
+
     #[error("invalid interval \"{0}\": {1}")]
     InvalidInterval(String, String),
 
@@ -366,6 +369,7 @@ fn retry_class_for_reconcile_error(error: &ReconcileError) -> RetryClass {
         | ReconcileError::EmptyPasswordSecret { .. }
         | ReconcileError::NoNamespace
         | ReconcileError::PlanSqlStorage(_) => RetryClass::Slow,
+        ReconcileError::PendingEphemeralAccessCleanup(_) => RetryClass::Transient,
         ReconcileError::PasswordGeneration(err) => {
             if err.is_transient() {
                 RetryClass::Transient
@@ -918,6 +922,18 @@ async fn apply_under_lock(
         }
     }
 
+    // Ephemeral overlays are deliberately resolved only after both database
+    // locks are held. Resolving them before lock acquisition would allow an
+    // activation or expiry transition to change membership ownership while an
+    // ordinary reconcile waits for the lock.
+    let mut effective_desired = desired.clone();
+    let ephemeral_roles = crate::ephemeral::compose_effective_graph(
+        &ctx.kube_client,
+        resource,
+        &mut effective_desired,
+    )
+    .await?;
+
     // 6. Inspect current state from the database.
     let has_database_grants = expanded
         .grants
@@ -930,7 +946,8 @@ async fn apply_under_lock(
                     .retirements
                     .iter()
                     .map(|retirement| retirement.role.clone()),
-            );
+            )
+            .with_additional_roles(ephemeral_roles);
     let inspection = pgroles_inspect::inspect_with_diagnostics(pool, &inspect_config).await?;
     ctx.observability.record_inspection(&inspection.stats);
     // Unsatisfiable wildcard grants mean the desired state cannot be reliably
@@ -964,7 +981,7 @@ async fn apply_under_lock(
     tracing::info!(%reconciliation_mode, "reconciliation mode");
     let mut changes = pgroles_core::diff::filter_changes(
         pgroles_core::diff::apply_role_retirements(
-            pgroles_core::diff::diff(&current, desired),
+            pgroles_core::diff::diff(&current, &effective_desired),
             &manifest.retirements,
         ),
         reconciliation_mode,
@@ -1853,6 +1870,15 @@ async fn reconcile_cleanup(
 
     info!(name, namespace, "cleaning up (resource deleted)");
 
+    // A target policy must remain addressable until every attached access
+    // policy has run its own finalizer and revoked its active requests. This
+    // preserves the existing PostgresPolicy deletion contract (durable grants
+    // are not revoked) while preventing ephemeral overlays from being stranded.
+    let remaining = crate::ephemeral::delete_access_policies_for_target(resource, ctx).await?;
+    if remaining > 0 {
+        return Err(ReconcileError::PendingEphemeralAccessCleanup(remaining));
+    }
+
     // Evict any cached pool for this resource's connection.
     ctx.evict_pool(&namespace, &resource.spec.connection).await;
 
@@ -1940,7 +1966,7 @@ fn parse_rfc3339_to_epoch_secs(timestamp: &str) -> Option<u64> {
     Some(days_since_epoch * 86400 + hours * 3600 + minutes * 60 + seconds)
 }
 
-async fn detect_sql_context(
+pub(crate) async fn detect_sql_context(
     pool: &sqlx::PgPool,
     inspect_config: &pgroles_inspect::InspectConfig,
 ) -> Result<pgroles_core::sql::SqlContext, ReconcileError> {
@@ -2182,6 +2208,7 @@ impl ReconcileError {
             ReconcileError::PlanSqlStorage(_) => "PlanSqlStorageFailed",
             ReconcileError::Kube(_) => "KubernetesApiError",
             ReconcileError::NoNamespace => "InvalidResource",
+            ReconcileError::PendingEphemeralAccessCleanup(_) => "EphemeralAccessCleanupPending",
         }
     }
 }
