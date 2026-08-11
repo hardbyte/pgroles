@@ -8,6 +8,8 @@ The pgroles operator watches `PostgresPolicy` custom resources and continuously 
 ---
 
 For the internal controller design, see the [operator architecture](/docs/operator-architecture) page.
+For bounded, request-driven PostgreSQL membership, see
+[ephemeral access](/docs/ephemeral-access).
 
 ## Overview
 
@@ -17,6 +19,8 @@ The operator brings the same convergent model as the CLI into Kubernetes. Instea
 - Database credentials referenced via Kubernetes Secrets
 - Status conditions and change summaries on the custom resource
 - Finalizer-based cleanup on resource deletion
+- Optional `EphemeralAccessPolicy` and `EphemeralAccessRequest` overlays for
+  bounded membership without mutating durable GitOps policy
 
 {% callout type="note" title="Bundle composition reaches the operator via render-bundle" %}
 The operator reconciles a single `PostgresPolicy` per resource — it does not load bundle fragments directly. To get cross-team or cross-environment fragment composition under the operator, compose the bundle in CI with `pgroles render-bundle --bundle pgroles.bundle.yaml --output pgroles.yaml`, then wrap the rendered manifest into a `PostgresPolicy` resource (the manifest fields go under `spec:` alongside `connection:`). Gate the bundle ↔ rendered-manifest relationship with `pgroles render-bundle --bundle … --check pgroles.yaml` in CI. See the [bundle composition guide](/docs/bundle-composition) for the full workflow.

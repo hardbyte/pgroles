@@ -927,12 +927,8 @@ async fn apply_under_lock(
     // activation or expiry transition to change membership ownership while an
     // ordinary reconcile waits for the lock.
     let mut effective_desired = desired.clone();
-    let ephemeral_roles = crate::ephemeral::compose_effective_graph(
-        &ctx.kube_client,
-        resource,
-        &mut effective_desired,
-    )
-    .await?;
+    let ephemeral_roles =
+        crate::ephemeral::compose_effective_graph(ctx, resource, &mut effective_desired).await?;
 
     // 6. Inspect current state from the database.
     let has_database_grants = expanded

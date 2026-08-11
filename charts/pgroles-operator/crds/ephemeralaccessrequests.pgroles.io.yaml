@@ -275,6 +275,10 @@
                   {
                     "message": "approval decisions are terminal",
                     "rule": "oldSelf.conditions.filter(c, (c.type == 'Approved' || c.type == 'Denied') && c.status == 'True').size() == 0 || self.conditions.filter(c, (c.type == 'Approved' || c.type == 'Denied') && c.status == 'True') == oldSelf.conditions.filter(c, (c.type == 'Approved' || c.type == 'Denied') && c.status == 'True')"
+                  },
+                  {
+                    "message": "request conditions must use a declared lifecycle or decision type",
+                    "rule": "self.conditions.all(c, c.type in ['Approved', 'Denied', 'Resolved', 'Ready', 'Applied'])"
                   }
                 ]
               }

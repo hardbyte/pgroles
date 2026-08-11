@@ -218,33 +218,89 @@ async fn main() -> anyhow::Result<()> {
             }
         });
 
-    let access_policy_controller = Controller::new(
+    let access_policies: Api<EphemeralAccessPolicy> = Api::all(client.clone());
+    let (access_policy_reader, access_policy_writer) = reflector::store();
+    let access_policy_stream = watcher(access_policies, watcher::Config::default())
+        .default_backoff()
+        .reflect(access_policy_writer)
+        .applied_objects();
+    let target_access_policy_store = access_policy_reader.clone();
+    let target_access_policy_triggers = watcher(
+        Api::<PostgresPolicy>::all(client.clone()),
+        watcher::Config::default(),
+    )
+    .default_backoff()
+    .touched_objects()
+    .filter_map(|target| async move { target.ok() })
+    .flat_map(move |target| {
+        let namespace = target.namespace();
+        let target_name = target.name_any();
+        let refs = target_access_policy_store
+            .state()
+            .into_iter()
+            .filter(|policy| {
+                policy.namespace() == namespace
+                    && policy.spec.postgres_policy_ref.name == target_name
+            })
+            .map(|policy| ObjectRef::from_obj(policy.as_ref()))
+            .collect::<Vec<_>>();
+        stream::iter(refs)
+    });
+
+    let access_policy_controller =
+        Controller::for_stream(access_policy_stream, access_policy_reader)
+            .reconcile_on(target_access_policy_triggers)
+            .shutdown_on_signal()
+            .run(
+                reconcile_access_policy,
+                access_policy_error_policy,
+                ctx.clone(),
+            )
+            .for_each(|result| async move {
+                if let Err(error) = result {
+                    tracing::error!(%error, "ephemeral access policy reconcile failed");
+                }
+            });
+
+    let access_requests: Api<EphemeralAccessRequest> = Api::all(client.clone());
+    let (access_request_reader, access_request_writer) = reflector::store();
+    let access_request_stream = watcher(access_requests, watcher::Config::default())
+        .default_backoff()
+        .reflect(access_request_writer)
+        .applied_objects();
+    let access_policy_request_store = access_request_reader.clone();
+    let access_policy_request_triggers = watcher(
         Api::<EphemeralAccessPolicy>::all(client.clone()),
         watcher::Config::default(),
     )
-    .shutdown_on_signal()
-    .run(
-        reconcile_access_policy,
-        access_policy_error_policy,
-        ctx.clone(),
-    )
-    .for_each(|result| async move {
-        if let Err(error) = result {
-            tracing::error!(%error, "ephemeral access policy reconcile failed");
-        }
+    .default_backoff()
+    .touched_objects()
+    .filter_map(|policy| async move { policy.ok() })
+    .flat_map(move |policy| {
+        let namespace = policy.namespace();
+        let policy_name = policy.name_any();
+        let refs = access_policy_request_store
+            .state()
+            .into_iter()
+            .filter(|request| {
+                request.namespace() == namespace
+                    && request.spec.access_policy_ref.name == policy_name
+            })
+            .map(|request| ObjectRef::from_obj(request.as_ref()))
+            .collect::<Vec<_>>();
+        stream::iter(refs)
     });
 
-    let access_request_controller = Controller::new(
-        Api::<EphemeralAccessRequest>::all(client.clone()),
-        watcher::Config::default(),
-    )
-    .shutdown_on_signal()
-    .run(reconcile_access_request, access_request_error_policy, ctx)
-    .for_each(|result| async move {
-        if let Err(error) = result {
-            tracing::error!(%error, "ephemeral access request reconcile failed");
-        }
-    });
+    let access_request_controller =
+        Controller::for_stream(access_request_stream, access_request_reader)
+            .reconcile_on(access_policy_request_triggers)
+            .shutdown_on_signal()
+            .run(reconcile_access_request, access_request_error_policy, ctx)
+            .for_each(|result| async move {
+                if let Err(error) = result {
+                    tracing::error!(%error, "ephemeral access request reconcile failed");
+                }
+            });
 
     futures::future::join3(
         policy_controller,

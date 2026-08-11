@@ -76,15 +76,15 @@ spec:
       preconditions:
         any:
           - key: >-
-              {{ request.object.status.conditions[?type == 'Approved'] || `[]` }}
+              {{ to_string(request.object.status.conditions[?type == 'Approved'] || `[]`) }}
             operator: NotEquals
             value: >-
-              {{ request.oldObject.status.conditions[?type == 'Approved'] || `[]` }}
+              {{ to_string(request.oldObject.status.conditions[?type == 'Approved'] || `[]`) }}
           - key: >-
-              {{ request.object.status.conditions[?type == 'Denied'] || `[]` }}
+              {{ to_string(request.object.status.conditions[?type == 'Denied'] || `[]`) }}
             operator: NotEquals
             value: >-
-              {{ request.oldObject.status.conditions[?type == 'Denied'] || `[]` }}
+              {{ to_string(request.oldObject.status.conditions[?type == 'Denied'] || `[]`) }}
       context:
         - name: subjectaccessreview
           apiCall:
@@ -109,6 +109,172 @@ spec:
         message: >-
           changing Approved or Denied requires the approve verb on the referenced
           EphemeralAccessPolicy
+        deny:
+          conditions:
+            any:
+              - key: "{{ subjectaccessreview.status.allowed }}"
+                operator: NotEquals
+                value: true
+
+    # Approvers share the CRD's /status endpoint with the operator, but own
+    # only Approved/Denied. Any other status mutation requires the logical
+    # `manage` verb, which is granted to the operator controller role.
+    - name: require-manage-on-lifecycle-status-change
+      match:
+        any:
+          - resources:
+              kinds: [pgroles.io/v1alpha1/EphemeralAccessRequest/status]
+              operations: [UPDATE]
+      preconditions:
+        any:
+          - key: "{{ request.object.status.phase || '' }}"
+            operator: NotEquals
+            value: "{{ request.oldObject.status.phase || '' }}"
+          - key: "{{ to_string(request.object.status.resolvedAccess || `{}`) }}"
+            operator: NotEquals
+            value: "{{ to_string(request.oldObject.status.resolvedAccess || `{}`) }}"
+          - key: "{{ request.object.status.approvalExpiresAt || '' }}"
+            operator: NotEquals
+            value: "{{ request.oldObject.status.approvalExpiresAt || '' }}"
+          - key: "{{ request.object.status.activatedAt || '' }}"
+            operator: NotEquals
+            value: "{{ request.oldObject.status.activatedAt || '' }}"
+          - key: "{{ request.object.status.expiresAt || '' }}"
+            operator: NotEquals
+            value: "{{ request.oldObject.status.expiresAt || '' }}"
+          - key: "{{ request.object.status.endedAt || '' }}"
+            operator: NotEquals
+            value: "{{ request.oldObject.status.endedAt || '' }}"
+          - key: "{{ request.object.status.lastError || '' }}"
+            operator: NotEquals
+            value: "{{ request.oldObject.status.lastError || '' }}"
+          - key: "{{ to_string(request.object.status.retainedMemberships || `[]`) }}"
+            operator: NotEquals
+            value: "{{ to_string(request.oldObject.status.retainedMemberships || `[]`) }}"
+          # The request CRD rejects undeclared condition types. Compare each
+          # operator-owned type explicitly so appending Approved/Denied never
+          # creates an ordering-sensitive false positive.
+          - key: >-
+              {{ to_string(request.object.status.conditions[?type == 'Resolved'] || `[]`) }}
+            operator: NotEquals
+            value: >-
+              {{ to_string(request.oldObject.status.conditions[?type == 'Resolved'] || `[]`) }}
+          - key: >-
+              {{ to_string(request.object.status.conditions[?type == 'Ready'] || `[]`) }}
+            operator: NotEquals
+            value: >-
+              {{ to_string(request.oldObject.status.conditions[?type == 'Ready'] || `[]`) }}
+          - key: >-
+              {{ to_string(request.object.status.conditions[?type == 'Applied'] || `[]`) }}
+            operator: NotEquals
+            value: >-
+              {{ to_string(request.oldObject.status.conditions[?type == 'Applied'] || `[]`) }}
+      context:
+        - name: subjectaccessreview
+          apiCall:
+            urlPath: /apis/authorization.k8s.io/v1/subjectaccessreviews
+            method: POST
+            data:
+              - key: kind
+                value: SubjectAccessReview
+              - key: apiVersion
+                value: authorization.k8s.io/v1
+              - key: spec
+                value:
+                  resourceAttributes:
+                    group: pgroles.io
+                    resource: ephemeralaccesspolicies
+                    namespace: "{{ request.namespace }}"
+                    name: "{{ request.object.spec.accessPolicyRef.name }}"
+                    verb: manage
+                  user: "{{ request.userInfo.username }}"
+                  groups: "{{ request.userInfo.groups }}"
+      validate:
+        message: >-
+          changing operator-owned EphemeralAccessRequest status requires the
+          manage verb on the referenced EphemeralAccessPolicy
+        deny:
+          conditions:
+            any:
+              - key: "{{ subjectaccessreview.status.allowed }}"
+                operator: NotEquals
+                value: true
+
+    - name: require-manage-to-remove-request-finalizer
+      match:
+        any:
+          - resources:
+              kinds: [pgroles.io/v1alpha1/EphemeralAccessRequest]
+              operations: [UPDATE]
+      preconditions:
+        all:
+          - key: >-
+              {{ contains(request.oldObject.metadata.finalizers || `[]`, 'ephemeralaccessrequest.pgroles.io/finalizer') && !contains(request.object.metadata.finalizers || `[]`, 'ephemeralaccessrequest.pgroles.io/finalizer') }}
+            operator: Equals
+            value: true
+      context:
+        - name: subjectaccessreview
+          apiCall:
+            urlPath: /apis/authorization.k8s.io/v1/subjectaccessreviews
+            method: POST
+            data:
+              - key: kind
+                value: SubjectAccessReview
+              - key: apiVersion
+                value: authorization.k8s.io/v1
+              - key: spec
+                value:
+                  resourceAttributes:
+                    group: pgroles.io
+                    resource: ephemeralaccesspolicies
+                    namespace: "{{ request.namespace }}"
+                    name: "{{ request.object.spec.accessPolicyRef.name }}"
+                    verb: manage
+                  user: "{{ request.userInfo.username }}"
+                  groups: "{{ request.userInfo.groups }}"
+      validate:
+        message: removing the request finalizer requires lifecycle management permission
+        deny:
+          conditions:
+            any:
+              - key: "{{ subjectaccessreview.status.allowed }}"
+                operator: NotEquals
+                value: true
+
+    - name: require-manage-to-remove-policy-finalizer
+      match:
+        any:
+          - resources:
+              kinds: [pgroles.io/v1alpha1/EphemeralAccessPolicy]
+              operations: [UPDATE]
+      preconditions:
+        all:
+          - key: >-
+              {{ contains(request.oldObject.metadata.finalizers || `[]`, 'ephemeralaccesspolicy.pgroles.io/finalizer') && !contains(request.object.metadata.finalizers || `[]`, 'ephemeralaccesspolicy.pgroles.io/finalizer') }}
+            operator: Equals
+            value: true
+      context:
+        - name: subjectaccessreview
+          apiCall:
+            urlPath: /apis/authorization.k8s.io/v1/subjectaccessreviews
+            method: POST
+            data:
+              - key: kind
+                value: SubjectAccessReview
+              - key: apiVersion
+                value: authorization.k8s.io/v1
+              - key: spec
+                value:
+                  resourceAttributes:
+                    group: pgroles.io
+                    resource: ephemeralaccesspolicies
+                    namespace: "{{ request.namespace }}"
+                    name: "{{ request.object.metadata.name }}"
+                    verb: manage
+                  user: "{{ request.userInfo.username }}"
+                  groups: "{{ request.userInfo.groups }}"
+      validate:
+        message: removing the access-policy finalizer requires lifecycle management permission
         deny:
           conditions:
             any:
@@ -150,36 +316,3 @@ spec:
           has(c.bundleHash) && c.bundleHash == object.status.resolvedAccess.bundleHash &&
           has(c.grantedDuration) &&
             c.grantedDuration == object.status.resolvedAccess.grantedDuration)
----
-apiVersion: policies.kyverno.io/v1
-kind: ValidatingPolicy
-metadata:
-  name: pgroles-ephemeral-access-finalizers
-  labels:
-    app.kubernetes.io/name: pgroles-operator
-    app.kubernetes.io/component: admission-policy
-spec:
-  failurePolicy: Fail
-  validationActions: [Deny]
-  evaluation:
-    admission:
-      enabled: true
-    background:
-      enabled: false
-  matchConstraints:
-    resourceRules:
-      - apiGroups: [pgroles.io]
-        apiVersions: [v1alpha1]
-        operations: [UPDATE]
-        resources: [ephemeralaccessrequests, ephemeralaccesspolicies]
-  validations:
-    - message: only pgroles-operator may remove an ephemeral-access finalizer
-      expression: >-
-        !oldObject.?metadata.finalizers.orValue([]).exists(f,
-          f in ['ephemeralaccessrequest.pgroles.io/finalizer',
-                'ephemeralaccesspolicy.pgroles.io/finalizer']) ||
-        object.?metadata.finalizers.orValue([]).exists(f,
-          f in ['ephemeralaccessrequest.pgroles.io/finalizer',
-                'ephemeralaccesspolicy.pgroles.io/finalizer']) ||
-        request.userInfo.username ==
-          'system:serviceaccount:pgroles-system:pgroles-operator'

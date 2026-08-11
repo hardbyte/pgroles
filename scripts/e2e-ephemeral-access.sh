@@ -34,6 +34,20 @@ wait_access_policy_accepted() {
   return 1
 }
 
+wait_access_policy_condition() {
+  local policy="$1" condition="$2" expected="$3"
+  for i in $(seq 1 45); do
+    actual="$(kubectl get pgeap "$policy" -o "jsonpath={.status.conditions[?(@.type==\"${condition}\")].status}" 2>/dev/null || true)"
+    if [ "$actual" = "$expected" ]; then
+      return 0
+    fi
+    echo "Waiting for $policy $condition=$expected (currently $actual, attempt $i/45)"
+    sleep 2
+  done
+  kubectl get pgeap "$policy" -o yaml || true
+  return 1
+}
+
 wait_policy_generation() {
   local policy="$1"
   for i in $(seq 1 45); do
@@ -46,6 +60,26 @@ wait_policy_generation() {
     sleep 2
   done
   kubectl get pgr "$policy" -o yaml || true
+  return 1
+}
+
+wait_pending_plan_for_current_generation() {
+  local policy="$1" generation plan plan_generation phase
+  generation="$(kubectl get pgr "$policy" -o jsonpath='{.metadata.generation}')"
+  for i in $(seq 1 45); do
+    plan="$(kubectl get pgr "$policy" -o jsonpath='{.status.current_plan_ref.name}' 2>/dev/null || true)"
+    if [ -n "$plan" ]; then
+      plan_generation="$(kubectl get pgplan "$plan" -o jsonpath='{.spec.policyGeneration}' 2>/dev/null || true)"
+      phase="$(kubectl get pgplan "$plan" -o jsonpath='{.status.phase}' 2>/dev/null || true)"
+      if [ "$plan_generation" = "$generation" ] && [ "$phase" = "Pending" ]; then
+        echo "$plan"
+        return 0
+      fi
+    fi
+    echo "Waiting for $policy generation $generation pending plan (attempt $i/45)" >&2
+    sleep 2
+  done
+  kubectl get pgr "$policy" -o yaml >&2 || true
   return 1
 }
 
@@ -69,6 +103,11 @@ assert_membership() {
 
 create_request() {
   local name="$1" policy="$2" duration="$3"
+  create_request_for_subject "$name" "$policy" "$duration" ephemeral_e2e_subject
+}
+
+create_request_for_subject() {
+  local name="$1" policy="$2" duration="$3" subject="$4"
   kubectl create -f - <<EOF
 apiVersion: pgroles.io/v1alpha1
 kind: EphemeralAccessRequest
@@ -78,16 +117,26 @@ spec:
   accessPolicyRef:
     name: ${policy}
   subject:
-    role: ephemeral_e2e_subject
+    role: ${subject}
   requestedDuration: ${duration}
   justification: E2E validation
 EOF
+}
+
+append_decision() {
+  local request="$1" decision="$2" identity="$3"
+  local bundle_hash granted_duration patch
+  bundle_hash="$(kubectl get pgear "$request" -o jsonpath='{.status.resolvedAccess.bundleHash}')"
+  granted_duration="$(kubectl get pgear "$request" -o jsonpath='{.status.resolvedAccess.grantedDuration}')"
+  patch="[{\"op\":\"add\",\"path\":\"/status/conditions/-\",\"value\":{\"type\":\"${decision}\",\"status\":\"True\",\"reason\":\"E2E${decision}\",\"bundleHash\":\"${bundle_hash}\",\"grantedDuration\":\"${granted_duration}\"}}]"
+  kubectl --as="$identity" patch pgear "$request" --subresource=status --type=json -p "$patch"
 }
 
 kubectl apply -f k8s/samples/ephemeral-access-e2e.yaml
 wait_for_ready_true ephemeral-e2e
 wait_access_policy_accepted ephemeral-e2e-automatic
 wait_access_policy_accepted ephemeral-e2e-required
+wait_access_policy_accepted ephemeral-e2e-session
 
 if [ "$secure_mode" = "true" ]; then
   if kubectl --as=system:serviceaccount:default:ephemeral-untrusted-requester \
@@ -129,6 +178,7 @@ fi
 echo "Automatic activation, immutable status, scoped plan, and natural expiry"
 create_request ephemeral-auto-expiry ephemeral-e2e-automatic 15s
 wait_request_phase ephemeral-auto-expiry Active
+wait_for_event_reason ephemeral-auto-expiry MembershipsGranted
 assert_membership ephemeral_e2e_editor ephemeral_e2e_subject 1
 assert_membership ephemeral_e2e_auditor ephemeral_e2e_subject 1
 
@@ -145,6 +195,38 @@ fi
 wait_request_phase ephemeral-auto-expiry Ended
 assert_membership ephemeral_e2e_editor ephemeral_e2e_subject 0
 assert_membership ephemeral_e2e_auditor ephemeral_e2e_subject 0
+
+echo "Applying recovery after absolute expiry revokes instead of re-granting"
+create_request ephemeral-expired-recovery ephemeral-e2e-automatic 1m
+wait_request_phase ephemeral-expired-recovery Active
+assert_membership ephemeral_e2e_editor ephemeral_e2e_subject 1
+recovery_patch='{"status":{"phase":"Applying","expiresAt":"2000-01-01T00:00:00Z"}}'
+if [ "$secure_mode" = "true" ]; then
+  kubectl --as=system:serviceaccount:pgroles-system:pgroles-operator \
+    patch pgear ephemeral-expired-recovery --subresource=status --type=merge -p "$recovery_patch"
+else
+  kubectl patch pgear ephemeral-expired-recovery --subresource=status --type=merge -p "$recovery_patch"
+fi
+wait_request_phase ephemeral-expired-recovery Ended
+assert_membership ephemeral_e2e_editor ephemeral_e2e_subject 0
+
+echo "A stale Accepted condition cannot authorize an unvalidated policy generation"
+pg_query "CREATE ROLE ephemeral_e2e_unmanaged_power NOLOGIN"
+kubectl patch pgeap ephemeral-e2e-automatic --type=merge \
+  -p '{"spec":{"memberships":[{"role":"ephemeral_e2e_unmanaged_power","inherit":false}]}}'
+create_request ephemeral-stale-policy ephemeral-e2e-automatic 30s
+for i in $(seq 1 30); do
+  resolved_status="$(kubectl get pgear ephemeral-stale-policy -o jsonpath='{.status.conditions[?(@.type=="Resolved")].status}' 2>/dev/null || true)"
+  [ "$resolved_status" = "False" ] && break
+  sleep 2
+done
+test "$resolved_status" = "False"
+assert_membership ephemeral_e2e_unmanaged_power ephemeral_e2e_subject 0
+kubectl delete pgear ephemeral-stale-policy --wait=true
+kubectl patch pgeap ephemeral-e2e-automatic --type=merge \
+  -p '{"spec":{"memberships":[{"role":"ephemeral_e2e_editor","inherit":false},{"role":"ephemeral_e2e_auditor","inherit":false}]}}'
+wait_access_policy_accepted ephemeral-e2e-automatic
+pg_query "DROP ROLE ephemeral_e2e_unmanaged_power"
 
 echo "Overlapping requests retain the edge until the final owner ends"
 create_request ephemeral-overlap-a ephemeral-e2e-automatic 1m
@@ -172,13 +254,22 @@ echo "An active request blocks durable removal of a role it still needs"
 create_request ephemeral-role-drop-block ephemeral-e2e-automatic 1m
 wait_request_phase ephemeral-role-drop-block Active
 kubectl patch pgr ephemeral-e2e --type=merge -p \
-  '{"spec":{"roles":[{"name":"ephemeral_e2e_subject","login":false},{"name":"ephemeral_e2e_auditor","login":false}]}}'
+  '{"spec":{"roles":[{"name":"ephemeral_e2e_subject","login":false},{"name":"ephemeral_e2e_auditor","login":false},{"name":"ephemeral_e2e_session_user","login":true}]}}'
 wait_for_ready_reason ephemeral-e2e InvalidSpec
 wait_for_last_error_contains ephemeral-e2e "active ephemeral request"
+test "$(kubectl get pgeap ephemeral-e2e-automatic -o jsonpath='{.status.conditions[?(@.type=="RoleRetirementBlocked")].status}')" = "True"
+blocking_uid="$(kubectl get pgear ephemeral-role-drop-block -o jsonpath='{.metadata.uid}')"
+kubectl get pgeap ephemeral-e2e-automatic -o jsonpath='{.status.conditions[?(@.type=="RoleRetirementBlocked")].message}' | grep -Fq "$blocking_uid"
 assert_membership ephemeral_e2e_editor ephemeral_e2e_subject 1
 kubectl patch pgr ephemeral-e2e --type=merge -p \
-  '{"spec":{"roles":[{"name":"ephemeral_e2e_subject","login":false},{"name":"ephemeral_e2e_editor","login":false},{"name":"ephemeral_e2e_auditor","login":false}]}}'
+  '{"spec":{"roles":[{"name":"ephemeral_e2e_subject","login":false},{"name":"ephemeral_e2e_editor","login":false},{"name":"ephemeral_e2e_auditor","login":false},{"name":"ephemeral_e2e_session_user","login":true}]}}'
 wait_for_ready_true ephemeral-e2e
+for i in $(seq 1 30); do
+  retirement_status="$(kubectl get pgeap ephemeral-e2e-automatic -o jsonpath='{.status.conditions[?(@.type=="RoleRetirementBlocked")].status}' 2>/dev/null || true)"
+  [ "$retirement_status" = "False" ] && break
+  sleep 2
+done
+test "$retirement_status" = "False"
 kubectl delete pgear ephemeral-role-drop-block --wait=true
 assert_membership ephemeral_e2e_editor ephemeral_e2e_subject 0
 
@@ -202,31 +293,235 @@ assert_membership ephemeral_e2e_editor ephemeral_e2e_subject 0
 kubectl patch pgeap ephemeral-e2e-required --type=merge -p '{"spec":{"suspend":false}}'
 kubectl delete pgear ephemeral-pending-suspended --wait=true
 
+echo "Approval deadlines continue while suspended and never revive"
+kubectl apply -f - <<'EOF'
+apiVersion: pgroles.io/v1alpha1
+kind: EphemeralAccessPolicy
+metadata:
+  name: ephemeral-e2e-short-approval
+spec:
+  postgresPolicyRef:
+    name: ephemeral-e2e
+  memberships:
+    - role: ephemeral_e2e_editor
+      inherit: false
+  maximumDuration: 1m
+  defaultDuration: 30s
+  pendingRequestTTL: 8s
+  justification:
+    required: true
+  approval:
+    mode: Required
+EOF
+wait_access_policy_accepted ephemeral-e2e-short-approval
+create_request ephemeral-approval-expiry ephemeral-e2e-short-approval 30s
+wait_request_phase ephemeral-approval-expiry PendingApproval
+kubectl patch pgeap ephemeral-e2e-short-approval --type=merge -p '{"spec":{"suspend":true}}'
+wait_request_phase ephemeral-approval-expiry ApprovalExpired
+kubectl patch pgeap ephemeral-e2e-short-approval --type=merge -p '{"spec":{"suspend":false}}'
+sleep 4
+test "$(kubectl get pgear ephemeral-approval-expiry -o jsonpath='{.status.phase}')" = "ApprovalExpired"
+assert_membership ephemeral_e2e_editor ephemeral_e2e_subject 0
+kubectl delete pgear ephemeral-approval-expiry --wait=true
+
+echo "Approval-mode and bundle changes cancel the immutable pending snapshot"
+create_request ephemeral-mode-change ephemeral-e2e-required 45s
+wait_request_phase ephemeral-mode-change PendingApproval
+kubectl patch pgeap ephemeral-e2e-required --type=merge -p '{"spec":{"approval":{"mode":"Automatic"}}}'
+wait_request_phase ephemeral-mode-change Cancelled
+assert_membership ephemeral_e2e_editor ephemeral_e2e_subject 0
+kubectl patch pgeap ephemeral-e2e-required --type=merge -p '{"spec":{"approval":{"mode":"Required"}}}'
+wait_access_policy_accepted ephemeral-e2e-required
+kubectl delete pgear ephemeral-mode-change --wait=true
+
+create_request ephemeral-bundle-change ephemeral-e2e-required 45s
+wait_request_phase ephemeral-bundle-change PendingApproval
+kubectl patch pgeap ephemeral-e2e-required --type=merge \
+  -p '{"spec":{"memberships":[{"role":"ephemeral_e2e_auditor","inherit":false}]}}'
+wait_request_phase ephemeral-bundle-change Cancelled
+assert_membership ephemeral_e2e_editor ephemeral_e2e_subject 0
+kubectl patch pgeap ephemeral-e2e-required --type=merge \
+  -p '{"spec":{"memberships":[{"role":"ephemeral_e2e_editor","inherit":false}]}}'
+wait_access_policy_accepted ephemeral-e2e-required
+kubectl delete pgear ephemeral-bundle-change --wait=true
+
+echo "A status-only lifecycle forgery has no activation provenance"
+create_request ephemeral-phase-forgery ephemeral-e2e-required 45s
+wait_request_phase ephemeral-phase-forgery PendingApproval
+if [ "$secure_mode" = "true" ]; then
+  if kubectl --as=system:serviceaccount:default:ephemeral-status-writer \
+    patch pgear ephemeral-phase-forgery --subresource=status --type=merge \
+    -p '{"status":{"phase":"Applying"}}'; then
+    echo "::error::unauthorized lifecycle mutation unexpectedly passed Kyverno"
+    exit 1
+  fi
+else
+  kubectl --as=system:serviceaccount:default:ephemeral-status-writer \
+    patch pgear ephemeral-phase-forgery --subresource=status --type=merge \
+    -p '{"status":{"phase":"Applying"}}'
+  wait_request_phase ephemeral-phase-forgery Cancelled
+fi
+assert_membership ephemeral_e2e_editor ephemeral_e2e_subject 0
+kubectl delete pgear ephemeral-phase-forgery --wait=true
+
 echo "Required approval trust boundary"
 create_request ephemeral-required ephemeral-e2e-required 45s
 wait_request_phase ephemeral-required PendingApproval
-bundle_hash="$(kubectl get pgear ephemeral-required -o jsonpath='{.status.resolvedAccess.bundleHash}')"
-granted_duration="$(kubectl get pgear ephemeral-required -o jsonpath='{.status.resolvedAccess.grantedDuration}')"
-approval_patch="{\"status\":{\"conditions\":[{\"type\":\"Approved\",\"status\":\"True\",\"reason\":\"E2EApproval\",\"bundleHash\":\"${bundle_hash}\",\"grantedDuration\":\"${granted_duration}\"}]}}"
 
 if [ "$secure_mode" = "true" ]; then
   test "$(kubectl auth can-i approve ephemeralaccesspolicies.pgroles.io --as=system:serviceaccount:pgroles-system:pgroles-operator -n default)" = "no"
-  if kubectl --as=system:serviceaccount:default:ephemeral-status-writer \
-    patch pgear ephemeral-required --subresource=status --type=merge -p "$approval_patch"; then
+  test "$(kubectl auth can-i manage ephemeralaccesspolicies.pgroles.io --as=system:serviceaccount:pgroles-system:pgroles-operator -n default)" = "yes"
+  if append_decision ephemeral-required Approved system:serviceaccount:default:ephemeral-status-writer; then
     echo "::error::unauthorized approval unexpectedly passed Kyverno"
     exit 1
   fi
-  kubectl --as=system:serviceaccount:default:ephemeral-approver \
-    patch pgear ephemeral-required --subresource=status --type=merge -p "$approval_patch"
+  if kubectl --as=system:serviceaccount:default:ephemeral-status-writer \
+    patch pgear ephemeral-required --subresource=status --type=merge \
+    -p '{"status":{"phase":"Applying"}}'; then
+    echo "::error::unauthorized lifecycle mutation unexpectedly passed Kyverno"
+    exit 1
+  fi
+  append_decision ephemeral-required Approved system:serviceaccount:default:ephemeral-approver
 else
-  kubectl --as=system:serviceaccount:default:ephemeral-status-writer \
-    patch pgear ephemeral-required --subresource=status --type=merge -p "$approval_patch"
+  append_decision ephemeral-required Approved system:serviceaccount:default:ephemeral-status-writer
 fi
 
 wait_request_phase ephemeral-required Active
 assert_membership ephemeral_e2e_editor ephemeral_e2e_subject 1
+if [ "$secure_mode" = "true" ]; then
+  if kubectl --as=system:serviceaccount:default:ephemeral-status-writer \
+    patch pgear ephemeral-required --type=merge -p '{"metadata":{"finalizers":[]}}'; then
+    echo "::error::unauthorized finalizer removal unexpectedly passed Kyverno"
+    exit 1
+  fi
+fi
 kubectl delete pgear ephemeral-required --wait=true
 assert_membership ephemeral_e2e_editor ephemeral_e2e_subject 0
+
+echo "Denied requests terminate without database mutation"
+create_request ephemeral-denied ephemeral-e2e-required 45s
+wait_request_phase ephemeral-denied PendingApproval
+if [ "$secure_mode" = "true" ]; then
+  append_decision ephemeral-denied Denied system:serviceaccount:default:ephemeral-approver
+else
+  append_decision ephemeral-denied Denied system:serviceaccount:default:ephemeral-status-writer
+fi
+wait_request_phase ephemeral-denied Denied
+assert_membership ephemeral_e2e_editor ephemeral_e2e_subject 0
+kubectl delete pgear ephemeral-denied --wait=true
+
+echo "Target suspension surfaces status and blocks new activation"
+kubectl patch pgr ephemeral-e2e --type=merge -p '{"spec":{"suspend":true}}'
+wait_access_policy_condition ephemeral-e2e-automatic Suspended True
+create_request ephemeral-target-suspended ephemeral-e2e-automatic 30s
+for i in $(seq 1 30); do
+  reason="$(kubectl get pgear ephemeral-target-suspended -o jsonpath='{.status.conditions[?(@.type=="Resolved")].reason}' 2>/dev/null || true)"
+  [ "$reason" = "Suspended" ] && break
+  sleep 2
+done
+test "$reason" = "Suspended"
+assert_membership ephemeral_e2e_editor ephemeral_e2e_subject 0
+kubectl patch pgr ephemeral-e2e --type=merge -p '{"spec":{"suspend":false}}'
+wait_for_ready_true ephemeral-e2e
+wait_access_policy_condition ephemeral-e2e-automatic Suspended False
+wait_request_phase ephemeral-target-suspended Active
+test -z "$(kubectl get pgear ephemeral-target-suspended -o jsonpath='{.status.lastError}' 2>/dev/null || true)"
+kubectl delete pgear ephemeral-target-suspended --wait=true
+assert_membership ephemeral_e2e_editor ephemeral_e2e_subject 0
+
+echo "Scoped revocation remains effective in additive reconciliation"
+kubectl patch pgr ephemeral-e2e --type=merge -p '{"spec":{"reconciliation_mode":"additive"}}'
+wait_for_ready_true ephemeral-e2e
+create_request ephemeral-additive ephemeral-e2e-automatic 45s
+wait_request_phase ephemeral-additive Active
+assert_membership ephemeral_e2e_editor ephemeral_e2e_subject 1
+kubectl delete pgear ephemeral-additive --wait=true
+assert_membership ephemeral_e2e_editor ephemeral_e2e_subject 0
+kubectl patch pgr ephemeral-e2e --type=merge -p '{"spec":{"reconciliation_mode":"authoritative"}}'
+wait_for_ready_true ephemeral-e2e
+
+echo "An external subject declared in policy is not implicitly created"
+kubectl patch pgr ephemeral-e2e --type=merge -p \
+  '{"spec":{"roles":[{"name":"ephemeral_e2e_subject","login":false},{"name":"ephemeral_e2e_editor","login":false},{"name":"ephemeral_e2e_auditor","login":false},{"name":"ephemeral_e2e_session_user","login":true},{"name":"ephemeral_e2e_missing_external","external":true}]}}'
+wait_for_ready_true ephemeral-e2e
+create_request_for_subject ephemeral-missing-subject ephemeral-e2e-automatic 30s ephemeral_e2e_missing_external
+for i in $(seq 1 30); do
+  request_error="$(kubectl get pgear ephemeral-missing-subject -o jsonpath='{.status.lastError}' 2>/dev/null || true)"
+  printf '%s' "$request_error" | grep -Fq 'must already exist in PostgreSQL' && break
+  sleep 2
+done
+printf '%s' "$request_error" | grep -Fq 'must already exist in PostgreSQL'
+kubectl delete pgear ephemeral-missing-subject --wait=true
+kubectl patch pgr ephemeral-e2e --type=merge -p \
+  '{"spec":{"roles":[{"name":"ephemeral_e2e_subject","login":false},{"name":"ephemeral_e2e_editor","login":false},{"name":"ephemeral_e2e_auditor","login":false},{"name":"ephemeral_e2e_session_user","login":true}]}}'
+wait_for_ready_true ephemeral-e2e
+
+echo "An already-elevated session retains SET ROLE, while fresh SET ROLE is denied"
+pg_query "ALTER ROLE ephemeral_e2e_session_user PASSWORD 'ephemeral-session-password'"
+create_request_for_subject ephemeral-session ephemeral-e2e-session 1m ephemeral_e2e_session_user
+wait_request_phase ephemeral-session Active
+assert_membership ephemeral_e2e_editor ephemeral_e2e_session_user 1
+session_output="$(mktemp)"
+kubectl exec -i postgres-0 -- env PGPASSWORD=ephemeral-session-password \
+  psql -X -v ON_ERROR_STOP=0 -h 127.0.0.1 -U ephemeral_e2e_session_user -d postgres \
+  >"$session_output" 2>&1 <<'SQL' &
+SET ROLE ephemeral_e2e_editor;
+SELECT 'before=' || current_user;
+SELECT pg_sleep(12);
+SELECT 'during=' || current_user;
+RESET ROLE;
+SET ROLE ephemeral_e2e_editor;
+SQL
+session_pid=$!
+for i in $(seq 1 30); do
+  active_sleep="$(pg_query "SELECT count(*) FROM pg_stat_activity WHERE usename='ephemeral_e2e_session_user' AND query LIKE '%pg_sleep%'")"
+  [ "$active_sleep" = "1" ] && break
+  sleep 1
+done
+test "$active_sleep" = "1"
+kubectl delete pgear ephemeral-session --wait=true
+assert_membership ephemeral_e2e_editor ephemeral_e2e_session_user 0
+wait "$session_pid" || true
+grep -Fq 'before=ephemeral_e2e_editor' "$session_output"
+grep -Fq 'during=ephemeral_e2e_editor' "$session_output"
+grep -Fq 'permission denied to set role "ephemeral_e2e_editor"' "$session_output"
+rm -f "$session_output"
+if kubectl exec postgres-0 -- env PGPASSWORD=ephemeral-session-password \
+  psql -X -v ON_ERROR_STOP=1 -h 127.0.0.1 -U ephemeral_e2e_session_user -d postgres \
+  -c 'SET ROLE ephemeral_e2e_editor;'; then
+  echo "::error::fresh SET ROLE unexpectedly succeeded after revocation"
+  exit 1
+fi
+
+echo "Two operator replicas serialize scoped activation through the database lock"
+kubectl -n pgroles-system scale deployment/pgroles-operator --replicas=2
+kubectl -n pgroles-system rollout status deployment/pgroles-operator --timeout=90s
+create_request ephemeral-multi-replica ephemeral-e2e-automatic 45s
+wait_request_phase ephemeral-multi-replica Active
+assert_membership ephemeral_e2e_editor ephemeral_e2e_subject 1
+kubectl delete pgear ephemeral-multi-replica --wait=true
+assert_membership ephemeral_e2e_editor ephemeral_e2e_subject 0
+kubectl -n pgroles-system scale deployment/pgroles-operator --replicas=1
+kubectl -n pgroles-system rollout status deployment/pgroles-operator --timeout=90s
+
+echo "Ephemeral churn does not replace or re-hash a pending durable plan"
+kubectl patch pgr ephemeral-e2e --type=merge -p \
+  '{"spec":{"approval":"manual","roles":[{"name":"ephemeral_e2e_subject","login":false},{"name":"ephemeral_e2e_editor","login":false},{"name":"ephemeral_e2e_auditor","login":false},{"name":"ephemeral_e2e_session_user","login":true},{"name":"ephemeral_e2e_plan_probe","login":false}]}}'
+# Manual approval deliberately leaves observedGeneration at the last applied
+# generation. The pending currentPlanRef is the readiness signal here.
+durable_plan="$(wait_pending_plan_for_current_generation ephemeral-e2e)"
+durable_hash="$(kubectl get pgplan "$durable_plan" -o jsonpath='{.status.sqlHash}')"
+create_request ephemeral-plan-stability ephemeral-e2e-automatic 45s
+wait_request_phase ephemeral-plan-stability Active
+sleep 6
+test "$(kubectl get pgr ephemeral-e2e -o jsonpath='{.status.current_plan_ref.name}')" = "$durable_plan"
+test "$(kubectl get pgplan "$durable_plan" -o jsonpath='{.status.sqlHash}')" = "$durable_hash"
+kubectl delete pgear ephemeral-plan-stability --wait=true
+assert_membership ephemeral_e2e_editor ephemeral_e2e_subject 0
+approve_plan "$durable_plan"
+wait_for_ready_true ephemeral-e2e
+kubectl patch pgr ephemeral-e2e --type=merge -p '{"spec":{"approval":"auto"}}'
+wait_for_ready_true ephemeral-e2e
 
 echo "Access-policy deletion is a revoke-all kill switch"
 create_request ephemeral-policy-delete ephemeral-e2e-automatic 1m
@@ -273,7 +568,8 @@ for i in $(seq 1 30); do
     awk '
       /pgroles\.ephemeral_access\.lifecycle/ { lifecycle = 1 }
       /bundle_hash/ { bundle = 1 }
-      END { exit !(lifecycle && bundle) }
+      /pgroles.ephemeral_access.transitions/ { metrics = 1 }
+      END { exit !(lifecycle && bundle && metrics) }
     '
   then
     exit 0

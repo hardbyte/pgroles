@@ -143,6 +143,12 @@ pgroles-operator -> OpenTelemetry Collector -> metrics backend
 
 The operator deliberately does not default to a built-in Prometheus scrape endpoint.
 
+Ephemeral access uses the same database and advisory locks as durable
+reconciliation. Request-owned scoped plans establish execution provenance, and
+their active membership edges are composed into the single effective desired
+graph before diffing. See [ephemeral access](/docs/ephemeral-access) for the
+approval, audit, expiry, and session contracts.
+
 For object-local debugging, the controller also emits transition-based Kubernetes Events for notable status changes such as conflicts, suspend/resume, plan-mode drift detection, recovery, secret failures, database connectivity failures, and insufficient privileges. The intended split is:
 
 - status: current state of the policy
@@ -166,6 +172,9 @@ CI covers:
 - OTLP metrics export through an in-cluster Collector
 - generated load policies across 2 databases with 30 schemas / 60 generated roles
 - scheduled fairness/load coverage across 5 policies, 3 databases, 100 schemas, and 200 generated roles with repeated secret churn
+- trusted-writer and Kyverno-secured ephemeral access lifecycle matrices,
+  including approval ownership, overlap, suspension, restart recovery,
+  additive revocation, multiple replicas, target deletion, and session behavior
 
 Further hardening work:
 

@@ -34,6 +34,11 @@ rules:
   - apiGroups: ["pgroles.io"]
     resources: ["ephemeralaccesspolicies/finalizers", "ephemeralaccessrequests/finalizers"]
     verbs: ["update"]
+  # Logical verb used by admission policy to authorize operator-owned request
+  # lifecycle status and finalizer changes without hard-coding an SA identity.
+  - apiGroups: ["pgroles.io"]
+    resources: ["ephemeralaccesspolicies"]
+    verbs: ["manage"]
   # Read Secrets for database connection strings and password references;
   # create/update Secrets for operator-generated passwords.
   - apiGroups: [""]

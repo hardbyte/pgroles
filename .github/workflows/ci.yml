@@ -158,7 +158,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        pg_version: ["16", "17", "18"]
+        pg_version: ["15", "16", "17", "18"]
     services:
       postgres:
         image: postgres:${{ matrix.pg_version }}
@@ -1041,7 +1041,7 @@ jobs:
     needs: stack-gate
     if: needs.stack-gate.outputs.run_heavy == 'true'
     runs-on: ubuntu-latest
-    timeout-minutes: 35
+    timeout-minutes: 50
     strategy:
       fail-fast: false
       matrix:

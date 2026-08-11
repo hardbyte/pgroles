@@ -1119,9 +1119,6 @@ impl std::fmt::Display for PlanPhase {
 pub const EPHEMERAL_BUNDLE_ENCODING_V1: &str = "pgroles.io/ephemeral-membership-bundle-v1";
 pub const EPHEMERAL_MEMBERSHIP_SEMANTICS_V1: &str =
     "postgres-membership-v1-admin-false-set-server-default";
-pub const LABEL_ACCESS_POLICY: &str = "pgroles.io/access-policy";
-pub const LABEL_TARGET_POLICY: &str = "pgroles.io/target-policy";
-
 /// A GitOps-managed bundle of PostgreSQL memberships that may be requested.
 #[derive(CustomResource, KubeSchema, Debug, Clone, Serialize, Deserialize)]
 #[kube(
@@ -1242,7 +1239,10 @@ pub struct EphemeralAccessSubject {
     ).message("Approved=True and Denied=True are mutually exclusive"),
     validation = Rule::new(
         "oldSelf.conditions.filter(c, (c.type == 'Approved' || c.type == 'Denied') && c.status == 'True').size() == 0 || self.conditions.filter(c, (c.type == 'Approved' || c.type == 'Denied') && c.status == 'True') == oldSelf.conditions.filter(c, (c.type == 'Approved' || c.type == 'Denied') && c.status == 'True')"
-    ).message("approval decisions are terminal")
+    ).message("approval decisions are terminal"),
+    validation = Rule::new(
+        "self.conditions.all(c, c.type in ['Approved', 'Denied', 'Resolved', 'Ready', 'Applied'])"
+    ).message("request conditions must use a declared lifecycle or decision type")
 )]
 #[serde(rename_all = "camelCase")]
 pub struct EphemeralAccessRequestStatus {

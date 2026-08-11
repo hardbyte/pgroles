@@ -79,26 +79,45 @@ ownership. Because that CEL environment does not expose Kubernetes'
 
 - require the logical `use` verb on an access policy to create a request;
 - require the logical `approve` verb to change `Approved` or `Denied`;
+- require the logical `manage` verb to change operator-owned lifecycle status
+  or remove an ephemeral-access finalizer;
 - bind a decision to the resolved bundle hash and duration;
-- prevent non-operator principals from stripping cleanup finalizers.
+- leave approvers able to change only their `Approved`/`Denied` conditions.
 
 The companion `k8s/security/ephemeral-access-rbac.yaml` defines requester and
 approver ClusterRoles. Bind those roles to deployment-specific users, groups,
 or brokers. The pgroles operator service account deliberately has neither
-logical verb. The manifest also grants Kyverno's reports controller read-only
-CRD discovery through an aggregated role; it does not grant mutation access.
+`use` nor `approve`; its normal controller ClusterRole carries `manage`.
+Authorizing lifecycle ownership through a logical verb avoids hard-coding a
+namespace or service-account name and remains correct with Helm naming
+overrides. The manifest also grants Kyverno's reports controller read-only CRD
+discovery through an aggregated role; it does not grant mutation access.
 
-An approver copies the resolved hash and duration into a typed decision:
+An approver appends a typed decision while preserving operator-owned
+conditions. JSON Patch is convenient because it does not replace the condition
+array:
 
-```yaml
-status:
-  conditions:
-    - type: Approved
-      status: "True"
-      reason: ApprovedByAccessReview
-      bundleHash: sha256:...
-      grantedDuration: 1800s
+```json
+[
+  {
+    "op": "add",
+    "path": "/status/conditions/-",
+    "value": {
+      "type": "Approved",
+      "status": "True",
+      "reason": "ApprovedByAccessReview",
+      "bundleHash": "sha256:...",
+      "grantedDuration": "1800s"
+    }
+  }
+]
 ```
+
+The controller also treats a request-owned activation plan as execution
+provenance. `Applying` and `Active` status without a matching controller owner
+UID, origin, operation, and bundle hash never enters the effective graph;
+revocation likewise cannot execute without that activation record. This is a
+defence-in-depth boundary for trusted-writer installations without Kyverno.
 
 ## Audit is an external durability requirement
 
@@ -145,6 +164,18 @@ through OTLP as well as JSON stdout. Route OTLP logs to append-only or otherwise
 tamper-resistant off-cluster storage. Configure `OTEL_LOGS_EXPORTER=none` only
 when another agent already ships container logs durably.
 
+The same transitions emit Kubernetes Events on the request object. OTLP
+metrics include:
+
+- `pgroles.ephemeral_access.transitions`
+- `pgroles.ephemeral_access.failures`
+- `pgroles.ephemeral_access.expiry_lag`
+- `pgroles.ephemeral_access.retained_memberships`
+- `pgroles.ephemeral_access.role_retirement_blocked`
+
+Metrics and Events are operational signals, not substitutes for API audit and
+off-cluster lifecycle logs.
+
 ## Expiry and deletion
 
 Activation persists the absolute expiry before changing PostgreSQL. Expiry and
@@ -153,8 +184,39 @@ only memberships for the approved bundle may be changed. An edge is removed
 only after its final ephemeral owner ends and when the current durable graph
 does not own it.
 
+Recovery never resets the absolute deadline. An `Applying` request found after
+its deadline is cancelled if SQL never began, or immediately cleaned up if its
+activation plan shows that execution may have started. It is never granted a
+fresh duration after restart.
+
 Suspending an access policy blocks new activation while active requests run to
 their existing expiry. Deleting an access policy deletes and revokes its
 requests before the policy finalizer completes. Do not forcibly remove
 finalizers: authoritative reconciliation can later heal a stranded edge, but
 additive mode may leave it indefinitely.
+
+Deleting a target `PostgresPolicy` first deletes attached access policies and
+waits for their request finalizers, keeping the database connection available
+until scoped revocation completes. Invalid unresolved requests expose
+`Resolved=False`, a reason, and `status.lastError` with a slower retry rather
+than remaining silent in `Pending`.
+
+Role retirement is blocked before SQL planning when an active request still
+uses the subject or granted role. The target policy error and affected access
+policy `RoleRetirementBlocked` condition include the blocking request name and
+UID.
+
+## Existing sessions
+
+Revoking membership prevents a fresh `SET ROLE`; it does not terminate a
+session which already assumed the capability role. The E2E suite verifies that
+an elevated session remains under its current role until `RESET ROLE` or
+disconnect, while a subsequent and a newly connected `SET ROLE` are rejected.
+Connection pools therefore need their own bounded-lifetime or eviction policy
+when wall-clock session termination is required. pgroles does not implicitly
+call `pg_terminate_backend`.
+
+Natural terminal requests remain as Kubernetes operational records. Deletion
+is currently the garbage-collection mechanism; choose explicit retention and
+cleanup automation for the cluster, while keeping Kubernetes audit and OTLP
+logs as the durable record.

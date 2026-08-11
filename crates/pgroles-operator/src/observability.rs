@@ -3,7 +3,7 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use axum::extract::State;
 use axum::http::StatusCode;
@@ -44,6 +44,11 @@ struct Metrics {
     database_connection_failures_total: Counter<u64>,
     apply_total: Counter<u64>,
     apply_statements_total: Counter<u64>,
+    ephemeral_transition_total: Counter<u64>,
+    ephemeral_failure_total: Counter<u64>,
+    ephemeral_retained_memberships_total: Counter<u64>,
+    ephemeral_expiry_lag_ms: Histogram<u64>,
+    ephemeral_role_retirement_blocked_total: Counter<u64>,
 }
 
 pub struct ReconcileGuard {
@@ -201,6 +206,48 @@ impl OperatorObservability {
         }
         if let Some(metrics) = &self.metrics {
             metrics.apply_statements_total.add(statements as u64, &[]);
+        }
+    }
+
+    pub fn record_ephemeral_transition(&self, phase: &str, reason: &str) {
+        if let Some(metrics) = &self.metrics {
+            metrics.ephemeral_transition_total.add(
+                1,
+                &[
+                    KeyValue::new("phase", phase.to_string()),
+                    KeyValue::new("reason", reason.to_string()),
+                ],
+            );
+            if matches!(phase, "Failed" | "Denied" | "ApprovalExpired") {
+                metrics
+                    .ephemeral_failure_total
+                    .add(1, &[KeyValue::new("reason", reason.to_string())]);
+            }
+        }
+    }
+
+    pub fn record_ephemeral_retained_memberships(&self, count: usize) {
+        if count == 0 {
+            return;
+        }
+        if let Some(metrics) = &self.metrics {
+            metrics
+                .ephemeral_retained_memberships_total
+                .add(count as u64, &[]);
+        }
+    }
+
+    pub fn record_ephemeral_expiry_lag(&self, lag: Duration) {
+        if let Some(metrics) = &self.metrics {
+            metrics
+                .ephemeral_expiry_lag_ms
+                .record(lag.as_millis() as u64, &[]);
+        }
+    }
+
+    pub fn record_ephemeral_role_retirement_blocked(&self) {
+        if let Some(metrics) = &self.metrics {
+            metrics.ephemeral_role_retirement_blocked_total.add(1, &[]);
         }
     }
 
@@ -389,6 +436,27 @@ impl Metrics {
                 .u64_counter("pgroles.apply.statements")
                 .with_description("SQL statements executed during successful applies")
                 .build(),
+            ephemeral_transition_total: meter
+                .u64_counter("pgroles.ephemeral_access.transitions")
+                .with_description("Ephemeral access lifecycle transitions by phase and reason")
+                .build(),
+            ephemeral_failure_total: meter
+                .u64_counter("pgroles.ephemeral_access.failures")
+                .with_description("Terminal ephemeral access failures by reason")
+                .build(),
+            ephemeral_retained_memberships_total: meter
+                .u64_counter("pgroles.ephemeral_access.retained_memberships")
+                .with_description("Ephemeral memberships retained because they became durable")
+                .build(),
+            ephemeral_expiry_lag_ms: meter
+                .u64_histogram("pgroles.ephemeral_access.expiry_lag")
+                .with_unit("ms")
+                .with_description("Delay between absolute expiry and revocation processing")
+                .build(),
+            ephemeral_role_retirement_blocked_total: meter
+                .u64_counter("pgroles.ephemeral_access.role_retirement_blocked")
+                .with_description("Role retirements blocked by active access requests")
+                .build(),
         }
     }
 }
@@ -564,6 +632,11 @@ mod tests {
         observability.record_planned_changes(2);
         observability.record_apply_result("success");
         observability.record_apply_statements(4);
+        observability.record_ephemeral_transition("Active", "MembershipsGranted");
+        observability.record_ephemeral_transition("Failed", "InvalidRequestState");
+        observability.record_ephemeral_retained_memberships(2);
+        observability.record_ephemeral_expiry_lag(Duration::from_millis(250));
+        observability.record_ephemeral_role_retirement_blocked();
         guard.record_result("conflict", "ConflictingPolicy");
 
         provider.force_flush().expect("flush should succeed");
@@ -576,6 +649,26 @@ mod tests {
         assert!(metric_exists(&metrics, "pgroles.reconcile.duration"));
         assert!(metric_exists(&metrics, "pgroles.inspect.duration"));
         assert_eq!(u64_sum_value(&metrics, "pgroles.inspect.items"), Some(119));
+        assert_eq!(
+            u64_sum_value(&metrics, "pgroles.ephemeral_access.transitions"),
+            Some(2)
+        );
+        assert_eq!(
+            u64_sum_value(&metrics, "pgroles.ephemeral_access.failures"),
+            Some(1)
+        );
+        assert_eq!(
+            u64_sum_value(&metrics, "pgroles.ephemeral_access.retained_memberships"),
+            Some(2)
+        );
+        assert!(metric_exists(
+            &metrics,
+            "pgroles.ephemeral_access.expiry_lag"
+        ));
+        assert_eq!(
+            u64_sum_value(&metrics, "pgroles.ephemeral_access.role_retirement_blocked"),
+            Some(1)
+        );
         assert_eq!(
             u64_sum_value(&metrics, "pgroles.wildcard.grantability_queries"),
             Some(1)

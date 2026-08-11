@@ -156,6 +156,28 @@ conditions. A plan object supports review and recent history, but is not
 independent proof of current database state and may be removed by terminal-plan
 retention.
 
+## Ephemeral Access
+
+Use `EphemeralAccessPolicy` for a GitOps-managed, bounded bundle of concrete
+memberships and `EphemeralAccessRequest` for one runtime lease. Do not patch
+`PostgresPolicy` memberships for just-in-time access.
+
+For `approval.mode: Required`, install the version-matched Kyverno policy and
+bind the logical `use` and `approve` roles. The operator owns lifecycle status
+through the logical `manage` verb; approvers append only `Approved` or `Denied`
+conditions containing the exact resolved bundle hash and duration. Verify
+`status.observedGeneration`, request phase, expiry, request-owned scoped plan,
+and database membership rather than treating creation or approval alone as
+success.
+
+Deleting a request revokes its final-owner memberships through a finalizer.
+Deleting an access policy is revoke-all, while suspension blocks new activation
+and leaves active requests on their existing deadlines. Never force-remove
+finalizers: authoritative reconciliation may repair the edge later, but
+additive reconciliation can strand access. Membership expiry does not terminate
+an existing session which already executed `SET ROLE`; apply a separate session
+or pool lifetime when that guarantee is required.
+
 ## Suspension And Maintenance
 
 `spec.suspend: true` prevents new work after a reconcile observes the suspended

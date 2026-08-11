@@ -112,7 +112,18 @@ async fn reconcile_access_policy_apply(
     let namespace = policy
         .namespace()
         .ok_or_else(|| EphemeralError::Invalid("resource has no namespace".to_string()))?;
-    let maximum = parse_duration(&policy.spec.maximum_duration)?;
+    let maximum = match parse_duration(&policy.spec.maximum_duration) {
+        Ok(duration) => duration,
+        Err(error) => {
+            return update_access_policy_failure(
+                policy,
+                ctx,
+                "InvalidDuration",
+                &error.to_string(),
+            )
+            .await;
+        }
+    };
     let cluster_maximum =
         cluster_duration("EPHEMERAL_ACCESS_MAXIMUM_DURATION", DEFAULT_CLUSTER_MAXIMUM)?;
     if maximum > cluster_maximum {
@@ -128,7 +139,18 @@ async fn reconcile_access_policy_apply(
         )
         .await;
     }
-    let pending_ttl = parse_duration(&policy.spec.pending_request_ttl)?;
+    let pending_ttl = match parse_duration(&policy.spec.pending_request_ttl) {
+        Ok(duration) => duration,
+        Err(error) => {
+            return update_access_policy_failure(
+                policy,
+                ctx,
+                "InvalidDuration",
+                &error.to_string(),
+            )
+            .await;
+        }
+    };
     let cluster_pending_maximum = cluster_duration(
         "EPHEMERAL_ACCESS_MAX_PENDING_TTL",
         DEFAULT_CLUSTER_PENDING_MAXIMUM,
@@ -142,16 +164,28 @@ async fn reconcile_access_policy_apply(
         )
         .await;
     }
-    if let Some(default_duration) = &policy.spec.default_duration
-        && parse_duration(default_duration)? > maximum
-    {
-        return update_access_policy_failure(
-            policy,
-            ctx,
-            "InvalidDuration",
-            "defaultDuration must not exceed maximumDuration",
-        )
-        .await;
+    if let Some(default_duration) = &policy.spec.default_duration {
+        let default_duration = match parse_duration(default_duration) {
+            Ok(duration) => duration,
+            Err(error) => {
+                return update_access_policy_failure(
+                    policy,
+                    ctx,
+                    "InvalidDuration",
+                    &error.to_string(),
+                )
+                .await;
+            }
+        };
+        if default_duration > maximum {
+            return update_access_policy_failure(
+                policy,
+                ctx,
+                "InvalidDuration",
+                "defaultDuration must not exceed maximumDuration",
+            )
+            .await;
+        }
     }
     if policy.spec.memberships.is_empty() {
         return update_access_policy_failure(
@@ -239,6 +273,26 @@ async fn reconcile_access_policy_apply(
         &mut status.conditions,
         access_condition("ResolvedRefs", true, "Resolved", "Target roles resolved"),
     );
+    let suspended = policy.spec.suspend || target.spec.suspend;
+    set_condition(
+        &mut status.conditions,
+        access_condition(
+            "Suspended",
+            suspended,
+            if policy.spec.suspend {
+                "AccessPolicySuspended"
+            } else if target.spec.suspend {
+                "TargetPolicySuspended"
+            } else {
+                "Active"
+            },
+            if suspended {
+                "New ephemeral access activation is suspended"
+            } else {
+                "Ephemeral access activation is enabled"
+            },
+        ),
+    );
     patch_access_policy_status(policy, ctx, &status).await?;
     Ok(Action::requeue(Duration::from_secs(300)))
 }
@@ -265,8 +319,16 @@ async fn patch_access_policy_status(
     ctx: &OperatorContext,
     status: &EphemeralAccessPolicyStatus,
 ) -> Result<(), kube::Error> {
+    patch_access_policy_status_with_client(policy, &ctx.kube_client, status).await
+}
+
+async fn patch_access_policy_status_with_client(
+    policy: &EphemeralAccessPolicy,
+    client: &kube::Client,
+    status: &EphemeralAccessPolicyStatus,
+) -> Result<(), kube::Error> {
     let namespace = policy.namespace().unwrap_or_else(|| "default".to_string());
-    let api: Api<EphemeralAccessPolicy> = Api::namespaced(ctx.kube_client.clone(), &namespace);
+    let api: Api<EphemeralAccessPolicy> = Api::namespaced(client.clone(), &namespace);
     api.patch_status(
         &policy.name_any(),
         &PatchParams::apply("pgroles-operator"),
@@ -386,8 +448,11 @@ fn parse_duration(value: &str) -> Result<Duration, EphemeralError> {
                 )));
             }
         };
+        let seconds = amount
+            .checked_mul(multiplier)
+            .ok_or_else(|| EphemeralError::Invalid("duration is too large".to_string()))?;
         total = total
-            .checked_add(amount * multiplier)
+            .checked_add(seconds)
             .ok_or_else(|| EphemeralError::Invalid("duration is too large".to_string()))?;
     }
     if !number.is_empty() {
@@ -451,7 +516,14 @@ pub async fn reconcile_access_request(
     let api: Api<EphemeralAccessRequest> = Api::namespaced(ctx.kube_client.clone(), &namespace);
     finalizer::finalizer(&api, ACCESS_REQUEST_FINALIZER, resource, |event| async {
         match event {
-            FinalizerEvent::Apply(request) => reconcile_access_request_apply(&request, &ctx).await,
+            FinalizerEvent::Apply(request) => {
+                match reconcile_access_request_apply(&request, &ctx).await {
+                    Err(EphemeralError::Invalid(message)) => {
+                        update_request_validation_error(&request, &ctx, &message).await
+                    }
+                    result => result,
+                }
+            }
             FinalizerEvent::Cleanup(request) => {
                 reconcile_access_request_cleanup(&request, &ctx).await
             }
@@ -461,17 +533,40 @@ pub async fn reconcile_access_request(
 }
 
 pub fn access_request_error_policy(
-    _resource: Arc<EphemerAccessRequestAlias>,
+    _resource: Arc<EphemeralAccessRequest>,
     error: &finalizer::Error<EphemeralError>,
     _ctx: Arc<OperatorContext>,
 ) -> Action {
     tracing::warn!(%error, "ephemeral access request reconciliation failed");
+    if matches!(
+        error,
+        finalizer::Error::ApplyFailed(EphemeralError::Reconcile(ReconcileError::LockContention(
+            _,
+            _
+        ))) | finalizer::Error::CleanupFailed(EphemeralError::Reconcile(
+            ReconcileError::LockContention(_, _)
+        ))
+    ) {
+        let delay = ephemeral_lock_retry_delay();
+        tracing::debug!(
+            delay_millis = delay.as_millis(),
+            "requeuing ephemeral access after lock contention with jitter"
+        );
+        return Action::requeue(delay);
+    }
     Action::requeue(RETRY_DELAY)
 }
 
-// Keep the public error-policy signature readable without repeating a long type
-// in generated rustdoc.
-type EphemerAccessRequestAlias = EphemeralAccessRequest;
+fn ephemeral_lock_retry_delay() -> Duration {
+    // A short, sub-second component prevents phase-locking with target policies
+    // that reconcile on whole-second intervals without consuming a material
+    // part of a short access grant's lifetime.
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .subsec_nanos();
+    Duration::from_millis(750 + u64::from(nanos % 2_251))
+}
 
 async fn reconcile_access_request_apply(
     request: &EphemeralAccessRequest,
@@ -480,13 +575,24 @@ async fn reconcile_access_request_apply(
     let mut status = request.status.clone().unwrap_or_default();
 
     if status.resolved_access.is_none() {
-        let (resolved, approval_deadline, mode, suspended) = resolve_request(request, ctx).await?;
+        let (resolved, approval_deadline, mode, suspended) =
+            match resolve_request(request, ctx).await {
+                Ok(resolved) => resolved,
+                Err(EphemeralError::Invalid(message)) => {
+                    return update_request_resolution_failure(request, ctx, &message).await;
+                }
+                Err(error) => return Err(error),
+            };
         if suspended {
-            return Err(EphemeralError::Invalid(
-                "access policy is suspended".to_string(),
-            ));
+            return update_request_resolution_failure(
+                request,
+                ctx,
+                "access policy or target PostgresPolicy is suspended",
+            )
+            .await;
         }
         status.resolved_access = Some(resolved.clone());
+        status.last_error = None;
         status.approval_expires_at = Some(timestamp_from_epoch(approval_deadline));
         status.phase = match mode {
             EphemeralApprovalMode::Automatic => EphemeralAccessRequestPhase::Applying,
@@ -501,11 +607,16 @@ async fn reconcile_access_request_apply(
                 "Immutable access bundle resolved",
             ),
         );
+        set_condition(
+            &mut status.conditions,
+            access_condition("Ready", true, "Resolved", "Request is ready to progress"),
+        );
         if mode == EphemeralApprovalMode::Automatic {
             persist_activation_deadline(&mut status, &resolved)?;
         }
         patch_request_status(request, ctx, &status).await?;
-        audit_transition(request, None, &status, "Resolved");
+        audit_transition(request, ctx, None, &status, "Resolved");
+        publish_request_event_best_effort(request, ctx, &status, "Resolved").await;
         return Ok(Action::requeue(Duration::ZERO));
     }
 
@@ -556,10 +667,19 @@ async fn reconcile_access_request_apply(
         EphemeralAccessRequestPhase::PendingApproval | EphemeralAccessRequestPhase::Applying
     ) {
         let (current_resolved, _, mode, suspended) = resolve_request(request, ctx).await?;
+        let snapshot_mode = if status.phase == EphemeralAccessRequestPhase::PendingApproval
+            || decision_condition(&status, "Approved").is_some()
+            || decision_condition(&status, "Denied").is_some()
+        {
+            EphemeralApprovalMode::Required
+        } else {
+            EphemeralApprovalMode::Automatic
+        };
         let changed = current_resolved.access_policy_uid != resolved.access_policy_uid
             || current_resolved.target_policy_uid != resolved.target_policy_uid
             || current_resolved.compute_bundle_hash() != resolved.bundle_hash
-            || current_resolved.granted_duration != resolved.granted_duration;
+            || current_resolved.granted_duration != resolved.granted_duration
+            || mode != snapshot_mode;
         if changed || (suspended && status.phase == EphemeralAccessRequestPhase::Applying) {
             if status.phase == EphemeralAccessRequestPhase::Applying
                 && request_has_scoped_activation_plan(&ctx.kube_client, request, &resolved, true)
@@ -641,8 +761,62 @@ async fn reconcile_access_request_apply(
         return Ok(Action::requeue(Duration::ZERO));
     }
 
+    if status.phase == EphemeralAccessRequestPhase::Applying
+        && mode == EphemeralApprovalMode::Required
+    {
+        let approved = decision_condition(&status, "Approved").ok_or_else(|| {
+            EphemeralError::Invalid(
+                "Required request cannot apply without Approved=True".to_string(),
+            )
+        })?;
+        if approved.bundle_hash.as_deref() != Some(resolved.bundle_hash.as_str())
+            || approved.granted_duration.as_deref() != Some(resolved.granted_duration.as_str())
+        {
+            return Err(EphemeralError::Invalid(
+                "approval does not attest to the resolved bundle hash and duration".to_string(),
+            ));
+        }
+    }
+
     match status.phase {
         EphemeralAccessRequestPhase::Applying => {
+            let expires_at = status
+                .expires_at
+                .as_deref()
+                .and_then(parse_timestamp)
+                .ok_or_else(|| EphemeralError::Invalid("invalid access expiry".to_string()))?;
+            if expires_at <= now_epoch_secs() {
+                ctx.observability
+                    .record_ephemeral_expiry_lag(Duration::from_secs(
+                        now_epoch_secs().saturating_sub(expires_at),
+                    ));
+                let activation_started =
+                    request_has_scoped_activation_plan(&ctx.kube_client, request, &resolved, true)
+                        .await?;
+                if activation_started {
+                    status.retained_memberships = apply_scoped_memberships(
+                        request,
+                        ctx,
+                        &resolved,
+                        ScopedPlanOperation::Revoke,
+                    )
+                    .await?;
+                    status.ended_at = Some(crate::crd::now_rfc3339());
+                }
+                transition_request(
+                    request,
+                    ctx,
+                    &mut status,
+                    if activation_started {
+                        EphemeralAccessRequestPhase::Ended
+                    } else {
+                        EphemeralAccessRequestPhase::Cancelled
+                    },
+                    "ExpiredBeforeActivation",
+                )
+                .await?;
+                return Ok(Action::await_change());
+            }
             apply_scoped_memberships(request, ctx, &resolved, ScopedPlanOperation::Activate)
                 .await?;
             set_condition(
@@ -693,10 +867,18 @@ async fn reconcile_access_request_apply(
             Ok(Action::requeue(Duration::ZERO))
         }
         EphemeralAccessRequestPhase::Revoking => {
+            if let Some(expires_at) = status.expires_at.as_deref().and_then(parse_timestamp) {
+                ctx.observability
+                    .record_ephemeral_expiry_lag(Duration::from_secs(
+                        now_epoch_secs().saturating_sub(expires_at),
+                    ));
+            }
             let retained =
                 apply_scoped_memberships(request, ctx, &resolved, ScopedPlanOperation::Revoke)
                     .await?;
             status.retained_memberships = retained;
+            ctx.observability
+                .record_ephemeral_retained_memberships(status.retained_memberships.len());
             status.ended_at = Some(crate::crd::now_rfc3339());
             let reason = if status.retained_memberships.is_empty() {
                 "MembershipsRevoked"
@@ -751,14 +933,16 @@ async fn resolve_request(
     let policies: Api<EphemeralAccessPolicy> = Api::namespaced(ctx.kube_client.clone(), &namespace);
     let policy = policies.get(&request.spec.access_policy_ref.name).await?;
     let accepted = policy.status.as_ref().is_some_and(|status| {
-        status
-            .conditions
-            .iter()
-            .any(|condition| condition.condition_type == "Accepted" && condition.status == "True")
+        status.observed_generation == policy.metadata.generation
+            && ["Accepted", "ResolvedRefs"].iter().all(|condition_type| {
+                status.conditions.iter().any(|condition| {
+                    condition.condition_type == *condition_type && condition.status == "True"
+                })
+            })
     });
     if !accepted {
         return Err(EphemeralError::Invalid(
-            "access policy is not Accepted".to_string(),
+            "access policy current generation is not Accepted and Resolved".to_string(),
         ));
     }
     if policy.spec.justification.required
@@ -785,6 +969,32 @@ async fn resolve_request(
     let expanded_target =
         pgroles_core::manifest::expand_manifest(&target.spec.to_policy_manifest())
             .map_err(ReconcileError::from)?;
+    let target_roles: BTreeMap<_, _> = expanded_target
+        .roles
+        .iter()
+        .map(|role| (role.name.as_str(), role))
+        .collect();
+    let mut unique_memberships = BTreeSet::new();
+    for membership in &policy.spec.memberships {
+        let Some(role) = target_roles.get(membership.role.as_str()) else {
+            return Err(EphemeralError::Invalid(format!(
+                "access policy role {} is not in the current expanded target policy",
+                membership.role
+            )));
+        };
+        if role.external {
+            return Err(EphemeralError::Invalid(format!(
+                "access policy role {} is externally managed",
+                membership.role
+            )));
+        }
+        if !unique_memberships.insert(membership.role.as_str()) {
+            return Err(EphemeralError::Invalid(format!(
+                "access policy role {} appears more than once",
+                membership.role
+            )));
+        }
+    }
     if !expanded_target
         .roles
         .iter()
@@ -856,16 +1066,65 @@ async fn patch_request_status(
 ) -> Result<(), kube::Error> {
     let namespace = request.namespace().unwrap_or_else(|| "default".to_string());
     let api: Api<EphemeralAccessRequest> = Api::namespaced(ctx.kube_client.clone(), &namespace);
+    let status_patch = request_status_patch_value(status);
     api.patch_status(
         &request.name_any(),
         &PatchParams::apply("pgroles-operator"),
         &Patch::Merge(serde_json::json!({
             "metadata": { "resourceVersion": request.resource_version() },
-            "status": status,
+            "status": status_patch,
         })),
     )
     .await?;
     Ok(())
+}
+
+fn request_status_patch_value(status: &EphemeralAccessRequestStatus) -> serde_json::Value {
+    let mut status_patch = serde_json::json!(status);
+    // Merge Patch treats an omitted field as "leave unchanged". The status
+    // schema omits None values for clean reads, so explicitly send null when a
+    // successful reconcile clears a previously surfaced validation error.
+    if status.last_error.is_none()
+        && let Some(fields) = status_patch.as_object_mut()
+    {
+        fields.insert("lastError".to_string(), serde_json::Value::Null);
+    }
+    status_patch
+}
+
+async fn update_request_resolution_failure(
+    request: &EphemeralAccessRequest,
+    ctx: &OperatorContext,
+    message: &str,
+) -> Result<Action, EphemeralError> {
+    let mut status = request.status.clone().unwrap_or_default();
+    status.last_error = Some(message.to_string());
+    let reason = if message.contains("suspended") {
+        "Suspended"
+    } else {
+        "InvalidRequest"
+    };
+    set_condition(
+        &mut status.conditions,
+        access_condition("Resolved", false, reason, message),
+    );
+    patch_request_status(request, ctx, &status).await?;
+    Ok(Action::requeue(Duration::from_secs(60)))
+}
+
+async fn update_request_validation_error(
+    request: &EphemeralAccessRequest,
+    ctx: &OperatorContext,
+    message: &str,
+) -> Result<Action, EphemeralError> {
+    let mut status = request.status.clone().unwrap_or_default();
+    status.last_error = Some(message.to_string());
+    set_condition(
+        &mut status.conditions,
+        access_condition("Ready", false, "InvalidRequestState", message),
+    );
+    patch_request_status(request, ctx, &status).await?;
+    Ok(Action::requeue(Duration::from_secs(60)))
 }
 
 async fn transition_request(
@@ -878,17 +1137,30 @@ async fn transition_request(
     let previous = status.phase;
     status.phase = phase;
     status.last_error = None;
+    set_condition(
+        &mut status.conditions,
+        access_condition(
+            "Ready",
+            true,
+            &phase.to_string(),
+            "Request lifecycle is progressing normally",
+        ),
+    );
     patch_request_status(request, ctx, status).await?;
-    audit_transition(request, Some(previous), status, reason);
+    audit_transition(request, ctx, Some(previous), status, reason);
+    publish_request_event_best_effort(request, ctx, status, reason).await;
     Ok(())
 }
 
 fn audit_transition(
     request: &EphemeralAccessRequest,
+    ctx: &OperatorContext,
     previous: Option<EphemeralAccessRequestPhase>,
     status: &EphemeralAccessRequestStatus,
     reason: &str,
 ) {
+    ctx.observability
+        .record_ephemeral_transition(&status.phase.to_string(), reason);
     let resolved = status.resolved_access.as_ref();
     tracing::info!(
         audit_event = "pgroles.ephemeral_access.lifecycle",
@@ -908,6 +1180,30 @@ fn audit_transition(
     );
 }
 
+async fn publish_request_event_best_effort(
+    request: &EphemeralAccessRequest,
+    ctx: &OperatorContext,
+    status: &EphemeralAccessRequestStatus,
+    reason: &str,
+) {
+    let note = format!(
+        "Request {} entered {} ({reason})",
+        request.name_any(),
+        status.phase
+    );
+    if let Err(error) = crate::events::publish_ephemeral_request_event(
+        &ctx.event_recorder,
+        request,
+        status.phase,
+        reason,
+        note,
+    )
+    .await
+    {
+        tracing::warn!(request = %request.name_any(), %error, "failed to publish ephemeral access Event");
+    }
+}
+
 async fn reconcile_access_request_cleanup(
     request: &EphemeralAccessRequest,
     ctx: &OperatorContext,
@@ -921,11 +1217,30 @@ async fn reconcile_access_request_cleanup(
                 | EphemeralAccessRequestPhase::Revoking
         )
     {
-        apply_scoped_memberships(request, ctx, resolved, ScopedPlanOperation::Revoke).await?;
+        if !resolved.has_valid_bundle_hash() {
+            return Err(EphemeralError::Invalid(
+                "refusing finalizer cleanup for a non-canonical resolved bundle".to_string(),
+            ));
+        }
+        let activation_started =
+            request_has_scoped_activation_plan(&ctx.kube_client, request, resolved, true).await?;
+        if activation_started {
+            apply_scoped_memberships(request, ctx, resolved, ScopedPlanOperation::Revoke).await?;
+        } else {
+            tracing::warn!(
+                request = %request.name_any(),
+                request_uid = %request.uid().unwrap_or_default(),
+                "request cleanup skipped SQL because no request-owned activation plan exists"
+            );
+        }
         let mut ended = status.clone();
         ended.phase = EphemeralAccessRequestPhase::Revoked;
         ended.ended_at = Some(crate::crd::now_rfc3339());
-        audit_transition(request, Some(status.phase), &ended, "RequestDeleted");
+        // Deletion is the initial early-revocation API. This phase is emitted
+        // to the durable audit stream but deliberately is not persisted to an
+        // object whose finalizer is about to be removed.
+        audit_transition(request, ctx, Some(status.phase), &ended, "RequestDeleted");
+        publish_request_event_best_effort(request, ctx, &ended, "RequestDeleted").await;
     }
     Ok(Action::await_change())
 }
@@ -943,14 +1258,15 @@ fn graph_membership_key(membership: &pgroles_core::model::MembershipEdge) -> Mem
 /// Merge currently owned ephemeral edges into an ordinary policy's desired
 /// graph. Callers must hold both the in-process and PostgreSQL advisory locks.
 pub async fn compose_effective_graph(
-    client: &kube::Client,
+    ctx: &OperatorContext,
     policy: &PostgresPolicy,
     desired: &mut pgroles_core::model::RoleGraph,
 ) -> Result<BTreeSet<String>, ReconcileError> {
     let namespace = policy.namespace().ok_or(ReconcileError::NoNamespace)?;
     let policy_uid = policy.uid().unwrap_or_default();
-    let requests: Api<EphemeralAccessRequest> = Api::namespaced(client.clone(), &namespace);
-    let plans: Api<PostgresPolicyPlan> = Api::namespaced(client.clone(), &namespace);
+    let requests: Api<EphemeralAccessRequest> =
+        Api::namespaced(ctx.kube_client.clone(), &namespace);
+    let plans: Api<PostgresPolicyPlan> = Api::namespaced(ctx.kube_client.clone(), &namespace);
     let scoped_plans = plans.list(&ListParams::default()).await?;
     let mut additional_roles = BTreeSet::new();
     let mut overlays: BTreeMap<MembershipKey, pgroles_core::model::MembershipEdge> =
@@ -969,11 +1285,14 @@ pub async fn compose_effective_graph(
         let Some(resolved) = status.resolved_access.as_ref() else {
             continue;
         };
-        if status.phase == EphemeralAccessRequestPhase::Applying
-            && !scoped_plans
-                .items
-                .iter()
-                .any(|plan| plan_authorizes_activation(plan, &request, resolved, true))
+        // Status is mutable control-plane data; a request-owned activation
+        // plan is the durable provenance anchor proving the operator began
+        // this exact bundle for this request UID. Require it for both Applying
+        // and Active so a forged phase/snapshot can never enter the graph.
+        if !scoped_plans
+            .items
+            .iter()
+            .any(|plan| plan_authorizes_activation(plan, &request, resolved, true))
         {
             continue;
         }
@@ -981,14 +1300,31 @@ pub async fn compose_effective_graph(
             continue;
         }
         for membership in &resolved.memberships {
-            if !desired.roles.contains_key(&membership.role)
-                || !desired.roles.contains_key(&membership.member)
-            {
+            let missing_granted_role = !desired.roles.contains_key(&membership.role);
+            let missing_subject = !desired.roles.contains_key(&membership.member);
+            if missing_granted_role || missing_subject {
+                let relationship = match (missing_granted_role, missing_subject) {
+                    (true, true) => "granted role and subject",
+                    (true, false) => "granted role",
+                    (false, true) => "subject",
+                    (false, false) => unreachable!(),
+                };
+                ctx.observability.record_ephemeral_role_retirement_blocked();
+                set_role_retirement_blocked(
+                    &ctx.kube_client,
+                    &request,
+                    resolved,
+                    membership,
+                    relationship,
+                )
+                .await?;
                 return Err(ReconcileError::InvalidSpec(format!(
-                    "active ephemeral request {} blocks removal of membership role {} or subject {}",
+                    "active ephemeral request {} ({}) blocks removal of {}: membership {} -> {}",
                     request.name_any(),
-                    membership.role,
-                    membership.member
+                    request.uid().unwrap_or_default(),
+                    relationship,
+                    membership.member,
+                    membership.role
                 )));
             }
             additional_roles.insert(membership.role.clone());
@@ -1025,8 +1361,91 @@ pub async fn compose_effective_graph(
             overlays.insert(key, edge);
         }
     }
+    clear_role_retirement_blocked(&ctx.kube_client, policy).await?;
     desired.memberships.extend(overlays.into_values());
     Ok(additional_roles)
+}
+
+async fn set_role_retirement_blocked(
+    client: &kube::Client,
+    request: &EphemeralAccessRequest,
+    resolved: &ResolvedEphemeralAccess,
+    membership: &ResolvedEphemeralMembership,
+    relationship: &str,
+) -> Result<(), kube::Error> {
+    let namespace = request.namespace().unwrap_or_else(|| "default".to_string());
+    let policies: Api<EphemeralAccessPolicy> = Api::namespaced(client.clone(), &namespace);
+    let Ok(policy) = policies.get(&request.spec.access_policy_ref.name).await else {
+        return Ok(());
+    };
+    if policy.uid().as_deref() != Some(resolved.access_policy_uid.as_str()) {
+        return Ok(());
+    }
+    let mut status = policy.status.clone().unwrap_or_default();
+    let previous = status.conditions.clone();
+    set_condition(
+        &mut status.conditions,
+        access_condition(
+            "RoleRetirementBlocked",
+            true,
+            "ActiveRequest",
+            &format!(
+                "request {} ({}) references {} as {}; membership {} -> {}",
+                request.name_any(),
+                request.uid().unwrap_or_default(),
+                if relationship == "subject" {
+                    &membership.member
+                } else {
+                    &membership.role
+                },
+                relationship,
+                membership.member,
+                membership.role
+            ),
+        ),
+    );
+    if status.conditions != previous {
+        patch_access_policy_status_with_client(&policy, client, &status).await?;
+    }
+    Ok(())
+}
+
+async fn clear_role_retirement_blocked(
+    client: &kube::Client,
+    target: &PostgresPolicy,
+) -> Result<(), kube::Error> {
+    let namespace = target.namespace().unwrap_or_else(|| "default".to_string());
+    let policies: Api<EphemeralAccessPolicy> = Api::namespaced(client.clone(), &namespace);
+    for policy in policies.list(&ListParams::default()).await? {
+        if policy.spec.postgres_policy_ref.name != target.name_any() {
+            continue;
+        }
+        let Some(existing_status) = policy.status.as_ref() else {
+            continue;
+        };
+        if !existing_status
+            .conditions
+            .iter()
+            .any(|condition| condition.condition_type == "RoleRetirementBlocked")
+        {
+            continue;
+        }
+        let mut status = existing_status.clone();
+        let previous = status.conditions.clone();
+        set_condition(
+            &mut status.conditions,
+            access_condition(
+                "RoleRetirementBlocked",
+                false,
+                "NoBlockingRequests",
+                "No active request blocks role retirement",
+            ),
+        );
+        if status.conditions != previous {
+            patch_access_policy_status_with_client(&policy, client, &status).await?;
+        }
+    }
+    Ok(())
 }
 
 async fn apply_scoped_memberships(
@@ -1035,6 +1454,19 @@ async fn apply_scoped_memberships(
     resolved: &ResolvedEphemeralAccess,
     operation: ScopedPlanOperation,
 ) -> Result<Vec<ResolvedEphemeralMembership>, EphemeralError> {
+    if !resolved.has_valid_bundle_hash() {
+        return Err(EphemeralError::Invalid(
+            "resolved bundle hash does not match its canonical payload".to_string(),
+        ));
+    }
+    if operation == ScopedPlanOperation::Revoke
+        && !request_has_scoped_activation_plan(&ctx.kube_client, request, resolved, true).await?
+    {
+        return Err(EphemeralError::Invalid(
+            "refusing scoped revocation without a matching request-owned activation plan"
+                .to_string(),
+        ));
+    }
     let namespace = request
         .namespace()
         .ok_or_else(|| EphemeralError::Invalid("resource has no namespace".to_string()))?;
@@ -1111,8 +1543,7 @@ async fn apply_scoped_memberships_under_lock(
         pgroles_core::model::RoleGraph::from_expanded(&expanded, manifest.default_owner.as_deref())
             .map_err(ReconcileError::from)?;
     let durable_memberships = durable.memberships.clone();
-    let mut additional_roles =
-        compose_effective_graph(&ctx.kube_client, target, &mut durable).await?;
+    let mut additional_roles = compose_effective_graph(ctx, target, &mut durable).await?;
     for membership in &resolved.memberships {
         additional_roles.insert(membership.role.clone());
         additional_roles.insert(membership.member.clone());
@@ -1154,6 +1585,14 @@ async fn apply_scoped_memberships_under_lock(
         ScopedPlanOperation::Activate => {
             for membership in &resolved.memberships {
                 let key = membership_key(membership);
+                if !current.roles.contains_key(&membership.role)
+                    || !current.roles.contains_key(&membership.member)
+                {
+                    return Err(EphemeralError::Invalid(format!(
+                        "membership roles {} and {} must already exist in PostgreSQL",
+                        membership.member, membership.role
+                    )));
+                }
                 if durable_by_key.contains_key(&key) {
                     return Err(EphemeralError::Invalid(format!(
                         "membership {} -> {} is already durable",
@@ -1286,11 +1725,10 @@ async fn active_owner_keys(
         let Some(resolved) = status.resolved_access.as_ref() else {
             continue;
         };
-        if status.phase == EphemeralAccessRequestPhase::Applying
-            && !scoped_plans
-                .items
-                .iter()
-                .any(|plan| plan_authorizes_activation(plan, &request, resolved, true))
+        if !scoped_plans
+            .items
+            .iter()
+            .any(|plan| plan_authorizes_activation(plan, &request, resolved, true))
         {
             continue;
         }
@@ -1369,11 +1807,33 @@ async fn create_scoped_plan(
         ScopedPlanOperation::Activate => "activate",
         ScopedPlanOperation::Revoke => "revoke",
     };
-    let suffix = &resolved.bundle_hash.trim_start_matches("sha256:")[..12];
+    let bundle_digest = resolved
+        .bundle_hash
+        .strip_prefix("sha256:")
+        .ok_or_else(|| {
+            EphemeralError::Invalid("bundle hash must use the sha256 encoding".to_string())
+        })?;
+    let suffix = bundle_digest.get(..12).ok_or_else(|| {
+        EphemeralError::Invalid("bundle hash is too short for a scoped plan name".to_string())
+    })?;
+    let request_uid = request.uid().filter(|uid| !uid.is_empty()).ok_or_else(|| {
+        EphemeralError::Invalid("request has no UID for scoped plan ownership".to_string())
+    })?;
+    let uid_suffix = request_uid
+        .chars()
+        .filter(|character| character.is_ascii_alphanumeric())
+        .take(8)
+        .collect::<String>();
+    if uid_suffix.len() != 8 {
+        return Err(EphemeralError::Invalid(
+            "request UID is too short for a scoped plan name".to_string(),
+        ));
+    }
     let prefix = crate::k8s_names::sanitize_dns_label_segment(&request.name_any(), "request");
-    let max_prefix = 253usize.saturating_sub(operation_name.len() + suffix.len() + 2);
+    let max_prefix =
+        253usize.saturating_sub(uid_suffix.len() + operation_name.len() + suffix.len() + 3);
     let prefix = crate::k8s_names::truncate_name_prefix(&prefix, max_prefix);
-    let name = format!("{prefix}-{operation_name}-{suffix}");
+    let name = format!("{prefix}-{uid_suffix}-{operation_name}-{suffix}");
     let mut plan = PostgresPolicyPlan::new(
         &name,
         PostgresPolicyPlanSpec {
@@ -1434,9 +1894,65 @@ async fn create_scoped_plan(
                 &Patch::Merge(serde_json::json!({ "status": initial_status })),
             )
             .await?),
-        Err(kube::Error::Api(error)) if error.code == 409 => Ok(plans.get(&name).await?),
+        Err(kube::Error::Api(error)) if error.code == 409 => {
+            let existing = plans.get(&name).await?;
+            validate_existing_scoped_plan(
+                &existing,
+                request,
+                &target.name_any(),
+                resolved,
+                operation,
+                execution.database_identity,
+            )?;
+            Ok(existing)
+        }
         Err(error) => Err(error.into()),
     }
+}
+
+fn validate_existing_scoped_plan(
+    plan: &PostgresPolicyPlan,
+    request: &EphemeralAccessRequest,
+    target_name: &str,
+    resolved: &ResolvedEphemeralAccess,
+    operation: ScopedPlanOperation,
+    database_identity: &str,
+) -> Result<(), EphemeralError> {
+    let request_uid = request.uid().unwrap_or_default();
+    let owned_by_request = plan
+        .metadata
+        .owner_references
+        .as_deref()
+        .unwrap_or_default()
+        .iter()
+        .any(|owner| {
+            owner.controller == Some(true)
+                && owner.kind == "EphemeralAccessRequest"
+                && owner.uid == request_uid
+        });
+    let origin_matches = plan.spec.origin.as_ref().is_some_and(|origin| {
+        origin.kind == "EphemeralAccessRequest"
+            && origin.name == request.name_any()
+            && origin.uid == request_uid
+    });
+    let scope_matches = plan.spec.scope.as_ref().is_some_and(|scope| {
+        scope.kind == "MembershipBundle"
+            && scope.operation == operation
+            && scope.bundle_hash == resolved.bundle_hash
+    });
+    if !owned_by_request
+        || !origin_matches
+        || !scope_matches
+        || plan.spec.policy_ref.name != target_name
+        || plan.spec.managed_database_identity != database_identity
+    {
+        return Err(EphemeralError::Invalid(format!(
+            "existing scoped plan {} does not belong to request UID {} and its resolved scope",
+            plan.name_any(),
+            request_uid
+        )));
+    }
+    Ok(())
 }
 
 fn scoped_change_summary(changes: &[pgroles_core::diff::Change]) -> ChangeSummary {
@@ -1494,6 +2010,31 @@ mod tests {
         assert!(parse_duration("0s").is_err());
         assert!(parse_duration("5d").is_err());
         assert!(parse_duration("").is_err());
+        assert!(parse_duration("18446744073709551615h").is_err());
+    }
+
+    #[test]
+    fn request_status_patch_explicitly_clears_last_error() {
+        let mut status = EphemeralAccessRequestStatus {
+            last_error: Some("invalid request".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(
+            request_status_patch_value(&status)["lastError"],
+            "invalid request"
+        );
+
+        status.last_error = None;
+        assert!(request_status_patch_value(&status)["lastError"].is_null());
+    }
+
+    #[test]
+    fn ephemeral_lock_retry_uses_short_bounded_jitter() {
+        for _ in 0..32 {
+            let delay = ephemeral_lock_retry_delay();
+            assert!(delay >= Duration::from_millis(750));
+            assert!(delay <= Duration::from_millis(3_000));
+        }
     }
 
     #[test]
@@ -1585,6 +2126,30 @@ mod tests {
         ));
         plan.metadata.owner_references = request.controller_owner_ref(&()).map(|owner| vec![owner]);
         assert!(plan_authorizes_activation(&plan, &request, &resolved, true));
+        assert!(
+            validate_existing_scoped_plan(
+                &plan,
+                &request,
+                "target",
+                &resolved,
+                ScopedPlanOperation::Activate,
+                "default/database",
+            )
+            .is_ok()
+        );
+        plan.spec.origin.as_mut().expect("origin").uid = "stale-request-uid".into();
+        assert!(
+            validate_existing_scoped_plan(
+                &plan,
+                &request,
+                "target",
+                &resolved,
+                ScopedPlanOperation::Activate,
+                "default/database",
+            )
+            .is_err()
+        );
+        plan.spec.origin.as_mut().expect("origin").uid = "request-uid".into();
         assert!(!plan_authorizes_activation(
             &plan, &request, &resolved, false
         ));
