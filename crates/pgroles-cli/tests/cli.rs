@@ -1446,54 +1446,25 @@ mod live_db {
         });
     }
 
-    fn postgres_version_num() -> i32 {
-        with_runtime(async {
-            let pool = PgPool::connect(&database_url())
-                .await
-                .expect("failed to connect to live test database");
-            sqlx::query_scalar("SELECT current_setting('server_version_num')::int")
-                .fetch_one(&pool)
-                .await
-                .expect("failed to query PostgreSQL version")
-        })
-    }
-
     fn query_membership_flags(role: &str, member: &str) -> (bool, bool) {
         with_runtime(async {
             let pool = PgPool::connect(&database_url())
                 .await
                 .expect("failed to connect to live test database");
-            let version: i32 =
-                sqlx::query_scalar("SELECT current_setting('server_version_num')::int")
-                    .fetch_one(&pool)
-                    .await
-                    .expect("failed to query PostgreSQL version");
-            let query = if version >= 160_000 {
+            let row = sqlx::query(
                 r#"
-                    SELECT m.admin_option, m.inherit_option
-                    FROM pg_auth_members m
-                    JOIN pg_roles gr ON gr.oid = m.roleid
-                    JOIN pg_roles mr ON mr.oid = m.member
-                    WHERE gr.rolname = $1 AND mr.rolname = $2
-                "#
-            } else {
-                // PostgreSQL 15 stores INHERIT on the member role rather than
-                // on each membership edge. This matches the compatibility
-                // projection used by pgroles-inspect.
-                r#"
-                    SELECT m.admin_option, mr.rolinherit AS inherit_option
-                    FROM pg_auth_members m
-                    JOIN pg_roles gr ON gr.oid = m.roleid
-                    JOIN pg_roles mr ON mr.oid = m.member
-                    WHERE gr.rolname = $1 AND mr.rolname = $2
-                "#
-            };
-            let row = sqlx::query(query)
-                .bind(role)
-                .bind(member)
-                .fetch_one(&pool)
-                .await
-                .expect("failed to query membership flags");
+                SELECT m.admin_option, m.inherit_option
+                FROM pg_auth_members m
+                JOIN pg_roles gr ON gr.oid = m.roleid
+                JOIN pg_roles mr ON mr.oid = m.member
+                WHERE gr.rolname = $1 AND mr.rolname = $2
+                "#,
+            )
+            .bind(role)
+            .bind(member)
+            .fetch_one(&pool)
+            .await
+            .expect("failed to query membership flags");
             (row.get("admin_option"), row.get("inherit_option"))
         })
     }
@@ -3708,11 +3679,6 @@ grants:
     fn membership_option_updates_apply_without_dropping_membership() {
         let group_role = unique_name("group_role");
         let member_role = unique_name("member_role");
-        // PostgreSQL 15 has no per-membership INHERIT option; pgroles projects
-        // the member role's INHERIT attribute instead. Keep that implied value
-        // stable there while still exercising the ADMIN update. PostgreSQL 16+
-        // exercises both per-membership options.
-        let updated_inherit = postgres_version_num() < 160_000;
 
         execute_sql(&format!(
             r#"
@@ -3757,7 +3723,7 @@ memberships:
   - role: {group_role}
     members:
       - name: {member_role}
-        inherit: {updated_inherit}
+        inherit: false
         admin: true
 "#
         ));
@@ -3775,7 +3741,7 @@ memberships:
 
         assert_eq!(
             query_membership_flags(&group_role, &member_role),
-            (true, updated_inherit),
+            (true, false),
             "membership should remain present with updated admin/inherit flags"
         );
 

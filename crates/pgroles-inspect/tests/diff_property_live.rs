@@ -34,11 +34,6 @@
 //!   this cannot mask a real mismatch.
 //! * **`password_valid_until`** is never generated; instead of normalizing it
 //!   away we *assert* it inspects as `None` for every generated role.
-//! * **PostgreSQL 15 membership inheritance.** PostgreSQL 15 stores `INHERIT`
-//!   on the member role, not on each membership edge. Generated edge values
-//!   are therefore projected from their member role on PostgreSQL 15, exactly
-//!   as `pgroles-inspect` projects the live catalog. PostgreSQL 16+ retains
-//!   independent per-edge generation and comparison.
 //!
 //! Nothing else is normalized — graphs are compared field-for-field.
 //!
@@ -92,8 +87,8 @@ use pgroles_core::model::{
     DefaultPrivKey, DefaultPrivState, GrantKey, GrantState, MembershipEdge, RoleAttribute,
     RoleGraph, RoleState, SchemaState, default_schema_owner_privileges,
 };
-use pgroles_core::sql::{SqlContext, quote_ident, render_statements_with_context};
-use pgroles_inspect::{InspectConfig, detect_pg_version, inspect};
+use pgroles_core::sql::{quote_ident, render_statements};
+use pgroles_inspect::{InspectConfig, inspect};
 
 // ---------------------------------------------------------------------------
 // Test harness plumbing
@@ -122,15 +117,9 @@ async fn execute_sql(pool: &PgPool, statement: &str, seed: u64, phase: &str) {
         .unwrap_or_else(|error| panic!("seed {seed} [{phase}]: failed `{statement}`: {error}"));
 }
 
-async fn execute_changes(
-    pool: &PgPool,
-    changes: &[Change],
-    sql_context: &SqlContext,
-    seed: u64,
-    phase: &str,
-) {
+async fn execute_changes(pool: &PgPool, changes: &[Change], seed: u64, phase: &str) {
     for change in changes {
-        for statement in render_statements_with_context(change, sql_context) {
+        for statement in render_statements(change) {
             execute_sql(pool, &statement, seed, phase).await;
         }
     }
@@ -789,20 +778,6 @@ fn generate_case(seed: u64, names: &Names) -> Case {
     }
 }
 
-fn project_pg15_membership_inheritance(graph: &mut RoleGraph) {
-    graph.memberships = std::mem::take(&mut graph.memberships)
-        .into_iter()
-        .map(|mut edge| {
-            edge.inherit = graph
-                .roles
-                .get(&edge.member)
-                .map(|role| role.inherit)
-                .unwrap_or(true);
-            edge
-        })
-        .collect();
-}
-
 // ---------------------------------------------------------------------------
 // Interpreter: pure-data semantics of each Change variant.
 //
@@ -1119,7 +1094,7 @@ fn inspect_config(roles: &[String], schemas: &[String]) -> InspectConfig {
 // Per-seed execution
 // ---------------------------------------------------------------------------
 
-async fn run_seed(pool: &PgPool, sql_context: &SqlContext, seed: u64, names: &Names, case: &Case) {
+async fn run_seed(pool: &PgPool, seed: u64, names: &Names, case: &Case) {
     let Case {
         current,
         desired,
@@ -1135,7 +1110,7 @@ async fn run_seed(pool: &PgPool, sql_context: &SqlContext, seed: u64, names: &Na
         ..RoleGraph::default()
     };
     let changes = diff(&RoleGraph::default(), &skeleton);
-    execute_changes(pool, &changes, sql_context, seed, "bootstrap:roles+schemas").await;
+    execute_changes(pool, &changes, seed, "bootstrap:roles+schemas").await;
 
     // --- Backing objects: every concrete relation grant target in either
     // graph lives in a base schema, and all base schemas exist in `current`,
@@ -1163,7 +1138,7 @@ async fn run_seed(pool: &PgPool, sql_context: &SqlContext, seed: u64, names: &Na
 
     // --- Bootstrap phase 2: grants, default privileges, memberships. ---
     let changes = diff(&skeleton, current);
-    execute_changes(pool, &changes, sql_context, seed, "bootstrap:bindings").await;
+    execute_changes(pool, &changes, seed, "bootstrap:bindings").await;
 
     // --- Live-only drift (owner schema-privilege revocations). ---
     for statement in drift_sql {
@@ -1181,7 +1156,7 @@ async fn run_seed(pool: &PgPool, sql_context: &SqlContext, seed: u64, names: &Na
     // --- Converge, predicting the outcome with the pure interpreter. ---
     let changes = diff(&inspected_current, desired);
     let predicted = apply_changes(&inspected_current, &changes);
-    execute_changes(pool, &changes, sql_context, seed, "converge").await;
+    execute_changes(pool, &changes, seed, "converge").await;
 
     // --- Re-inspect: the live convergence oracle. ---
     let re_inspected = filter_prefix(
@@ -1236,19 +1211,11 @@ fn live_convergence_matches_desired_and_interpreter() {
     let pool = runtime
         .block_on(PgPool::connect(&database_url()))
         .expect("failed to connect to live test database");
-    let version = runtime
-        .block_on(detect_pg_version(&pool))
-        .expect("failed to detect PostgreSQL version");
-    let sql_context = SqlContext::from_version_num(version.version_num);
 
     for seed in 0..seed_count() {
         let started = Instant::now();
         let names = Names::new(seed);
-        let mut case = generate_case(seed, &names);
-        if !version.supports_grant_with_options() {
-            project_pg15_membership_inheritance(&mut case.current);
-            project_pg15_membership_inheritance(&mut case.desired);
-        }
+        let case = generate_case(seed, &names);
         let (roles, schemas) = union_names(&case.current, &case.desired);
 
         // Defensive pre-clean in case a previous run leaked this namespace.
@@ -1257,7 +1224,7 @@ fn live_convergence_matches_desired_and_interpreter() {
         // Guard runs even on panic; dropped in sync context so it may build
         // its own runtime.
         let cleanup = SeedCleanup { roles, schemas };
-        runtime.block_on(run_seed(&pool, &sql_context, seed, &names, &case));
+        runtime.block_on(run_seed(&pool, seed, &names, &case));
         drop(cleanup);
 
         eprintln!(
@@ -1306,10 +1273,6 @@ fn issue_140_owner_transfer_with_stale_owner_grant_converges_single_pass() {
         let pool = PgPool::connect(&database_url())
             .await
             .expect("failed to connect to live test database");
-        let version = detect_pg_version(&pool)
-            .await
-            .expect("failed to detect PostgreSQL version");
-        let sql_context = SqlContext::from_version_num(version.version_num);
 
         // Bootstrap the exact issue-140 current state via raw SQL.
         for statement in [
@@ -1329,7 +1292,7 @@ fn issue_140_owner_transfer_with_stale_owner_grant_converges_single_pass() {
                 .any(|c| matches!(c, Change::AlterSchemaOwner { name, owner } if *name == s && *owner == z)),
             "plan must transfer ownership, got: {changes:?}"
         );
-        execute_changes(&pool, &changes, &sql_context, 140, "converge").await;
+        execute_changes(&pool, &changes, 140, "converge").await;
 
         // The new owner must still hold USAGE on its own schema — the bug
         // stripped it here.

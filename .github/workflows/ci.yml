@@ -158,7 +158,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        pg_version: ["15", "16", "17", "18"]
+        pg_version: ["16", "17", "18"]
     services:
       postgres:
         image: postgres:${{ matrix.pg_version }}

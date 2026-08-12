@@ -153,6 +153,9 @@ PR CI validates:
 - invalid specs, missing secrets, insufficient privileges
 - Kubernetes Event delivery for warning and recovery transitions
 - generated policies spanning 2 databases, 30 schemas, 60 roles
+- trusted-writer and Kyverno-secured ephemeral access lifecycles, including
+  approval ownership, overlap, suspension, recovery, additive revocation,
+  multiple replicas, target deletion, and session behavior
 
 Scheduled coverage on `main` additionally exercises:
 

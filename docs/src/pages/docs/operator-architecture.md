@@ -155,31 +155,6 @@ For object-local debugging, the controller also emits transition-based Kubernete
 - Events: notable transitions visible in `kubectl describe`
 - OTLP metrics: fleet-level trends and alerting
 
-## CI coverage
-
-CI covers:
-
-- happy-path reconciliation in kind
-- same-database disjoint policies
-- same-database disjoint policies recovering through shared-secret churn
-- same-database conflicting policies
-- invalid specs
-- missing secrets
-- insufficient database privileges
-- secret rotation and recovery
-- Kubernetes Event delivery for warning and recovery transitions
-- plan-mode drift detection without SQL execution
-- OTLP metrics export through an in-cluster Collector
-- generated load policies across 2 databases with 30 schemas / 60 generated roles
-- scheduled fairness/load coverage across 5 policies, 3 databases, 100 schemas, and 200 generated roles with repeated secret churn
-- trusted-writer and Kyverno-secured ephemeral access lifecycle matrices,
-  including approval ownership, overlap, suspension, restart recovery,
-  additive revocation, multiple replicas, target deletion, and session behavior
-
-Further hardening work:
-
-- broader scale and long-run validation beyond the scheduled workflow profile
-
 ## Relationship to the CLI
 
 The CLI remains the simplest path for explicit, reviewed role changes. The operator is the continuous control plane version of the same model.
