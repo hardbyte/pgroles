@@ -4484,34 +4484,33 @@ retirements:
     }
 
     fn assert_bounded_strings_and_collections(schema: &serde_json::Value, path: &str) {
-        let Some(object) = schema.as_object() else {
-            return;
-        };
-        match object.get("type").and_then(serde_json::Value::as_str) {
-            Some("string") if !object.contains_key("enum") => {
-                assert!(
-                    object.contains_key("maxLength"),
-                    "unbounded string schema at {path}"
-                );
+        match schema {
+            serde_json::Value::Object(object) => {
+                match object.get("type").and_then(serde_json::Value::as_str) {
+                    Some("string") if !object.contains_key("enum") => {
+                        assert!(
+                            object.contains_key("maxLength"),
+                            "unbounded string schema at {path}"
+                        );
+                    }
+                    Some("array") => {
+                        assert!(
+                            object.contains_key("maxItems"),
+                            "unbounded collection schema at {path}"
+                        );
+                    }
+                    _ => {}
+                }
+                for (name, child) in object {
+                    assert_bounded_strings_and_collections(child, &format!("{path}.{name}"));
+                }
             }
-            Some("array") => {
-                assert!(
-                    object.contains_key("maxItems"),
-                    "unbounded collection schema at {path}"
-                );
-                if let Some(items) = object.get("items") {
-                    assert_bounded_strings_and_collections(items, &format!("{path}[]"));
+            serde_json::Value::Array(items) => {
+                for (index, child) in items.iter().enumerate() {
+                    assert_bounded_strings_and_collections(child, &format!("{path}[{index}]"));
                 }
             }
             _ => {}
-        }
-        if let Some(properties) = object
-            .get("properties")
-            .and_then(serde_json::Value::as_object)
-        {
-            for (name, property) in properties {
-                assert_bounded_strings_and_collections(property, &format!("{path}.{name}"));
-            }
         }
     }
 
