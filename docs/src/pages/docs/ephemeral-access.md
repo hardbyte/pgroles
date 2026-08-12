@@ -8,7 +8,7 @@ description: Request, approve, audit, and revoke bounded PostgreSQL role members
 Ephemeral access grants an existing PostgreSQL identity one predefined bundle of
 role memberships for a bounded duration. `PostgresPolicy` remains the durable
 source of truth; an `EphemeralAccessPolicy` defines a requestable bundle, and an
-immutable `EphemeralAccessRequest` records one approval and lease lifecycle.
+immutable `EphemeralAccessRequest` records one approval and request lifecycle.
 
 The feature does not issue credentials, implement cloud login, or terminate
 existing sessions. Revoking membership prevents a new `SET ROLE`, but a session
@@ -41,15 +41,15 @@ spec:
 
 The target must be a same-namespace `PostgresPolicy` in `mode: apply`. Roles are
 concrete names from its expanded graph. The subject already exists; pgroles does
-not create a login identity for a request. Membership never carries `ADMIN
-OPTION`. Durations are one or more integer/unit pairs using `s`, `m`, or `h`
-(for example `45s` or `1h30m`); unitless values are rejected.
+not create a login identity for a request. Ephemeral memberships never include
+`ADMIN OPTION`: the subject can use the granted role but cannot grant it to
+another role. Durations are one or more integer/unit pairs using `s`, `m`, or
+`h` (for example `45s` or `1h30m`); unitless values are rejected.
 
-PostgreSQL 16 and later can enforce `inherit` per membership. On PostgreSQL 15,
-the requested value must match the subject role's server-wide `INHERIT`
-attribute; the request fails before SQL when it does not. This prevents a
-set-role-only (`inherit: false`) bundle from becoming implicitly inherited on
-servers that cannot encode that option on `GRANT ROLE`.
+Ephemeral access requires PostgreSQL 16 or later so that `inherit` is enforced
+on each membership edge. Setting `inherit: false` creates set-role-only access:
+the subject must explicitly run `SET ROLE`, rather than inheriting the granted
+role's privileges immediately.
 
 ```yaml
 apiVersion: pgroles.io/v1alpha1
@@ -76,6 +76,11 @@ revocation until the original target is restored. This fail-closed rule avoids
 revoking an identically named role in a different database.
 
 ## Secure `Required` approval with Kyverno
+
+{% callout type="warning" title="Admission enforcement is required" %}
+For secure `Required` approval, install the supplied Kyverno policies. RBAC
+alone cannot protect approval decisions on a custom resource's status.
+{% /callout %}
 
 CRDs have no custom `/approval` subresource. Kubernetes RBAC alone cannot
 separate approval-condition mutation from other status updates. A `Required`
@@ -191,11 +196,10 @@ off-cluster lifecycle logs.
 
 ## Expiry and deletion
 
-Activation persists the absolute expiry before changing PostgreSQL. Expiry and
-request deletion use the same database locks and a request-owned scoped plan;
-only memberships for the approved bundle may be changed. An edge is removed
-only after its final ephemeral owner ends and when the current durable graph
-does not own it.
+Activation records the absolute expiry before changing PostgreSQL. Expiry and
+request deletion can change only memberships in the approved bundle. A
+membership remains while another active request still needs it or when it has
+become part of the durable `PostgresPolicy` configuration.
 
 Recovery never resets the absolute deadline. An `Applying` request found after
 its deadline is cancelled if SQL never began, or immediately cleaned up if its
@@ -222,9 +226,9 @@ UID.
 ## Existing sessions
 
 Revoking membership prevents a fresh `SET ROLE`; it does not terminate a
-session which already assumed the capability role. The E2E suite verifies that
-an elevated session remains under its current role until `RESET ROLE` or
-disconnect, while a subsequent and a newly connected `SET ROLE` are rejected.
+session which already assumed the granted role. The current session remains
+elevated until `RESET ROLE` or disconnect. Further `SET ROLE` attempts,
+including from new sessions, are rejected after revocation.
 Connection pools therefore need their own bounded-lifetime or eviction policy
 when wall-clock session termination is required. pgroles does not implicitly
 call `pg_terminate_backend`.

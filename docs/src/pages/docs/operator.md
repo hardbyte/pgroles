@@ -143,25 +143,6 @@ The operator's safety model — serialized reconciliation, conflict detection, f
 
 - Deleting a `PostgresPolicy` stops reconciliation but does not revert the database. This is by design (stop managing, not undo) but differs from GitOps conventions where deleting a resource reverts its effects.
 
-### CI coverage
-
-PR CI validates:
-
-- conflicting and non-overlapping same-database policies
-- shared-secret churn and recovery
-- synced and generated password lifecycle flows
-- invalid specs, missing secrets, insufficient privileges
-- Kubernetes Event delivery for warning and recovery transitions
-- generated policies spanning 2 databases, 30 schemas, 60 roles
-- trusted-writer and Kyverno-secured ephemeral access lifecycles, including
-  approval ownership, overlap, suspension, recovery, additive revocation,
-  multiple replicas, target deletion, and session behavior
-
-Scheduled coverage on `main` additionally exercises:
-
-- 5 policies across 3 databases, 100 schemas, 200 roles
-- repeated secret churn with latency reporting
-
 ### Path to API stability
 
 - Carry controller semantics into the CRD contract rather than leaving them as implementation conventions.

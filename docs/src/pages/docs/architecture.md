@@ -16,7 +16,7 @@ The core library with no database dependencies. Contains:
 - **Manifest parsing** (`manifest.rs`) -- YAML deserialization, profile expansion, validation. Includes `AuthProvider` model for managed PostgreSQL provider metadata.
 - **Role graph model** (`model.rs`) -- normalized representation of roles, grants, default privileges, and memberships
 - **Diff engine** (`diff.rs`) -- compares two `RoleGraph` instances and produces an ordered list of `Change` operations. Changes are `serde::Serialize` for JSON output.
-- **SQL generation** (`sql.rs`) -- renders `Change` operations into PostgreSQL DDL statements. Uses `SqlContext` for version-dependent rendering (PG 16+ `WITH INHERIT`/`WITH ADMIN`, the CI-tested path, vs a PG 14/15 legacy-syntax fallback that remains in the code but is best-effort and untested).
+- **SQL generation** (`sql.rs`) -- renders `Change` operations into PostgreSQL DDL statements using server-version context.
 - **Export** (`export.rs`) -- converts a `RoleGraph` back into a flat `PolicyManifest` for brownfield adoption (`generate` command).
 
 All types use `BTreeMap` and `BTreeSet` for deterministic output ordering.
