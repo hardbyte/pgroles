@@ -126,13 +126,16 @@ spec:
     name: ${policy}
   subject:
     role: ${subject}
+  requestedBy:
+    username: e2e-client
+    groups: [system:masters]
   requestedDuration: ${duration}
   justification: E2E validation
 EOF
 }
 
 append_decision() {
-  local request="$1" decision="$2" identity="$3"
+  local request="$1" decision="$2" identity="$3" asserted_identity="${4:-$3}"
   local bundle_hash granted_duration patch
   bundle_hash="$(kubectl get pgear "$request" -o jsonpath='{.status.resolvedAccess.bundleHash}')"
   granted_duration="$(kubectl get pgear "$request" -o jsonpath='{.status.resolvedAccess.grantedDuration}')"
@@ -140,7 +143,7 @@ append_decision() {
     echo "::error::request $request has no resolved bundle to attest" >&2
     return 1
   fi
-  patch="[{\"op\":\"add\",\"path\":\"/status/conditions/-\",\"value\":{\"type\":\"${decision}\",\"status\":\"True\",\"reason\":\"E2E${decision}\",\"bundleHash\":\"${bundle_hash}\",\"grantedDuration\":\"${granted_duration}\"}}]"
+  patch="[{\"op\":\"add\",\"path\":\"/status/conditions/-\",\"value\":{\"type\":\"${decision}\",\"status\":\"True\",\"reason\":\"E2E${decision}\",\"bundleHash\":\"${bundle_hash}\",\"grantedDuration\":\"${granted_duration}\"}},{\"op\":\"add\",\"path\":\"/status/decidedBy\",\"value\":{\"username\":\"${asserted_identity}\",\"groups\":[]}}]"
   kubectl --as="$identity" patch pgear "$request" --subresource=status --type=json -p "$patch"
 }
 
@@ -151,6 +154,82 @@ wait_access_policy_accepted ephemeral-e2e-required
 wait_access_policy_accepted ephemeral-e2e-session
 
 if [ "$secure_mode" = "true" ]; then
+  echo "ResourceQuota rejects request-object growth before controller reconciliation"
+  quota_namespace="ephemeral-quota-e2e"
+  kubectl create namespace "$quota_namespace"
+  sed \
+    -e "s/namespace: pgroles-system/namespace: ${quota_namespace}/" \
+    -e 's/count\/ephemeralaccessrequests.pgroles.io: "500"/count\/ephemeralaccessrequests.pgroles.io: "2"/' \
+    k8s/security/ephemeral-access-resource-quota.yaml | kubectl apply -f -
+  for i in $(seq 1 30); do
+    quota_hard="$(kubectl -n "$quota_namespace" get resourcequota pgroles-ephemeral-access \
+      -o json | jq -r '.status.hard["count/ephemeralaccessrequests.pgroles.io"] // ""')"
+    [ "$quota_hard" = "2" ] && break
+    sleep 1
+  done
+  test "$quota_hard" = "2"
+  for request_number in 1 2; do
+    kubectl --as=system:serviceaccount:default:ephemeral-requester \
+      -n "$quota_namespace" create -f - <<EOF
+apiVersion: pgroles.io/v1alpha1
+kind: EphemeralAccessRequest
+metadata:
+  name: quota-request-${request_number}
+spec:
+  accessPolicyRef:
+    name: quota-probe
+  subject:
+    role: quota_probe
+  requestedBy:
+    username: forged-requester
+  requestedDuration: 10s
+  justification: ResourceQuota E2E validation
+EOF
+  done
+  if kubectl --as=system:serviceaccount:default:ephemeral-requester \
+    -n "$quota_namespace" create -f - <<'EOF'
+apiVersion: pgroles.io/v1alpha1
+kind: EphemeralAccessRequest
+metadata:
+  name: quota-request-3
+spec:
+  accessPolicyRef:
+    name: quota-probe
+  subject:
+    role: quota_probe
+  requestedBy:
+    username: forged-requester
+  requestedDuration: 10s
+  justification: This request must be rejected by ResourceQuota
+EOF
+  then
+    echo "::error::request above the ResourceQuota unexpectedly succeeded"
+    exit 1
+  fi
+  test "$(kubectl -n "$quota_namespace" get pgear --no-headers | wc -l | tr -d ' ')" = "2"
+  kubectl delete namespace "$quota_namespace" --wait=true
+
+  echo "CRD schema rejects oversized user-controlled fields"
+  oversized_justification="$(printf 'x%.0s' $(seq 1 2049))"
+  if jq -n \
+    --arg justification "$oversized_justification" \
+    '{
+      apiVersion: "pgroles.io/v1alpha1",
+      kind: "EphemeralAccessRequest",
+      metadata: {name: "ephemeral-oversized-justification"},
+      spec: {
+        accessPolicyRef: {name: "ephemeral-e2e-automatic"},
+        subject: {role: "ephemeral_e2e_subject"},
+        requestedBy: {username: "forged-requester"},
+        requestedDuration: "10s",
+        justification: $justification
+      }
+    }' | kubectl --as=system:serviceaccount:default:ephemeral-requester create -f -
+  then
+    echo "::error::request with an oversized justification unexpectedly succeeded"
+    exit 1
+  fi
+
   if kubectl --as=system:serviceaccount:default:ephemeral-untrusted-requester \
     create -f - <<'EOF'
 apiVersion: pgroles.io/v1alpha1
@@ -162,6 +241,9 @@ spec:
     name: ephemeral-e2e-automatic
   subject:
     role: ephemeral_e2e_subject
+  requestedBy:
+    username: forged-requester
+    groups: [forged-group]
   requestedDuration: 10s
   justification: This caller lacks the logical use verb
 EOF
@@ -183,6 +265,9 @@ spec:
   justification: Logical use verb validation
 EOF
   wait_request_phase ephemeral-use-allowed Active
+  test "$(kubectl get pgear ephemeral-use-allowed -o jsonpath='{.spec.requestedBy.username}')" = \
+    "system:serviceaccount:default:ephemeral-requester"
+  test "$(kubectl get pgear ephemeral-use-allowed -o jsonpath='{.spec.requestedBy.groups}' | tr ' ' '\n' | grep -c '^forged-group$' || true)" = "0"
   kubectl --as=system:serviceaccount:default:ephemeral-requester \
     delete pgear ephemeral-use-allowed --wait=true
 fi
@@ -410,9 +495,20 @@ if [ "$secure_mode" = "true" ]; then
     echo "::error::unauthorized lifecycle mutation unexpectedly passed Kyverno"
     exit 1
   fi
-  append_decision ephemeral-required Approved system:serviceaccount:default:ephemeral-approver
+  append_decision ephemeral-required Approved system:serviceaccount:default:ephemeral-approver forged-approver
 else
   append_decision ephemeral-required Approved system:serviceaccount:default:ephemeral-status-writer
+fi
+
+if [ "$secure_mode" = "true" ]; then
+  test "$(kubectl get pgear ephemeral-required -o jsonpath='{.status.decidedBy.username}')" = \
+    "system:serviceaccount:default:ephemeral-approver"
+  if kubectl --as=system:serviceaccount:default:ephemeral-approver \
+    patch pgear ephemeral-required --subresource=status --type=merge \
+    -p '{"status":{"decidedBy":{"username":"replacement-approver","groups":[]}}}'; then
+    echo "::error::write-once decision identity mutation unexpectedly succeeded"
+    exit 1
+  fi
 fi
 
 wait_request_phase ephemeral-required Active
@@ -598,8 +694,10 @@ for i in $(seq 1 30); do
     awk '
       /pgroles\.ephemeral_access\.lifecycle/ { lifecycle = 1 }
       /bundle_hash/ { bundle = 1 }
+      /requester/ { requester = 1 }
+      /decision_maker/ { decision_maker = 1 }
       /pgroles.ephemeral_access.transitions/ { metrics = 1 }
-      END { exit !(lifecycle && bundle && metrics) }
+      END { exit !(lifecycle && bundle && requester && decision_maker && metrics) }
     '
   then
     exit 0

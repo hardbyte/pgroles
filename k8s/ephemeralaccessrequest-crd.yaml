@@ -58,6 +58,8 @@
                   "accessPolicyRef": {
                     "properties": {
                       "name": {
+                        "maxLength": 253,
+                        "minLength": 1,
                         "type": "string"
                       }
                     },
@@ -67,10 +69,41 @@
                     "type": "object"
                   },
                   "justification": {
+                    "maxLength": 2048,
                     "nullable": true,
                     "type": "string"
                   },
+                  "requestedBy": {
+                    "description": "Kubernetes identity which created the request. The recommended Kyverno\npolicy overwrites this from authenticated admission `userInfo`.",
+                    "properties": {
+                      "groups": {
+                        "default": [],
+                        "items": {
+                          "maxLength": 256,
+                          "minLength": 1,
+                          "type": "string"
+                        },
+                        "maxItems": 64,
+                        "type": "array"
+                      },
+                      "uid": {
+                        "maxLength": 128,
+                        "nullable": true,
+                        "type": "string"
+                      },
+                      "username": {
+                        "maxLength": 512,
+                        "minLength": 1,
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "username"
+                    ],
+                    "type": "object"
+                  },
                   "requestedDuration": {
+                    "maxLength": 64,
                     "nullable": true,
                     "pattern": "^([0-9]+[smh])+$",
                     "type": "string"
@@ -78,6 +111,8 @@
                   "subject": {
                     "properties": {
                       "role": {
+                        "maxLength": 63,
+                        "minLength": 1,
                         "type": "string"
                       }
                     },
@@ -89,6 +124,7 @@
                 },
                 "required": [
                   "accessPolicyRef",
+                  "requestedBy",
                   "subject"
                 ],
                 "type": "object",
@@ -103,10 +139,12 @@
                 "nullable": true,
                 "properties": {
                   "activatedAt": {
+                    "maxLength": 64,
                     "nullable": true,
                     "type": "string"
                   },
                   "approvalExpiresAt": {
+                    "maxLength": 64,
                     "nullable": true,
                     "type": "string"
                   },
@@ -115,29 +153,38 @@
                     "items": {
                       "properties": {
                         "bundleHash": {
+                          "maxLength": 71,
                           "nullable": true,
                           "type": "string"
                         },
                         "grantedDuration": {
+                          "maxLength": 64,
                           "nullable": true,
                           "type": "string"
                         },
                         "lastTransitionTime": {
+                          "maxLength": 64,
                           "nullable": true,
                           "type": "string"
                         },
                         "message": {
+                          "maxLength": 2048,
                           "nullable": true,
                           "type": "string"
                         },
                         "reason": {
+                          "maxLength": 128,
                           "nullable": true,
                           "type": "string"
                         },
                         "status": {
+                          "maxLength": 16,
+                          "minLength": 1,
                           "type": "string"
                         },
                         "type": {
+                          "maxLength": 32,
+                          "minLength": 1,
                           "type": "string"
                         }
                       },
@@ -150,15 +197,48 @@
                     "maxItems": 8,
                     "type": "array"
                   },
+                  "decidedBy": {
+                    "description": "Kubernetes identity which approved or denied the request. The\nrecommended Kyverno policy overwrites this from authenticated admission\n`userInfo` in the same status update as the terminal decision.",
+                    "nullable": true,
+                    "properties": {
+                      "groups": {
+                        "default": [],
+                        "items": {
+                          "maxLength": 256,
+                          "minLength": 1,
+                          "type": "string"
+                        },
+                        "maxItems": 64,
+                        "type": "array"
+                      },
+                      "uid": {
+                        "maxLength": 128,
+                        "nullable": true,
+                        "type": "string"
+                      },
+                      "username": {
+                        "maxLength": 512,
+                        "minLength": 1,
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "username"
+                    ],
+                    "type": "object"
+                  },
                   "endedAt": {
+                    "maxLength": 64,
                     "nullable": true,
                     "type": "string"
                   },
                   "expiresAt": {
+                    "maxLength": 64,
                     "nullable": true,
                     "type": "string"
                   },
                   "lastError": {
+                    "maxLength": 4096,
                     "nullable": true,
                     "type": "string"
                   },
@@ -187,15 +267,19 @@
                         "type": "integer"
                       },
                       "accessPolicyUid": {
+                        "maxLength": 128,
                         "type": "string"
                       },
                       "bundleEncoding": {
+                        "maxLength": 128,
                         "type": "string"
                       },
                       "bundleHash": {
+                        "maxLength": 71,
                         "type": "string"
                       },
                       "grantedDuration": {
+                        "maxLength": 64,
                         "type": "string"
                       },
                       "memberships": {
@@ -205,9 +289,13 @@
                               "type": "boolean"
                             },
                             "member": {
+                              "maxLength": 63,
+                              "minLength": 1,
                               "type": "string"
                             },
                             "role": {
+                              "maxLength": 63,
+                              "minLength": 1,
                               "type": "string"
                             }
                           },
@@ -218,10 +306,12 @@
                           ],
                           "type": "object"
                         },
+                        "maxItems": 32,
                         "type": "array"
                       },
                       "targetDatabaseFingerprint": {
                         "description": "SHA-256 fingerprint of resolved host, port, and database name. It binds\nactivation and revocation to one database without persisting secrets.",
+                        "maxLength": 71,
                         "type": "string"
                       },
                       "targetPolicyGeneration": {
@@ -229,6 +319,7 @@
                         "type": "integer"
                       },
                       "targetPolicyUid": {
+                        "maxLength": 128,
                         "type": "string"
                       }
                     },
@@ -253,9 +344,13 @@
                           "type": "boolean"
                         },
                         "member": {
+                          "maxLength": 63,
+                          "minLength": 1,
                           "type": "string"
                         },
                         "role": {
+                          "maxLength": 63,
+                          "minLength": 1,
                           "type": "string"
                         }
                       },
@@ -266,6 +361,7 @@
                       ],
                       "type": "object"
                     },
+                    "maxItems": 32,
                     "type": "array"
                   }
                 },
@@ -282,6 +378,14 @@
                   {
                     "message": "approval decisions are terminal",
                     "rule": "oldSelf.conditions.filter(c, (c.type == 'Approved' || c.type == 'Denied') && c.status == 'True').size() == 0 || self.conditions.filter(c, (c.type == 'Approved' || c.type == 'Denied') && c.status == 'True') == oldSelf.conditions.filter(c, (c.type == 'Approved' || c.type == 'Denied') && c.status == 'True')"
+                  },
+                  {
+                    "message": "decision identity is write-once",
+                    "rule": "!has(oldSelf.decidedBy) || (has(self.decidedBy) && self.decidedBy == oldSelf.decidedBy)"
+                  },
+                  {
+                    "message": "a terminal approval decision and decidedBy identity must be recorded together",
+                    "rule": "self.conditions.exists(c, (c.type == 'Approved' || c.type == 'Denied') && c.status == 'True') == has(self.decidedBy)"
                   },
                   {
                     "message": "request conditions must use a declared lifecycle or decision type",

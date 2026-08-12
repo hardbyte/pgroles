@@ -593,6 +593,9 @@ jobs:
           pg_query "SELECT has_table_privilege('loadb_10-viewer', 'loadb_10.items', 'SELECT')" loadtest | grep -qx "t"
           pg_query "SELECT has_sequence_privilege('loadb_05-editor', 'loadb_05.audit_seq', 'USAGE')" loadtest | grep -qx "t"
 
+      - name: Run ephemeral request cache regression
+        run: scripts/e2e-ephemeral-request-load.sh
+
       - name: Cleanup
         if: always()
         run: kind delete cluster --name pgroles-e2e-load

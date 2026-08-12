@@ -170,6 +170,15 @@ conditions containing the exact resolved bundle hash and duration. Verify
 and database membership rather than treating creation or approval alone as
 success.
 
+Every request supplies `spec.requestedBy`. The recommended Kyverno policy
+replaces it from authenticated admission `userInfo` and records the identity
+which approves or denies in write-once `status.decidedBy`. Without that
+admission boundary both fields are broker assertions, not independent proof.
+Apply a namespace `ResourceQuota` for
+`count/ephemeralaccessrequests.pgroles.io` and
+`count/ephemeralaccesspolicies.pgroles.io`; the repository ships
+`k8s/security/ephemeral-access-resource-quota.yaml` as a tunable example.
+
 Deleting a request revokes its final-owner memberships through a finalizer.
 Deleting an access policy is revoke-all, while suspension blocks new activation
 and leaves active requests on their existing deadlines. Never force-remove

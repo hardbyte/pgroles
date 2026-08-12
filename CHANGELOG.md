@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **The Kubernetes operator can grant bounded, request-driven PostgreSQL role memberships.** `EphemeralAccessPolicy` defines a concrete reusable bundle and approval policy, while immutable `EphemeralAccessRequest` resources resolve, activate, audit, expire, and safely revoke one request without mutating the durable `PostgresPolicy`. Request-owned plans bind execution to the approved bundle and database target; overlapping requests and memberships later made durable are co-owner aware. The secure deployment profile uses Kyverno to authorize logical `use`, `approve`, and `manage` verbs and to persist authenticated requester and decision identities. Every ephemeral API field is size-bounded, a namespace `ResourceQuota` example limits object counts, and CI covers trusted-writer and Kyverno lifecycles plus request-cache memory and throughput regression. Ephemeral membership options require PostgreSQL 16 or later. (#158)
+
 ## [0.8.0] - 2026-08-02
 
 ### Fixed

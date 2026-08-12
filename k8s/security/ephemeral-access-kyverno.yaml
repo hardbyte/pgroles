@@ -30,6 +30,22 @@ spec:
   validationFailureAction: Enforce
   background: false
   rules:
+    # Bind the persisted requester to authenticated admission userInfo. This
+    # deliberately replaces any client-supplied assertion before validation.
+    - name: record-authenticated-requester
+      match:
+        any:
+          - resources:
+              kinds: [pgroles.io/v1alpha1/EphemeralAccessRequest]
+              operations: [CREATE]
+      mutate:
+        patchStrategicMerge:
+          spec:
+            requestedBy:
+              username: "{{ request.userInfo.username }}"
+              uid: "{{ request.userInfo.uid || '' }}"
+              groups: "{{ request.userInfo.groups }}"
+
     - name: require-use-on-access-policy
       match:
         any:
@@ -66,6 +82,35 @@ spec:
               - key: "{{ subjectaccessreview.status.allowed }}"
                 operator: NotEquals
                 value: true
+
+    # Record the authenticated identity in the same status mutation as the
+    # first terminal approval decision. CRD transition rules make it
+    # write-once after admission persists it.
+    - name: record-authenticated-decision-maker
+      match:
+        any:
+          - resources:
+              kinds: [pgroles.io/v1alpha1/EphemeralAccessRequest/status]
+              operations: [UPDATE]
+      preconditions:
+        any:
+          - key: >-
+              {{ to_string(request.object.status.conditions[?type == 'Approved'] || `[]`) }}
+            operator: NotEquals
+            value: >-
+              {{ to_string(request.oldObject.status.conditions[?type == 'Approved'] || `[]`) }}
+          - key: >-
+              {{ to_string(request.object.status.conditions[?type == 'Denied'] || `[]`) }}
+            operator: NotEquals
+            value: >-
+              {{ to_string(request.oldObject.status.conditions[?type == 'Denied'] || `[]`) }}
+      mutate:
+        patchStrategicMerge:
+          status:
+            decidedBy:
+              username: "{{ request.userInfo.username }}"
+              uid: "{{ request.userInfo.uid || '' }}"
+              groups: "{{ request.userInfo.groups }}"
 
     - name: require-approve-on-decision-change
       match:

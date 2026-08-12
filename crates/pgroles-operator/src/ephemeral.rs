@@ -395,11 +395,22 @@ fn access_condition(
         condition_type: condition_type.to_string(),
         status: if status { "True" } else { "False" }.to_string(),
         reason: Some(reason.to_string()),
-        message: Some(message.to_string()),
+        message: Some(truncate_utf8(message, 2048)),
         last_transition_time: Some(crate::crd::now_rfc3339()),
         bundle_hash: None,
         granted_duration: None,
     }
+}
+
+fn truncate_utf8(value: &str, max_bytes: usize) -> String {
+    if value.len() <= max_bytes {
+        return value.to_string();
+    }
+    let mut end = max_bytes;
+    while !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    value[..end].to_string()
 }
 
 fn set_condition(
@@ -1110,7 +1121,7 @@ async fn update_request_resolution_failure(
     message: &str,
 ) -> Result<Action, EphemeralError> {
     let mut status = request.status.clone().unwrap_or_default();
-    status.last_error = Some(message.to_string());
+    status.last_error = Some(truncate_utf8(message, 4096));
     let reason = if message.contains("suspended") {
         "Suspended"
     } else {
@@ -1130,7 +1141,7 @@ async fn update_request_validation_error(
     message: &str,
 ) -> Result<Action, EphemeralError> {
     let mut status = request.status.clone().unwrap_or_default();
-    status.last_error = Some(message.to_string());
+    status.last_error = Some(truncate_utf8(message, 4096));
     set_condition(
         &mut status.conditions,
         access_condition("Ready", false, "InvalidRequestState", message),
@@ -1174,6 +1185,11 @@ fn audit_transition(
     ctx.observability
         .record_ephemeral_transition(&status.phase.to_string(), reason);
     let resolved = status.resolved_access.as_ref();
+    let decision = ["Approved", "Denied"]
+        .into_iter()
+        .find(|condition_type| decision_condition(status, condition_type).is_some())
+        .unwrap_or("");
+    let decided_by = status.decided_by.as_ref();
     tracing::info!(
         audit_event = "pgroles.ephemeral_access.lifecycle",
         request_name = %request.name_any(),
@@ -1182,6 +1198,13 @@ fn audit_transition(
         target_policy_uid = %resolved.map(|value| value.target_policy_uid.as_str()).unwrap_or(""),
         bundle_hash = %resolved.map(|value| value.bundle_hash.as_str()).unwrap_or(""),
         subject = %request.spec.subject.role,
+        requester = %request.spec.requested_by.username,
+        requester_uid = %request.spec.requested_by.uid.as_deref().unwrap_or(""),
+        requester_groups = ?request.spec.requested_by.groups,
+        decision,
+        decision_maker = %decided_by.map(|actor| actor.username.as_str()).unwrap_or(""),
+        decision_maker_uid = %decided_by.and_then(|actor| actor.uid.as_deref()).unwrap_or(""),
+        decision_maker_groups = ?decided_by.map(|actor| actor.groups.as_slice()).unwrap_or(&[]),
         previous_phase = %previous.map(|value| value.to_string()).unwrap_or_default(),
         phase = %status.phase,
         reason,
@@ -2270,6 +2293,11 @@ mod tests {
                 },
                 subject: crate::crd::EphemeralAccessSubject {
                     role: "alice".into(),
+                },
+                requested_by: crate::crd::EphemeralAccessActor {
+                    username: "requester@example.com".into(),
+                    uid: Some("requester-uid".into()),
+                    groups: vec!["developers".into()],
                 },
                 requested_duration: Some("30m".into()),
                 justification: Some("test".into()),

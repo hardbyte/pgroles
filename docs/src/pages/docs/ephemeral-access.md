@@ -47,7 +47,7 @@ another role. Durations are one or more integer/unit pairs using `s`, `m`, or
 `h` (for example `45s` or `1h30m`); unitless values are rejected.
 
 Ephemeral access requires PostgreSQL 16 or later so that `inherit` is enforced
-on each membership edge. Setting `inherit: false` creates set-role-only access:
+on each membership. Setting `inherit: false` creates set-role-only access:
 the subject must explicitly run `SET ROLE`, rather than inheriting the granted
 role's privileges immediately.
 
@@ -62,9 +62,17 @@ spec:
     name: inventory-incident-editor
   subject:
     role: alice@example.com
+  requestedBy:
+    username: alice@example.com
   requestedDuration: 30m
   justification: Investigating INC-1234
 ```
+
+`requestedBy` is required so every request has an operational identity even in
+a trusted-broker installation. In the recommended secure installation,
+Kyverno replaces the submitted username, UID, and groups with the authenticated
+Kubernetes admission identity. A client therefore cannot choose who the
+request appears to come from.
 
 The request spec is immutable. The operator resolves concrete memberships into
 write-once `status.resolvedAccess`, including the target and access-policy UIDs,
@@ -95,8 +103,11 @@ does not expose Kubernetes'
 `SubjectAccessReview` API calls for the logical verbs and enforces ownership of
 operator-managed lifecycle status and finalizers. Together they:
 
+- replace `spec.requestedBy` with the authenticated request creator;
 - require the logical `use` verb on an access policy to create a request;
 - require the logical `approve` verb to change `Approved` or `Denied`;
+- record the authenticated approver or denier in write-once
+  `status.decidedBy`;
 - require the logical `manage` verb to change operator-owned lifecycle status
   or remove an ephemeral-access finalizer;
 - bind a decision to the resolved bundle hash and duration;
@@ -131,17 +142,50 @@ array:
 ]
 ```
 
-The controller also treats a request-owned activation plan as execution
-provenance. `Applying` and `Active` status without a matching controller owner
-UID, origin, operation, and bundle hash never enters the effective graph;
-revocation likewise cannot execute without that activation record. This is a
-defence-in-depth boundary for trusted-writer installations without Kyverno.
+Kyverno adds `status.decidedBy` from the authenticated admission identity in
+the same update. A trusted broker operating without Kyverno must include that
+field itself; the resulting value is useful operational metadata but is not an
+independent authentication record.
+
+The controller grants only the exact resolved bundle recorded for the request,
+and revokes only memberships proven to have been activated by that request.
+Forged lifecycle status cannot create access or authorize revocation. See
+[operator architecture](/docs/operator-architecture#ephemeral-access-overlays)
+for the ownership and execution-record checks behind this guarantee.
+Without Kyverno, `requestedBy` and `decidedBy` are assertions made by the
+trusted client or broker; Kubernetes API audit remains the only independent
+record of the authenticated caller.
+
+## Bound request-object growth
+
+The CRD limits one access policy to 32 memberships, one actor identity to 64
+groups, conditions to small fixed collections, justification and description
+text to 2 KiB, and every other user-controlled string or collection to an
+explicit maximum. These limits bound each object; they do not bound the number
+of objects in a namespace.
+
+Apply a Kubernetes `ResourceQuota` in every namespace where ephemeral access
+is enabled. The supplied example permits 50 access policies and 500 retained
+requests:
+
+```shell
+kubectl apply -f k8s/security/ephemeral-access-resource-quota.yaml
+```
+
+Edit its namespace and limits for local request volume and retention. The
+quota is an API-server hard stop, so excess objects are rejected before they
+enter the controller cache or reconciliation queue. It limits persisted
+requests, not simultaneous active grants; keep the quota conservative and
+delete terminal request objects according to your retention policy.
 
 ## Audit is an external durability requirement
 
 In-cluster policy, request, plan, status, and Event objects are operational
 state. They are **not the system of record**: finalizers, retention, garbage
 collection, administrators, and etcd lifecycle can all remove or rewrite them.
+`spec.requestedBy` and `status.decidedBy` make the current object and lifecycle
+logs self-describing, but only an independently retained API audit event proves
+which authenticated identity performed each mutation.
 
 Enable Kubernetes API auditing and send it to an off-cluster backend with an
 independent retention policy. This audit-policy fragment records the request and
@@ -175,8 +219,9 @@ admission decision identifying the authenticated caller.
 
 As belt-and-braces evidence, every request lifecycle transition also emits a
 structured `pgroles.ephemeral_access.lifecycle` log event with request UID,
-access-policy UID, target-policy UID, bundle hash, subject, old/new phase,
-reason, and lifecycle timestamps. When `OTEL_EXPORTER_OTLP_ENDPOINT` or
+access-policy UID, target-policy UID, bundle hash, subject, requester,
+decision-maker, old/new phase, reason, and lifecycle timestamps. When
+`OTEL_EXPORTER_OTLP_ENDPOINT` or
 `OTEL_EXPORTER_OTLP_LOGS_ENDPOINT` is configured, these events are exported
 through OTLP as well as JSON stdout. Route OTLP logs to append-only or otherwise
 tamper-resistant off-cluster storage. Configure `OTEL_LOGS_EXPORTER=none` only
@@ -209,7 +254,7 @@ fresh duration after restart.
 Suspending an access policy blocks new activation while active requests run to
 their existing expiry. Deleting an access policy deletes and revokes its
 requests before the policy finalizer completes. Do not forcibly remove
-finalizers: authoritative reconciliation can later heal a stranded edge, but
+finalizers: authoritative reconciliation can later heal a stranded membership, but
 additive mode may leave it indefinitely.
 
 Deleting a target `PostgresPolicy` first deletes attached access policies and

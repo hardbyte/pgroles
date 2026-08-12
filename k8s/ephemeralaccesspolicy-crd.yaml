@@ -66,15 +66,18 @@
                     "type": "object"
                   },
                   "defaultDuration": {
+                    "maxLength": 64,
                     "nullable": true,
                     "pattern": "^([0-9]+[smh])+$",
                     "type": "string"
                   },
                   "description": {
+                    "maxLength": 2048,
                     "nullable": true,
                     "type": "string"
                   },
                   "displayName": {
+                    "maxLength": 128,
                     "nullable": true,
                     "type": "string"
                   },
@@ -90,6 +93,7 @@
                     "type": "object"
                   },
                   "maximumDuration": {
+                    "maxLength": 64,
                     "pattern": "^([0-9]+[smh])+$",
                     "type": "string"
                   },
@@ -100,6 +104,8 @@
                           "type": "boolean"
                         },
                         "role": {
+                          "maxLength": 63,
+                          "minLength": 1,
                           "type": "string"
                         }
                       },
@@ -109,17 +115,21 @@
                       ],
                       "type": "object"
                     },
+                    "maxItems": 32,
                     "minItems": 1,
                     "type": "array"
                   },
                   "pendingRequestTTL": {
                     "default": "15m",
+                    "maxLength": 64,
                     "pattern": "^([0-9]+[smh])+$",
                     "type": "string"
                   },
                   "postgresPolicyRef": {
                     "properties": {
                       "name": {
+                        "maxLength": 253,
+                        "minLength": 1,
                         "type": "string"
                       }
                     },
@@ -150,29 +160,38 @@
                     "items": {
                       "properties": {
                         "bundleHash": {
+                          "maxLength": 71,
                           "nullable": true,
                           "type": "string"
                         },
                         "grantedDuration": {
+                          "maxLength": 64,
                           "nullable": true,
                           "type": "string"
                         },
                         "lastTransitionTime": {
+                          "maxLength": 64,
                           "nullable": true,
                           "type": "string"
                         },
                         "message": {
+                          "maxLength": 2048,
                           "nullable": true,
                           "type": "string"
                         },
                         "reason": {
+                          "maxLength": 128,
                           "nullable": true,
                           "type": "string"
                         },
                         "status": {
+                          "maxLength": 16,
+                          "minLength": 1,
                           "type": "string"
                         },
                         "type": {
+                          "maxLength": 32,
+                          "minLength": 1,
                           "type": "string"
                         }
                       },
@@ -182,6 +201,7 @@
                       ],
                       "type": "object"
                     },
+                    "maxItems": 16,
                     "type": "array"
                   },
                   "observedGeneration": {
@@ -192,8 +212,11 @@
                   "resolvedRoles": {
                     "default": [],
                     "items": {
+                      "maxLength": 63,
+                      "minLength": 1,
                       "type": "string"
                     },
+                    "maxItems": 32,
                     "type": "array"
                   }
                 },
