@@ -13,12 +13,22 @@ The operator supports two connection modes: a single connection URL from a Secre
 
 ### Connection URL (single Secret)
 
-Create a Secret containing your PostgreSQL connection string:
+Create a Secret containing your PostgreSQL connection string. Read the value
+interactively so a password-bearing URL does not enter shell history or the
+process list:
 
-```shell
+```bash
+umask 077
+read -rsp 'Database URL: ' DATABASE_URL && printf '\n'
+printf '%s' "$DATABASE_URL" > db-url
+unset DATABASE_URL
 kubectl create secret generic mydb-credentials \
-  --from-literal=DATABASE_URL='postgresql://user:password@host:5432/database'
+  --from-file=DATABASE_URL=db-url
+rm db-url
 ```
+
+In production, prefer a secret manager or CSI driver over creating the Secret
+by hand.
 
 Reference it in the policy:
 

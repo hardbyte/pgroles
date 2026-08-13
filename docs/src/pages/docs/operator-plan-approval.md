@@ -121,7 +121,7 @@ Use `suspend` when you want the controller to stop reconciling entirely. Use `pl
 `suspend`, `mode`, and `approval` are three separate gates, checked in that
 order. Only the last one is about human review:
 
-| `suspend` | `mode` | `approval` | Plan created? | SQL executed? |
+| `suspend` | `mode` | `approval` | Plan created? | Mutating SQL executed? |
 |---|---|---|---|---|
 | `true` | — | — | no | no — nothing reconciles at all |
 | `false` | `plan` | *ignored* | yes | **never** |
@@ -131,7 +131,8 @@ order. Only the last one is about human review:
 **`approval` has no effect in `plan` mode.** A plan-mode policy computes the
 diff, publishes a `PostgresPolicyPlan`, and returns before it ever consults
 `approval`. Annotating that plan with `pgroles.io/approved=true` is accepted by
-the API server and then does nothing: the plan stays `Pending` and no SQL runs.
+the API server and then does nothing: the plan stays `Pending` and no database
+changes are applied.
 Because that is indistinguishable from a stalled operator, the policy reports an
 `ApprovalIgnored` condition naming the plan and emits a warning Event. If you
 want a reviewed apply, the combination you want is `mode: apply` with

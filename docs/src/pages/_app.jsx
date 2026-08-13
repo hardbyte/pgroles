@@ -82,6 +82,7 @@ export default function App({ Component, pageProps }) {
     <div className={`${sans.variable} ${display.variable} ${mono.variable}`}>
       <Head>
         <title>{pageTitle}</title>
+        <link rel="icon" href="/logo.svg" type="image/svg+xml" />
         {description && <meta name="description" content={description} />}
       </Head>
       <Layout title={title} tableOfContents={tableOfContents}>

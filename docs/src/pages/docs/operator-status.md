@@ -117,7 +117,7 @@ The intended deployment model is operator -> OpenTelemetry Collector -> your met
 | `pgroles.ephemeral_access.transitions` | `phase`, `reason` | Ephemeral request phase transitions |
 | `pgroles.ephemeral_access.failures` | `reason` | Ephemeral activation and revocation failures |
 | `pgroles.ephemeral_access.retained_memberships` | - | Memberships kept at expiry because they became durable |
-| `pgroles.ephemeral_access.expiry_lag` | - | Seconds between expiry and revocation |
+| `pgroles.ephemeral_access.expiry_lag` | - | Milliseconds between expiry and revocation |
 | `pgroles.ephemeral_access.role_retirement_blocked` | - | Role retirements blocked by an in-flight request |
 
 Useful alerting signals: `Degraded=True` for reconcile failure (not bare

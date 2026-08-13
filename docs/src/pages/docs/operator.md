@@ -59,8 +59,11 @@ The Secret it references holds the connection string. Read it from a file rather
 than passing it as an argument, so the password stays out of shell history and
 out of the process list:
 
-```shell
-printf '%s' 'postgresql://admin:password@postgres:5432/myapp' > db-url
+```bash
+umask 077
+read -rsp 'Database URL: ' DATABASE_URL && printf '\n'
+printf '%s' "$DATABASE_URL" > db-url
+unset DATABASE_URL
 kubectl create secret generic myapp-db-credentials -n default \
   --from-file=DATABASE_URL=db-url
 rm db-url

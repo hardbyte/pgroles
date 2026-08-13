@@ -211,7 +211,7 @@ To safely collapse per-name grants into wildcards (e.g. turning per-table `GRANT
 
 The log output documents what was extracted and why each remaining role stayed flat:
 
-```
+```text
 profile suggestion complete profiles_extracted=2 roles_skipped=3
 extracted profile profile=reader pattern={schema}_{profile} schemas=["analytics","billing","checkout","inventory"]
 extracted profile profile=editor pattern={schema}_{profile} schemas=["billing","checkout","inventory"]

@@ -7,23 +7,23 @@ Getting the pgroles operator running in your cluster, and the chart values that 
 
 ---
 
-## Installation
-
 ## Helm
 
 ```shell
 helm install pgroles-operator oci://ghcr.io/hardbyte/charts/pgroles-operator
 ```
 
-## Rust crate
+## Embed the Rust library
 
-Add the operator crate from crates.io:
+This is not an alternative way to run the operator. If you are building a Rust
+program which embeds its reconciler or CRD types, add the library crate from
+crates.io:
 
 ```shell
 cargo add pgroles-operator
 ```
 
-If you are embedding the reconciler or CRD types directly from source, depend on the repository in your `Cargo.toml`:
+To depend on the current repository source instead:
 
 ```toml
 [dependencies]
@@ -45,7 +45,7 @@ operator:
     - name: RUST_LOG
       value: "info,pgroles_operator=debug"
 
-  # Required for GKE Workload Identity — see Database connection below.
+  # Required for GKE Workload Identity — see the Database connections page.
   serviceAccount:
     annotations: {}
 
@@ -59,6 +59,9 @@ operator:
 ```
 
 The operator runs as `nobody` (UID 65534) with a read-only root filesystem, no capabilities, and seccomp enabled by default.
+
+See [Database connections](/docs/operator-connections) for URL Secrets,
+structured parameters, and GKE Workload Identity configuration.
 
 The chart ships CRDs in `charts/pgroles-operator/crds/`, so Helm installs them
 on `helm install` and — by Helm's design — does **not** update them on
