@@ -207,7 +207,9 @@ EOF
     exit 1
   fi
   test "$(kubectl -n "$quota_namespace" get pgear --no-headers | wc -l | tr -d ' ')" = "2"
-  kubectl delete namespace "$quota_namespace" --wait=true
+  # Namespace teardown must bypass per-request ownership checks once the
+  # namespace itself is Terminating, while request finalizers still complete.
+  kubectl delete namespace "$quota_namespace" --wait=true --timeout=90s
 
   echo "CRD schema rejects oversized user-controlled fields"
   oversized_justification="$(printf 'x%.0s' $(seq 1 2049))"

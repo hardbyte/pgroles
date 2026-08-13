@@ -48,7 +48,8 @@ controls:
    same update as the terminal condition.
 6. Bind approval to the exact write-once bundle hash and granted duration.
 7. Let a requester delete only their own request; require lifecycle-management
-   authority to delete another request.
+   authority to delete another request during normal operation, without
+   blocking cleanup of a namespace that is already terminating.
 8. Prevent requesters and approvers from modifying controller-owned lifecycle
    status or removing finalizers; reserve that authority for a logical `manage`
    action and the operator.
@@ -126,7 +127,9 @@ The reference implementation:
 - replaces `spec.requestedBy` with the authenticated request creator;
 - requires `use` on the referenced access policy;
 - lets requesters delete their own requests but requires `manage` to delete
-  another caller's request;
+  another caller's request during normal operation;
+- allows the namespace controller to complete deletion once the namespace is
+  already terminating, while pgroles finalizers still perform scoped cleanup;
 - requires `approve` for terminal decisions;
 - replaces `status.decidedBy` with the authenticated decision maker;
 - restricts approvers to their decision conditions;
