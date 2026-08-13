@@ -1,6 +1,6 @@
 ---
 title: Ephemeral access
-description: Request, approve, audit, and revoke bounded PostgreSQL role memberships.
+description: Request, approve, and revoke bounded PostgreSQL role memberships.
 ---
 
 # Ephemeral PostgreSQL access
@@ -8,11 +8,18 @@ description: Request, approve, audit, and revoke bounded PostgreSQL role members
 Ephemeral access grants an existing PostgreSQL identity one predefined bundle of
 role memberships for a bounded duration. `PostgresPolicy` remains the durable
 source of truth; an `EphemeralAccessPolicy` defines a requestable bundle, and an
-immutable `EphemeralAccessRequest` records one approval and request lifecycle.
+immutable `EphemeralAccessRequest` records one request lifecycle.
 
 The feature does not issue credentials, implement cloud login, or terminate
 existing sessions. Revoking membership prevents a new `SET ROLE`, but a session
 which already assumed the role can retain it until it resets or disconnects.
+
+{% callout type="warning" title="Choose a trust model before enabling requests" %}
+Direct Kubernetes API access needs admission enforcement; a trusted broker must
+authenticate callers and be the only non-controller writer. pgroles ships a
+CI-tested Kyverno reference implementation, but Kyverno is not part of the
+operator itself. See [securing ephemeral access](/docs/ephemeral-access-security).
+{% /callout %}
 
 ## Define a requestable bundle
 
@@ -47,9 +54,11 @@ another role. Durations are one or more integer/unit pairs using `s`, `m`, or
 `h` (for example `45s` or `1h30m`); unitless values are rejected.
 
 Ephemeral access requires PostgreSQL 16 or later so that `inherit` is enforced
-on each membership. Setting `inherit: false` creates set-role-only access:
-the subject must explicitly run `SET ROLE`, rather than inheriting the granted
+on each membership. Setting `inherit: false` creates set-role-only access: the
+subject must explicitly run `SET ROLE`, rather than inheriting the granted
 role's privileges immediately.
+
+## Create a request
 
 ```yaml
 apiVersion: pgroles.io/v1alpha1
@@ -68,63 +77,30 @@ spec:
   justification: Investigating INC-1234
 ```
 
-`requestedBy` is required so every request has an operational identity even in
-a trusted-broker installation. In the recommended secure installation,
-Kyverno replaces the submitted username, UID, and groups with the authenticated
-Kubernetes admission identity. A client therefore cannot choose who the
-request appears to come from.
+`requestedBy` is required so every request is self-describing. It is trustworthy
+only when an admission policy derives it from the authenticated Kubernetes
+caller or a trusted broker supplies it after authenticating the requester. The
+supplied Kyverno reference policy replaces the submitted username, UID, and
+groups with admission `userInfo`. Its `use` check authorizes the bundle, not a
+mapping from the caller to `subject.role`; restrict requesters accordingly or
+add that identity mapping in admission.
 
 The request spec is immutable. The operator resolves concrete memberships into
 write-once `status.resolvedAccess`, including the target and access-policy UIDs,
-a non-secret fingerprint of the resolved host/port/database, a versioned
-canonical bundle hash, and the granted duration. The fingerprint is part of the
-approved bundle. Credential rotation is allowed, but changing the resolved
-host, port, or database blocks activation, durable reconciliation, and
-revocation until the original target is restored. This fail-closed rule avoids
-revoking an identically named role in a different database.
+a non-secret fingerprint of the resolved host, port, and database, a versioned
+canonical bundle hash, and the granted duration. Credential rotation is allowed,
+but changing the resolved host, port, or database blocks activation, durable
+reconciliation, and revocation until the original target is restored.
 
-## Secure `Required` approval with Kyverno
+## Approve a request
 
-{% callout type="warning" title="Admission enforcement is required" %}
-For secure `Required` approval, install the supplied Kyverno policies. RBAC
-alone cannot protect approval decisions on a custom resource's status.
-{% /callout %}
+`approval.mode: Automatic` begins activation after the request resolves. It
+removes the decision step, not the need to authenticate and authorize whoever
+can create requests.
 
-CRDs have no custom `/approval` subresource. Kubernetes RBAC alone cannot
-separate approval-condition mutation from other status updates. A `Required`
-policy without admission enforcement is therefore only a trusted-status-writer
-contract.
-
-The recommended secure installation is in
-`k8s/security/ephemeral-access-kyverno.yaml`. Kyverno's CEL
-`ValidatingPolicy` enforces decision integrity. Because that CEL environment
-does not expose Kubernetes'
-`authorizer`, a narrowly scoped Kyverno `ClusterPolicy` performs documented
-`SubjectAccessReview` API calls for the logical verbs and enforces ownership of
-operator-managed lifecycle status and finalizers. Together they:
-
-- replace `spec.requestedBy` with the authenticated request creator;
-- require the logical `use` verb on an access policy to create a request;
-- require the logical `approve` verb to change `Approved` or `Denied`;
-- record the authenticated approver or denier in write-once
-  `status.decidedBy`;
-- require the logical `manage` verb to change operator-owned lifecycle status
-  or remove an ephemeral-access finalizer;
-- bind a decision to the resolved bundle hash and duration;
-- leave approvers able to change only their `Approved`/`Denied` conditions.
-
-The companion `k8s/security/ephemeral-access-rbac.yaml` defines requester and
-approver ClusterRoles. Bind those roles to deployment-specific users, groups,
-or brokers. The pgroles operator service account deliberately has neither
-`use` nor `approve`; its normal controller ClusterRole carries `manage`.
-Authorizing lifecycle ownership through a logical verb avoids hard-coding a
-namespace or service-account name and remains correct with Helm naming
-overrides. The manifest also grants Kyverno's reports controller read-only CRD
-discovery through an aggregated role; it does not grant mutation access.
-
-An approver appends a typed decision while preserving operator-owned
-conditions. JSON Patch is convenient because it does not replace the condition
-array:
+`approval.mode: Required` waits for one terminal `Approved=True` or
+`Denied=True` condition. An approval must attest to the exact resolved bundle
+hash and duration. The condition and `status.decidedBy` are recorded together:
 
 ```json
 [
@@ -138,106 +114,24 @@ array:
       "bundleHash": "sha256:...",
       "grantedDuration": "1800s"
     }
+  },
+  {
+    "op": "add",
+    "path": "/status/decidedBy",
+    "value": {
+      "username": "approver@example.com",
+      "groups": []
+    }
   }
 ]
 ```
 
-Kyverno adds `status.decidedBy` from the authenticated admission identity in
-the same update. A trusted broker operating without Kyverno must include that
-field itself; the resulting value is useful operational metadata but is not an
-independent authentication record.
-
-The controller grants only the exact resolved bundle recorded for the request,
-and revokes only memberships proven to have been activated by that request.
-Forged lifecycle status cannot create access or authorize revocation. See
-[operator architecture](/docs/operator-architecture#ephemeral-access-overlays)
-for the ownership and execution-record checks behind this guarantee.
-Without Kyverno, `requestedBy` and `decidedBy` are assertions made by the
-trusted client or broker; Kubernetes API audit remains the only independent
-record of the authenticated caller.
-
-## Bound request-object growth
-
-The CRD limits one access policy to 32 memberships, one actor identity to 64
-groups, conditions to small fixed collections, justification and description
-text to 2 KiB, and every other user-controlled string or collection to an
-explicit maximum. These limits bound each object; they do not bound the number
-of objects in a namespace.
-
-Apply a Kubernetes `ResourceQuota` in every namespace where ephemeral access
-is enabled. The supplied example permits 50 access policies and 500 retained
-requests:
-
-```shell
-kubectl apply -f k8s/security/ephemeral-access-resource-quota.yaml
-```
-
-Edit its namespace and limits for local request volume and retention. The
-quota is an API-server hard stop, so excess objects are rejected before they
-enter the controller cache or reconciliation queue. It limits persisted
-requests, not simultaneous active grants; keep the quota conservative and
-delete terminal request objects according to your retention policy.
-
-## Audit is an external durability requirement
-
-In-cluster policy, request, plan, status, and Event objects are operational
-state. They are **not the system of record**: finalizers, retention, garbage
-collection, administrators, and etcd lifecycle can all remove or rewrite them.
-`spec.requestedBy` and `status.decidedBy` make the current object and lifecycle
-logs self-describing, but only an independently retained API audit event proves
-which authenticated identity performed each mutation.
-
-Enable Kubernetes API auditing and send it to an off-cluster backend with an
-independent retention policy. This audit-policy fragment records the request and
-response bodies for all security-relevant ephemeral-access mutations:
-
-```yaml
-apiVersion: audit.k8s.io/v1
-kind: Policy
-omitStages:
-  - RequestReceived
-rules:
-  - level: RequestResponse
-    verbs: [create, update, patch, delete]
-    resources:
-      - group: pgroles.io
-        resources:
-          - ephemeralaccesspolicies
-          - ephemeralaccessrequests
-          - ephemeralaccessrequests/status
-          - postgrespolicyplans
-          - postgrespolicyplans/status
-  - level: Metadata
-    resources:
-      - group: pgroles.io
-        resources: ["*"]
-```
-
-`RequestResponse` captures subjects and justifications, so protect the audit
-backend accordingly. At minimum, retain request status patches and the
-admission decision identifying the authenticated caller.
-
-As belt-and-braces evidence, every request lifecycle transition also emits a
-structured `pgroles.ephemeral_access.lifecycle` log event with request UID,
-access-policy UID, target-policy UID, bundle hash, subject, requester,
-decision-maker, old/new phase, reason, and lifecycle timestamps. When
-`OTEL_EXPORTER_OTLP_ENDPOINT` or
-`OTEL_EXPORTER_OTLP_LOGS_ENDPOINT` is configured, these events are exported
-through OTLP as well as JSON stdout. Route OTLP logs to append-only or otherwise
-tamper-resistant off-cluster storage. Configure `OTEL_LOGS_EXPORTER=none` only
-when another agent already ships container logs durably.
-
-The same transitions emit Kubernetes Events on the request object. OTLP
-metrics include:
-
-- `pgroles.ephemeral_access.transitions`
-- `pgroles.ephemeral_access.failures`
-- `pgroles.ephemeral_access.expiry_lag`
-- `pgroles.ephemeral_access.retained_memberships`
-- `pgroles.ephemeral_access.role_retirement_blocked`
-
-Metrics and Events are operational signals, not substitutes for API audit and
-off-cluster lifecycle logs.
+The Kyverno reference policy overwrites `decidedBy` with authenticated admission
+`userInfo`. A trusted broker must set it from its authenticated decision maker.
+The CRD makes the decision and identity terminal, while the deployment's
+security boundary determines whether that identity is authoritative. See
+[securing ephemeral access](/docs/ephemeral-access-security) for the required
+controls and tested manifests.
 
 ## Expiry and deletion
 
@@ -254,8 +148,8 @@ fresh duration after restart.
 Suspending an access policy blocks new activation while active requests run to
 their existing expiry. Deleting an access policy deletes and revokes its
 requests before the policy finalizer completes. Do not forcibly remove
-finalizers: authoritative reconciliation can later heal a stranded membership, but
-additive mode may leave it indefinitely.
+finalizers: authoritative reconciliation can later heal a stranded membership,
+but additive mode may leave it indefinitely.
 
 Deleting a target `PostgresPolicy` first deletes attached access policies and
 waits for their request finalizers, keeping the database connection available
@@ -274,11 +168,12 @@ Revoking membership prevents a fresh `SET ROLE`; it does not terminate a
 session which already assumed the granted role. The current session remains
 elevated until `RESET ROLE` or disconnect. Further `SET ROLE` attempts,
 including from new sessions, are rejected after revocation.
+
 Connection pools therefore need their own bounded-lifetime or eviction policy
 when wall-clock session termination is required. pgroles does not implicitly
 call `pg_terminate_backend`.
 
 Natural terminal requests remain as Kubernetes operational records. Deletion
-is currently the garbage-collection mechanism; choose explicit retention and
-cleanup automation for the cluster, while keeping Kubernetes audit and OTLP
-logs as the durable record.
+is currently the garbage-collection mechanism. Choose explicit retention and
+cleanup automation, and follow the [security guide](/docs/ephemeral-access-security)
+for durable audit and resource-exhaustion controls.

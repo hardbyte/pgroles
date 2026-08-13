@@ -1,5 +1,5 @@
 # Bind these logical verbs to deployment-specific requester and approver
-# identities. They are consumed by the recommended Kyverno ValidatingPolicies;
+# identities. They are consumed by the tested Kyverno reference policies;
 # the Kubernetes API does not invoke them for ordinary CRD operations.
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
@@ -22,5 +22,8 @@ rules:
     resources: [ephemeralaccesspolicies]
     verbs: [get, list, approve]
   - apiGroups: [pgroles.io]
-    resources: [ephemeralaccessrequests, ephemeralaccessrequests/status]
-    verbs: [get, list, watch, patch, update]
+    resources: [ephemeralaccessrequests]
+    verbs: [get, list, watch]
+  - apiGroups: [pgroles.io]
+    resources: [ephemeralaccessrequests/status]
+    verbs: [get, patch, update]

@@ -230,6 +230,30 @@ EOF
     exit 1
   fi
 
+  echo "Admission rejects client-owned request finalizers"
+  if kubectl --as=system:serviceaccount:default:ephemeral-requester \
+    create -f - <<'EOF'
+apiVersion: pgroles.io/v1alpha1
+kind: EphemeralAccessRequest
+metadata:
+  name: ephemeral-client-finalizer
+  finalizers:
+    - example.com/quota-hostage
+spec:
+  accessPolicyRef:
+    name: ephemeral-e2e-automatic
+  subject:
+    role: ephemeral_e2e_subject
+  requestedBy:
+    username: forged-requester
+  requestedDuration: 10s
+  justification: This request must be rejected by admission
+EOF
+  then
+    echo "::error::request with a client-supplied finalizer unexpectedly succeeded"
+    exit 1
+  fi
+
   if kubectl --as=system:serviceaccount:default:ephemeral-untrusted-requester \
     create -f - <<'EOF'
 apiVersion: pgroles.io/v1alpha1
@@ -268,6 +292,11 @@ EOF
   test "$(kubectl get pgear ephemeral-use-allowed -o jsonpath='{.spec.requestedBy.username}')" = \
     "system:serviceaccount:default:ephemeral-requester"
   test "$(kubectl get pgear ephemeral-use-allowed -o jsonpath='{.spec.requestedBy.groups}' | tr ' ' '\n' | grep -c '^forged-group$' || true)" = "0"
+  if kubectl --as=system:serviceaccount:default:ephemeral-untrusted-requester \
+    delete pgear ephemeral-use-allowed --wait=false; then
+    echo "::error::requester deleted another identity's request"
+    exit 1
+  fi
   kubectl --as=system:serviceaccount:default:ephemeral-requester \
     delete pgear ephemeral-use-allowed --wait=true
 fi
@@ -485,6 +514,7 @@ wait_request_phase ephemeral-required PendingApproval
 if [ "$secure_mode" = "true" ]; then
   test "$(kubectl auth can-i approve ephemeralaccesspolicies.pgroles.io --as=system:serviceaccount:pgroles-system:pgroles-operator -n default)" = "no"
   test "$(kubectl auth can-i manage ephemeralaccesspolicies.pgroles.io --as=system:serviceaccount:pgroles-system:pgroles-operator -n default)" = "yes"
+  test "$(kubectl auth can-i patch ephemeralaccessrequests.pgroles.io --as=system:serviceaccount:default:ephemeral-approver -n default)" = "no"
   if append_decision ephemeral-required Approved system:serviceaccount:default:ephemeral-status-writer; then
     echo "::error::unauthorized approval unexpectedly passed Kyverno"
     exit 1

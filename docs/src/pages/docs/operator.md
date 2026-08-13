@@ -137,7 +137,9 @@ The operator's safety model — serialized reconciliation, conflict detection, f
 
 **Deployment security:**
 
-- The operator requires a ClusterRole with Secret read access. There is no namespace-scoped deployment option or RBAC hardening guidance.
+- The operator requires cluster-scoped controller RBAC with Secret read access;
+  there is no namespace-scoped deployment option. Ephemeral request and
+  approval hardening is covered in [securing ephemeral access](/docs/ephemeral-access-security).
 
 **Deletion semantics:**
 

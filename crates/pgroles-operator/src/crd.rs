@@ -1228,8 +1228,8 @@ pub struct EphemeralAccessPolicyStatus {
 pub struct EphemeralAccessRequestSpec {
     pub access_policy_ref: LocalObjectReference,
     pub subject: EphemeralAccessSubject,
-    /// Kubernetes identity which created the request. The recommended Kyverno
-    /// policy overwrites this from authenticated admission `userInfo`.
+    /// Kubernetes identity which created the request. The supplied Kyverno
+    /// reference policy overwrites this from authenticated admission `userInfo`.
     pub requested_by: EphemeralAccessActor,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(length(max = 64), regex(pattern = r"^([0-9]+[smh])+$"))]
@@ -1247,9 +1247,9 @@ pub struct EphemeralAccessSubject {
 
 /// Authenticated Kubernetes identity associated with an access action.
 ///
-/// In a secured installation Kyverno replaces these values from the admission
-/// request's `userInfo`. Without admission enforcement they are assertions by
-/// the trusted request or approval broker.
+/// The supplied Kyverno reference policy replaces these values from the
+/// admission request's `userInfo`. Without admission enforcement they are
+/// assertions by the trusted request or approval broker.
 #[derive(KubeSchema, Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct EphemeralAccessActor {
@@ -1293,8 +1293,8 @@ pub struct EphemeralAccessRequestStatus {
     pub conditions: Vec<EphemeralAccessCondition>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resolved_access: Option<ResolvedEphemeralAccess>,
-    /// Kubernetes identity which approved or denied the request. The
-    /// recommended Kyverno policy overwrites this from authenticated admission
+    /// Kubernetes identity which approved or denied the request. The supplied
+    /// Kyverno reference policy overwrites this from authenticated admission
     /// `userInfo` in the same status update as the terminal decision.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub decided_by: Option<EphemeralAccessActor>,

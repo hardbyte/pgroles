@@ -147,7 +147,9 @@ Ephemeral access uses the same database and advisory locks as durable
 reconciliation. Request-owned scoped plans establish execution provenance, and
 their active membership edges are composed into the single effective desired
 graph before diffing. See [ephemeral access](/docs/ephemeral-access) for the
-approval, audit, expiry, and session contracts.
+request, approval, expiry, and session contracts, and
+[securing ephemeral access](/docs/ephemeral-access-security) for the deployment
+trust and audit boundaries.
 
 For object-local debugging, the controller also emits transition-based Kubernetes Events for notable status changes such as conflicts, suspend/resume, plan-mode drift detection, recovery, secret failures, database connectivity failures, and insufficient privileges. The intended split is:
 

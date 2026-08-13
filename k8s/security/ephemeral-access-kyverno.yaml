@@ -83,6 +83,66 @@ spec:
                 operator: NotEquals
                 value: true
 
+    # A requester may cancel their own request. Deleting a request created by
+    # another identity is a lifecycle-management action. This check relies on
+    # record-authenticated-requester making requestedBy authoritative.
+    - name: require-manage-to-delete-another-request
+      match:
+        any:
+          - resources:
+              kinds: [pgroles.io/v1alpha1/EphemeralAccessRequest]
+              operations: [DELETE]
+      preconditions:
+        all:
+          - key: "{{ request.oldObject.spec.requestedBy.username }}"
+            operator: NotEquals
+            value: "{{ request.userInfo.username }}"
+      context:
+        - name: subjectaccessreview
+          apiCall:
+            urlPath: /apis/authorization.k8s.io/v1/subjectaccessreviews
+            method: POST
+            data:
+              - key: kind
+                value: SubjectAccessReview
+              - key: apiVersion
+                value: authorization.k8s.io/v1
+              - key: spec
+                value:
+                  resourceAttributes:
+                    group: pgroles.io
+                    resource: ephemeralaccesspolicies
+                    namespace: "{{ request.namespace }}"
+                    name: "{{ request.oldObject.spec.accessPolicyRef.name }}"
+                    verb: manage
+                  user: "{{ request.userInfo.username }}"
+                  groups: "{{ request.userInfo.groups }}"
+      validate:
+        message: deleting another request requires lifecycle management permission
+        deny:
+          conditions:
+            any:
+              - key: "{{ subjectaccessreview.status.allowed }}"
+                operator: NotEquals
+                value: true
+
+    # The controller owns request finalizers. Reject client-supplied finalizers
+    # at creation so a requester cannot hold quota with an undeletable object.
+    - name: reject-client-supplied-request-finalizers
+      match:
+        any:
+          - resources:
+              kinds: [pgroles.io/v1alpha1/EphemeralAccessRequest]
+              operations: [CREATE]
+      validate:
+        message: EphemeralAccessRequest finalizers are controller-owned
+        deny:
+          conditions:
+            any:
+              - key: "{{ length(request.object.metadata.finalizers || `[]`) }}"
+                operator: GreaterThan
+                value: 0
+
     # Record the authenticated identity in the same status mutation as the
     # first terminal approval decision. CRD transition rules make it
     # write-once after admission persists it.

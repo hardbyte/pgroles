@@ -166,7 +166,8 @@ docker run --rm ghcr.io/hardbyte/pgroles --help
   Use `spec.mode: plan` to inspect drift without executing SQL.
 - **Ephemeral access** — define GitOps-managed membership bundles and request,
   approve, audit, and revoke bounded PostgreSQL access through Kubernetes-native
-  resources. Secure approval can be enforced with the supplied Kyverno policy.
+  resources. The supplied, CI-tested Kyverno reference policy demonstrates the
+  required secure approval controls.
 
 ## Documentation
 
@@ -179,6 +180,7 @@ Full documentation is published at [hardbyte.github.io/pgroles](https://hardbyte
 - [Kubernetes operator](https://hardbyte.github.io/pgroles/docs/operator/)
 - [Operator architecture](https://hardbyte.github.io/pgroles/docs/operator-architecture/)
 - [Ephemeral access](https://hardbyte.github.io/pgroles/docs/ephemeral-access/)
+- [Securing ephemeral access](https://hardbyte.github.io/pgroles/docs/ephemeral-access-security/)
 
 ## Agent Skills
 

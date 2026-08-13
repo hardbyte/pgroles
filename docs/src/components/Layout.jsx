@@ -43,6 +43,7 @@ const navigation = [
             {title: 'Staged adoption', href: '/docs/adoption'},
             {title: 'Kubernetes operator', href: '/docs/operator'},
             {title: 'Ephemeral access', href: '/docs/ephemeral-access'},
+            {title: 'Securing ephemeral access', href: '/docs/ephemeral-access-security'},
             {title: 'Operator architecture', href: '/docs/operator-architecture'},
         ],
     },

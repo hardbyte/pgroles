@@ -74,7 +74,7 @@
                     "type": "string"
                   },
                   "requestedBy": {
-                    "description": "Kubernetes identity which created the request. The recommended Kyverno\npolicy overwrites this from authenticated admission `userInfo`.",
+                    "description": "Kubernetes identity which created the request. The supplied Kyverno\nreference policy overwrites this from authenticated admission `userInfo`.",
                     "properties": {
                       "groups": {
                         "default": [],
@@ -198,7 +198,7 @@
                     "type": "array"
                   },
                   "decidedBy": {
-                    "description": "Kubernetes identity which approved or denied the request. The\nrecommended Kyverno policy overwrites this from authenticated admission\n`userInfo` in the same status update as the terminal decision.",
+                    "description": "Kubernetes identity which approved or denied the request. The supplied\nKyverno reference policy overwrites this from authenticated admission\n`userInfo` in the same status update as the terminal decision.",
                     "nullable": true,
                     "properties": {
                       "groups": {

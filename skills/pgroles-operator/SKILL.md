@@ -162,15 +162,21 @@ Use `EphemeralAccessPolicy` for a GitOps-managed, bounded bundle of concrete
 memberships and `EphemeralAccessRequest` for one runtime lease. Do not patch
 `PostgresPolicy` memberships for just-in-time access.
 
-For `approval.mode: Required`, install the version-matched Kyverno policy and
-bind the logical `use` and `approve` roles. The operator owns lifecycle status
-through the logical `manage` verb; approvers append only `Approved` or `Denied`
-conditions containing the exact resolved bundle hash and duration. Verify
-`status.observedGeneration`, request phase, expiry, request-owned scoped plan,
-and database membership rather than treating creation or approval alone as
-success.
+For `approval.mode: Required`, first choose an admission-enforced or trusted
+broker model. Kubernetes RBAC cannot isolate approval writes on a CRD's
+`/status` subresource. The version-matched Kyverno and RBAC manifests under
+`k8s/security/` are the CI-tested reference implementation, not an operator
+runtime dependency. Any alternative must authenticate requester and decision
+identities, define who may select each PostgreSQL subject, authorize the logical
+`use`, `approve`, and `manage` actions, bind the exact resolved bundle hash and
+duration, restrict cross-request deletion, reject client-owned finalizers, and
+protect controller-owned lifecycle state. The reference `use` check delegates
+selection of any concrete subject; add an identity mapping where that is too
+broad. Verify `status.observedGeneration`, request phase, expiry, request-owned
+scoped plan, and database membership rather than treating creation or approval
+alone as success.
 
-Every request supplies `spec.requestedBy`. The recommended Kyverno policy
+Every request supplies `spec.requestedBy`. The supplied Kyverno reference policy
 replaces it from authenticated admission `userInfo` and records the identity
 which approves or denies in write-once `status.decidedBy`. Without that
 admission boundary both fields are broker assertions, not independent proof.
