@@ -127,7 +127,7 @@ It also records:
 - current plan reference
 
 This is the main operator-facing debugging surface for SREs. The rendered SQL
-lives on the referenced `PostgresPolicyPlan` rather than in policy status.
+lives on the referenced `PostgresPolicyPlan`.
 
 ## Observability
 
