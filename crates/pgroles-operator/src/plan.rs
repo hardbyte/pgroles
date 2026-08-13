@@ -2194,6 +2194,21 @@ mod tests {
     }
 
     #[test]
+    fn render_redacted_sql_password_only_plan() {
+        // A plan whose only change is a password rotation still has to redact:
+        // there is no surrounding DDL to dilute a leak.
+        let changes = vec![pgroles_core::diff::Change::SetPassword {
+            name: "db-user".to_string(),
+            password: "my_secret_pw".to_string(),
+        }];
+        let ctx = pgroles_core::sql::SqlContext::default();
+        let redacted = render_redacted_sql(&changes, &ctx);
+
+        assert!(redacted.contains("[REDACTED]"));
+        assert!(!redacted.contains("my_secret_pw"));
+    }
+
+    #[test]
     fn render_full_sql_includes_passwords() {
         let changes = vec![pgroles_core::diff::Change::SetPassword {
             name: "app".to_string(),

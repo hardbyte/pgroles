@@ -377,7 +377,7 @@ Generated Secrets are created in the same namespace as the `PostgresPolicy`, own
 
 - Passwords are only allowed on roles with `login: true`.
 - Exactly one of `password.secretRef` or `password.generate` must be set.
-- Password values are redacted in operator logs and the `status.planned_sql` field.
+- Password values are redacted in operator logs and in the SQL preview stored on `PostgresPolicyPlan`.
 - If the referenced Secret or key is missing, the operator sets a `SecretMissing` or `SecretFetchFailed` status condition and retries on the normal interval.
 - Password updates are driven by password-source Secret changes. After a successful `apply`, unchanged password sources do not create permanent drift in later `plan` reconciles.
 - pgroles cannot detect direct password changes made in PostgreSQL outside the operator, because PostgreSQL does not expose comparable password state safely.
@@ -499,8 +499,7 @@ In `plan` mode:
 - the operator connects to the database and computes the full diff normally
 - no PostgreSQL SQL is executed
 - `status.change_summary` records the pending changes
-- `status.planned_sql` stores the rendered SQL, truncated if needed for status size safety
-- `status.current_plan_ref.name` points at the generated `PostgresPolicyPlan`
+- `status.current_plan_ref.name` points at the generated `PostgresPolicyPlan`, which holds the rendered SQL in `status.sqlInline` or, for larger plans, a gzipped ConfigMap referenced by `status.sqlRef`
 - `Ready=True` with reason `Planned`
 - `Drifted=True` when changes are pending, `Drifted=False` when the database is already in sync
 - for `password.generate`, the controller does not create or recreate the generated Kubernetes Secret while running in `plan` mode
@@ -533,16 +532,133 @@ status:
   current_plan_ref:
     name: plan-policy-plan-20260512-090308-118e50e437c9
   last_reconcile_mode: plan
-  planned_sql: |-
-    CREATE ROLE "plan-preview-user" LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE INHERIT NOREPLICATION NOBYPASSRLS;
-    COMMENT ON ROLE "plan-preview-user" IS 'Preview-only role';
-    GRANT CONNECT ON DATABASE "postgres" TO "plan-preview-user";
-  planned_sql_truncated: false
 ```
+
+The rendered SQL lives on the plan, so start from the policy name you already
+have and follow `current_plan_ref` to it:
+
+```bash
+POLICY=plan-policy
+PLAN="$(kubectl get pgr "$POLICY" -o jsonpath='{.status.current_plan_ref.name}')"
+kubectl get pgplan "$PLAN" -o jsonpath='{.status.sqlInline}'
+```
+
+```text
+CREATE ROLE "plan-preview-user" LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE INHERIT NOREPLICATION NOBYPASSRLS;
+COMMENT ON ROLE "plan-preview-user" IS 'Preview-only role';
+GRANT CONNECT ON DATABASE "postgres" TO "plan-preview-user";
+```
+
+To see every plan a policy has produced rather than just the current one, list
+plans and read the `POLICY` column, which carries the full policy name:
+
+```bash
+kubectl get pgplan
+```
+
+```text
+NAME                                                     POLICY        MODE            APPROVED   CHANGES   PHASE     AGE
+plan-policy-plan-20260512-090308-118e50e437c9            plan-policy   authoritative   False      2         Pending   3s
+```
+
+Avoid selecting plans with `-l pgroles.io/policy=<name>`. That label is a
+server-side prefilter truncated to 63 bytes, so it is not an identity and two
+policies sharing a long prefix select each other's plans.
+
+Plans above the inline size limit set `status.sqlRef` instead of `sqlInline`,
+naming a ConfigMap whose `plan.sql.gz` entry holds the gzipped SQL under
+`binaryData`. Fetching that takes a decode step:
+
+```bash
+CM="$(kubectl get pgplan "$PLAN" -o jsonpath='{.status.sqlRef.name}')"
+kubectl get configmap "$CM" -o jsonpath="{.binaryData['plan\.sql\.gz']}" |
+  base64 -d | gunzip
+```
+
+A plan whose compressed preview would still exceed the ConfigMap limit sets no
+`sqlRef` at all, and `status.sqlInline` carries a truncated preview ending in a
+`-- truncated: ... --` marker.
+
+The preview is a review artifact in every case. pgroles never executes stored
+SQL: an approved plan is re-rendered from the current diff at execution time and
+superseded if the hash no longer matches.
 
 Use `suspend` when you want the controller to stop reconciling entirely. Use `plan` when you want it to keep inspecting and showing you what it would do.
 
+### What executes: mode and approval together
+
+`suspend`, `mode`, and `approval` are three separate gates, checked in that
+order. Only the last one is about human review:
+
+| `suspend` | `mode` | `approval` | Plan created? | SQL executed? |
+|---|---|---|---|---|
+| `true` | — | — | no | no — nothing reconciles at all |
+| `false` | `plan` | *ignored* | yes | **never** |
+| `false` | `apply` | `auto` | yes | immediately, plan auto-approved |
+| `false` | `apply` | `manual` | yes | only once approved *and* still current |
+
+**`approval` has no effect in `plan` mode.** A plan-mode policy computes the
+diff, publishes a `PostgresPolicyPlan`, and returns before it ever consults
+`approval`. Annotating that plan with `pgroles.io/approved=true` is accepted by
+the API server and then does nothing: the plan stays `Pending` and no SQL runs.
+Because that is indistinguishable from a stalled operator, the policy reports an
+`ApprovalIgnored` condition naming the plan and emits a warning Event. If you
+want a reviewed apply, the combination you want is `mode: apply` with
+`approval: manual` — plan mode is for looking, not for gated applying.
+
+Execution never trusts stored SQL. An approved plan is re-rendered from the
+current diff and its hash compared against the approved one, so the plan object
+is a review artifact rather than an execution payload.
+
+#### When the policy changes mid-review
+
+With `mode: apply` and `approval: manual`, a pending plan is **frozen** — the
+operator returns early while a plan awaits a decision, so it neither refreshes
+nor supersedes it. Two consequences worth knowing before you rely on the review
+step:
+
+- The policy's status reports the *freshly computed* change count each reconcile,
+  while the pending plan still holds the SQL from when it was created. Status and
+  plan can therefore disagree after a manifest change, and the plan is the stale
+  one.
+- Approving a stale plan does not apply it. On the next reconcile the hash
+  comparison fails, the plan is marked `Superseded`, and a **new** plan is
+  created awaiting approval. Nothing unsafe executes, but the approval is
+  consumed without effect and a second review round is required.
+
+Check that the plan you are approving matches the current generation:
+
+```bash
+kubectl get pgr <policy> -o jsonpath='{.metadata.generation}{"\n"}'
+kubectl get pgplan <plan> -o jsonpath='{.spec.policyGeneration}{"\n"}'
+```
+
+Everywhere else, a superseding write happens automatically: creating a plan marks
+any other `Pending` plan for the same policy `Superseded`, so plan mode and the
+first plan after an approval both converge on a single current plan.
+
+Rejecting with `pgroles.io/rejected=true` marks the plan `Rejected` and clears
+`status.current_plan_ref`. The replacement is created on the *next* reconcile
+rather than immediately, which keeps a rejected plan from spinning in a
+reject-recreate loop.
+
 ### Plan approval resources
+
+{% callout type="warning" title="Set `spec.approval` explicitly" %}
+`spec.approval` decides whether a human gates SQL execution. When it is omitted
+the operator still infers it from `spec.mode` — `apply` implies `auto`, `plan`
+implies `manual` — which leaves that gate invisible on the object: nothing in
+`kubectl get pgr -o yaml` tells you whether the policy applies DDL on its own.
+
+That inference is deprecated. A policy relying on it reports an `ApprovalUnset`
+status condition naming the inferred value, emits a warning Event, and counts
+toward the `pgroles.deprecated.approval_unset` metric. A future release will
+reject a policy that omits the field.
+
+Write down the value you are already getting — `approval: auto` for a policy in
+`mode: apply`, `approval: manual` for `mode: plan` — and the condition clears on
+the next reconcile with no change in behaviour.
+{% /callout %}
 
 When `spec.approval: manual` is used with `mode: apply`, the operator creates a `PostgresPolicyPlan` and waits for approval instead of immediately executing the SQL.
 
@@ -698,7 +814,7 @@ status:
       message: "Applied 5 changes"
       last_transition_time: "2026-03-06T10:30:00Z"
   observed_generation: 3
-  last_reconcile_time: "2026-03-06T10:30:00Z"
+  last_successful_reconcile_time: "2026-03-06T10:30:00Z"
   lastHandledReconcileAt: "2026-03-06T10:31:00Z"
   transient_failure_count: 0
   change_summary:
@@ -738,6 +854,15 @@ status:
 | `Drifted` | `True` when `plan` mode found pending changes |
 | `Reconciling` | `True` while a reconciliation is in progress |
 | `Degraded` | `True` when the last reconciliation failed (includes error detail) |
+| `Conflict` | `True` when another policy targets the same database with overlapping ownership |
+| `Paused` | `True` while `spec.suspend` stops reconciliation |
+| `ApprovalUnset` | `True` while `spec.approval` is omitted and inferred from `spec.mode` (deprecated) |
+| `ApprovalIgnored` | `True` when a plan is approved but `spec.mode: plan` means it will never execute |
+
+`ApprovalUnset` and `ApprovalIgnored` are advisory: they report a configuration
+that will not do what it looks like, and neither indicates a failed
+reconciliation. Both clear on the next reconcile once the configuration is
+corrected.
 
 On failure, the operator chooses a retry path based on the failure mode:
 

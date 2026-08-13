@@ -41,6 +41,7 @@ struct Metrics {
     lock_contention_total: Counter<u64>,
     policy_conflicts_total: Counter<u64>,
     invalid_spec_total: Counter<u64>,
+    deprecated_approval_unset_total: Counter<u64>,
     database_connection_failures_total: Counter<u64>,
     apply_total: Counter<u64>,
     apply_statements_total: Counter<u64>,
@@ -131,6 +132,17 @@ impl OperatorObservability {
     pub fn record_invalid_spec(&self) {
         if let Some(metrics) = &self.metrics {
             metrics.invalid_spec_total.add(1, &[]);
+        }
+    }
+
+    /// Count a reconcile that relied on the deprecated `spec.approval`
+    /// inference, so the remaining exposure is alertable fleet-wide rather than
+    /// only visible per object.
+    pub fn record_deprecated_approval_unset(&self, inferred: &str) {
+        if let Some(metrics) = &self.metrics {
+            metrics
+                .deprecated_approval_unset_total
+                .add(1, &[KeyValue::new("inferred", inferred.to_string())]);
         }
     }
 
@@ -423,6 +435,13 @@ impl Metrics {
             invalid_spec_total: meter
                 .u64_counter("pgroles.invalid_spec.total")
                 .with_description("Invalid PostgresPolicy specifications")
+                .build(),
+            deprecated_approval_unset_total: meter
+                .u64_counter("pgroles.deprecated.approval_unset")
+                .with_description(
+                    "Reconciles of a PostgresPolicy that omits spec.approval and relies on the \
+                     deprecated inference from spec.mode",
+                )
                 .build(),
             database_connection_failures_total: meter
                 .u64_counter("pgroles.database.connection_failures")

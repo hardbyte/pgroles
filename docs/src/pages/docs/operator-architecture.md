@@ -112,6 +112,8 @@ The operator writes status conditions and summaries back to the `PostgresPolicy`
 - `Degraded`
 - `Conflict`
 - `Paused`
+- `ApprovalUnset` and `ApprovalIgnored`, which are advisory: they report a
+  configuration that will not behave as it looks, not a failed reconcile
 
 It also records:
 
@@ -124,9 +126,10 @@ It also records:
 - transient failure count
 - change summary
 - last reconcile mode
-- planned SQL (truncated when needed for status size safety)
+- current plan reference
 
-This is the main operator-facing debugging surface for SREs.
+This is the main operator-facing debugging surface for SREs. The rendered SQL
+lives on the referenced `PostgresPolicyPlan`.
 
 ## Observability
 

@@ -312,10 +312,15 @@ jobs:
           kubectl apply -f k8s/samples/disjoint-policy.yaml
           wait_for_ready_true disjoint-policy
           assert_role_exists analytics
+          # This fixture deliberately omits spec.approval, so it must report the
+          # deprecation condition while the inference still exists.
+          wait_for_condition_status disjoint-policy ApprovalUnset True
 
           pg_query 'DROP SCHEMA IF EXISTS operator_owned_schema CASCADE; DROP ROLE IF EXISTS operator_schema_owner;'
           kubectl apply -f k8s/samples/schema-owner-policy.yaml
           wait_for_ready_true schema-owner-policy
+          # ...whereas this one sets it explicitly and must stay quiet.
+          assert_condition_absent schema-owner-policy ApprovalUnset
           assert_role_exists operator_schema_owner
           assert_schema_exists operator_owned_schema
           assert_schema_owner operator_owned_schema operator_schema_owner
@@ -354,9 +359,20 @@ jobs:
           wait_for_ready_status_reason plan-policy True Planned
           wait_for_drift_status plan-policy True
           kubectl get pgr plan-policy -o jsonpath='{.status.last_reconcile_mode}' | grep -qx "plan"
-          kubectl get pgr plan-policy -o jsonpath='{.status.planned_sql}' | grep -q 'CREATE ROLE \"plan-preview-user\"'
+          plan_preview_plan="$(wait_for_current_plan_ref plan-policy)"
+          get_plan_sql "$plan_preview_plan" | grep -q 'CREATE ROLE \"plan-preview-user\"'
           assert_role_absent plan-preview-user
           wait_for_event_reason plan-policy DriftDetected
+
+          # Approving a plan-mode plan can never execute. The policy must say so
+          # rather than look stalled, and must still not touch the database.
+          assert_condition_absent plan-policy ApprovalIgnored
+          approve_plan "$plan_preview_plan"
+          wait_for_condition_status plan-policy ApprovalIgnored True
+          wait_for_event_reason plan-policy ApprovalIgnored
+          assert_role_absent plan-preview-user
+          kubectl annotate pgplan "$plan_preview_plan" pgroles.io/approved- --overwrite
+          wait_for_condition_absent plan-policy ApprovalIgnored
 
           upsert_secret rotating-postgres-credentials \
             DATABASE_URL='postgres://postgres:devpassword@postgres.default.svc.cluster.local:5432/postgres'
