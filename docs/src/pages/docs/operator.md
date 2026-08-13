@@ -558,7 +558,79 @@ superseded if the hash no longer matches.
 
 Use `suspend` when you want the controller to stop reconciling entirely. Use `plan` when you want it to keep inspecting and showing you what it would do.
 
+### What executes: mode and approval together
+
+`suspend`, `mode`, and `approval` are three separate gates, checked in that
+order. Only the last one is about human review:
+
+| `suspend` | `mode` | `approval` | Plan created? | SQL executed? |
+|---|---|---|---|---|
+| `true` | — | — | no | no — nothing reconciles at all |
+| `false` | `plan` | *ignored* | yes | **never** |
+| `false` | `apply` | `auto` | yes | immediately, plan auto-approved |
+| `false` | `apply` | `manual` | yes | only once approved *and* still current |
+
+**`approval` has no effect in `plan` mode.** A plan-mode policy computes the
+diff, publishes a `PostgresPolicyPlan`, and returns before it ever consults
+`approval`. Annotating that plan with `pgroles.io/approved=true` is accepted by
+the API server and then does nothing: the plan stays `Pending`, no SQL runs, and
+no condition or Event explains the no-op. If you want a reviewed apply, the
+combination you want is `mode: apply` with `approval: manual` — plan mode is for
+looking, not for gated applying.
+
+Execution never trusts stored SQL. An approved plan is re-rendered from the
+current diff and its hash compared against the approved one, so the plan object
+is a review artifact rather than an execution payload.
+
+#### When the policy changes mid-review
+
+With `mode: apply` and `approval: manual`, a pending plan is **frozen** — the
+operator returns early while a plan awaits a decision, so it neither refreshes
+nor supersedes it. Two consequences worth knowing before you rely on the review
+step:
+
+- The policy's status reports the *freshly computed* change count each reconcile,
+  while the pending plan still holds the SQL from when it was created. Status and
+  plan can therefore disagree after a manifest change, and the plan is the stale
+  one.
+- Approving a stale plan does not apply it. On the next reconcile the hash
+  comparison fails, the plan is marked `Superseded`, and a **new** plan is
+  created awaiting approval. Nothing unsafe executes, but the approval is
+  consumed without effect and a second review round is required.
+
+Check that the plan you are approving matches the current generation:
+
+```bash
+kubectl get pgr <policy> -o jsonpath='{.metadata.generation}{"\n"}'
+kubectl get pgplan <plan> -o jsonpath='{.spec.policyGeneration}{"\n"}'
+```
+
+Everywhere else, a superseding write happens automatically: creating a plan marks
+any other `Pending` plan for the same policy `Superseded`, so plan mode and the
+first plan after an approval both converge on a single current plan.
+
+Rejecting with `pgroles.io/rejected=true` marks the plan `Rejected` and clears
+`status.current_plan_ref`. The replacement is created on the *next* reconcile
+rather than immediately, which keeps a rejected plan from spinning in a
+reject-recreate loop.
+
 ### Plan approval resources
+
+{% callout type="warning" title="Set `spec.approval` explicitly" %}
+`spec.approval` decides whether a human gates SQL execution. When it is omitted
+the operator still infers it from `spec.mode` — `apply` implies `auto`, `plan`
+implies `manual` — which leaves that gate invisible on the object: nothing in
+`kubectl get pgr -o yaml` tells you whether the policy applies DDL on its own.
+
+That inference is deprecated. A policy relying on it reports an `ApprovalUnset`
+status condition naming the inferred value, emits a warning Event, and counts
+toward the `pgroles.deprecated.approval_unset` metric. A future release will
+reject a policy that omits the field.
+
+Write down the value you are already getting — `approval: auto` for a policy in
+`mode: apply`, `approval: manual` for `mode: plan` — and the condition clears on
+the next reconcile with no change in behaviour.
+{% /callout %}
 
 When `spec.approval: manual` is used with `mode: apply`, the operator creates a `PostgresPolicyPlan` and waits for approval instead of immediately executing the SQL.
 

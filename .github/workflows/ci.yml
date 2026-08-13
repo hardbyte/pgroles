@@ -312,10 +312,15 @@ jobs:
           kubectl apply -f k8s/samples/disjoint-policy.yaml
           wait_for_ready_true disjoint-policy
           assert_role_exists analytics
+          # This fixture deliberately omits spec.approval, so it must report the
+          # deprecation condition while the inference still exists.
+          wait_for_condition_status disjoint-policy ApprovalUnset True
 
           pg_query 'DROP SCHEMA IF EXISTS operator_owned_schema CASCADE; DROP ROLE IF EXISTS operator_schema_owner;'
           kubectl apply -f k8s/samples/schema-owner-policy.yaml
           wait_for_ready_true schema-owner-policy
+          # ...whereas this one sets it explicitly and must stay quiet.
+          assert_condition_absent schema-owner-policy ApprovalUnset
           assert_role_exists operator_schema_owner
           assert_schema_exists operator_owned_schema
           assert_schema_owner operator_owned_schema operator_schema_owner

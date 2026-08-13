@@ -192,6 +192,17 @@ fn derive_status_events(
         events.push(event(EventType::Normal, reason, "StatusTransition", note));
     }
 
+    if transitioned_to_true(old_status, new_status, crate::crd::CONDITION_APPROVAL_UNSET) {
+        let note = condition_message(new_status, crate::crd::CONDITION_APPROVAL_UNSET)
+            .unwrap_or_else(|| "spec.approval is not set and is being inferred".to_string());
+        events.push(event(
+            EventType::Warning,
+            "ApprovalUnset",
+            "StatusTransition",
+            note,
+        ));
+    }
+
     if let Some(reason) = noteworthy_failure_reason(old_status, new_status) {
         let note = condition_message(new_status, "Ready")
             .or_else(|| new_status.last_error.clone())
@@ -477,6 +488,37 @@ mod tests {
         assert_eq!(reasons(&events), vec!["GcpAuthFailed"]);
         assert!(matches!(events[0].type_, EventType::Warning));
         assert_eq!(events[0].note.as_deref(), Some("token request rejected"));
+    }
+
+    #[test]
+    fn emits_approval_unset_warning_once_on_transition() {
+        let mut new_status = PostgresPolicyStatus::default();
+        new_status.set_condition(crate::crd::approval_unset_condition(
+            crate::crd::ApprovalMode::Auto,
+        ));
+
+        let events = derive_status_events(None, &new_status);
+        assert!(reasons(&events).contains(&"ApprovalUnset"));
+        let approval_event = events
+            .iter()
+            .find(|e| e.reason == "ApprovalUnset")
+            .expect("expected an ApprovalUnset event");
+        assert!(matches!(approval_event.type_, EventType::Warning));
+        assert!(
+            approval_event
+                .note
+                .as_deref()
+                .is_some_and(|note| note.contains("approval: auto")),
+            "the event note should carry the remediation, not just the warning"
+        );
+
+        // A deprecation nag must not re-fire on every reconcile: with the
+        // condition already present, the transition has already been reported.
+        let events = derive_status_events(Some(&new_status), &new_status);
+        assert!(
+            !reasons(&events).contains(&"ApprovalUnset"),
+            "steady state should not keep emitting the deprecation event"
+        );
     }
 
     #[test]

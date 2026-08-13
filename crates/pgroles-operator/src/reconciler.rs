@@ -1019,6 +1019,22 @@ async fn apply_under_lock(
     let sql_ctx = detect_sql_context(pool, &inspect_config).await?;
 
     let effective_approval = resource.spec.effective_approval();
+    if resource.spec.approval.is_none() {
+        let inferred = match effective_approval {
+            crate::crd::ApprovalMode::Auto => "auto",
+            crate::crd::ApprovalMode::Manual => "manual",
+        };
+        // Logged as well as surfaced on status: Kubernetes Events expire, so a
+        // deployment that only ships logs still sees the deprecation.
+        tracing::warn!(
+            name,
+            namespace,
+            inferred,
+            "spec.approval is not set and is being inferred from spec.mode; this inference is \
+             deprecated and will become an error in a future release"
+        );
+        ctx.observability.record_deprecated_approval_unset(inferred);
+    }
 
     if resource.spec.mode == PolicyMode::Plan {
         let drift_detected = !changes.is_empty();
@@ -2002,6 +2018,10 @@ where
     let mut status = old_status.clone().unwrap_or_default();
 
     mutate(&mut status);
+    // Applied centrally rather than at each caller: every status write passes
+    // through here, so the condition cannot be missed on one path or go stale
+    // once the field is finally set.
+    apply_approval_deprecation_condition(resource, &mut status);
 
     let patch = serde_json::json!({
         "status": status
@@ -2021,6 +2041,25 @@ where
     }
 
     Ok(())
+}
+
+/// Report whether this policy relies on `spec.approval` being inferred from
+/// `spec.mode`. The inference is deprecated and becomes an error in a future
+/// release, so a policy depending on it carries a condition until the field is
+/// written down. Setting the field clears the condition on the next write.
+fn apply_approval_deprecation_condition(
+    resource: &PostgresPolicy,
+    status: &mut PostgresPolicyStatus,
+) {
+    if resource.spec.approval.is_some() {
+        status
+            .conditions
+            .retain(|condition| condition.condition_type != crate::crd::CONDITION_APPROVAL_UNSET);
+        return;
+    }
+    status.set_condition(crate::crd::approval_unset_condition(
+        resource.spec.effective_approval(),
+    ));
 }
 
 async fn detect_policy_conflict(
@@ -2333,6 +2372,90 @@ mod tests {
                 approval: None,
             },
         )
+    }
+
+    fn approval_condition(status: &PostgresPolicyStatus) -> Option<&crate::crd::PolicyCondition> {
+        status
+            .conditions
+            .iter()
+            .find(|c| c.condition_type == crate::crd::CONDITION_APPROVAL_UNSET)
+    }
+
+    #[test]
+    fn approval_deprecation_condition_reports_inference_per_mode() {
+        for (mode, expected) in [(PolicyMode::Apply, "auto"), (PolicyMode::Plan, "manual")] {
+            let mut policy = valid_role_policy("p", "app", "s");
+            policy.spec.mode = mode;
+            policy.spec.approval = None;
+
+            let mut status = PostgresPolicyStatus::default();
+            apply_approval_deprecation_condition(&policy, &mut status);
+
+            let cond = approval_condition(&status)
+                .unwrap_or_else(|| panic!("{mode:?} without approval should set the condition"));
+            assert_eq!(cond.status, "True");
+            assert!(
+                cond.message
+                    .as_deref()
+                    .is_some_and(|m| m.contains(&format!("inferred as {expected}"))),
+                "condition should name the mode-specific inference for {mode:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn approval_deprecation_condition_absent_when_field_is_explicit() {
+        for approval in [
+            crate::crd::ApprovalMode::Auto,
+            crate::crd::ApprovalMode::Manual,
+        ] {
+            let mut policy = valid_role_policy("p", "app", "s");
+            policy.spec.approval = Some(approval);
+
+            let mut status = PostgresPolicyStatus::default();
+            apply_approval_deprecation_condition(&policy, &mut status);
+
+            assert!(
+                approval_condition(&status).is_none(),
+                "an explicit approval mode must not be reported as unset"
+            );
+        }
+    }
+
+    #[test]
+    fn approval_deprecation_condition_is_cleared_once_the_field_is_set() {
+        // The condition is written by an earlier reconcile and must not linger
+        // on the object after the user acts on it.
+        let mut policy = valid_role_policy("p", "app", "s");
+        policy.spec.approval = None;
+        let mut status = PostgresPolicyStatus::default();
+        apply_approval_deprecation_condition(&policy, &mut status);
+        assert!(approval_condition(&status).is_some());
+
+        policy.spec.approval = Some(crate::crd::ApprovalMode::Auto);
+        apply_approval_deprecation_condition(&policy, &mut status);
+        assert!(
+            approval_condition(&status).is_none(),
+            "stale condition should be removed when approval becomes explicit"
+        );
+    }
+
+    #[test]
+    fn approval_deprecation_condition_preserves_other_conditions() {
+        let mut policy = valid_role_policy("p", "app", "s");
+        policy.spec.approval = Some(crate::crd::ApprovalMode::Auto);
+        let mut status = PostgresPolicyStatus::default();
+        status.set_condition(ready_condition(true, "Reconciled", "All changes applied"));
+
+        apply_approval_deprecation_condition(&policy, &mut status);
+
+        assert!(
+            status
+                .conditions
+                .iter()
+                .any(|c| c.condition_type == "Ready"),
+            "clearing the deprecation condition must not disturb other conditions"
+        );
     }
 
     fn invalid_profile_policy(name: &str, secret_name: &str) -> PostgresPolicy {

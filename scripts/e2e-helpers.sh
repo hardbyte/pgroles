@@ -51,6 +51,43 @@ wait_for_ready_reason() {
   wait_for_ready_status_reason "$policy" "False" "$expected_reason"
 }
 
+policy_condition_status() {
+  local policy="$1"
+  local condition="$2"
+  kubectl get pgr "$policy" \
+    -o jsonpath="{.status.conditions[?(@.type==\"$condition\")].status}" 2>/dev/null || true
+}
+
+wait_for_condition_status() {
+  local policy="$1"
+  local condition="$2"
+  local expected="$3"
+  for i in $(seq 1 30); do
+    status="$(policy_condition_status "$policy" "$condition")"
+    if [ "$status" = "$expected" ]; then
+      echo "$policy reached $condition=$expected"
+      return 0
+    fi
+    echo "Waiting for $policy $condition=$expected (currently '${status:-absent}', attempt $i/30)"
+    sleep 3
+  done
+  echo "::error::$policy did not reach $condition=$expected"
+  kubectl get pgr "$policy" -o yaml || true
+  return 1
+}
+
+assert_condition_absent() {
+  local policy="$1"
+  local condition="$2"
+  status="$(policy_condition_status "$policy" "$condition")"
+  if [ -n "$status" ]; then
+    echo "::error::$policy unexpectedly reports $condition=$status"
+    kubectl get pgr "$policy" -o yaml || true
+    return 1
+  fi
+  echo "$policy has no $condition condition, as expected"
+}
+
 wait_for_drift_status() {
   local policy="$1"
   local expected_status="$2"

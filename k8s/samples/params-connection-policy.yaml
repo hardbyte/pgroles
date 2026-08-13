@@ -22,6 +22,7 @@ spec:
       #   the operator authenticates as a low-privilege identity that has
       #   been granted membership in a privileged role (e.g. Cloud SQL
       #   IAM user + cloudsqlsuperuser).
+  approval: auto
   interval: "5m"
   default_owner: postgres
 
