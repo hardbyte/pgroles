@@ -28,7 +28,7 @@ Plan mode is useful when you want the operator to stay in-cluster but you are no
 In `plan` mode:
 
 - the operator connects to the database and computes the full diff normally
-- no PostgreSQL SQL is executed
+- no mutating PostgreSQL SQL is executed
 - `status.change_summary` records the pending changes
 - `status.current_plan_ref.name` points at the generated `PostgresPolicyPlan`, which holds the rendered SQL in `status.sqlInline` or, for larger plans, a gzipped ConfigMap referenced by `status.sqlRef`
 - `Ready=True` with reason `Planned`
@@ -141,7 +141,7 @@ Execution never trusts stored SQL. An approved plan is re-rendered from the
 current diff and its hash compared against the approved one, so the plan object
 is a review artifact rather than an execution payload.
 
-#### When the policy changes mid-review
+### When the policy changes mid-review
 
 With `mode: apply` and `approval: manual`, a pending plan is **frozen** — the
 operator returns early while a plan awaits a decision, so it neither refreshes

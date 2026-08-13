@@ -100,7 +100,7 @@ Declared schemas can be created and have ownership converged by the operator. Sc
 
 Roles can either sync a password from an existing Kubernetes Secret or ask the operator to generate and manage a per-role Secret. In both cases the password value is resolved at reconcile time and only sent to PostgreSQL inside the apply transaction.
 
-#### Sync from an existing Secret
+### Sync from an existing Secret
 
 ```yaml
 spec:
@@ -118,7 +118,7 @@ spec:
 - `password.secretKey` — the key within the Secret. Defaults to the role name if omitted.
 - `password_valid_until` — ISO 8601 timestamp for PostgreSQL `VALID UNTIL`.
 
-#### Generate and manage a Secret
+### Generate and manage a Secret
 
 ```yaml
 spec:
@@ -138,7 +138,7 @@ spec:
 
 Generated Secrets are created in the same namespace as the `PostgresPolicy`, owned by that policy, and include both the cleartext password and a SCRAM verifier. The cleartext password is written at `password.generate.secretKey` (default `password`) and the SCRAM verifier is written at the fixed key `verifier`. `password.generate.secretKey` must not be `verifier`; the CRD rejects that value. Deleting the generated Secret causes the operator to recreate it and rotate the PostgreSQL password on the next reconcile.
 
-#### Validation and reconcile semantics
+### Validation and reconcile semantics
 
 - Passwords are only allowed on roles with `login: true`.
 - Exactly one of `password.secretRef` or `password.generate` must be set.

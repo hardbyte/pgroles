@@ -14,6 +14,7 @@ If the operator can connect to PostgreSQL but the management role cannot inspect
 Current behavior:
 
 - `Ready=False`
+- `Degraded=True`
 - reason `InsufficientPrivileges`
 - `last_error` contains the PostgreSQL error message, for example `permission denied to create role`
 - the policy retries on its normal reconcile interval rather than exponential transient backoff
@@ -25,6 +26,7 @@ This is the expected state when the database credential is valid but under-privi
 Before issuing any DDL, the operator validates that every schema referenced by the policy exists in the target database. If one is missing, the apply is aborted up front and the policy settles into a non-ready state with a clear message.
 
 - `Ready=False`
+- `Degraded=True`
 - reason `MissingDatabaseObject`
 - `last_error` lists the missing objects, e.g. `policy references objects that do not exist in target database: schema "etl". Either create the missing objects, remove them from the policy, or verify the policy is pointing at the intended database.`
 - the policy retries on its normal reconcile interval rather than exponential transient backoff

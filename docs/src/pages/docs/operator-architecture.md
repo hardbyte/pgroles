@@ -53,13 +53,17 @@ Generation and annotation filtering matter. The controller intentionally ignores
 The operator resolves credentials from a Secret in the same namespace as the
 policy — either a whole connection URL via `connection.secretRef`, or individual
 `connection.params` fields, each of which may be a literal or its own Secret
-reference. It caches `sqlx::PgPool` instances by:
+reference. It caches `sqlx::PgPool` instances. In URL mode the cache identity is:
 
 ```text
 namespace / secret name / secret key
 ```
 
-When the Secret changes, the controller refetches it and refreshes the cached pool on the next reconcile. This is what enables credential rotation and recovery without restarting the operator.
+In `connection.params` mode the key covers every connection field, and the
+operator additionally fingerprints the `resourceVersion` of all referenced
+Secrets.
+
+When any referenced Secret changes, the controller refetches it and refreshes the cached pool on the next reconcile. This is what enables credential rotation and recovery without restarting the operator.
 
 ### Reconcile engine
 

@@ -11,7 +11,7 @@ How the operator finds and authenticates to your database. {% .lead %}
 
 The operator supports two connection modes: a single connection URL from a Secret, or structured parameters with separate fields for host, port, database, and credentials.
 
-#### Connection URL (single Secret)
+### Connection URL (single Secret)
 
 Create a Secret containing your PostgreSQL connection string:
 
@@ -31,7 +31,7 @@ connection:
 
 When the Secret's `resourceVersion` changes (e.g. credential rotation), the operator automatically reconnects with updated credentials.
 
-#### Structured parameters
+### Structured parameters
 
 Use `connection.params` to build the connection from individual fields. Each field is either a literal value or a reference to a key in a Kubernetes Secret. This integrates natively with PostgreSQL operators that create credential Secrets (Zalando, CloudNativePG, CrunchyData PGO).
 
@@ -80,7 +80,7 @@ Each connection field supports a literal value and a `*Secret` variant:
 | `dbname` / `dbnameSecret` | Database name | SecretKeySelector | Yes (exactly one) |
 | `username` / `usernameSecret` | Username string | SecretKeySelector | Yes (exactly one) |
 | `password` / `passwordSecret` | Password string | SecretKeySelector | Yes unless `auth` is set |
-| `auth` | Provider-backed auth config (`provider`, `scope`, `impersonateServiceAccount`) | n/a | No |
+| `auth` | Provider-backed auth config (`type`, `scope`, `impersonateServiceAccount`) | n/a | No |
 | `setRole` | Role to `SET ROLE` to on every operator connection | n/a | No |
 | `sslMode` / `sslModeSecret` | SSL mode string | SecretKeySelector | No |
 
@@ -88,7 +88,7 @@ Valid `sslMode` values: `disable`, `allow`, `prefer`, `require`, `verify-ca`, `v
 
 For required fields, exactly one of the literal or Secret variant must be set. For optional fields, at most one may be set. When a Secret referenced by `params` changes, the operator detects the `resourceVersion` change and reconnects automatically.
 
-#### GKE Workload Identity for Cloud SQL IAM
+### GKE Workload Identity for Cloud SQL IAM
 
 Use `connection.params.auth.type: gcp_workload_identity` when the operator pod runs on GKE with Workload Identity and connects to Cloud SQL using IAM database authentication. The operator fetches a short-lived OAuth token from the GKE metadata server and uses it as the PostgreSQL password. `password` and `passwordSecret` must be omitted. If `sslMode` is omitted, the operator uses `require`.
 

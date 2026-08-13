@@ -11,16 +11,16 @@ Declare your PostgreSQL roles, memberships, and privileges as a Kubernetes resou
 By default a `PostgresPolicy` runs in `mode: apply` with
 `reconciliation_mode: authoritative`, which means anything in the database but
 not in the policy is revoked or dropped. On an existing database that can be
-thousands of grants. Start with `mode: plan`, which executes no SQL at all, and
+thousands of grants. Start with `mode: plan`, which executes no mutating SQL, and
 read [staged adoption](/docs/adoption) before pointing pgroles at something you
 care about.
 {% /callout %}
 
 ## A first policy
 
-Install the operator, then apply a policy. This one is deliberately read-only —
-it computes what it *would* change and publishes it for review, without touching
-the database:
+Install the operator, then apply a policy. This one is deliberately non-mutating:
+it inspects the database, computes what it *would* change, and publishes that for
+review without executing any DDL.
 
 ```yaml
 apiVersion: pgroles.io/v1alpha1
@@ -34,7 +34,7 @@ spec:
       name: myapp-db-credentials
     secretKey: DATABASE_URL
 
-  mode: plan          # compute and publish; execute nothing
+  mode: plan          # inspect and publish a plan; change nothing
   approval: manual
   interval: 5m
 
@@ -46,26 +46,34 @@ spec:
 
   memberships:
     - role: myapp-readonly
-      member: myapp-service
+      members:
+        - name: myapp-service
 
   grants:
-    - privileges: [CONNECT]
-      on: database
-      to: [myapp-readonly]
+    - role: myapp-readonly
+      object: { type: database }
+      privileges: [CONNECT]
 ```
 
-The Secret it references holds the connection string:
+The Secret it references holds the connection string. Read it from a file rather
+than passing it as an argument, so the password stays out of shell history and
+out of the process list:
 
 ```shell
-kubectl create secret generic myapp-db-credentials \
-  --from-literal=DATABASE_URL='postgresql://admin:password@postgres:5432/myapp'
+printf '%s' 'postgresql://admin:password@postgres:5432/myapp' > db-url
+kubectl create secret generic myapp-db-credentials -n default \
+  --from-file=DATABASE_URL=db-url
+rm db-url
 ```
+
+In production, prefer a secret manager — External Secrets Operator, Vault, or
+your cloud provider's CSI driver — over creating the Secret by hand.
 
 Apply it and read the result:
 
 ```shell
 kubectl apply -f policy.yaml
-kubectl get pgr myapp-roles
+kubectl get pgr myapp-roles -n default
 ```
 
 ```text
