@@ -547,7 +547,14 @@ GRANT CONNECT ON DATABASE "postgres" TO "plan-preview-user";
 ```
 
 Plans above the inline size limit set `status.sqlRef` instead, naming a ConfigMap
-whose `plan.sql.gz` entry holds the gzipped SQL under `binaryData`.
+whose `plan.sql.gz` entry holds the gzipped SQL under `binaryData`. A plan whose
+compressed preview would still exceed the ConfigMap limit sets no `sqlRef` at
+all, and `status.sqlInline` carries a truncated preview ending in a
+`-- truncated: ... --` marker.
+
+The preview is a review artifact in every case. pgroles never executes stored
+SQL: an approved plan is re-rendered from the current diff at execution time and
+superseded if the hash no longer matches.
 
 Use `suspend` when you want the controller to stop reconciling entirely. Use `plan` when you want it to keep inspecting and showing you what it would do.
 

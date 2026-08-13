@@ -271,6 +271,9 @@ get_plan_sql() {
   cm_name="$(kubectl get pgplan "$plan" -o jsonpath='{.status.sqlRef.name}' 2>/dev/null || true)"
   cm_key="$(kubectl get pgplan "$plan" -o jsonpath='{.status.sqlRef.key}' 2>/dev/null || true)"
   compression="$(kubectl get pgplan "$plan" -o jsonpath='{.status.sqlRef.compression}' 2>/dev/null || true)"
+  # No sqlRef is a real outcome, not a failure: a plan too large to store even
+  # compressed keeps a truncated preview in sqlInline instead. Empty output is
+  # reserved for that case, so retrieval failures below must not look like it.
   if [ -z "$cm_name" ] || [ -z "$cm_key" ]; then
     echo ""
     return 0
@@ -280,11 +283,17 @@ get_plan_sql() {
   escaped_key="${cm_key//./\\.}"
   if [ "$compression" = "gzip" ]; then
     # Compressed SQL is stored in binaryData, which kubectl returns base64-encoded.
-    kubectl get configmap "$cm_name" -o jsonpath="{.binaryData['${escaped_key}']}" 2>/dev/null |
-      base64 -d | gunzip
-    return 0
+    # pipefail is set in a subshell so a failing kubectl/base64/gunzip surfaces
+    # here rather than downstream as SQL that merely lacks the expected text,
+    # without disturbing the shell options of whatever sourced this file.
+    (
+      set -o pipefail
+      kubectl get configmap "$cm_name" -o jsonpath="{.binaryData['${escaped_key}']}" |
+        base64 -d | gunzip
+    )
+    return
   fi
-  kubectl get configmap "$cm_name" -o jsonpath="{.data['${escaped_key}']}" 2>/dev/null || true
+  kubectl get configmap "$cm_name" -o jsonpath="{.data['${escaped_key}']}"
 }
 
 wait_for_current_plan_ref() {
