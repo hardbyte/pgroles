@@ -8,6 +8,8 @@ The pgroles operator watches `PostgresPolicy` custom resources and continuously 
 ---
 
 For the internal controller design, see the [operator architecture](/docs/operator-architecture) page.
+For bounded, request-driven PostgreSQL membership, see
+[ephemeral access](/docs/ephemeral-access).
 
 ## Overview
 
@@ -17,6 +19,8 @@ The operator brings the same convergent model as the CLI into Kubernetes. Instea
 - Database credentials referenced via Kubernetes Secrets
 - Status conditions and change summaries on the custom resource
 - Finalizer-based cleanup on resource deletion
+- Optional `EphemeralAccessPolicy` and `EphemeralAccessRequest` overlays for
+  bounded membership without mutating durable GitOps policy
 
 {% callout type="note" title="Bundle composition reaches the operator via render-bundle" %}
 The operator reconciles a single `PostgresPolicy` per resource — it does not load bundle fragments directly. To get cross-team or cross-environment fragment composition under the operator, compose the bundle in CI with `pgroles render-bundle --bundle pgroles.bundle.yaml --output pgroles.yaml`, then wrap the rendered manifest into a `PostgresPolicy` resource (the manifest fields go under `spec:` alongside `connection:`). Gate the bundle ↔ rendered-manifest relationship with `pgroles render-bundle --bundle … --check pgroles.yaml` in CI. See the [bundle composition guide](/docs/bundle-composition) for the full workflow.
@@ -133,27 +137,13 @@ The operator's safety model — serialized reconciliation, conflict detection, f
 
 **Deployment security:**
 
-- The operator requires a ClusterRole with Secret read access. There is no namespace-scoped deployment option or RBAC hardening guidance.
+- The operator requires cluster-scoped controller RBAC with Secret read access;
+  there is no namespace-scoped deployment option. Ephemeral request and
+  approval hardening is covered in [securing ephemeral access](/docs/ephemeral-access-security).
 
 **Deletion semantics:**
 
 - Deleting a `PostgresPolicy` stops reconciliation but does not revert the database. This is by design (stop managing, not undo) but differs from GitOps conventions where deleting a resource reverts its effects.
-
-### CI coverage
-
-PR CI validates:
-
-- conflicting and non-overlapping same-database policies
-- shared-secret churn and recovery
-- synced and generated password lifecycle flows
-- invalid specs, missing secrets, insufficient privileges
-- Kubernetes Event delivery for warning and recovery transitions
-- generated policies spanning 2 databases, 30 schemas, 60 roles
-
-Scheduled coverage on `main` additionally exercises:
-
-- 5 policies across 3 databases, 100 schemas, 200 roles
-- repeated secret churn with latency reporting
 
 ### Path to API stability
 

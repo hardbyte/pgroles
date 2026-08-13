@@ -593,6 +593,9 @@ jobs:
           pg_query "SELECT has_table_privilege('loadb_10-viewer', 'loadb_10.items', 'SELECT')" loadtest | grep -qx "t"
           pg_query "SELECT has_sequence_privilege('loadb_05-editor', 'loadb_05.audit_seq', 'USAGE')" loadtest | grep -qx "t"
 
+      - name: Run ephemeral request cache regression
+        run: scripts/e2e-ephemeral-request-load.sh
+
       - name: Cleanup
         if: always()
         run: kind delete cluster --name pgroles-e2e-load
@@ -1032,3 +1035,101 @@ jobs:
       - name: Cleanup
         if: always()
         run: kind delete cluster --name pgroles-e2e-plans
+
+  # ---------------------------------------------------------------------------
+  # Job 7: Ephemeral access — lifecycle plus secure Kyverno admission boundary
+  # ---------------------------------------------------------------------------
+  e2e-ephemeral-access:
+    name: Ephemeral Access E2E (${{ matrix.secure == 'true' && 'Kyverno' || 'trusted-writer' }})
+    needs: stack-gate
+    if: needs.stack-gate.outputs.run_heavy == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 50
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - secure: "false"
+            cluster: pgroles-e2e-ephemeral-trusted
+          - secure: "true"
+            cluster: pgroles-e2e-ephemeral-secure
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - uses: ./.github/actions/setup-e2e
+        with:
+          cluster-name: ${{ matrix.cluster }}
+
+      - name: Install ephemeral access test identities
+        run: |
+          kubectl apply -f k8s/security/ephemeral-access-rbac.yaml
+          kubectl apply -f k8s/security/ephemeral-access-e2e-rbac.yaml
+
+      - name: Install Kyverno secure admission boundary
+        if: matrix.secure == 'true'
+        run: |
+          curl -fsSL -o /tmp/kyverno-install.yaml \
+            https://github.com/kyverno/kyverno/releases/download/v1.18.2/install.yaml
+          echo "3dcd43eaf11f0719084217148cd0c82a8fa49faa9b1a783ea5bea2cf84041bda  /tmp/kyverno-install.yaml" \
+            | sha256sum -c -
+          kubectl create -f /tmp/kyverno-install.yaml
+          kubectl wait --for=condition=Established \
+            crd/clusterpolicies.kyverno.io \
+            crd/validatingpolicies.policies.kyverno.io \
+            --timeout=120s
+          kubectl -n kyverno wait --for=condition=Available \
+            deployment/kyverno-admission-controller \
+            deployment/kyverno-background-controller \
+            deployment/kyverno-cleanup-controller \
+            deployment/kyverno-reports-controller \
+            --timeout=240s
+          # A Deployment can become Available just before the admission
+          # process starts serving its policy webhooks. Applying the policy is
+          # the end-to-end readiness probe, so retry only transient webhook
+          # startup failures and fail immediately for a malformed policy.
+          policy_apply_log="$(mktemp)"
+          trap 'rm -f "$policy_apply_log"' EXIT
+          policy_applied=false
+          for attempt in $(seq 1 30); do
+            if kubectl apply -f k8s/security/ephemeral-access-kyverno.yaml \
+              >"$policy_apply_log" 2>&1; then
+              cat "$policy_apply_log"
+              policy_applied=true
+              break
+            fi
+            cat "$policy_apply_log"
+            if ! grep -Eq \
+              'failed calling webhook|no endpoints available|connection refused|context deadline exceeded' \
+              "$policy_apply_log"; then
+              exit 1
+            fi
+            if [ "$attempt" -eq 30 ]; then
+              break
+            fi
+            echo "Kyverno admission webhook is not serving yet (attempt $attempt/30)"
+            sleep 2
+          done
+          if [ "$policy_applied" != true ]; then
+            echo "::error::Kyverno admission webhook did not become ready"
+            exit 1
+          fi
+          kubectl wait --for=jsonpath='{.status.conditionStatus.ready}'=true \
+            validatingpolicy/pgroles-ephemeral-access-decision-integrity \
+            --timeout=120s
+
+      - name: Run ephemeral access lifecycle E2E
+        run: scripts/e2e-ephemeral-access.sh "${{ matrix.secure }}"
+
+      - name: Diagnostics
+        if: failure()
+        run: |
+          kubectl get pgr,pgeap,pgear,pgplan -A -o wide || true
+          kubectl -n pgroles-system logs deployment/pgroles-operator --tail=500 || true
+          kubectl -n pgroles-system logs deployment/otel-collector --tail=500 || true
+          kubectl -n kyverno logs deployment/kyverno-admission-controller --tail=300 || true
+
+      - name: Cleanup
+        if: always()
+        run: kind delete cluster --name "${{ matrix.cluster }}"

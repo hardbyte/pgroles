@@ -13,10 +13,20 @@ use kube::runtime::reflector::ObjectRef;
 use kube::runtime::{Controller, WatchStreamExt, predicates, reflector, watcher};
 use kube::{Api, Client, Resource, ResourceExt};
 use tracing::info;
+use tracing_subscriber::prelude::*;
 
 use pgroles_operator::context::OperatorContext;
-use pgroles_operator::crd::{PostgresPolicy, PostgresPolicyPlan, REQUESTED_RECONCILE_ANNOTATION};
-use pgroles_operator::observability::{OperatorObservability, serve_health};
+use pgroles_operator::crd::{
+    EphemeralAccessPolicy, EphemeralAccessRequest, PostgresPolicy, PostgresPolicyPlan,
+    REQUESTED_RECONCILE_ANNOTATION,
+};
+use pgroles_operator::ephemeral::{
+    access_policy_error_policy, access_request_error_policy, reconcile_access_policy,
+    reconcile_access_request,
+};
+use pgroles_operator::observability::{
+    OperatorObservability, init_log_provider_from_env, serve_health,
+};
 use pgroles_operator::reconciler::{error_policy, reconcile};
 
 /// Hash for plan annotation changes — triggers parent policy reconciliation
@@ -60,14 +70,20 @@ fn policy_trigger_hash(policy: &PostgresPolicy) -> Option<u64> {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    // Initialize structured logging.
-    tracing_subscriber::fmt()
-        .with_env_filter(
+    // Initialize structured stdout logs and, when configured, export the same
+    // events through OTLP. Lifecycle audit events therefore survive outside
+    // the cluster without making Kubernetes objects the system of record.
+    let logger_provider = init_log_provider_from_env()?;
+    let otel_log_layer = logger_provider
+        .as_ref()
+        .map(opentelemetry_appender_tracing::layer::OpenTelemetryTracingBridge::new);
+    tracing_subscriber::registry()
+        .with(
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
         )
-        .json()
-        .with_target(false)
+        .with(tracing_subscriber::fmt::layer().json().with_target(false))
+        .with(otel_log_layer)
         .init();
 
     info!(
@@ -78,7 +94,7 @@ async fn main() -> anyhow::Result<()> {
     // Build kube client from in-cluster config or KUBECONFIG.
     let client = Client::try_default().await?;
 
-    let observability = OperatorObservability::from_env()?;
+    let observability = OperatorObservability::from_env()?.with_logger_provider(logger_provider);
     let http_addr = std::env::var("OPERATOR_HTTP_ADDR")
         .unwrap_or_else(|_| "0.0.0.0:8080".to_string())
         .parse()?;
@@ -146,7 +162,7 @@ async fn main() -> anyhow::Result<()> {
     // When a plan's annotations change, trigger reconciliation of the parent policy.
     let plan_policy_store = reader.clone();
     let plan_triggers = watcher(
-        Api::<PostgresPolicyPlan>::all(client),
+        Api::<PostgresPolicyPlan>::all(client.clone()),
         watcher::Config::default(),
     )
     .default_backoff()
@@ -183,14 +199,14 @@ async fn main() -> anyhow::Result<()> {
         stream::iter(refs)
     });
 
-    info!("starting controller");
+    info!("starting controllers");
     observability.mark_ready();
 
-    Controller::for_stream(policy_stream, reader)
+    let policy_controller = Controller::for_stream(policy_stream, reader)
         .reconcile_on(secret_triggers)
         .reconcile_on(plan_triggers)
         .shutdown_on_signal()
-        .run(reconcile, error_policy, ctx)
+        .run(reconcile, error_policy, ctx.clone())
         .for_each(|result| async move {
             match result {
                 Ok(action) => {
@@ -200,14 +216,104 @@ async fn main() -> anyhow::Result<()> {
                     tracing::error!(%error, "reconcile failed");
                 }
             }
-        })
-        .await;
+        });
+
+    let access_policies: Api<EphemeralAccessPolicy> = Api::all(client.clone());
+    let (access_policy_reader, access_policy_writer) = reflector::store();
+    let access_policy_stream = watcher(access_policies, watcher::Config::default())
+        .default_backoff()
+        .reflect(access_policy_writer)
+        .applied_objects();
+    let target_access_policy_store = access_policy_reader.clone();
+    let target_access_policy_triggers = watcher(
+        Api::<PostgresPolicy>::all(client.clone()),
+        watcher::Config::default(),
+    )
+    .default_backoff()
+    .touched_objects()
+    .filter_map(|target| async move { target.ok() })
+    .flat_map(move |target| {
+        let namespace = target.namespace();
+        let target_name = target.name_any();
+        let refs = target_access_policy_store
+            .state()
+            .into_iter()
+            .filter(|policy| {
+                policy.namespace() == namespace
+                    && policy.spec.postgres_policy_ref.name == target_name
+            })
+            .map(|policy| ObjectRef::from_obj(policy.as_ref()))
+            .collect::<Vec<_>>();
+        stream::iter(refs)
+    });
+
+    let access_policy_controller =
+        Controller::for_stream(access_policy_stream, access_policy_reader)
+            .reconcile_on(target_access_policy_triggers)
+            .shutdown_on_signal()
+            .run(
+                reconcile_access_policy,
+                access_policy_error_policy,
+                ctx.clone(),
+            )
+            .for_each(|result| async move {
+                if let Err(error) = result {
+                    tracing::error!(%error, "ephemeral access policy reconcile failed");
+                }
+            });
+
+    let access_requests: Api<EphemeralAccessRequest> = Api::all(client.clone());
+    let (access_request_reader, access_request_writer) = reflector::store();
+    let access_request_stream = watcher(access_requests, watcher::Config::default())
+        .default_backoff()
+        .reflect(access_request_writer)
+        .applied_objects();
+    let access_policy_request_store = access_request_reader.clone();
+    let access_policy_request_triggers = watcher(
+        Api::<EphemeralAccessPolicy>::all(client.clone()),
+        watcher::Config::default(),
+    )
+    .default_backoff()
+    .touched_objects()
+    .filter_map(|policy| async move { policy.ok() })
+    .flat_map(move |policy| {
+        let namespace = policy.namespace();
+        let policy_name = policy.name_any();
+        let refs = access_policy_request_store
+            .state()
+            .into_iter()
+            .filter(|request| {
+                request.namespace() == namespace
+                    && request.spec.access_policy_ref.name == policy_name
+            })
+            .map(|request| ObjectRef::from_obj(request.as_ref()))
+            .collect::<Vec<_>>();
+        stream::iter(refs)
+    });
+
+    let access_request_controller =
+        Controller::for_stream(access_request_stream, access_request_reader)
+            .reconcile_on(access_policy_request_triggers)
+            .shutdown_on_signal()
+            .run(reconcile_access_request, access_request_error_policy, ctx)
+            .for_each(|result| async move {
+                if let Err(error) = result {
+                    tracing::error!(%error, "ephemeral access request reconcile failed");
+                }
+            });
+
+    futures::future::join3(
+        policy_controller,
+        access_policy_controller,
+        access_request_controller,
+    )
+    .await;
 
     observability.mark_not_ready();
-    if let Err(error) = observability.shutdown() {
-        tracing::warn!(%error, "failed to shut down observability");
-    }
     info!("controller shut down");
+    if let Err(error) = observability.shutdown() {
+        eprintln!("failed to shut down observability: {error}");
+    }
     Ok(())
 }
 

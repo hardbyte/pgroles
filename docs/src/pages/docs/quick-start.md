@@ -9,8 +9,7 @@ Get up and running with pgroles in a few minutes. {% .lead %}
 
 ## Prerequisites
 
-- **PostgreSQL 16+** — CI runs integration tests on PostgreSQL **16, 17, and 18**; pgroles adapts membership SQL to the server version at runtime and PG 16+ gets full per-membership `INHERIT` support
-- PostgreSQL 14–15 have a legacy grant-syntax fallback in the code, but it's untested and best-effort — not recommended
+- **PostgreSQL 16, 17, or 18** — the versions supported and tested in CI
 - **Rust toolchain** (for building from source)
 
 ## Installation

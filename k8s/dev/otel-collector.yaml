@@ -26,6 +26,9 @@ data:
         metrics:
           receivers: [otlp]
           exporters: [debug]
+        logs:
+          receivers: [otlp]
+          exporters: [debug]
 ---
 apiVersion: v1
 kind: Service

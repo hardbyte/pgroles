@@ -6,7 +6,9 @@
 use std::path::PathBuf;
 
 use kube::CustomResourceExt;
-use pgroles_operator::crd::{PostgresPolicy, PostgresPolicyPlan};
+use pgroles_operator::crd::{
+    EphemeralAccessPolicy, EphemeralAccessRequest, PostgresPolicy, PostgresPolicyPlan,
+};
 
 struct CrdOutput {
     filename: &'static str,
@@ -24,6 +26,16 @@ fn generate() -> Vec<CrdOutput> {
             filename: "postgrespolicyplans.pgroles.io.yaml",
             json: serde_json::to_string_pretty(&PostgresPolicyPlan::crd())
                 .expect("PostgresPolicyPlan CRD should serialize"),
+        },
+        CrdOutput {
+            filename: "ephemeralaccesspolicies.pgroles.io.yaml",
+            json: serde_json::to_string_pretty(&EphemeralAccessPolicy::crd())
+                .expect("EphemeralAccessPolicy CRD should serialize"),
+        },
+        CrdOutput {
+            filename: "ephemeralaccessrequests.pgroles.io.yaml",
+            json: serde_json::to_string_pretty(&EphemeralAccessRequest::crd())
+                .expect("EphemeralAccessRequest CRD should serialize"),
         },
     ]
 }
@@ -54,7 +66,9 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use kube::CustomResourceExt;
-    use pgroles_operator::crd::{PostgresPolicy, PostgresPolicyPlan};
+    use pgroles_operator::crd::{
+        EphemeralAccessPolicy, EphemeralAccessRequest, PostgresPolicy, PostgresPolicyPlan,
+    };
 
     #[test]
     fn policy_crd_serializes_to_json() {
@@ -71,5 +85,19 @@ mod tests {
         assert!(json.contains("\"apiVersion\""));
         assert!(json.contains("\"PostgresPolicyPlan\""));
         assert!(json.contains("\"pgplan\""));
+    }
+
+    #[test]
+    fn ephemeral_crds_serialize_to_json() {
+        let policy = serde_json::to_string_pretty(&EphemeralAccessPolicy::crd())
+            .expect("policy CRD should serialize");
+        assert!(policy.contains("\"apiVersion\""));
+        assert!(policy.contains("\"EphemeralAccessPolicy\""));
+
+        let request = serde_json::to_string_pretty(&EphemeralAccessRequest::crd())
+            .expect("request CRD should serialize");
+        assert!(request.contains("\"apiVersion\""));
+        assert!(request.contains("\"EphemeralAccessRequest\""));
+        assert!(request.contains("x-kubernetes-validations"));
     }
 }

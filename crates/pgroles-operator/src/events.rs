@@ -9,7 +9,37 @@ use k8s_openapi::api::core::v1::ObjectReference;
 use kube::Resource;
 use kube::runtime::events::{Event, EventType, Recorder};
 
-use crate::crd::{PolicyCondition, PostgresPolicy, PostgresPolicyPlan, PostgresPolicyStatus};
+use crate::crd::{
+    EphemeralAccessRequest, EphemeralAccessRequestPhase, PolicyCondition, PostgresPolicy,
+    PostgresPolicyPlan, PostgresPolicyStatus,
+};
+
+/// Publish a request lifecycle Event on the request object itself.
+pub async fn publish_ephemeral_request_event(
+    recorder: &Recorder,
+    request: &EphemeralAccessRequest,
+    phase: EphemeralAccessRequestPhase,
+    reason: &str,
+    note: String,
+) -> Result<(), kube::Error> {
+    let reference: ObjectReference = request.object_ref(&());
+    let event_type = if matches!(
+        phase,
+        EphemeralAccessRequestPhase::Failed
+            | EphemeralAccessRequestPhase::Denied
+            | EphemeralAccessRequestPhase::ApprovalExpired
+    ) {
+        EventType::Warning
+    } else {
+        EventType::Normal
+    };
+    recorder
+        .publish(
+            &event(event_type, reason, "EphemeralAccessLifecycle", note),
+            &reference,
+        )
+        .await
+}
 
 /// Publish Kubernetes Events for notable status transitions.
 pub async fn publish_status_events(

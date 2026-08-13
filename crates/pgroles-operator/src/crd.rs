@@ -4,7 +4,7 @@
 //! The spec mirrors the CLI manifest schema with additional fields for
 //! database connection and reconciliation scheduling.
 
-use kube::CustomResource;
+use kube::{CustomResource, KubeSchema};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
@@ -969,6 +969,36 @@ pub struct PostgresPolicyPlanSpec {
     pub owned_schemas: Vec<String>,
     /// Database identity string for disambiguation in multi-db setups.
     pub managed_database_identity: String,
+    /// Origin of this plan. Omitted for ordinary durable reconciliation plans.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin: Option<PlanOrigin>,
+    /// Narrow execution scope for a non-durable plan.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope: Option<PlanScope>,
+}
+
+/// Immutable identity of the resource that caused a scoped plan.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct PlanOrigin {
+    pub kind: String,
+    pub name: String,
+    pub uid: String,
+}
+
+/// Scope enforced when executing a non-durable plan.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct PlanScope {
+    pub kind: String,
+    pub operation: ScopedPlanOperation,
+    pub bundle_hash: String,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+pub enum ScopedPlanOperation {
+    Activate,
+    Revoke,
 }
 
 /// Reference to the parent `PostgresPolicy` that generated a plan.
@@ -1079,6 +1109,333 @@ impl std::fmt::Display for PlanPhase {
             PlanPhase::Superseded => write!(f, "Superseded"),
             PlanPhase::Rejected => write!(f, "Rejected"),
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Ephemeral access CRDs
+// ---------------------------------------------------------------------------
+
+pub const EPHEMERAL_BUNDLE_ENCODING_V1: &str = "pgroles.io/ephemeral-membership-bundle-v1";
+pub const EPHEMERAL_MEMBERSHIP_SEMANTICS_V1: &str =
+    "postgres-membership-v1-admin-false-set-server-default";
+/// A GitOps-managed bundle of PostgreSQL memberships that may be requested.
+#[derive(CustomResource, KubeSchema, Debug, Clone, Serialize, Deserialize)]
+#[kube(
+    group = "pgroles.io",
+    version = "v1alpha1",
+    kind = "EphemeralAccessPolicy",
+    namespaced,
+    status = "EphemeralAccessPolicyStatus",
+    shortname = "pgeap",
+    category = "pgroles",
+    printcolumn = r#"{"name":"Target","type":"string","jsonPath":".spec.postgresPolicyRef.name"}"#,
+    printcolumn = r#"{"name":"Accepted","type":"string","jsonPath":".status.conditions[?(@.type==\"Accepted\")].status"}"#,
+    printcolumn = r#"{"name":"Suspended","type":"boolean","jsonPath":".spec.suspend"}"#,
+    printcolumn = r#"{"name":"Age","type":"date","jsonPath":".metadata.creationTimestamp"}"#
+)]
+#[serde(rename_all = "camelCase")]
+pub struct EphemeralAccessPolicySpec {
+    pub postgres_policy_ref: LocalObjectReference,
+    #[schemars(length(min = 1, max = 32))]
+    pub memberships: Vec<EphemeralMembership>,
+    #[schemars(length(max = 64), regex(pattern = r"^([0-9]+[smh])+$"))]
+    pub maximum_duration: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(length(max = 64), regex(pattern = r"^([0-9]+[smh])+$"))]
+    pub default_duration: Option<String>,
+    #[serde(rename = "pendingRequestTTL", default = "default_pending_request_ttl")]
+    #[schemars(length(max = 64), regex(pattern = r"^([0-9]+[smh])+$"))]
+    pub pending_request_ttl: String,
+    pub justification: EphemeralJustificationPolicy,
+    pub approval: EphemeralApprovalPolicy,
+    #[serde(default)]
+    pub suspend: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(length(max = 128))]
+    pub display_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(length(max = 2048))]
+    pub description: Option<String>,
+}
+
+fn default_pending_request_ttl() -> String {
+    "15m".to_string()
+}
+
+#[derive(KubeSchema, Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LocalObjectReference {
+    #[schemars(length(min = 1, max = 253))]
+    pub name: String,
+}
+
+#[derive(KubeSchema, Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct EphemeralMembership {
+    #[schemars(length(min = 1, max = 63))]
+    pub role: String,
+    pub inherit: bool,
+}
+
+#[derive(KubeSchema, Debug, Clone, Serialize, Deserialize)]
+pub struct EphemeralJustificationPolicy {
+    pub required: bool,
+}
+
+#[derive(KubeSchema, Debug, Clone, Serialize, Deserialize)]
+pub struct EphemeralApprovalPolicy {
+    pub mode: EphemeralApprovalMode,
+}
+
+#[derive(JsonSchema, Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum EphemeralApprovalMode {
+    Automatic,
+    Required,
+}
+
+#[derive(KubeSchema, Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EphemeralAccessPolicyStatus {
+    #[serde(default)]
+    pub observed_generation: Option<i64>,
+    #[serde(default)]
+    #[schemars(length(max = 16))]
+    pub conditions: Vec<EphemeralAccessCondition>,
+    #[serde(default)]
+    #[schemars(length(max = 32), inner(length(min = 1, max = 63)))]
+    pub resolved_roles: Vec<String>,
+}
+
+/// One immutable runtime request for a bounded access bundle.
+#[derive(CustomResource, KubeSchema, Debug, Clone, Serialize, Deserialize)]
+#[kube(
+    group = "pgroles.io",
+    version = "v1alpha1",
+    kind = "EphemeralAccessRequest",
+    namespaced,
+    status = "EphemeralAccessRequestStatus",
+    shortname = "pgear",
+    category = "pgroles",
+    printcolumn = r#"{"name":"Access Policy","type":"string","jsonPath":".spec.accessPolicyRef.name"}"#,
+    printcolumn = r#"{"name":"Subject","type":"string","jsonPath":".spec.subject.role"}"#,
+    printcolumn = r#"{"name":"Phase","type":"string","jsonPath":".status.phase"}"#,
+    printcolumn = r#"{"name":"Expires","type":"date","jsonPath":".status.expiresAt"}"#,
+    printcolumn = r#"{"name":"Age","type":"date","jsonPath":".metadata.creationTimestamp"}"#
+)]
+#[x_kube(
+    validation = Rule::new("self == oldSelf").message("request spec is immutable")
+)]
+#[serde(rename_all = "camelCase")]
+pub struct EphemeralAccessRequestSpec {
+    pub access_policy_ref: LocalObjectReference,
+    pub subject: EphemeralAccessSubject,
+    /// Kubernetes identity which created the request. The supplied Kyverno
+    /// reference policy overwrites this from authenticated admission `userInfo`.
+    pub requested_by: EphemeralAccessActor,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(length(max = 64), regex(pattern = r"^([0-9]+[smh])+$"))]
+    pub requested_duration: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(length(max = 2048))]
+    pub justification: Option<String>,
+}
+
+#[derive(KubeSchema, Debug, Clone, Serialize, Deserialize)]
+pub struct EphemeralAccessSubject {
+    #[schemars(length(min = 1, max = 63))]
+    pub role: String,
+}
+
+/// Authenticated Kubernetes identity associated with an access action.
+///
+/// The supplied Kyverno reference policy replaces these values from the
+/// admission request's `userInfo`. Without admission enforcement they are
+/// assertions by the trusted request or approval broker.
+#[derive(KubeSchema, Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct EphemeralAccessActor {
+    #[schemars(length(min = 1, max = 512))]
+    pub username: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(length(max = 128))]
+    pub uid: Option<String>,
+    #[serde(default)]
+    #[schemars(length(max = 64), inner(length(min = 1, max = 256)))]
+    pub groups: Vec<String>,
+}
+
+#[derive(KubeSchema, Debug, Clone, Default, Serialize, Deserialize)]
+#[x_kube(
+    validation = Rule::new(
+        "!has(oldSelf.resolvedAccess) || (has(self.resolvedAccess) && self.resolvedAccess == oldSelf.resolvedAccess)"
+    ).message("resolvedAccess is write-once"),
+    validation = Rule::new(
+        "!(self.conditions.exists(c, c.type == 'Approved' && c.status == 'True') && self.conditions.exists(c, c.type == 'Denied' && c.status == 'True'))"
+    ).message("Approved=True and Denied=True are mutually exclusive"),
+    validation = Rule::new(
+        "oldSelf.conditions.filter(c, (c.type == 'Approved' || c.type == 'Denied') && c.status == 'True').size() == 0 || self.conditions.filter(c, (c.type == 'Approved' || c.type == 'Denied') && c.status == 'True') == oldSelf.conditions.filter(c, (c.type == 'Approved' || c.type == 'Denied') && c.status == 'True')"
+    ).message("approval decisions are terminal"),
+    validation = Rule::new(
+        "!has(oldSelf.decidedBy) || (has(self.decidedBy) && self.decidedBy == oldSelf.decidedBy)"
+    ).message("decision identity is write-once"),
+    validation = Rule::new(
+        "self.conditions.exists(c, (c.type == 'Approved' || c.type == 'Denied') && c.status == 'True') == has(self.decidedBy)"
+    ).message("a terminal approval decision and decidedBy identity must be recorded together"),
+    validation = Rule::new(
+        "self.conditions.all(c, c.type in ['Approved', 'Denied', 'Resolved', 'Ready', 'Applied'])"
+    ).message("request conditions must use a declared lifecycle or decision type")
+)]
+#[serde(rename_all = "camelCase")]
+pub struct EphemeralAccessRequestStatus {
+    #[serde(default)]
+    pub phase: EphemeralAccessRequestPhase,
+    #[serde(default)]
+    #[schemars(length(max = 8))]
+    pub conditions: Vec<EphemeralAccessCondition>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolved_access: Option<ResolvedEphemeralAccess>,
+    /// Kubernetes identity which approved or denied the request. The supplied
+    /// Kyverno reference policy overwrites this from authenticated admission
+    /// `userInfo` in the same status update as the terminal decision.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub decided_by: Option<EphemeralAccessActor>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(length(max = 64))]
+    pub approval_expires_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(length(max = 64))]
+    pub activated_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(length(max = 64))]
+    pub expires_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(length(max = 64))]
+    pub ended_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(length(max = 4096))]
+    pub last_error: Option<String>,
+    #[serde(default)]
+    #[schemars(length(max = 32))]
+    pub retained_memberships: Vec<ResolvedEphemeralMembership>,
+}
+
+#[derive(JsonSchema, Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub enum EphemeralAccessRequestPhase {
+    #[default]
+    Pending,
+    PendingApproval,
+    Applying,
+    Active,
+    Revoking,
+    Ended,
+    Revoked,
+    Cancelled,
+    Denied,
+    ApprovalExpired,
+    Failed,
+}
+
+impl std::fmt::Display for EphemeralAccessRequestPhase {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{self:?}")
+    }
+}
+
+#[derive(KubeSchema, Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct EphemeralAccessCondition {
+    #[serde(rename = "type")]
+    #[schemars(length(min = 1, max = 32))]
+    pub condition_type: String,
+    #[schemars(length(min = 1, max = 16))]
+    pub status: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(length(max = 128))]
+    pub reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(length(max = 2048))]
+    pub message: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(length(max = 64))]
+    pub last_transition_time: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(length(max = 71))]
+    pub bundle_hash: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(length(max = 64))]
+    pub granted_duration: Option<String>,
+}
+
+#[derive(KubeSchema, Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ResolvedEphemeralAccess {
+    #[schemars(length(max = 128))]
+    pub access_policy_uid: String,
+    pub access_policy_generation: i64,
+    #[schemars(length(max = 128))]
+    pub target_policy_uid: String,
+    pub target_policy_generation: i64,
+    /// SHA-256 fingerprint of resolved host, port, and database name. It binds
+    /// activation and revocation to one database without persisting secrets.
+    #[schemars(length(max = 71))]
+    pub target_database_fingerprint: String,
+    #[schemars(length(max = 64))]
+    pub granted_duration: String,
+    #[schemars(length(max = 128))]
+    pub bundle_encoding: String,
+    #[schemars(length(max = 71))]
+    pub bundle_hash: String,
+    #[schemars(length(max = 32))]
+    pub memberships: Vec<ResolvedEphemeralMembership>,
+}
+
+#[derive(KubeSchema, Debug, Clone, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(rename_all = "camelCase")]
+pub struct ResolvedEphemeralMembership {
+    #[schemars(length(min = 1, max = 63))]
+    pub role: String,
+    #[schemars(length(min = 1, max = 63))]
+    pub member: String,
+    pub inherit: bool,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CanonicalEphemeralBundle<'a> {
+    bundle_encoding: &'a str,
+    membership_semantics: &'a str,
+    target_database_fingerprint: &'a str,
+    memberships: &'a [ResolvedEphemeralMembership],
+}
+
+impl ResolvedEphemeralAccess {
+    pub fn canonical_bundle_bytes(&self) -> Vec<u8> {
+        let mut memberships = self.memberships.clone();
+        memberships.sort();
+        serde_json::to_vec(&CanonicalEphemeralBundle {
+            bundle_encoding: EPHEMERAL_BUNDLE_ENCODING_V1,
+            membership_semantics: EPHEMERAL_MEMBERSHIP_SEMANTICS_V1,
+            target_database_fingerprint: &self.target_database_fingerprint,
+            memberships: &memberships,
+        })
+        .expect("canonical ephemeral bundle is serializable")
+    }
+
+    pub fn compute_bundle_hash(&self) -> String {
+        use sha2::{Digest, Sha256};
+        use std::fmt::Write;
+
+        let digest = Sha256::digest(self.canonical_bundle_bytes());
+        let mut hash = String::with_capacity(7 + digest.len() * 2);
+        hash.push_str("sha256:");
+        for byte in digest {
+            write!(&mut hash, "{byte:02x}").expect("writing to a String cannot fail");
+        }
+        hash
+    }
+
+    pub fn has_valid_bundle_hash(&self) -> bool {
+        self.bundle_encoding == EPHEMERAL_BUNDLE_ENCODING_V1
+            && self.bundle_hash == self.compute_bundle_hash()
     }
 }
 
@@ -4009,6 +4366,8 @@ retirements:
             owned_roles: vec!["role-a".into()],
             owned_schemas: vec!["public".into()],
             managed_database_identity: "ns/secret/key".into(),
+            origin: None,
+            scope: None,
         };
 
         let json = serde_json::to_value(&spec).expect("should serialize to JSON");
@@ -4038,5 +4397,143 @@ retirements:
             obj.contains_key("managedDatabaseIdentity"),
             "should use camelCase: managedDatabaseIdentity"
         );
+    }
+
+    fn resolved_bundle(memberships: Vec<ResolvedEphemeralMembership>) -> ResolvedEphemeralAccess {
+        ResolvedEphemeralAccess {
+            access_policy_uid: "access-uid".into(),
+            access_policy_generation: 1,
+            target_policy_uid: "target-uid".into(),
+            target_policy_generation: 2,
+            target_database_fingerprint: "sha256:database".into(),
+            granted_duration: "1800s".into(),
+            bundle_encoding: EPHEMERAL_BUNDLE_ENCODING_V1.into(),
+            bundle_hash: String::new(),
+            memberships,
+        }
+    }
+
+    #[test]
+    fn ephemeral_bundle_hash_is_order_independent_and_uid_independent() {
+        let first = ResolvedEphemeralMembership {
+            role: "editor".into(),
+            member: "alice@example.com".into(),
+            inherit: false,
+        };
+        let second = ResolvedEphemeralMembership {
+            role: "auditor".into(),
+            member: "alice@example.com".into(),
+            inherit: true,
+        };
+        let original = resolved_bundle(vec![first.clone(), second.clone()]);
+        let mut reordered = resolved_bundle(vec![second, first]);
+        reordered.access_policy_uid = "replacement-uid".into();
+        reordered.target_policy_generation = 99;
+
+        assert_eq!(
+            original.compute_bundle_hash(),
+            reordered.compute_bundle_hash()
+        );
+    }
+
+    #[test]
+    fn ephemeral_bundle_hash_covers_membership_options() {
+        let original = resolved_bundle(vec![ResolvedEphemeralMembership {
+            role: "editor".into(),
+            member: "alice@example.com".into(),
+            inherit: false,
+        }]);
+        let changed = resolved_bundle(vec![ResolvedEphemeralMembership {
+            role: "editor".into(),
+            member: "alice@example.com".into(),
+            inherit: true,
+        }]);
+        assert_ne!(
+            original.compute_bundle_hash(),
+            changed.compute_bundle_hash()
+        );
+    }
+
+    #[test]
+    fn ephemeral_bundle_hash_covers_database_target() {
+        let original = resolved_bundle(Vec::new());
+        let mut retargeted = original.clone();
+        retargeted.target_database_fingerprint = "sha256:other-database".into();
+
+        assert_ne!(
+            original.compute_bundle_hash(),
+            retargeted.compute_bundle_hash()
+        );
+    }
+
+    #[test]
+    fn ephemeral_request_crd_contains_immutability_rules() {
+        let json = serde_json::to_string(&EphemeralAccessRequest::crd())
+            .expect("request CRD should serialize");
+        assert!(json.contains("request spec is immutable"));
+        assert!(json.contains("resolvedAccess is write-once"));
+        assert!(json.contains("approval decisions are terminal"));
+        assert!(json.contains("decision identity is write-once"));
+        assert!(json.contains(
+            "a terminal approval decision and decidedBy identity must be recorded together"
+        ));
+        assert!(json.contains(r#""requestedBy""#));
+        assert!(json.contains(r#""decidedBy""#));
+        assert!(json.contains(r#""maxItems":8"#));
+        assert!(json.contains(r#""pattern":"^([0-9]+[smh])+$""#));
+    }
+
+    fn assert_bounded_strings_and_collections(schema: &serde_json::Value, path: &str) {
+        match schema {
+            serde_json::Value::Object(object) => {
+                match object.get("type").and_then(serde_json::Value::as_str) {
+                    Some("string") if !object.contains_key("enum") => {
+                        assert!(
+                            object.contains_key("maxLength"),
+                            "unbounded string schema at {path}"
+                        );
+                    }
+                    Some("array") => {
+                        assert!(
+                            object.contains_key("maxItems"),
+                            "unbounded collection schema at {path}"
+                        );
+                    }
+                    _ => {}
+                }
+                for (name, child) in object {
+                    assert_bounded_strings_and_collections(child, &format!("{path}.{name}"));
+                }
+            }
+            serde_json::Value::Array(items) => {
+                for (index, child) in items.iter().enumerate() {
+                    assert_bounded_strings_and_collections(child, &format!("{path}[{index}]"));
+                }
+            }
+            _ => {}
+        }
+    }
+
+    #[test]
+    fn ephemeral_crds_bound_every_string_and_collection() {
+        for (kind, crd) in [
+            ("EphemeralAccessPolicy", EphemeralAccessPolicy::crd()),
+            ("EphemeralAccessRequest", EphemeralAccessRequest::crd()),
+        ] {
+            let value = serde_json::to_value(crd).expect("CRD should serialize");
+            let schema = &value["spec"]["versions"][0]["schema"]["openAPIV3Schema"];
+            assert_bounded_strings_and_collections(schema, kind);
+        }
+    }
+
+    #[test]
+    fn ephemeral_policy_crd_exposes_operational_columns() {
+        let json = serde_json::to_string(&EphemeralAccessPolicy::crd())
+            .expect("policy CRD should serialize");
+        assert!(json.contains("postgresPolicyRef"));
+        assert!(json.contains("maximumDuration"));
+        assert!(json.contains("Accepted"));
+        assert!(json.contains(r#""minItems":1"#));
+        assert!(json.contains(r#""pattern":"^([0-9]+[smh])+$""#));
     }
 }

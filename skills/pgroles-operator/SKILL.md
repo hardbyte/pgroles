@@ -156,6 +156,43 @@ conditions. A plan object supports review and recent history, but is not
 independent proof of current database state and may be removed by terminal-plan
 retention.
 
+## Ephemeral Access
+
+Use `EphemeralAccessPolicy` for a GitOps-managed, bounded bundle of concrete
+memberships and `EphemeralAccessRequest` for one runtime lease. Do not patch
+`PostgresPolicy` memberships for just-in-time access.
+
+For `approval.mode: Required`, first choose an admission-enforced or trusted
+broker model. Kubernetes RBAC cannot isolate approval writes on a CRD's
+`/status` subresource. The version-matched Kyverno and RBAC manifests under
+`k8s/security/` are the CI-tested reference implementation, not an operator
+runtime dependency. Any alternative must authenticate requester and decision
+identities, define who may select each PostgreSQL subject, authorize the logical
+`use`, `approve`, and `manage` actions, bind the exact resolved bundle hash and
+duration, restrict cross-request deletion, reject client-owned finalizers, and
+protect controller-owned lifecycle state. The reference `use` check delegates
+selection of any concrete subject; add an identity mapping where that is too
+broad. Verify `status.observedGeneration`, request phase, expiry, request-owned
+scoped plan, and database membership rather than treating creation or approval
+alone as success.
+
+Every request supplies `spec.requestedBy`. The supplied Kyverno reference policy
+replaces it from authenticated admission `userInfo` and records the identity
+which approves or denies in write-once `status.decidedBy`. Without that
+admission boundary both fields are broker assertions, not independent proof.
+Apply a namespace `ResourceQuota` for
+`count/ephemeralaccessrequests.pgroles.io` and
+`count/ephemeralaccesspolicies.pgroles.io`; the repository ships
+`k8s/security/ephemeral-access-resource-quota.yaml` as a tunable example.
+
+Deleting a request revokes its final-owner memberships through a finalizer.
+Deleting an access policy is revoke-all, while suspension blocks new activation
+and leaves active requests on their existing deadlines. Never force-remove
+finalizers: authoritative reconciliation may repair the edge later, but
+additive reconciliation can strand access. Membership expiry does not terminate
+an existing session which already executed `SET ROLE`; apply a separate session
+or pool lifetime when that guarantee is required.
+
 ## Suspension And Maintenance
 
 `spec.suspend: true` prevents new work after a reconcile observes the suspended

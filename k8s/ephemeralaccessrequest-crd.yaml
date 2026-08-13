@@ -1,0 +1,412 @@
+{
+  "apiVersion": "apiextensions.k8s.io/v1",
+  "kind": "CustomResourceDefinition",
+  "metadata": {
+    "name": "ephemeralaccessrequests.pgroles.io"
+  },
+  "spec": {
+    "group": "pgroles.io",
+    "names": {
+      "categories": [
+        "pgroles"
+      ],
+      "kind": "EphemeralAccessRequest",
+      "plural": "ephemeralaccessrequests",
+      "shortNames": [
+        "pgear"
+      ],
+      "singular": "ephemeralaccessrequest"
+    },
+    "scope": "Namespaced",
+    "versions": [
+      {
+        "additionalPrinterColumns": [
+          {
+            "jsonPath": ".spec.accessPolicyRef.name",
+            "name": "Access Policy",
+            "type": "string"
+          },
+          {
+            "jsonPath": ".spec.subject.role",
+            "name": "Subject",
+            "type": "string"
+          },
+          {
+            "jsonPath": ".status.phase",
+            "name": "Phase",
+            "type": "string"
+          },
+          {
+            "jsonPath": ".status.expiresAt",
+            "name": "Expires",
+            "type": "date"
+          },
+          {
+            "jsonPath": ".metadata.creationTimestamp",
+            "name": "Age",
+            "type": "date"
+          }
+        ],
+        "name": "v1alpha1",
+        "schema": {
+          "openAPIV3Schema": {
+            "description": "Auto-generated derived type for EphemeralAccessRequestSpec via `CustomResource`",
+            "properties": {
+              "spec": {
+                "description": "One immutable runtime request for a bounded access bundle.",
+                "properties": {
+                  "accessPolicyRef": {
+                    "properties": {
+                      "name": {
+                        "maxLength": 253,
+                        "minLength": 1,
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "name"
+                    ],
+                    "type": "object"
+                  },
+                  "justification": {
+                    "maxLength": 2048,
+                    "nullable": true,
+                    "type": "string"
+                  },
+                  "requestedBy": {
+                    "description": "Kubernetes identity which created the request. The supplied Kyverno\nreference policy overwrites this from authenticated admission `userInfo`.",
+                    "properties": {
+                      "groups": {
+                        "default": [],
+                        "items": {
+                          "maxLength": 256,
+                          "minLength": 1,
+                          "type": "string"
+                        },
+                        "maxItems": 64,
+                        "type": "array"
+                      },
+                      "uid": {
+                        "maxLength": 128,
+                        "nullable": true,
+                        "type": "string"
+                      },
+                      "username": {
+                        "maxLength": 512,
+                        "minLength": 1,
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "username"
+                    ],
+                    "type": "object"
+                  },
+                  "requestedDuration": {
+                    "maxLength": 64,
+                    "nullable": true,
+                    "pattern": "^([0-9]+[smh])+$",
+                    "type": "string"
+                  },
+                  "subject": {
+                    "properties": {
+                      "role": {
+                        "maxLength": 63,
+                        "minLength": 1,
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "role"
+                    ],
+                    "type": "object"
+                  }
+                },
+                "required": [
+                  "accessPolicyRef",
+                  "requestedBy",
+                  "subject"
+                ],
+                "type": "object",
+                "x-kubernetes-validations": [
+                  {
+                    "message": "request spec is immutable",
+                    "rule": "self == oldSelf"
+                  }
+                ]
+              },
+              "status": {
+                "nullable": true,
+                "properties": {
+                  "activatedAt": {
+                    "maxLength": 64,
+                    "nullable": true,
+                    "type": "string"
+                  },
+                  "approvalExpiresAt": {
+                    "maxLength": 64,
+                    "nullable": true,
+                    "type": "string"
+                  },
+                  "conditions": {
+                    "default": [],
+                    "items": {
+                      "properties": {
+                        "bundleHash": {
+                          "maxLength": 71,
+                          "nullable": true,
+                          "type": "string"
+                        },
+                        "grantedDuration": {
+                          "maxLength": 64,
+                          "nullable": true,
+                          "type": "string"
+                        },
+                        "lastTransitionTime": {
+                          "maxLength": 64,
+                          "nullable": true,
+                          "type": "string"
+                        },
+                        "message": {
+                          "maxLength": 2048,
+                          "nullable": true,
+                          "type": "string"
+                        },
+                        "reason": {
+                          "maxLength": 128,
+                          "nullable": true,
+                          "type": "string"
+                        },
+                        "status": {
+                          "maxLength": 16,
+                          "minLength": 1,
+                          "type": "string"
+                        },
+                        "type": {
+                          "maxLength": 32,
+                          "minLength": 1,
+                          "type": "string"
+                        }
+                      },
+                      "required": [
+                        "status",
+                        "type"
+                      ],
+                      "type": "object"
+                    },
+                    "maxItems": 8,
+                    "type": "array"
+                  },
+                  "decidedBy": {
+                    "description": "Kubernetes identity which approved or denied the request. The supplied\nKyverno reference policy overwrites this from authenticated admission\n`userInfo` in the same status update as the terminal decision.",
+                    "nullable": true,
+                    "properties": {
+                      "groups": {
+                        "default": [],
+                        "items": {
+                          "maxLength": 256,
+                          "minLength": 1,
+                          "type": "string"
+                        },
+                        "maxItems": 64,
+                        "type": "array"
+                      },
+                      "uid": {
+                        "maxLength": 128,
+                        "nullable": true,
+                        "type": "string"
+                      },
+                      "username": {
+                        "maxLength": 512,
+                        "minLength": 1,
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "username"
+                    ],
+                    "type": "object"
+                  },
+                  "endedAt": {
+                    "maxLength": 64,
+                    "nullable": true,
+                    "type": "string"
+                  },
+                  "expiresAt": {
+                    "maxLength": 64,
+                    "nullable": true,
+                    "type": "string"
+                  },
+                  "lastError": {
+                    "maxLength": 4096,
+                    "nullable": true,
+                    "type": "string"
+                  },
+                  "phase": {
+                    "default": "Pending",
+                    "enum": [
+                      "Pending",
+                      "PendingApproval",
+                      "Applying",
+                      "Active",
+                      "Revoking",
+                      "Ended",
+                      "Revoked",
+                      "Cancelled",
+                      "Denied",
+                      "ApprovalExpired",
+                      "Failed"
+                    ],
+                    "type": "string"
+                  },
+                  "resolvedAccess": {
+                    "nullable": true,
+                    "properties": {
+                      "accessPolicyGeneration": {
+                        "format": "int64",
+                        "type": "integer"
+                      },
+                      "accessPolicyUid": {
+                        "maxLength": 128,
+                        "type": "string"
+                      },
+                      "bundleEncoding": {
+                        "maxLength": 128,
+                        "type": "string"
+                      },
+                      "bundleHash": {
+                        "maxLength": 71,
+                        "type": "string"
+                      },
+                      "grantedDuration": {
+                        "maxLength": 64,
+                        "type": "string"
+                      },
+                      "memberships": {
+                        "items": {
+                          "properties": {
+                            "inherit": {
+                              "type": "boolean"
+                            },
+                            "member": {
+                              "maxLength": 63,
+                              "minLength": 1,
+                              "type": "string"
+                            },
+                            "role": {
+                              "maxLength": 63,
+                              "minLength": 1,
+                              "type": "string"
+                            }
+                          },
+                          "required": [
+                            "inherit",
+                            "member",
+                            "role"
+                          ],
+                          "type": "object"
+                        },
+                        "maxItems": 32,
+                        "type": "array"
+                      },
+                      "targetDatabaseFingerprint": {
+                        "description": "SHA-256 fingerprint of resolved host, port, and database name. It binds\nactivation and revocation to one database without persisting secrets.",
+                        "maxLength": 71,
+                        "type": "string"
+                      },
+                      "targetPolicyGeneration": {
+                        "format": "int64",
+                        "type": "integer"
+                      },
+                      "targetPolicyUid": {
+                        "maxLength": 128,
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "accessPolicyGeneration",
+                      "accessPolicyUid",
+                      "bundleEncoding",
+                      "bundleHash",
+                      "grantedDuration",
+                      "memberships",
+                      "targetDatabaseFingerprint",
+                      "targetPolicyGeneration",
+                      "targetPolicyUid"
+                    ],
+                    "type": "object"
+                  },
+                  "retainedMemberships": {
+                    "default": [],
+                    "items": {
+                      "properties": {
+                        "inherit": {
+                          "type": "boolean"
+                        },
+                        "member": {
+                          "maxLength": 63,
+                          "minLength": 1,
+                          "type": "string"
+                        },
+                        "role": {
+                          "maxLength": 63,
+                          "minLength": 1,
+                          "type": "string"
+                        }
+                      },
+                      "required": [
+                        "inherit",
+                        "member",
+                        "role"
+                      ],
+                      "type": "object"
+                    },
+                    "maxItems": 32,
+                    "type": "array"
+                  }
+                },
+                "type": "object",
+                "x-kubernetes-validations": [
+                  {
+                    "message": "resolvedAccess is write-once",
+                    "rule": "!has(oldSelf.resolvedAccess) || (has(self.resolvedAccess) && self.resolvedAccess == oldSelf.resolvedAccess)"
+                  },
+                  {
+                    "message": "Approved=True and Denied=True are mutually exclusive",
+                    "rule": "!(self.conditions.exists(c, c.type == 'Approved' && c.status == 'True') && self.conditions.exists(c, c.type == 'Denied' && c.status == 'True'))"
+                  },
+                  {
+                    "message": "approval decisions are terminal",
+                    "rule": "oldSelf.conditions.filter(c, (c.type == 'Approved' || c.type == 'Denied') && c.status == 'True').size() == 0 || self.conditions.filter(c, (c.type == 'Approved' || c.type == 'Denied') && c.status == 'True') == oldSelf.conditions.filter(c, (c.type == 'Approved' || c.type == 'Denied') && c.status == 'True')"
+                  },
+                  {
+                    "message": "decision identity is write-once",
+                    "rule": "!has(oldSelf.decidedBy) || (has(self.decidedBy) && self.decidedBy == oldSelf.decidedBy)"
+                  },
+                  {
+                    "message": "a terminal approval decision and decidedBy identity must be recorded together",
+                    "rule": "self.conditions.exists(c, (c.type == 'Approved' || c.type == 'Denied') && c.status == 'True') == has(self.decidedBy)"
+                  },
+                  {
+                    "message": "request conditions must use a declared lifecycle or decision type",
+                    "rule": "self.conditions.all(c, c.type in ['Approved', 'Denied', 'Resolved', 'Ready', 'Applied'])"
+                  }
+                ]
+              }
+            },
+            "required": [
+              "spec"
+            ],
+            "title": "EphemeralAccessRequest",
+            "type": "object"
+          }
+        },
+        "served": true,
+        "storage": true,
+        "subresources": {
+          "status": {}
+        }
+      }
+    ]
+  }
+}

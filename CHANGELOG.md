@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **The Kubernetes operator can grant bounded, request-driven PostgreSQL role memberships.** `EphemeralAccessPolicy` defines a concrete reusable bundle and approval policy, while immutable `EphemeralAccessRequest` resources resolve, activate, audit, expire, and safely revoke one request without mutating the durable `PostgresPolicy`. **`approval.mode: Required` is only a real approval boundary under admission enforcement.** Kubernetes RBAC cannot separate approving a request from otherwise managing its status — both are writes to the same `ephemeralaccessrequests/status` endpoint — so without an admission policy every identity holding that permission is implicitly trusted to request, approve, and drive lifecycle state alike. Deploy the CI-tested Kyverno reference profile in `k8s/security/`, or front the request API with a trusted broker, before relying on approval separation; read [securing ephemeral access](https://hardbyte.github.io/pgroles/docs/ephemeral-access-security/) first, which sets out the three trust postures and what each one actually guarantees. That profile authorizes the logical `use`, `approve`, and `manage` verbs, authenticates requester and decision identities, scopes cancellation to request owners, and reserves controller-owned lifecycle status and finalizers for the operator. Request-owned plans bind execution to the approved bundle and database target, and are the durable provenance anchor that keeps a forged status snapshot out of the reconciled graph; overlapping requests and memberships later made durable are co-owner aware. Every ephemeral spec and status field is size-bounded, a namespace `ResourceQuota` example limits object counts, and CI covers trusted-writer and Kyverno lifecycles plus request-cache memory and throughput regression. Ephemeral membership options require PostgreSQL 16 or later. (#158)
+
 ## [0.8.0] - 2026-08-02
 
 ### Fixed

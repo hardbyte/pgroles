@@ -1,0 +1,241 @@
+{
+  "apiVersion": "apiextensions.k8s.io/v1",
+  "kind": "CustomResourceDefinition",
+  "metadata": {
+    "name": "ephemeralaccesspolicies.pgroles.io"
+  },
+  "spec": {
+    "group": "pgroles.io",
+    "names": {
+      "categories": [
+        "pgroles"
+      ],
+      "kind": "EphemeralAccessPolicy",
+      "plural": "ephemeralaccesspolicies",
+      "shortNames": [
+        "pgeap"
+      ],
+      "singular": "ephemeralaccesspolicy"
+    },
+    "scope": "Namespaced",
+    "versions": [
+      {
+        "additionalPrinterColumns": [
+          {
+            "jsonPath": ".spec.postgresPolicyRef.name",
+            "name": "Target",
+            "type": "string"
+          },
+          {
+            "jsonPath": ".status.conditions[?(@.type==\"Accepted\")].status",
+            "name": "Accepted",
+            "type": "string"
+          },
+          {
+            "jsonPath": ".spec.suspend",
+            "name": "Suspended",
+            "type": "boolean"
+          },
+          {
+            "jsonPath": ".metadata.creationTimestamp",
+            "name": "Age",
+            "type": "date"
+          }
+        ],
+        "name": "v1alpha1",
+        "schema": {
+          "openAPIV3Schema": {
+            "description": "Auto-generated derived type for EphemeralAccessPolicySpec via `CustomResource`",
+            "properties": {
+              "spec": {
+                "description": "A GitOps-managed bundle of PostgreSQL memberships that may be requested.",
+                "properties": {
+                  "approval": {
+                    "properties": {
+                      "mode": {
+                        "enum": [
+                          "Automatic",
+                          "Required"
+                        ],
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "mode"
+                    ],
+                    "type": "object"
+                  },
+                  "defaultDuration": {
+                    "maxLength": 64,
+                    "nullable": true,
+                    "pattern": "^([0-9]+[smh])+$",
+                    "type": "string"
+                  },
+                  "description": {
+                    "maxLength": 2048,
+                    "nullable": true,
+                    "type": "string"
+                  },
+                  "displayName": {
+                    "maxLength": 128,
+                    "nullable": true,
+                    "type": "string"
+                  },
+                  "justification": {
+                    "properties": {
+                      "required": {
+                        "type": "boolean"
+                      }
+                    },
+                    "required": [
+                      "required"
+                    ],
+                    "type": "object"
+                  },
+                  "maximumDuration": {
+                    "maxLength": 64,
+                    "pattern": "^([0-9]+[smh])+$",
+                    "type": "string"
+                  },
+                  "memberships": {
+                    "items": {
+                      "properties": {
+                        "inherit": {
+                          "type": "boolean"
+                        },
+                        "role": {
+                          "maxLength": 63,
+                          "minLength": 1,
+                          "type": "string"
+                        }
+                      },
+                      "required": [
+                        "inherit",
+                        "role"
+                      ],
+                      "type": "object"
+                    },
+                    "maxItems": 32,
+                    "minItems": 1,
+                    "type": "array"
+                  },
+                  "pendingRequestTTL": {
+                    "default": "15m",
+                    "maxLength": 64,
+                    "pattern": "^([0-9]+[smh])+$",
+                    "type": "string"
+                  },
+                  "postgresPolicyRef": {
+                    "properties": {
+                      "name": {
+                        "maxLength": 253,
+                        "minLength": 1,
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "name"
+                    ],
+                    "type": "object"
+                  },
+                  "suspend": {
+                    "default": false,
+                    "type": "boolean"
+                  }
+                },
+                "required": [
+                  "approval",
+                  "justification",
+                  "maximumDuration",
+                  "memberships",
+                  "postgresPolicyRef"
+                ],
+                "type": "object"
+              },
+              "status": {
+                "nullable": true,
+                "properties": {
+                  "conditions": {
+                    "default": [],
+                    "items": {
+                      "properties": {
+                        "bundleHash": {
+                          "maxLength": 71,
+                          "nullable": true,
+                          "type": "string"
+                        },
+                        "grantedDuration": {
+                          "maxLength": 64,
+                          "nullable": true,
+                          "type": "string"
+                        },
+                        "lastTransitionTime": {
+                          "maxLength": 64,
+                          "nullable": true,
+                          "type": "string"
+                        },
+                        "message": {
+                          "maxLength": 2048,
+                          "nullable": true,
+                          "type": "string"
+                        },
+                        "reason": {
+                          "maxLength": 128,
+                          "nullable": true,
+                          "type": "string"
+                        },
+                        "status": {
+                          "maxLength": 16,
+                          "minLength": 1,
+                          "type": "string"
+                        },
+                        "type": {
+                          "maxLength": 32,
+                          "minLength": 1,
+                          "type": "string"
+                        }
+                      },
+                      "required": [
+                        "status",
+                        "type"
+                      ],
+                      "type": "object"
+                    },
+                    "maxItems": 16,
+                    "type": "array"
+                  },
+                  "observedGeneration": {
+                    "format": "int64",
+                    "nullable": true,
+                    "type": "integer"
+                  },
+                  "resolvedRoles": {
+                    "default": [],
+                    "items": {
+                      "maxLength": 63,
+                      "minLength": 1,
+                      "type": "string"
+                    },
+                    "maxItems": 32,
+                    "type": "array"
+                  }
+                },
+                "type": "object"
+              }
+            },
+            "required": [
+              "spec"
+            ],
+            "title": "EphemeralAccessPolicy",
+            "type": "object"
+          }
+        },
+        "served": true,
+        "storage": true,
+        "subresources": {
+          "status": {}
+        }
+      }
+    ]
+  }
+}

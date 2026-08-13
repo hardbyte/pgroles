@@ -453,6 +453,10 @@ fn diff_schemas(
     grant_out: &mut Vec<Change>,
 ) {
     for (name, desired_state) in &desired.schemas {
+        let owner_changed = current
+            .schemas
+            .get(name)
+            .is_some_and(|current_state| current_state.owner != desired_state.owner);
         match current.schemas.get(name) {
             None => schema_out.push(Change::CreateSchema {
                 name: name.clone(),
@@ -479,11 +483,21 @@ fn diff_schemas(
         }
 
         let expected_privileges = default_schema_owner_privileges(owner);
-        let current_privileges = current
-            .schemas
-            .get(name)
-            .map(|state| state.owner_privileges.clone())
-            .unwrap_or_default();
+        // Inspected owner privileges belong to the current owner. They say
+        // nothing about the ACL entry PostgreSQL will retain or merge for an
+        // incoming owner, and that transfer behavior differs across supported
+        // server versions. Reassert the complete owner privilege set after a
+        // transfer instead of comparing the new owner against the old owner's
+        // privileges.
+        let current_privileges = if owner_changed {
+            BTreeSet::new()
+        } else {
+            current
+                .schemas
+                .get(name)
+                .map(|state| state.owner_privileges.clone())
+                .unwrap_or_default()
+        };
         let missing_privileges: BTreeSet<Privilege> = expected_privileges
             .difference(&current_privileges)
             .copied()
@@ -1211,11 +1225,18 @@ memberships:
             .insert("inventory".to_string(), managed_schema("new_owner"));
 
         let changes = diff(&current, &desired);
-        assert_eq!(changes.len(), 1);
+        assert_eq!(changes.len(), 2);
         assert!(matches!(
             &changes[0],
             Change::AlterSchemaOwner { name, owner }
                 if name == "inventory" && owner == "new_owner"
+        ));
+        assert!(matches!(
+            &changes[1],
+            Change::EnsureSchemaOwnerPrivileges { name, owner, privileges }
+                if name == "inventory"
+                    && owner == "new_owner"
+                    && privileges == &BTreeSet::from([Privilege::Create, Privilege::Usage])
         ));
     }
 
@@ -1300,7 +1321,7 @@ memberships:
                 privileges,
             } if name == "inventory"
                 && owner == "new_owner"
-                && privileges == &BTreeSet::from([Privilege::Create])
+                && privileges == &BTreeSet::from([Privilege::Create, Privilege::Usage])
         ));
     }
 

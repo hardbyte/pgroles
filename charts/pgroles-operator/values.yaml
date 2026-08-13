@@ -32,6 +32,16 @@ operator:
     #   value: http://otel-collector.observability.svc.cluster.local:4317
     # - name: OTEL_METRICS_EXPORTER
     #   value: otlp
+    # The same endpoint enables OTLP logs, including structured ephemeral-access
+    # lifecycle audit events. Set OTEL_LOGS_EXPORTER=none when another agent
+    # already ships JSON container logs to durable off-cluster storage.
+    # - name: OTEL_LOGS_EXPORTER
+    #   value: otlp
+    # Finite cluster ceilings for ephemeral access policies.
+    # - name: EPHEMERAL_ACCESS_MAXIMUM_DURATION
+    #   value: 24h
+    # - name: EPHEMERAL_ACCESS_MAX_PENDING_TTL
+    #   value: 1h
 
   podAnnotations: {}
 

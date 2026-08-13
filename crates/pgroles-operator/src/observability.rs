@@ -3,7 +3,7 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use axum::extract::State;
 use axum::http::StatusCode;
@@ -14,6 +14,7 @@ use opentelemetry::KeyValue;
 use opentelemetry::metrics::{Counter, Histogram, Meter, MeterProvider, UpDownCounter};
 use opentelemetry_otlp::{MetricExporter, Protocol, WithExportConfig};
 use opentelemetry_sdk::Resource;
+use opentelemetry_sdk::logs::SdkLoggerProvider;
 use opentelemetry_sdk::metrics::{PeriodicReader, SdkMeterProvider};
 use tokio::net::TcpListener;
 
@@ -23,6 +24,7 @@ const SERVICE_NAME: &str = "pgroles-operator";
 pub struct OperatorObservability {
     ready: Arc<AtomicBool>,
     metrics: Option<Arc<Metrics>>,
+    logger_provider: Option<SdkLoggerProvider>,
 }
 
 struct Metrics {
@@ -42,6 +44,11 @@ struct Metrics {
     database_connection_failures_total: Counter<u64>,
     apply_total: Counter<u64>,
     apply_statements_total: Counter<u64>,
+    ephemeral_transition_total: Counter<u64>,
+    ephemeral_failure_total: Counter<u64>,
+    ephemeral_retained_memberships_total: Counter<u64>,
+    ephemeral_expiry_lag_ms: Histogram<u64>,
+    ephemeral_role_retirement_blocked_total: Counter<u64>,
 }
 
 pub struct ReconcileGuard {
@@ -54,7 +61,13 @@ impl OperatorObservability {
         Ok(Self {
             ready: Arc::new(AtomicBool::new(false)),
             metrics: init_metrics_from_env()?,
+            logger_provider: None,
         })
+    }
+
+    pub fn with_logger_provider(mut self, provider: Option<SdkLoggerProvider>) -> Self {
+        self.logger_provider = provider;
+        self
     }
 
     pub fn mark_ready(&self) {
@@ -196,9 +209,54 @@ impl OperatorObservability {
         }
     }
 
+    pub fn record_ephemeral_transition(&self, phase: &str, reason: &str) {
+        if let Some(metrics) = &self.metrics {
+            metrics.ephemeral_transition_total.add(
+                1,
+                &[
+                    KeyValue::new("phase", phase.to_string()),
+                    KeyValue::new("reason", reason.to_string()),
+                ],
+            );
+            if matches!(phase, "Failed" | "Denied" | "ApprovalExpired") {
+                metrics
+                    .ephemeral_failure_total
+                    .add(1, &[KeyValue::new("reason", reason.to_string())]);
+            }
+        }
+    }
+
+    pub fn record_ephemeral_retained_memberships(&self, count: usize) {
+        if count == 0 {
+            return;
+        }
+        if let Some(metrics) = &self.metrics {
+            metrics
+                .ephemeral_retained_memberships_total
+                .add(count as u64, &[]);
+        }
+    }
+
+    pub fn record_ephemeral_expiry_lag(&self, lag: Duration) {
+        if let Some(metrics) = &self.metrics {
+            metrics
+                .ephemeral_expiry_lag_ms
+                .record(lag.as_millis() as u64, &[]);
+        }
+    }
+
+    pub fn record_ephemeral_role_retirement_blocked(&self) {
+        if let Some(metrics) = &self.metrics {
+            metrics.ephemeral_role_retirement_blocked_total.add(1, &[]);
+        }
+    }
+
     pub fn shutdown(&self) -> anyhow::Result<()> {
         if let Some(metrics) = &self.metrics {
             metrics.provider.shutdown()?;
+        }
+        if let Some(provider) = &self.logger_provider {
+            provider.shutdown()?;
         }
         Ok(())
     }
@@ -268,6 +326,38 @@ fn init_metrics_from_env() -> anyhow::Result<Option<Arc<Metrics>>> {
 
     let meter = provider.meter(SERVICE_NAME);
     Ok(Some(Arc::new(Metrics::new(provider, meter))))
+}
+
+/// Build the OTLP log provider before the global tracing subscriber is
+/// installed. The caller attaches an `OpenTelemetryTracingBridge` layer and
+/// stores the provider in `OperatorObservability` for graceful shutdown.
+pub fn init_log_provider_from_env() -> anyhow::Result<Option<SdkLoggerProvider>> {
+    let logs_exporter = std::env::var("OTEL_LOGS_EXPORTER").ok();
+    if matches!(logs_exporter.as_deref(), Some("none")) {
+        return Ok(None);
+    }
+    let endpoint_configured = std::env::var_os("OTEL_EXPORTER_OTLP_ENDPOINT").is_some()
+        || std::env::var_os("OTEL_EXPORTER_OTLP_LOGS_ENDPOINT").is_some();
+    if !endpoint_configured && !matches!(logs_exporter.as_deref(), Some("otlp")) {
+        return Ok(None);
+    }
+
+    let exporter = opentelemetry_otlp::LogExporter::builder()
+        .with_tonic()
+        .with_protocol(Protocol::Grpc)
+        .build()?;
+    let provider = SdkLoggerProvider::builder()
+        .with_resource(
+            Resource::builder_empty()
+                .with_attributes([
+                    KeyValue::new("service.name", SERVICE_NAME),
+                    KeyValue::new("service.version", env!("CARGO_PKG_VERSION")),
+                ])
+                .build(),
+        )
+        .with_batch_exporter(exporter)
+        .build();
+    Ok(Some(provider))
 }
 
 fn otel_metrics_enabled() -> bool {
@@ -346,6 +436,27 @@ impl Metrics {
                 .u64_counter("pgroles.apply.statements")
                 .with_description("SQL statements executed during successful applies")
                 .build(),
+            ephemeral_transition_total: meter
+                .u64_counter("pgroles.ephemeral_access.transitions")
+                .with_description("Ephemeral access lifecycle transitions by phase and reason")
+                .build(),
+            ephemeral_failure_total: meter
+                .u64_counter("pgroles.ephemeral_access.failures")
+                .with_description("Terminal ephemeral access failures by reason")
+                .build(),
+            ephemeral_retained_memberships_total: meter
+                .u64_counter("pgroles.ephemeral_access.retained_memberships")
+                .with_description("Ephemeral memberships retained because they became durable")
+                .build(),
+            ephemeral_expiry_lag_ms: meter
+                .u64_histogram("pgroles.ephemeral_access.expiry_lag")
+                .with_unit("ms")
+                .with_description("Delay between absolute expiry and revocation processing")
+                .build(),
+            ephemeral_role_retirement_blocked_total: meter
+                .u64_counter("pgroles.ephemeral_access.role_retirement_blocked")
+                .with_description("Role retirements blocked by active access requests")
+                .build(),
         }
     }
 }
@@ -394,6 +505,7 @@ mod tests {
         let observability = OperatorObservability {
             ready: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             metrics: Some(Arc::new(Metrics::new(provider.clone(), meter))),
+            logger_provider: None,
         };
 
         (observability, provider, exporter)
@@ -520,6 +632,11 @@ mod tests {
         observability.record_planned_changes(2);
         observability.record_apply_result("success");
         observability.record_apply_statements(4);
+        observability.record_ephemeral_transition("Active", "MembershipsGranted");
+        observability.record_ephemeral_transition("Failed", "InvalidRequestState");
+        observability.record_ephemeral_retained_memberships(2);
+        observability.record_ephemeral_expiry_lag(Duration::from_millis(250));
+        observability.record_ephemeral_role_retirement_blocked();
         guard.record_result("conflict", "ConflictingPolicy");
 
         provider.force_flush().expect("flush should succeed");
@@ -532,6 +649,26 @@ mod tests {
         assert!(metric_exists(&metrics, "pgroles.reconcile.duration"));
         assert!(metric_exists(&metrics, "pgroles.inspect.duration"));
         assert_eq!(u64_sum_value(&metrics, "pgroles.inspect.items"), Some(119));
+        assert_eq!(
+            u64_sum_value(&metrics, "pgroles.ephemeral_access.transitions"),
+            Some(2)
+        );
+        assert_eq!(
+            u64_sum_value(&metrics, "pgroles.ephemeral_access.failures"),
+            Some(1)
+        );
+        assert_eq!(
+            u64_sum_value(&metrics, "pgroles.ephemeral_access.retained_memberships"),
+            Some(2)
+        );
+        assert!(metric_exists(
+            &metrics,
+            "pgroles.ephemeral_access.expiry_lag"
+        ));
+        assert_eq!(
+            u64_sum_value(&metrics, "pgroles.ephemeral_access.role_retirement_blocked"),
+            Some(1)
+        );
         assert_eq!(
             u64_sum_value(&metrics, "pgroles.wildcard.grantability_queries"),
             Some(1)
