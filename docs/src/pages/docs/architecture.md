@@ -46,7 +46,7 @@ The command-line interface. Thin wrapper that:
 
 ### pgroles-operator
 
-A Kubernetes operator that reconciles `PostgresPolicy` custom resources against PostgreSQL databases using the same core manifest, diff, and SQL engine as the CLI.
+A Kubernetes operator that reconciles `PostgresPolicy` custom resources against PostgreSQL databases using the same core manifest, diff, and SQL engine as the CLI. It also runs the `EphemeralAccessPolicy` and `EphemeralAccessRequest` controllers, which overlay bounded memberships onto the same effective graph.
 
 ## Data flow
 

@@ -70,7 +70,7 @@ Steps 1–2 cover a greenfield executor. Steps 3–4 are additive, per-role gran
 
 None of RDS, Cloud SQL, AlloyDB, or Azure Database for PostgreSQL expose true superuser. The bootstrap above is run by the provider's admin user instead — `rds_superuser` member on RDS/Aurora, `cloudsqlsuperuser` member on Cloud SQL, `alloydbsuperuser` member on AlloyDB. See the [AWS RDS & Aurora](/docs/aws-rds) and [Google Cloud SQL](/docs/google-cloud-sql) pages for the specific attributes those admin roles lack and how pgroles adapts around them.
 
-For Cloud SQL IAM authentication, the operator can authenticate as a low-privilege IAM identity and `SET ROLE` to a privileged parent role on every connection via `connection.params.setRole` — see the [operator connection docs](/docs/operator#gke-workload-identity-for-cloud-sql-iam) for the full pattern.
+For Cloud SQL IAM authentication, the operator can authenticate as a low-privilege IAM identity and `SET ROLE` to a privileged parent role on every connection via `connection.params.setRole` — see the [operator connection docs](/docs/operator-connections#gke-workload-identity-for-cloud-sql-iam) for the full pattern.
 
 ## The superuser shortcut
 

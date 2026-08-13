@@ -31,30 +31,39 @@ The important difference is that the operator has to do this continuously, safel
 
 - Secret-based connection lookup
 - reconciliation interval
-- reconciliation mode (`apply` or `plan`)
+- execution mode (`apply` or `plan`) and approval mode (`auto` or `manual`)
+- reconciliation mode (`authoritative`, `additive`, or `adopt`)
 - suspend/pause behavior
 
 The controller converts the CRD into the same manifest types used by the CLI, so both paths share expansion, diffing, and SQL rendering semantics.
 
 ### Watch sources
 
-The operator currently reconciles from three primary trigger sources:
+The operator currently reconciles from four event-driven trigger sources, plus the periodic interval:
 
 - `PostgresPolicy` generation changes
 - `PostgresPolicy` `reconcile.pgroles.io/requestedAt` annotation changes
 - Secret `resourceVersion` changes for referenced database credentials
+- `PostgresPolicyPlan` changes, mapped back to the owning policy by controller-owner UID — this is what makes an approval or rejection annotation take effect immediately rather than at the next interval
 
 Generation and annotation filtering matter. The controller intentionally ignores status-only `PostgresPolicy` updates and unrelated annotation changes as reconcile triggers, otherwise successful status patches and GitOps tracking metadata can create hot loops that starve other policies targeting the same database.
 
 ### Database connection handling
 
-The operator reads `DATABASE_URL` from a Secret in the same namespace as the policy. It caches `sqlx::PgPool` instances by:
+The operator resolves credentials from a Secret in the same namespace as the
+policy — either a whole connection URL via `connection.secretRef`, or individual
+`connection.params` fields, each of which may be a literal or its own Secret
+reference. It caches `sqlx::PgPool` instances. In URL mode the cache identity is:
 
 ```text
 namespace / secret name / secret key
 ```
 
-When the Secret changes, the controller refetches it and refreshes the cached pool on the next reconcile. This is what enables credential rotation and recovery without restarting the operator.
+In `connection.params` mode the key covers every connection field, and the
+operator additionally fingerprints the `resourceVersion` of all referenced
+Secrets.
+
+When any referenced Secret changes, the controller refetches it and refreshes the cached pool on the next reconcile. This is what enables credential rotation and recovery without restarting the operator.
 
 ### Reconcile engine
 
