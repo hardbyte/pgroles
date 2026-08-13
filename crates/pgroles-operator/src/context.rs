@@ -16,6 +16,7 @@ use tokio::sync::{Mutex, RwLock};
 
 use crate::crd::{ConnectionAuth, ConnectionSpec, SecretKeySelector};
 use crate::observability::OperatorObservability;
+use crate::request_index::RequestIndex;
 
 /// Minimum pool size required for reconciliation.
 ///
@@ -388,6 +389,12 @@ pub struct OperatorContext {
     /// Shared health/metrics state.
     pub observability: OperatorObservability,
 
+    /// Watch-fed indexes for relevant ephemeral requests.
+    pub request_index: RequestIndex,
+
+    /// Optional namespace which bounds every operator watch and list.
+    pub watch_namespace: Option<String>,
+
     /// Fetches short-lived provider-backed database passwords.
     gcp_token_provider: Arc<dyn GcpAccessTokenProvider>,
 }
@@ -399,11 +406,31 @@ impl OperatorContext {
         observability: OperatorObservability,
         event_recorder: Recorder,
     ) -> Self {
+        Self::new_with_runtime_config(
+            kube_client,
+            observability,
+            event_recorder,
+            RequestIndex::default(),
+            None,
+        )
+    }
+
+    /// Create a context with the request index and watch scope shared by the
+    /// controller runtime.
+    pub fn new_with_runtime_config(
+        kube_client: kube::Client,
+        observability: OperatorObservability,
+        event_recorder: Recorder,
+        request_index: RequestIndex,
+        watch_namespace: Option<String>,
+    ) -> Self {
         Self {
             kube_client,
             event_recorder,
             pool_cache: Arc::new(RwLock::new(HashMap::new())),
             observability,
+            request_index,
+            watch_namespace,
             database_locks: Arc::new(Mutex::new(HashMap::new())),
             gcp_token_provider: Arc::new(MetadataGcpAccessTokenProvider::default()),
         }

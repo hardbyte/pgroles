@@ -41,6 +41,9 @@ Key values you can override:
 ```yaml
 # values.yaml
 operator:
+  # Set this to avoid cluster-wide watches and grant only namespaced RBAC.
+  watchNamespace: ""
+
   image:
     repository: ghcr.io/hardbyte/pgroles-operator
     tag: ""  # defaults to Chart.appVersion
@@ -63,6 +66,11 @@ operator:
 ```
 
 The operator runs as `nobody` (UID 65534) with a read-only root filesystem, no capabilities, and seccomp enabled by default.
+
+Set `operator.watchNamespace` when one operator instance should reconcile only
+one namespace. The chart then configures `WATCH_NAMESPACE` and installs a
+namespaced `Role` and `RoleBinding` instead of cluster-wide RBAC. Leave it empty
+for the default cluster-wide deployment.
 
 See [Database connections](/docs/operator-connections) for URL Secrets,
 structured parameters, and GKE Workload Identity configuration.

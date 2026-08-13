@@ -238,7 +238,7 @@ Edit its namespace and limits for expected request volume and retention. The
 quota rejects excess objects before they enter the controller cache or
 reconciliation queue. It limits persisted requests, not simultaneous active
 grants; policy-level concurrency limits are tracked separately in
-[issue #162](https://github.com/hardbyte/pgroles/issues/162).
+[issue #163](https://github.com/hardbyte/pgroles/issues/163).
 
 Delete terminal request objects according to an explicit retention policy after
 their durable audit records have been exported.

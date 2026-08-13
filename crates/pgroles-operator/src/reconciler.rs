@@ -2118,7 +2118,10 @@ async fn detect_policy_conflict(
     identity: &DatabaseIdentity,
     ownership: &crate::crd::OwnershipClaims,
 ) -> Result<Option<String>, ReconcileError> {
-    let api: Api<PostgresPolicy> = Api::all(ctx.kube_client.clone());
+    let api: Api<PostgresPolicy> = match &ctx.watch_namespace {
+        Some(namespace) => Api::namespaced(ctx.kube_client.clone(), namespace),
+        None => Api::all(ctx.kube_client.clone()),
+    };
     let policies = api.list(&Default::default()).await?;
 
     Ok(detect_policy_conflict_in_list(

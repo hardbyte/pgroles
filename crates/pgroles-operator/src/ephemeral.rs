@@ -17,9 +17,10 @@ use crate::context::{ContextError, OperatorContext};
 use crate::crd::{
     ChangeSummary, DatabaseIdentity, EPHEMERAL_BUNDLE_ENCODING_V1, EphemeralAccessCondition,
     EphemeralAccessPolicy, EphemeralAccessPolicyStatus, EphemeralAccessRequest,
-    EphemeralAccessRequestPhase, EphemeralAccessRequestStatus, EphemeralApprovalMode, LABEL_POLICY,
-    PlanOrigin, PlanPhase, PlanScope, PolicyCondition, PolicyMode, PolicyPlanRef, PostgresPolicy,
-    PostgresPolicyPlan, PostgresPolicyPlanSpec, PostgresPolicyPlanStatus, ResolvedEphemeralAccess,
+    EphemeralAccessRequestPhase, EphemeralAccessRequestStatus, EphemeralApprovalMode,
+    LABEL_ACCESS_POLICY_UID, LABEL_POLICY, LABEL_TARGET_POLICY_UID, PlanOrigin, PlanPhase,
+    PlanScope, PolicyCondition, PolicyMode, PolicyPlanRef, PostgresPolicy, PostgresPolicyPlan,
+    PostgresPolicyPlanSpec, PostgresPolicyPlanStatus, ResolvedEphemeralAccess,
     ResolvedEphemeralMembership, ScopedPlanOperation,
 };
 use crate::k8s_names::LabelValue;
@@ -84,6 +85,9 @@ pub async fn reconcile_access_policy(
     resource: Arc<EphemeralAccessPolicy>,
     ctx: Arc<OperatorContext>,
 ) -> Result<Action, finalizer::Error<EphemeralError>> {
+    let _metrics = ctx
+        .observability
+        .start_ephemeral_reconcile("access_policy", ctx.request_index.len());
     let namespace = resource
         .namespace()
         .unwrap_or_else(|| "default".to_string());
@@ -349,11 +353,24 @@ async fn reconcile_access_policy_cleanup(
     let namespace = policy
         .namespace()
         .ok_or_else(|| EphemeralError::Invalid("resource has no namespace".to_string()))?;
+    let policy_uid = policy.uid().unwrap_or_default();
+    let mut indexed = ctx
+        .request_index
+        .for_access_policy_name(&namespace, &policy.name_any())
+        .await;
+    indexed.extend(
+        ctx.request_index
+            .for_access_policy_uid(&namespace, &policy_uid)
+            .await,
+    );
+    indexed.sort_by_key(|request| request.uid().unwrap_or_default());
+    indexed.dedup_by_key(|request| request.uid().unwrap_or_default());
+    ctx.observability
+        .record_ephemeral_relevant_requests("access_policy_cleanup", indexed.len());
     let requests: Api<EphemeralAccessRequest> =
         Api::namespaced(ctx.kube_client.clone(), &namespace);
-    let policy_uid = policy.uid().unwrap_or_default();
     let mut remaining = 0usize;
-    for request in requests.list(&ListParams::default()).await? {
+    for request in indexed {
         let resolved_match = request
             .status
             .as_ref()
@@ -514,6 +531,9 @@ pub async fn reconcile_access_request(
     resource: Arc<EphemeralAccessRequest>,
     ctx: Arc<OperatorContext>,
 ) -> Result<Action, finalizer::Error<EphemeralError>> {
+    let _metrics = ctx
+        .observability
+        .start_ephemeral_reconcile("access_request", ctx.request_index.len());
     let namespace = resource
         .namespace()
         .unwrap_or_else(|| "default".to_string());
@@ -618,6 +638,7 @@ async fn reconcile_access_request_apply(
         if mode == EphemeralApprovalMode::Automatic {
             persist_activation_deadline(&mut status, &resolved)?;
         }
+        patch_request_index_labels(request, ctx, &resolved).await?;
         patch_request_status(request, ctx, &status).await?;
         audit_transition(request, ctx, None, &status, "Resolved");
         publish_request_event_best_effort(request, ctx, &status, "Resolved").await;
@@ -912,6 +933,29 @@ async fn reconcile_access_request_apply(
         }
         _ => Ok(Action::requeue(RETRY_DELAY)),
     }
+}
+
+async fn patch_request_index_labels(
+    request: &EphemeralAccessRequest,
+    ctx: &OperatorContext,
+    resolved: &ResolvedEphemeralAccess,
+) -> Result<(), EphemeralError> {
+    let namespace = request.namespace().unwrap_or_else(|| "default".to_string());
+    let api: Api<EphemeralAccessRequest> = Api::namespaced(ctx.kube_client.clone(), &namespace);
+    api.patch(
+        &request.name_any(),
+        &PatchParams::apply("pgroles-operator"),
+        &Patch::Merge(serde_json::json!({
+            "metadata": {
+                "labels": {
+                    (LABEL_ACCESS_POLICY_UID): resolved.access_policy_uid,
+                    (LABEL_TARGET_POLICY_UID): resolved.target_policy_uid,
+                }
+            }
+        })),
+    )
+    .await?;
+    Ok(())
 }
 
 fn persist_activation_deadline(
@@ -1302,9 +1346,17 @@ pub async fn compose_effective_graph(
     desired: &mut pgroles_core::model::RoleGraph,
 ) -> Result<BTreeSet<String>, ReconcileError> {
     let namespace = policy.namespace().ok_or(ReconcileError::NoNamespace)?;
-    let requests: Api<EphemeralAccessRequest> =
-        Api::namespaced(ctx.kube_client.clone(), &namespace);
-    let requests = requests.list(&ListParams::default()).await?;
+    let policy_uid = policy.uid().unwrap_or_default();
+    let indexed = ctx
+        .request_index
+        .for_target_policy_uid(&namespace, &policy_uid)
+        .await;
+    ctx.observability
+        .record_ephemeral_relevant_requests("effective_graph", indexed.len());
+    let requests: Vec<_> = indexed
+        .iter()
+        .map(|request| request.as_ref().clone())
+        .collect();
     let scoped_plans = list_scoped_plans(&ctx.kube_client, &namespace, &policy.name_any()).await?;
     let target_database_fingerprint = ctx
         .resolve_database_target_fingerprint(&namespace, &policy.spec.connection)
@@ -1314,7 +1366,7 @@ pub async fn compose_effective_graph(
         ctx,
         policy,
         desired,
-        &requests.items,
+        &requests,
         &scoped_plans,
         &target_database_fingerprint,
     )
@@ -1644,17 +1696,24 @@ async fn apply_scoped_memberships_under_lock(
     let durable_memberships = durable.memberships.clone();
     let namespace = target.namespace().ok_or(ReconcileError::NoNamespace)?;
     // Keep Kubernetes API calls bounded while the database locks are held:
-    // one request LIST and one server-side narrowed plan LIST feed every
-    // ownership and provenance check below.
-    let requests_api: Api<EphemeralAccessRequest> =
-        Api::namespaced(ctx.kube_client.clone(), &namespace);
-    let requests = requests_api.list(&ListParams::default()).await?;
+    // one indexed request snapshot and one server-side narrowed plan LIST feed
+    // every ownership and provenance check below.
+    let indexed = ctx
+        .request_index
+        .for_target_policy_uid(&namespace, &resolved.target_policy_uid)
+        .await;
+    ctx.observability
+        .record_ephemeral_relevant_requests("scoped_membership", indexed.len());
+    let requests: Vec<_> = indexed
+        .iter()
+        .map(|request| request.as_ref().clone())
+        .collect();
     let scoped_plans = list_scoped_plans(&ctx.kube_client, &namespace, &target.name_any()).await?;
     let mut additional_roles = compose_effective_graph_from_resources(
         ctx,
         target,
         &mut durable,
-        &requests.items,
+        &requests,
         &scoped_plans,
         database.target_fingerprint,
     )
@@ -1687,7 +1746,7 @@ async fn apply_scoped_memberships_under_lock(
         .collect();
     let other_owners = active_owner_keys_from_resources(
         target,
-        &requests.items,
+        &requests,
         &scoped_plans,
         Some(request.uid().unwrap_or_default().as_str()),
     );
