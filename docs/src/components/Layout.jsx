@@ -21,26 +21,8 @@ const navigation = [
         ],
     },
     {
-        title: 'User Guide',
+        title: 'Kubernetes operator',
         links: [
-            {title: 'Installation', href: '/docs/installation'},
-            {title: 'Executor privileges', href: '/docs/executor-privileges'},
-            {title: 'Manifest guide', href: '/docs/manifest-format'},
-            {title: 'Profiles & schemas', href: '/docs/profiles'},
-            {title: 'Grants & privileges', href: '/docs/grants'},
-            {title: 'Default privileges', href: '/docs/default-privileges'},
-            {title: 'Memberships', href: '/docs/memberships'},
-        ],
-    },
-    {
-        title: 'Deployment',
-        links: [
-            {title: 'CI/CD integration', href: '/docs/ci-cd'},
-            {title: 'Application access patterns', href: '/docs/tooling'},
-            {title: 'Bundle composition', href: '/docs/bundle-composition'},
-            {title: 'Google Cloud SQL', href: '/docs/google-cloud-sql'},
-            {title: 'AWS RDS & Aurora', href: '/docs/aws-rds'},
-            {title: 'Staged adoption', href: '/docs/adoption'},
             {title: 'Kubernetes operator', href: '/docs/operator'},
             {title: 'Ephemeral access', href: '/docs/ephemeral-access'},
             {title: 'Securing ephemeral access', href: '/docs/ephemeral-access-security'},
@@ -48,11 +30,39 @@ const navigation = [
         ],
     },
     {
+        title: 'Writing policy',
+        links: [
+            {title: 'Manifest guide', href: '/docs/manifest-format'},
+            {title: 'Profiles & schemas', href: '/docs/profiles'},
+            {title: 'Grants & privileges', href: '/docs/grants'},
+            {title: 'Default privileges', href: '/docs/default-privileges'},
+            {title: 'Memberships', href: '/docs/memberships'},
+            {title: 'Bundle composition', href: '/docs/bundle-composition'},
+            {title: 'Manifest reference', href: '/docs/manifest-reference'},
+        ],
+    },
+    {
+        title: 'Connecting to PostgreSQL',
+        links: [
+            {title: 'Executor privileges', href: '/docs/executor-privileges'},
+            {title: 'Staged adoption', href: '/docs/adoption'},
+            {title: 'Google Cloud SQL', href: '/docs/google-cloud-sql'},
+            {title: 'AWS RDS & Aurora', href: '/docs/aws-rds'},
+        ],
+    },
+    {
+        title: 'CLI',
+        links: [
+            {title: 'Install the CLI', href: '/docs/installation'},
+            {title: 'CLI commands', href: '/docs/cli'},
+            {title: 'CI/CD integration', href: '/docs/ci-cd'},
+            {title: 'Application access patterns', href: '/docs/tooling'},
+        ],
+    },
+    {
         title: 'Reference',
         links: [
-            {title: 'CLI commands', href: '/docs/cli'},
             {title: 'Architecture', href: '/docs/architecture'},
-            {title: 'Manifest reference', href: '/docs/manifest-reference'},
             {title: 'Limitations', href: '/docs/limitations'},
         ],
     },
