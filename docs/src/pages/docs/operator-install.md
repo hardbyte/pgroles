@@ -7,6 +7,10 @@ Getting the pgroles operator running in your cluster, and the chart values that 
 
 ---
 
+For a complete first reconciliation, including a connection Secret, safe
+additive policy, SQL review, and manual approval, use the
+[operator quick start](/docs/operator-quick-start).
+
 ## Helm
 
 ```shell

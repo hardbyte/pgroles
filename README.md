@@ -178,6 +178,7 @@ Full documentation is published at [hardbyte.github.io/pgroles](https://hardbyte
 - [Manifest guide](https://hardbyte.github.io/pgroles/docs/manifest-format/)
 - [CLI reference](https://hardbyte.github.io/pgroles/docs/cli/)
 - [Kubernetes operator](https://hardbyte.github.io/pgroles/docs/operator/)
+- [Operator quick start](https://hardbyte.github.io/pgroles/docs/operator-quick-start/)
 - [Operator architecture](https://hardbyte.github.io/pgroles/docs/operator-architecture/)
 - [Ephemeral access](https://hardbyte.github.io/pgroles/docs/ephemeral-access/)
 - [Securing ephemeral access](https://hardbyte.github.io/pgroles/docs/ephemeral-access-security/)

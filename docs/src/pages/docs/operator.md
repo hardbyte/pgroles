@@ -18,9 +18,10 @@ care about.
 
 ## A first policy
 
-Install the operator, then apply a policy. This one is deliberately non-mutating:
-it inspects the database, computes what it *would* change, and publishes that for
-review without executing any DDL.
+For a copyable install-to-approval walkthrough, start with the
+[operator quick start](/docs/operator-quick-start). The shorter example below is
+deliberately non-mutating: it inspects the database, computes what it *would*
+change, and publishes that for review without executing any DDL.
 
 ```yaml
 apiVersion: pgroles.io/v1alpha1
@@ -115,13 +116,14 @@ The custom resources have short names in `kubectl`: `pgr` for `PostgresPolicy`,
 
 | Page | What it covers |
 | --- | --- |
+| [Operator quick start](/docs/operator-quick-start) | Install, preview, approve, and verify a safe first policy |
 | [Install the operator](/docs/operator-install) | Helm install, chart values, CRD upgrades |
 | [The PostgresPolicy resource](/docs/operator-postgrespolicy) | Spec fields, execution and approval modes, role passwords |
 | [Database connections](/docs/operator-connections) | Connection URLs, structured parameters, cloud IAM auth |
 | [Plan and approval](/docs/operator-plan-approval) | Previewing changes and gating execution behind review |
 | [Running the operator](/docs/operator-operations) | Intervals, force reconcile, suspend, reconciliation mode, deletion |
 | [Status and telemetry](/docs/operator-status) | Conditions, Events, metrics, what to alert on |
-| [Troubleshooting](/docs/operator-troubleshooting) | A policy that will not converge |
+| [Troubleshooting index](/docs/operator-troubleshooting) | Follow status reasons to the failing boundary |
 | [RBAC and security](/docs/operator-security) | Permissions the operator needs |
 | [Production status](/docs/operator-production-status) | Maturity and known gaps — read before deploying |
 
