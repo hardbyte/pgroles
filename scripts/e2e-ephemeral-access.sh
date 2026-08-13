@@ -208,7 +208,8 @@ EOF
   fi
   test "$(kubectl -n "$quota_namespace" get pgear --no-headers | wc -l | tr -d ' ')" = "2"
   # Namespace teardown must bypass per-request ownership checks once the
-  # namespace itself is Terminating, while request finalizers still complete.
+  # namespace itself is Terminating. These unresolved quota probes verify
+  # admission availability, not revocation of an active database membership.
   kubectl delete namespace "$quota_namespace" --wait=true --timeout=90s
 
   echo "CRD schema rejects oversized user-controlled fields"

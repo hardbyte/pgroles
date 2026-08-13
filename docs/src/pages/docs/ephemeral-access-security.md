@@ -129,7 +129,7 @@ The reference implementation:
 - lets requesters delete their own requests but requires `manage` to delete
   another caller's request during normal operation;
 - allows the namespace controller to complete deletion once the namespace is
-  already terminating, while pgroles finalizers still perform scoped cleanup;
+  already terminating, without admission blocking pgroles finalizer attempts;
 - requires `approve` for terminal decisions;
 - replaces `status.decidedBy` with the authenticated decision maker;
 - restricts approvers to their decision conditions;
@@ -143,6 +143,14 @@ portable mapping between Kubernetes identities and PostgreSQL roles. Restrict
 `Automatic` policies to trusted requesters, or extend the admission policy with
 your identity mapping. With `Required`, approvers must verify the named subject
 as part of their decision.
+
+Namespace deletion does not guarantee PostgreSQL revocation. Kubernetes may
+delete the connection Secret, access policy, target policy, or scoped plan
+before a request finalizer can use them. Before deleting a namespace, delete
+its ephemeral access requests and access policies, wait for their finalizers to
+complete, and verify that active memberships have been revoked. The namespace
+termination exception prevents admission deadlock; it does not replace that
+drain procedure.
 
 Kyverno mutation occurs before schema validation, so client-supplied actor
 fields are replaced before the CRD validates and persists the object. The
