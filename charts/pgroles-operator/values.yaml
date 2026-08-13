@@ -3,9 +3,6 @@
 nameOverride: ""
 fullnameOverride: ""
 
-# If false, CRDs must be installed separately before installing the chart.
-installCRDs: true
-
 operator:
   image:
     repository: ghcr.io/hardbyte/pgroles-operator

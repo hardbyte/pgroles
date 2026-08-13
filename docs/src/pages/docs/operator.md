@@ -59,8 +59,6 @@ Key values you can override:
 
 ```yaml
 # values.yaml
-installCRDs: true
-
 operator:
   image:
     repository: ghcr.io/hardbyte/pgroles-operator
@@ -69,6 +67,10 @@ operator:
   env:
     - name: RUST_LOG
       value: "info,pgroles_operator=debug"
+
+  # Required for GKE Workload Identity — see Database connection below.
+  serviceAccount:
+    annotations: {}
 
   resources:
     requests:
@@ -80,6 +82,16 @@ operator:
 ```
 
 The operator runs as `nobody` (UID 65534) with a read-only root filesystem, no capabilities, and seccomp enabled by default.
+
+The chart ships CRDs in `charts/pgroles-operator/crds/`, so Helm installs them
+on `helm install` and — by Helm's design — does **not** update them on
+`helm upgrade`. Apply CRD changes yourself before upgrading the chart. To manage
+CRDs out of band entirely, install with `--skip-crds`.
+
+The Deployment is fixed at a single replica with a `Recreate` strategy and the
+chart exposes no replica count. Per-database advisory locks make the operator
+safe to run with more than one replica, but running multiple replicas today
+requires patching the Deployment.
 
 ## Operational guidance
 
@@ -153,7 +165,20 @@ The operator's safety model — serialized reconciliation, conflict detection, f
 
 ## Custom resource
 
-A `PostgresPolicy` spec mirrors the CLI manifest format with added Kubernetes-specific fields for connection and scheduling. The example below uses a connection URL Secret; see [Database connection](#database-connection) for structured parameter support (Zalando, CloudNativePG, PGO).
+A `PostgresPolicy` declares the roles, memberships, schemas, grants, and default
+privileges pgroles should converge the database to, plus Kubernetes-specific
+fields for connection and scheduling. Those policy sections are the same ones the
+CLI manifest uses, so the [manifest guide](/docs/manifest-format) and
+[manifest reference](/docs/manifest-reference) describe them field by field —
+under `spec:` rather than at the top level.
+
+The example below uses a connection URL Secret; see
+[Database connection](#database-connection) for structured parameter support
+(Zalando, CloudNativePG, PGO).
+
+The custom resources use short names in `kubectl`: `pgr` for `PostgresPolicy`,
+`pgplan` for `PostgresPolicyPlan`, `pgeap` for `EphemeralAccessPolicy`, and
+`pgear` for `EphemeralAccessRequest`.
 
 ```yaml
 apiVersion: pgroles.io/v1alpha1
@@ -170,6 +195,7 @@ spec:
   interval: "5m"   # reconciliation interval (supports 5m, 1h, 30s, 1h30m)
   suspend: false   # set true to pause reconciliation
   mode: apply      # apply changes, or use plan for non-mutating drift preview
+  approval: auto   # auto applies immediately; manual gates behind a reviewed plan
   reconciliation_mode: authoritative  # authoritative | additive | adopt
 
   default_owner: app_owner
@@ -299,7 +325,8 @@ Each connection field supports a literal value and a `*Secret` variant:
 | `dbname` / `dbnameSecret` | Database name | SecretKeySelector | Yes (exactly one) |
 | `username` / `usernameSecret` | Username string | SecretKeySelector | Yes (exactly one) |
 | `password` / `passwordSecret` | Password string | SecretKeySelector | Yes unless `auth` is set |
-| `auth` | Provider-backed auth config | n/a | No |
+| `auth` | Provider-backed auth config (`provider`, `scope`, `impersonateServiceAccount`) | n/a | No |
+| `setRole` | Role to `SET ROLE` to on every operator connection | n/a | No |
 | `sslMode` / `sslModeSecret` | SSL mode string | SecretKeySelector | No |
 
 Valid `sslMode` values: `disable`, `allow`, `prefer`, `require`, `verify-ca`, `verify-full`.
@@ -325,7 +352,26 @@ connection:
       scope: https://www.googleapis.com/auth/sqlservice.login
 ```
 
-The Kubernetes ServiceAccount used by the operator must be annotated for Workload Identity, and the Google service account must have Cloud SQL IAM database login permissions for the target instance.
+The Kubernetes ServiceAccount used by the operator must be annotated for Workload Identity — set `operator.serviceAccount.annotations` in the chart — and the Google service account must have Cloud SQL IAM database login permissions for the target instance.
+
+An IAM identity usually has too few privileges to manage roles itself. Use
+`connection.params.setRole` to authenticate as the low-privilege IAM identity
+and switch to a privileged parent role on every connection:
+
+```yaml
+connection:
+  params:
+    username: pgroles-operator@my-project.iam
+    setRole: pgroles_admin
+    auth:
+      type: gcp_workload_identity
+```
+
+The IAM identity must be a member of the target role. `setRole` accepts
+`^[A-Za-z_][A-Za-z0-9_$-]*$` — deliberately excluding `@` and `.`, so an IAM
+principal name such as `sa@project.iam` is rejected. Name the PostgreSQL group
+role to switch into, not the identity you authenticate as. See
+[executor privileges](/docs/executor-privileges) for what that role needs.
 
 {% callout type="note" title="Host resolution" %}
 The `host` must be reachable from the operator pod. For an in-cluster database in a different namespace, use the fully qualified service name (e.g. `my-postgres.my-namespace.svc`). For a database outside the cluster, use the external hostname or IP directly (e.g. `db.example.com` or `10.0.1.50`).
@@ -378,7 +424,7 @@ Generated Secrets are created in the same namespace as the `PostgresPolicy`, own
 - Passwords are only allowed on roles with `login: true`.
 - Exactly one of `password.secretRef` or `password.generate` must be set.
 - Password values are redacted in operator logs and in the SQL preview stored on `PostgresPolicyPlan`.
-- If the referenced Secret or key is missing, the operator sets a `SecretMissing` or `SecretFetchFailed` status condition and retries on the normal interval.
+- If the referenced Secret or key is missing, the operator sets `Ready=False` and `Degraded=True` with reason `SecretMissing` or `SecretFetchFailed`, and retries on the normal interval.
 - Password updates are driven by password-source Secret changes. After a successful `apply`, unchanged password sources do not create permanent drift in later `plan` reconciles.
 - pgroles cannot detect direct password changes made in PostgreSQL outside the operator, because PostgreSQL does not expose comparable password state safely.
 
@@ -414,11 +460,12 @@ Note that this is distinct from `connection.params.setRole`, which controls the 
 
 ## Reconciliation
 
-The operator reconciles on four paths:
+The operator reconciles on five paths:
 
 - `PostgresPolicy` spec changes
 - referenced Secret changes
 - force-reconcile annotation changes
+- `PostgresPolicyPlan` changes, matched back to the owning policy by controller-owner UID — this is what makes approving or rejecting a plan take effect immediately rather than at the next `interval`
 - the normal periodic `interval`
 
 Each reconcile inspects the current database state, computes a diff from the policy, and then either applies it or publishes a plan depending on `spec.mode`. Plan mode is non-mutating: it does not execute PostgreSQL DDL and it does not create generated password Secrets. Same-database policies are serialized, and status-only updates do not retrigger the controller.
@@ -487,6 +534,7 @@ spec:
     secretRef:
       name: postgres-credentials
   mode: plan
+  approval: manual
   roles:
     - name: preview-user
       login: true
@@ -772,30 +820,62 @@ operator:
 
 The intended deployment model is operator -> OpenTelemetry Collector -> your metrics backend.
 
-The exported metrics include reconcile, plan, apply, lock-contention, conflict, and database-connection counters. They also include database inspection measurements for larger deployments:
-
 | Metric | Labels | Meaning |
 | --- | --- | --- |
-| `pgroles.inspect.duration` | `phase` | Duration for each inspection phase, such as roles, memberships, object privileges, database privileges, and default privileges |
-| `pgroles.inspect.items` | `kind` | Counts of inspected roles, memberships, schemas, grants, default privileges, configured wildcard scopes, unsatisfied wildcard scopes, wildcard inventory objects, and grantability objects |
-| `pgroles.wildcard.grantability_queries` | - | Number of wildcard grantability catalog queries issued |
-| `pgroles.wildcard.unsatisfied_grants` | - | Number of wildcard grants missing privileges before grantability checks |
+| `pgroles.reconcile.total` | `result`, `reason` | Reconcile outcomes |
+| `pgroles.reconcile.duration` | - | Reconcile wall time |
+| `pgroles.reconcile.inflight` | - | Reconciles currently running |
+| `pgroles.plan.total` | `result` | Plans computed |
+| `pgroles.plan.changes` | - | Changes per plan |
+| `pgroles.apply.total` | `result` | Applies attempted |
+| `pgroles.apply.statements` | - | SQL statements executed |
+| `pgroles.lock_contention.total` | - | Reconciles that lost the per-database lock |
+| `pgroles.policy.conflicts` | - | Overlapping-ownership conflicts detected |
+| `pgroles.database.connection_failures` | - | Failed database connections |
+| `pgroles.invalid_spec.total` | - | Specs rejected as invalid |
+| `pgroles.deprecated.approval_unset` | `inferred` | Policies relying on the deprecated `spec.approval` inference |
+| `pgroles.inspect.duration` | `phase` | Duration for each inspection phase |
+| `pgroles.inspect.items` | `kind` | Counts of inspected objects by kind |
+| `pgroles.wildcard.grantability_queries` | - | Wildcard grantability catalog queries issued |
+| `pgroles.wildcard.unsatisfied_grants` | - | Wildcard grants missing privileges before grantability checks |
+| `pgroles.ephemeral_access.transitions` | `phase`, `reason` | Ephemeral request phase transitions |
+| `pgroles.ephemeral_access.failures` | `reason` | Ephemeral activation and revocation failures |
+| `pgroles.ephemeral_access.retained_memberships` | - | Memberships kept at expiry because they became durable |
+| `pgroles.ephemeral_access.expiry_lag` | - | Seconds between expiry and revocation |
+| `pgroles.ephemeral_access.role_retirement_blocked` | - | Role retirements blocked by an in-flight request |
 
-The operator also emits transition-based Kubernetes Events such as:
+Useful alerting signals: `Degraded=True` for reconcile failure (not bare
+`Ready=False`, which is also how a healthy plan-awaiting-approval policy
+reports), sustained `Drifted=True` on an auto-applying policy,
+`pgroles.lock_contention.total` rising steadily, and
+`pgroles.deprecated.approval_unset` as the count of policies still relying on
+the deprecated inference.
 
-- `ConflictDetected`
-- `ConflictResolved`
+The operator also emits transition-based Kubernetes Events on the policy.
+Status transitions:
+
+- `ConflictDetected`, `ConflictResolved`
 - `Suspended`
-- `Reconciled`
-- `Recovered`
+- `Reconciled`, `Recovered`
+- `DriftDetected`, `PlanClean`
+- `ApprovalUnset`, `ApprovalIgnored`
+- `InvalidSpec`
 - `SecretFetchFailed`
-- `DriftDetected`
-- `PlanClean`
 - `DatabaseConnectionFailed`
+- `GcpAuthFailed`
 - `InsufficientPrivileges`
-- `InvalidConnectionParams`
-- `MissingDatabaseObject`
 - `UnsafeRoleDropsBlocked`
+
+Plan lifecycle:
+
+- `PlanCreated`, `PlanApproved`, `PlanRejected`
+- `ApplyStarted`, `ApplySucceeded`, `ApplyFailed`
+
+Not every failure becomes an Event. `MissingDatabaseObject`,
+`InvalidConnectionParams`, and `UnsatisfiableWildcardGrant` are condition
+*reasons* only — they appear in `status.conditions[].reason` and never as an
+Event, so alert on the condition rather than watching for an Event that will
+not arrive.
 
 ### Deletion behaviour
 
@@ -851,7 +931,7 @@ status:
 | Type | Meaning |
 | --- | --- |
 | `Ready` | `True` when the last reconciliation succeeded |
-| `Drifted` | `True` when `plan` mode found pending changes |
+| `Drifted` | `True` when changes are pending but not applied — in `mode: plan`, and in `mode: apply` with `approval: manual` while a plan awaits a decision |
 | `Reconciling` | `True` while a reconciliation is in progress |
 | `Degraded` | `True` when the last reconciliation failed (includes error detail) |
 | `Conflict` | `True` when another policy targets the same database with overlapping ownership |
@@ -874,12 +954,29 @@ On failure, the operator chooses a retry path based on the failure mode:
 
 The operator requires a ClusterRole with these permissions:
 
-| Resource | Verbs |
-| --- | --- |
-| `postgrespolicies` | get, list, watch, patch, update |
-| `postgrespolicies/status` | get, patch, update |
-| `postgrespolicies/finalizers` | update |
-| `secrets` | get, list, watch, create, update, patch |
-| `events` | create, patch |
+| API group | Resource | Verbs |
+| --- | --- | --- |
+| `pgroles.io` | `postgrespolicies` | get, list, watch, patch, update |
+| `pgroles.io` | `postgrespolicies/status` | get, patch, update |
+| `pgroles.io` | `postgrespolicies/finalizers` | update |
+| `pgroles.io` | `postgrespolicyplans` | get, list, watch, create, update, patch, delete |
+| `pgroles.io` | `postgrespolicyplans/status` | get, patch, update |
+| `pgroles.io` | `ephemeralaccesspolicies`, `ephemeralaccessrequests` | get, list, watch, patch, update, delete |
+| `pgroles.io` | `ephemeralaccesspolicies/status`, `ephemeralaccessrequests/status` | get, patch, update |
+| `pgroles.io` | `ephemeralaccesspolicies/finalizers`, `ephemeralaccessrequests/finalizers` | update |
+| `pgroles.io` | `ephemeralaccesspolicies` | `manage` |
+| `""` | `secrets` | get, list, watch, create, update, patch |
+| `""` | `configmaps` | get, list, create, update, patch, delete |
+| `events.k8s.io` | `events` | create, patch |
 
-The Helm chart creates the ClusterRole, ClusterRoleBinding, and ServiceAccount automatically.
+Every rule is load-bearing. `postgrespolicyplans` is required to apply anything
+at all, because each apply goes through a plan; `configmaps` stores plan SQL
+above the inline size limit. The `manage` verb is a logical permission with no
+built-in meaning: admission policy uses it to authorize operator-owned request
+lifecycle changes without hard-coding a service account identity, which is why
+the operator holds it while holding neither `use` nor `approve`. See
+[securing ephemeral access](/docs/ephemeral-access-security).
+
+The Helm chart creates the ClusterRole, ClusterRoleBinding, and ServiceAccount
+automatically. `charts/pgroles-operator/templates/clusterrole.yaml` is the source
+of truth; check it against this table before hand-writing a role.

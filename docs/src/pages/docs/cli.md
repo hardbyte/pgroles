@@ -3,7 +3,7 @@ title: CLI commands
 description: Reference for all pgroles CLI commands and options.
 ---
 
-The `pgroles` CLI provides seven commands for managing PostgreSQL role policies. {% .lead %}
+The `pgroles` CLI provides eight commands for managing PostgreSQL role policies. {% .lead %}
 
 ---
 
@@ -50,6 +50,7 @@ pgroles diff --bundle path/to/pgroles.bundle.yaml --database-url postgres://loca
 | `--format` | Output format: `sql` (default), `summary`, or `json` |
 | `--mode` | Reconciliation mode: `authoritative` (default), `additive`, or `adopt` |
 | `--exit-code` | Exit with code 2 when drift is detected (default: `true`) |
+| `--no-exit-code` | Always exit 0, even when drift is detected |
 
 The `sql` format prints the full SQL script. The `summary` format shows counts of each change type.
 
@@ -287,7 +288,7 @@ The command patches the policy annotation `reconcile.pgroles.io/requestedAt` wit
 |---|---|
 | `-n`, `--namespace` | Kubernetes namespace containing the `PostgresPolicy` (default: `default`) |
 | `--wait` | Poll the policy until `status.lastHandledReconcileAt` reaches the requested timestamp |
-| `--timeout` | Maximum wait duration, e.g. `30s`, `2m`, or `1m30s` (default: `2m`) |
+| `--timeout` | Maximum wait duration, e.g. `30s`, `2m`, or `1m30s` (default: `2m`). Requires `--wait` |
 
 ## graph
 

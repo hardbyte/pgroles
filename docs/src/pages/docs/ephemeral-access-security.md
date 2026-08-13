@@ -3,8 +3,6 @@ title: Securing ephemeral access
 description: Trust models, admission controls, audit, and abuse resistance for ephemeral PostgreSQL access.
 ---
 
-# Securing ephemeral access
-
 The pgroles operator enforces bounded PostgreSQL membership and safe lifecycle
 transitions. Your deployment must establish who may request, approve, and
 administer that lifecycle, and must retain authenticated evidence outside the

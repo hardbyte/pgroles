@@ -31,7 +31,7 @@ For databases where multiple schemas share the same access pattern (a `*_reader`
 pgroles generate --database-url $DATABASE_URL --suggest-profiles > pgroles.yaml
 ```
 
-The suggester extracts reusable [profiles](/docs/profiles) deterministically and only commits to them when round-trip equivalence with the flat manifest is verified. Roles that don't fit a uniform pattern stay flat. See the [CLI reference](/docs/cli#refining-with---suggest-profiles) for details.
+The suggester extracts reusable [profiles](/docs/profiles) deterministically and only commits to them when round-trip equivalence with the flat manifest is verified. Roles that don't fit a uniform pattern stay flat. See the [CLI reference](/docs/cli#refining-with-suggest-profiles) for details.
 
 ### 2. Plan mode first
 
@@ -40,6 +40,7 @@ Deploy with `mode: plan` to see what pgroles *would* do without executing any SQ
 ```yaml
 spec:
   mode: plan
+  approval: manual
   reconciliation_mode: additive
 ```
 
@@ -62,6 +63,7 @@ Switch to `mode: apply` with `reconciliation_mode: additive`. This applies all n
 ```yaml
 spec:
   mode: apply
+  approval: auto
   reconciliation_mode: additive
 ```
 

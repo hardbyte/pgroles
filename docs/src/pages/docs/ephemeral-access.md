@@ -3,8 +3,6 @@ title: Ephemeral access
 description: Request, approve, and revoke bounded PostgreSQL role memberships.
 ---
 
-# Ephemeral PostgreSQL access
-
 Ephemeral access grants an existing PostgreSQL identity one predefined bundle of
 role memberships for a bounded duration. `PostgresPolicy` remains the durable
 source of truth; an `EphemeralAccessPolicy` defines a requestable bundle, and an
@@ -57,6 +55,25 @@ Ephemeral access requires PostgreSQL 16 or later so that `inherit` is enforced
 on each membership. Setting `inherit: false` creates set-role-only access: the
 subject must explicitly run `SET ROLE`, rather than inheriting the granted
 role's privileges immediately.
+
+`pendingRequestTTL` defaults to `15m` when omitted: a request that is not
+approved within that window becomes `ApprovalExpired` and cannot be revived.
+
+### Cluster ceilings
+
+Two operator environment variables cap what any access policy may ask for. They
+are the only cluster-wide limit on ephemeral access, so set them before enabling
+the feature — a namespace `ResourceQuota` bounds how many objects exist, not how
+long access lasts.
+
+| Variable | Default | Bounds |
+| --- | --- | --- |
+| `EPHEMERAL_ACCESS_MAXIMUM_DURATION` | `24h` | `spec.maximumDuration` |
+| `EPHEMERAL_ACCESS_MAX_PENDING_TTL` | `1h` | `spec.pendingRequestTTL` |
+
+An access policy exceeding either ceiling is rejected with `Accepted=False` and
+reason `DurationExceedsClusterMaximum`, so it never becomes requestable. Set them
+through `operator.env` in the Helm chart.
 
 ## Create a request
 

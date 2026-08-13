@@ -81,12 +81,12 @@ The login roles (`app_runtime`, `analyst`) get access through memberships rather
 
 | Section | Defines | Referenced by |
 |---|---|---|
-| [`default_owner`](/docs/manifest-reference#default_owner) | Default object-creator role for future grants | `default_privileges`, `profiles`, `schemas` |
+| [`default_owner`](/docs/manifest-reference#default-owner) | Default object-creator role for future grants | `default_privileges`, `profiles`, `schemas` |
 | [`profiles`](/docs/manifest-reference#profiles) | Reusable schema-relative grant templates | `schemas[].profiles` |
 | [`schemas`](/docs/manifest-reference#schemas) | Managed schemas and profile bindings | `profiles`, generated roles, generated grants |
 | [`roles`](/docs/manifest-reference#roles) | Explicit PostgreSQL roles | `grants`, `memberships`, `default_privileges` |
 | [`grants`](/docs/manifest-reference#grants) | Current object privileges | role names and object targets |
-| [`default_privileges`](/docs/manifest-reference#default_privileges) | Future object privileges | owner roles, grantee roles, schemas |
+| [`default_privileges`](/docs/manifest-reference#default-privileges) | Future object privileges | owner roles, grantee roles, schemas |
 | [`memberships`](/docs/manifest-reference#memberships) | Role inheritance edges | parent roles and member roles |
 | [`retirements`](/docs/manifest-reference#retirements) | Safe role removal workflow | roles omitted from desired state |
 
