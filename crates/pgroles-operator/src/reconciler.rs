@@ -741,6 +741,25 @@ async fn reconcile_apply_inner(
 
     info!(name, namespace, "starting reconciliation");
 
+    // Reported here, before any fallible work, so a policy that relies on the
+    // deprecated inference is counted even when this reconcile later fails on
+    // an unrelated problem — otherwise the remaining exposure looks smaller
+    // than it is. The condition itself is applied in `update_status`.
+    if resource.spec.approval.is_none() {
+        let inferred = match resource.spec.effective_approval() {
+            crate::crd::ApprovalMode::Auto => "auto",
+            crate::crd::ApprovalMode::Manual => "manual",
+        };
+        tracing::warn!(
+            name,
+            namespace,
+            inferred,
+            "spec.approval is not set and is being inferred from spec.mode; this inference is \
+             deprecated and will become an error in a future release"
+        );
+        ctx.observability.record_deprecated_approval_unset(inferred);
+    }
+
     // Update status to "Reconciling".
     // Note: do NOT clear last_error here — it should persist until a successful
     // reconcile clears it. Clearing on every retry cycle would race with the
@@ -1019,22 +1038,6 @@ async fn apply_under_lock(
     let sql_ctx = detect_sql_context(pool, &inspect_config).await?;
 
     let effective_approval = resource.spec.effective_approval();
-    if resource.spec.approval.is_none() {
-        let inferred = match effective_approval {
-            crate::crd::ApprovalMode::Auto => "auto",
-            crate::crd::ApprovalMode::Manual => "manual",
-        };
-        // Logged as well as surfaced on status: Kubernetes Events expire, so a
-        // deployment that only ships logs still sees the deprecation.
-        tracing::warn!(
-            name,
-            namespace,
-            inferred,
-            "spec.approval is not set and is being inferred from spec.mode; this inference is \
-             deprecated and will become an error in a future release"
-        );
-        ctx.observability.record_deprecated_approval_unset(inferred);
-    }
 
     if resource.spec.mode == PolicyMode::Plan {
         let drift_detected = !changes.is_empty();
@@ -1061,6 +1064,9 @@ async fn apply_under_lock(
 
         // Create a PostgresPolicyPlan resource for changes (if any).
         let mut plan_ref_name = None;
+        // Tracks a plan that someone approved even though this policy never
+        // executes, so the pointless approval is reported rather than ignored.
+        let mut ignored_approval_plan = None;
         if drift_detected {
             let creation_result = crate::plan::create_or_update_plan(
                 &ctx.kube_client,
@@ -1075,20 +1081,38 @@ async fn apply_under_lock(
             .await?;
             let plan_name = creation_result.plan_name().to_string();
 
+            let plans_api: Api<PostgresPolicyPlan> =
+                Api::namespaced(ctx.kube_client.clone(), namespace);
+            let plan = plans_api.get(&plan_name).await?;
+
             // Only emit PlanCreated event for genuinely new plans, not dedup hits.
             if creation_result.is_created() {
-                let plans_api: Api<PostgresPolicyPlan> =
-                    Api::namespaced(ctx.kube_client.clone(), namespace);
-                let created_plan = plans_api.get(&plan_name).await?;
                 emit_plan_event(
                     ctx,
                     resource,
-                    &created_plan,
+                    &plan,
                     PlanEventType::Created {
                         change_count: summary.total,
                     },
                 )
                 .await;
+            }
+
+            // Plan mode returns without ever consulting spec.approval, so an
+            // approval annotation here is inert. Left unreported it looks like
+            // the operator is stuck rather than working as designed.
+            if matches!(
+                crate::plan::check_plan_approval(&plan),
+                crate::plan::PlanApprovalState::Approved
+            ) {
+                tracing::warn!(
+                    name,
+                    namespace,
+                    plan = %plan_name,
+                    "plan is approved but spec.mode is `plan`; approval has no effect and no SQL \
+                     will run"
+                );
+                ignored_approval_plan = Some(plan_name.clone());
             }
 
             crate::plan::update_policy_plan_ref(&ctx.kube_client, resource, &plan_name).await?;
@@ -1097,6 +1121,14 @@ async fn apply_under_lock(
         }
 
         update_status(ctx, resource, |status| {
+            match &ignored_approval_plan {
+                Some(plan) => {
+                    status.set_condition(crate::crd::approval_ignored_condition(plan));
+                }
+                None => status
+                    .conditions
+                    .retain(|c| c.condition_type != crate::crd::CONDITION_APPROVAL_IGNORED),
+            }
             status.set_condition(ready_condition(true, "Planned", &ready_message));
             status.set_condition(drifted_condition(
                 drift_detected,
@@ -2021,7 +2053,11 @@ where
     // Applied centrally rather than at each caller: every status write passes
     // through here, so the condition cannot be missed on one path or go stale
     // once the field is finally set.
-    apply_approval_deprecation_condition(resource, &mut status);
+    // Read the spec from `latest`, not the reconcile's snapshot: if the field
+    // was set while this reconcile ran, the snapshot would re-add a condition
+    // that no longer applies.
+    apply_approval_deprecation_condition(&latest, &mut status);
+    clear_stale_approval_ignored_condition(&latest, &mut status);
 
     let patch = serde_json::json!({
         "status": status
@@ -2060,6 +2096,20 @@ fn apply_approval_deprecation_condition(
     status.set_condition(crate::crd::approval_unset_condition(
         resource.spec.effective_approval(),
     ));
+}
+
+/// Clear `ApprovalIgnored` for any policy that is not in plan mode. The plan
+/// path maintains the condition itself; this only stops a stale one surviving a
+/// switch to `mode: apply`, where an approval is no longer ignored.
+fn clear_stale_approval_ignored_condition(
+    resource: &PostgresPolicy,
+    status: &mut PostgresPolicyStatus,
+) {
+    if resource.spec.mode != PolicyMode::Plan {
+        status
+            .conditions
+            .retain(|condition| condition.condition_type != crate::crd::CONDITION_APPROVAL_IGNORED);
+    }
 }
 
 async fn detect_policy_conflict(
@@ -2437,6 +2487,35 @@ mod tests {
         assert!(
             approval_condition(&status).is_none(),
             "stale condition should be removed when approval becomes explicit"
+        );
+    }
+
+    #[test]
+    fn stale_approval_ignored_condition_cleared_when_leaving_plan_mode() {
+        let mut policy = valid_role_policy("p", "app", "s");
+        policy.spec.mode = PolicyMode::Plan;
+        let mut status = PostgresPolicyStatus::default();
+        status.set_condition(crate::crd::approval_ignored_condition("p-plan-1"));
+
+        // Still in plan mode: the plan path owns the condition, leave it alone.
+        clear_stale_approval_ignored_condition(&policy, &mut status);
+        assert!(
+            status
+                .conditions
+                .iter()
+                .any(|c| c.condition_type == crate::crd::CONDITION_APPROVAL_IGNORED),
+            "plan mode must keep the condition the plan path maintains"
+        );
+
+        // Switched to apply: an approval is honoured now, so the warning is wrong.
+        policy.spec.mode = PolicyMode::Apply;
+        clear_stale_approval_ignored_condition(&policy, &mut status);
+        assert!(
+            !status
+                .conditions
+                .iter()
+                .any(|c| c.condition_type == crate::crd::CONDITION_APPROVAL_IGNORED),
+            "leaving plan mode must clear the stale warning"
         );
     }
 

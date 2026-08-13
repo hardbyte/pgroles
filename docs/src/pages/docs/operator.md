@@ -573,10 +573,11 @@ order. Only the last one is about human review:
 **`approval` has no effect in `plan` mode.** A plan-mode policy computes the
 diff, publishes a `PostgresPolicyPlan`, and returns before it ever consults
 `approval`. Annotating that plan with `pgroles.io/approved=true` is accepted by
-the API server and then does nothing: the plan stays `Pending`, no SQL runs, and
-no condition or Event explains the no-op. If you want a reviewed apply, the
-combination you want is `mode: apply` with `approval: manual` — plan mode is for
-looking, not for gated applying.
+the API server and then does nothing: the plan stays `Pending` and no SQL runs.
+Because that is indistinguishable from a stalled operator, the policy reports an
+`ApprovalIgnored` condition naming the plan and emits a warning Event. If you
+want a reviewed apply, the combination you want is `mode: apply` with
+`approval: manual` — plan mode is for looking, not for gated applying.
 
 Execution never trusts stored SQL. An approved plan is re-rendered from the
 current diff and its hash compared against the approved one, so the plan object
@@ -826,6 +827,15 @@ status:
 | `Drifted` | `True` when `plan` mode found pending changes |
 | `Reconciling` | `True` while a reconciliation is in progress |
 | `Degraded` | `True` when the last reconciliation failed (includes error detail) |
+| `Conflict` | `True` when another policy targets the same database with overlapping ownership |
+| `Paused` | `True` while `spec.suspend` stops reconciliation |
+| `ApprovalUnset` | `True` while `spec.approval` is omitted and inferred from `spec.mode` (deprecated) |
+| `ApprovalIgnored` | `True` when a plan is approved but `spec.mode: plan` means it will never execute |
+
+`ApprovalUnset` and `ApprovalIgnored` are advisory: they report a configuration
+that will not do what it looks like, and neither indicates a failed
+reconciliation. Both clear on the next reconcile once the configuration is
+corrected.
 
 On failure, the operator chooses a retry path based on the failure mode:
 

@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Approving a plan that can never execute is now reported instead of silently ignored.** A policy in `spec.mode: plan` computes a diff and publishes a `PostgresPolicyPlan`, but returns before it consults `spec.approval` — so annotating that plan with `pgroles.io/approved=true` is accepted by the API server and then does nothing. Since that is indistinguishable from a stalled operator, the policy now reports an `ApprovalIgnored` condition naming the plan, emits a warning Event once, and logs each reconcile; the condition points at `mode: apply` with `approval: manual`, which is the combination that actually gates an apply. The condition clears when the annotation is removed or the policy leaves plan mode.
+
 ### Deprecated
 
 - **Omitting `spec.approval` on a `PostgresPolicy` is deprecated; a future release will reject it.** Behaviour is unchanged in this release: the value is still inferred from `spec.mode` (`apply` → `auto`, `plan` → `manual`), so no policy changes what it does on upgrade. The problem with the inference is that it hides a safety-critical property — whether a human gates SQL execution — behind an unrelated field, so `kubectl get pgr -o yaml` cannot tell you whether a policy applies DDL on its own. Because `spec.mode` itself defaults to `apply`, the most minimal policy is an auto-applying one. A policy relying on the inference now reports an `ApprovalUnset` status condition naming the value it resolved to, emits a warning Event once on transition, logs a warning each reconcile, and increments `pgroles.deprecated.approval_unset`. **Migration:** write down the value you already get — `approval: auto` under `mode: apply`, `approval: manual` under `mode: plan` — and the condition clears on the next reconcile. Do not skip straight to `manual` on an `apply` policy unless you intend to gate it: a policy awaiting approval reports `Ready=True` while applying nothing, so the pause is easy to miss. (#73)

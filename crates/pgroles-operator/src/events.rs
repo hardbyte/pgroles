@@ -192,6 +192,21 @@ fn derive_status_events(
         events.push(event(EventType::Normal, reason, "StatusTransition", note));
     }
 
+    if transitioned_to_true(
+        old_status,
+        new_status,
+        crate::crd::CONDITION_APPROVAL_IGNORED,
+    ) {
+        let note = condition_message(new_status, crate::crd::CONDITION_APPROVAL_IGNORED)
+            .unwrap_or_else(|| "Plan approval has no effect in plan mode".to_string());
+        events.push(event(
+            EventType::Warning,
+            "ApprovalIgnored",
+            "StatusTransition",
+            note,
+        ));
+    }
+
     if transitioned_to_true(old_status, new_status, crate::crd::CONDITION_APPROVAL_UNSET) {
         let note = condition_message(new_status, crate::crd::CONDITION_APPROVAL_UNSET)
             .unwrap_or_else(|| "spec.approval is not set and is being inferred".to_string());
@@ -488,6 +503,31 @@ mod tests {
         assert_eq!(reasons(&events), vec!["GcpAuthFailed"]);
         assert!(matches!(events[0].type_, EventType::Warning));
         assert_eq!(events[0].note.as_deref(), Some("token request rejected"));
+    }
+
+    #[test]
+    fn emits_approval_ignored_warning_once_on_transition() {
+        let mut new_status = PostgresPolicyStatus::default();
+        new_status.set_condition(crate::crd::approval_ignored_condition("policy-plan-123"));
+
+        let events = derive_status_events(None, &new_status);
+        let ignored = events
+            .iter()
+            .find(|e| e.reason == "ApprovalIgnored")
+            .expect("expected an ApprovalIgnored event");
+        assert!(matches!(ignored.type_, EventType::Warning));
+        assert!(
+            ignored.note.as_deref().is_some_and(
+                |note| note.contains("policy-plan-123") && note.contains("mode: apply")
+            ),
+            "the note should name the plan and the combination that does execute"
+        );
+
+        let events = derive_status_events(Some(&new_status), &new_status);
+        assert!(
+            !reasons(&events).contains(&"ApprovalIgnored"),
+            "steady state should not keep re-emitting the warning"
+        );
     }
 
     #[test]

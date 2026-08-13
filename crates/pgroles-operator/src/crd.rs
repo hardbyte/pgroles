@@ -2023,6 +2023,29 @@ pub fn conflict_condition(reason: &str, message: &str) -> PolicyCondition {
 /// inferred from `spec.mode`. Removed once the field becomes required.
 pub const CONDITION_APPROVAL_UNSET: &str = "ApprovalUnset";
 
+/// Condition type reporting that a plan carries an approval annotation which
+/// cannot take effect, because `spec.mode: plan` never executes.
+pub const CONDITION_APPROVAL_IGNORED: &str = "ApprovalIgnored";
+
+/// Helper to create an "ApprovalIgnored" condition.
+///
+/// Approving a plan under `spec.mode: plan` is accepted by the API server and
+/// then does nothing at all, which is indistinguishable from an operator that
+/// has stalled. Say so on the object, and name the combination that does gate
+/// an apply.
+pub fn approval_ignored_condition(plan_name: &str) -> PolicyCondition {
+    PolicyCondition {
+        condition_type: CONDITION_APPROVAL_IGNORED.to_string(),
+        status: "True".to_string(),
+        reason: Some("PlanModeNeverExecutes".to_string()),
+        message: Some(format!(
+            "Plan {plan_name} is approved, but spec.mode is `plan`, so it will never execute and \
+             no SQL will run. For a reviewed apply use `mode: apply` with `approval: manual`."
+        )),
+        last_transition_time: Some(now_rfc3339()),
+    }
+}
+
 /// Helper to create an "ApprovalUnset" condition naming the inferred mode.
 ///
 /// The message states the resolved value rather than only the deprecation, so

@@ -51,11 +51,14 @@ wait_for_ready_reason() {
   wait_for_ready_status_reason "$policy" "False" "$expected_reason"
 }
 
+# Empty output means the condition is absent, so a failed read must be a
+# non-zero exit rather than empty output — otherwise a deleted policy or an API
+# outage looks exactly like "the condition is not set" and assertions pass.
 policy_condition_status() {
   local policy="$1"
   local condition="$2"
   kubectl get pgr "$policy" \
-    -o jsonpath="{.status.conditions[?(@.type==\"$condition\")].status}" 2>/dev/null || true
+    -o jsonpath="{.status.conditions[?(@.type==\"$condition\")].status}" 2>/dev/null
 }
 
 wait_for_condition_status() {
@@ -63,12 +66,15 @@ wait_for_condition_status() {
   local condition="$2"
   local expected="$3"
   for i in $(seq 1 30); do
-    status="$(policy_condition_status "$policy" "$condition")"
-    if [ "$status" = "$expected" ]; then
-      echo "$policy reached $condition=$expected"
-      return 0
+    if status="$(policy_condition_status "$policy" "$condition")"; then
+      if [ "$status" = "$expected" ]; then
+        echo "$policy reached $condition=$expected"
+        return 0
+      fi
+      echo "Waiting for $policy $condition=$expected (currently '${status:-absent}', attempt $i/30)"
+    else
+      echo "Waiting for $policy $condition=$expected (read failed, attempt $i/30)"
     fi
-    echo "Waiting for $policy $condition=$expected (currently '${status:-absent}', attempt $i/30)"
     sleep 3
   done
   echo "::error::$policy did not reach $condition=$expected"
@@ -79,13 +85,37 @@ wait_for_condition_status() {
 assert_condition_absent() {
   local policy="$1"
   local condition="$2"
-  status="$(policy_condition_status "$policy" "$condition")"
+  if ! status="$(policy_condition_status "$policy" "$condition")"; then
+    echo "::error::could not read $condition from $policy; absence is unproven"
+    return 1
+  fi
   if [ -n "$status" ]; then
     echo "::error::$policy unexpectedly reports $condition=$status"
     kubectl get pgr "$policy" -o yaml || true
     return 1
   fi
   echo "$policy has no $condition condition, as expected"
+}
+
+# Clearing a condition takes a reconcile, so an immediate assert would race.
+wait_for_condition_absent() {
+  local policy="$1"
+  local condition="$2"
+  for i in $(seq 1 30); do
+    if status="$(policy_condition_status "$policy" "$condition")"; then
+      if [ -z "$status" ]; then
+        echo "$policy no longer reports $condition"
+        return 0
+      fi
+      echo "Waiting for $policy to clear $condition (currently $status, attempt $i/30)"
+    else
+      echo "Waiting for $policy to clear $condition (read failed, attempt $i/30)"
+    fi
+    sleep 3
+  done
+  echo "::error::$policy did not clear $condition"
+  kubectl get pgr "$policy" -o yaml || true
+  return 1
 }
 
 wait_for_drift_status() {
@@ -299,21 +329,41 @@ reject_plan() {
 get_plan_sql() {
   local plan="$1"
   local inline
-  inline="$(kubectl get pgplan "$plan" -o jsonpath='{.status.sqlInline}' 2>/dev/null || true)"
+  # Empty output is reserved for a plan with no stored SQL, so every read here
+  # must fail loudly instead of falling through to that branch.
+  if ! inline="$(kubectl get pgplan "$plan" -o jsonpath='{.status.sqlInline}' 2>/dev/null)"; then
+    echo "::error::could not read PostgresPolicyPlan $plan" >&2
+    return 1
+  fi
   if [ -n "$inline" ]; then
     echo "$inline"
     return 0
   fi
   local cm_name cm_key compression escaped_key
-  cm_name="$(kubectl get pgplan "$plan" -o jsonpath='{.status.sqlRef.name}' 2>/dev/null || true)"
-  cm_key="$(kubectl get pgplan "$plan" -o jsonpath='{.status.sqlRef.key}' 2>/dev/null || true)"
-  compression="$(kubectl get pgplan "$plan" -o jsonpath='{.status.sqlRef.compression}' 2>/dev/null || true)"
-  # No sqlRef is a real outcome, not a failure: a plan too large to store even
-  # compressed keeps a truncated preview in sqlInline instead. Empty output is
-  # reserved for that case, so retrieval failures below must not look like it.
-  if [ -z "$cm_name" ] || [ -z "$cm_key" ]; then
+  if ! cm_name="$(kubectl get pgplan "$plan" -o jsonpath='{.status.sqlRef.name}' 2>/dev/null)"; then
+    echo "::error::could not read sqlRef.name from PostgresPolicyPlan $plan" >&2
+    return 1
+  fi
+  if ! cm_key="$(kubectl get pgplan "$plan" -o jsonpath='{.status.sqlRef.key}' 2>/dev/null)"; then
+    echo "::error::could not read sqlRef.key from PostgresPolicyPlan $plan" >&2
+    return 1
+  fi
+  if ! compression="$(kubectl get pgplan "$plan" \
+    -o jsonpath='{.status.sqlRef.compression}' 2>/dev/null)"; then
+    echo "::error::could not read sqlRef.compression from PostgresPolicyPlan $plan" >&2
+    return 1
+  fi
+  # No sqlRef at all is a real outcome, not a failure: a plan too large to store
+  # even compressed keeps a truncated preview in sqlInline instead.
+  if [ -z "$cm_name" ] && [ -z "$cm_key" ]; then
     echo ""
     return 0
+  fi
+  # A half-populated sqlRef is neither of those, and silently reading it as
+  # "absent" would hide a malformed plan.
+  if [ -z "$cm_name" ] || [ -z "$cm_key" ]; then
+    echo "::error::PostgresPolicyPlan $plan has an incomplete sqlRef (name='$cm_name' key='$cm_key')" >&2
+    return 1
   fi
   # The key contains dots (plan.sql.gz), which jsonpath reads as nested fields
   # unless they are escaped inside bracket notation.

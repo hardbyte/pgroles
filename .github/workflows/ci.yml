@@ -364,6 +364,16 @@ jobs:
           assert_role_absent plan-preview-user
           wait_for_event_reason plan-policy DriftDetected
 
+          # Approving a plan-mode plan can never execute. The policy must say so
+          # rather than look stalled, and must still not touch the database.
+          assert_condition_absent plan-policy ApprovalIgnored
+          approve_plan "$plan_preview_plan"
+          wait_for_condition_status plan-policy ApprovalIgnored True
+          wait_for_event_reason plan-policy ApprovalIgnored
+          assert_role_absent plan-preview-user
+          kubectl annotate pgplan "$plan_preview_plan" pgroles.io/approved- --overwrite
+          wait_for_condition_absent plan-policy ApprovalIgnored
+
           upsert_secret rotating-postgres-credentials \
             DATABASE_URL='postgres://postgres:devpassword@postgres.default.svc.cluster.local:5432/postgres'
           kubectl apply -f k8s/samples/rotated-secret-policy.yaml
