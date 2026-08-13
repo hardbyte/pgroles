@@ -534,10 +534,13 @@ status:
   last_reconcile_mode: plan
 ```
 
-Read the rendered SQL from the plan the policy points at:
+The rendered SQL lives on the plan, so start from the policy name you already
+have and follow `current_plan_ref` to it:
 
 ```bash
-kubectl get pgplan plan-policy-plan-20260512-090308-118e50e437c9 -o jsonpath='{.status.sqlInline}'
+POLICY=plan-policy
+PLAN="$(kubectl get pgr "$POLICY" -o jsonpath='{.status.current_plan_ref.name}')"
+kubectl get pgplan "$PLAN" -o jsonpath='{.status.sqlInline}'
 ```
 
 ```text
@@ -546,10 +549,34 @@ COMMENT ON ROLE "plan-preview-user" IS 'Preview-only role';
 GRANT CONNECT ON DATABASE "postgres" TO "plan-preview-user";
 ```
 
-Plans above the inline size limit set `status.sqlRef` instead, naming a ConfigMap
-whose `plan.sql.gz` entry holds the gzipped SQL under `binaryData`. A plan whose
-compressed preview would still exceed the ConfigMap limit sets no `sqlRef` at
-all, and `status.sqlInline` carries a truncated preview ending in a
+To see every plan a policy has produced rather than just the current one, list
+plans and read the `POLICY` column, which carries the full policy name:
+
+```bash
+kubectl get pgplan
+```
+
+```text
+NAME                                                     POLICY        MODE            APPROVED   CHANGES   PHASE     AGE
+plan-policy-plan-20260512-090308-118e50e437c9            plan-policy   authoritative   False      2         Pending   3s
+```
+
+Avoid selecting plans with `-l pgroles.io/policy=<name>`. That label is a
+server-side prefilter truncated to 63 bytes, so it is not an identity and two
+policies sharing a long prefix select each other's plans.
+
+Plans above the inline size limit set `status.sqlRef` instead of `sqlInline`,
+naming a ConfigMap whose `plan.sql.gz` entry holds the gzipped SQL under
+`binaryData`. Fetching that takes a decode step:
+
+```bash
+CM="$(kubectl get pgplan "$PLAN" -o jsonpath='{.status.sqlRef.name}')"
+kubectl get configmap "$CM" -o jsonpath="{.binaryData['plan\.sql\.gz']}" |
+  base64 -d | gunzip
+```
+
+A plan whose compressed preview would still exceed the ConfigMap limit sets no
+`sqlRef` at all, and `status.sqlInline` carries a truncated preview ending in a
 `-- truncated: ... --` marker.
 
 The preview is a review artifact in every case. pgroles never executes stored
