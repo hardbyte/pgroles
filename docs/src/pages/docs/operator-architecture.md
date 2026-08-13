@@ -124,9 +124,10 @@ It also records:
 - transient failure count
 - change summary
 - last reconcile mode
-- planned SQL (truncated when needed for status size safety)
+- current plan reference
 
-This is the main operator-facing debugging surface for SREs.
+This is the main operator-facing debugging surface for SREs. The rendered SQL
+lives on the referenced `PostgresPolicyPlan` rather than in policy status.
 
 ## Observability
 
