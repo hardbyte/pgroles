@@ -267,14 +267,24 @@ get_plan_sql() {
     echo "$inline"
     return 0
   fi
-  local cm_name cm_key
+  local cm_name cm_key compression escaped_key
   cm_name="$(kubectl get pgplan "$plan" -o jsonpath='{.status.sqlRef.name}' 2>/dev/null || true)"
   cm_key="$(kubectl get pgplan "$plan" -o jsonpath='{.status.sqlRef.key}' 2>/dev/null || true)"
-  if [ -n "$cm_name" ] && [ -n "$cm_key" ]; then
-    kubectl get configmap "$cm_name" -o jsonpath="{.data.${cm_key}}" 2>/dev/null || true
+  compression="$(kubectl get pgplan "$plan" -o jsonpath='{.status.sqlRef.compression}' 2>/dev/null || true)"
+  if [ -z "$cm_name" ] || [ -z "$cm_key" ]; then
+    echo ""
     return 0
   fi
-  echo ""
+  # The key contains dots (plan.sql.gz), which jsonpath reads as nested fields
+  # unless they are escaped inside bracket notation.
+  escaped_key="${cm_key//./\\.}"
+  if [ "$compression" = "gzip" ]; then
+    # Compressed SQL is stored in binaryData, which kubectl returns base64-encoded.
+    kubectl get configmap "$cm_name" -o jsonpath="{.binaryData['${escaped_key}']}" 2>/dev/null |
+      base64 -d | gunzip
+    return 0
+  fi
+  kubectl get configmap "$cm_name" -o jsonpath="{.data['${escaped_key}']}" 2>/dev/null || true
 }
 
 wait_for_current_plan_ref() {
@@ -286,10 +296,12 @@ wait_for_current_plan_ref() {
       echo "$plan_name"
       return 0
     fi
-    echo "Waiting for $policy currentPlanRef... ($i/30)"
+    # Progress goes to stderr: every caller captures this function with $(...),
+    # so anything on stdout would be taken for the plan name.
+    echo "Waiting for $policy currentPlanRef... ($i/30)" >&2
     sleep 3
   done
-  echo "::error::$policy did not get currentPlanRef within timeout"
+  echo "::error::$policy did not get currentPlanRef within timeout" >&2
   return 1
 }
 

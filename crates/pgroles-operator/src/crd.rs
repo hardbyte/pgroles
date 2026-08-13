@@ -810,10 +810,6 @@ pub struct PostgresPolicyStatus {
     #[serde(default)]
     pub last_successful_reconcile_time: Option<String>,
 
-    /// Deprecated alias retained for compatibility with older status readers.
-    #[serde(default)]
-    pub last_reconcile_time: Option<String>,
-
     /// Last force-reconcile annotation value handled by the operator.
     #[serde(default, rename = "lastHandledReconcileAt")]
     pub last_handled_reconcile_at: Option<String>,
@@ -825,14 +821,6 @@ pub struct PostgresPolicyStatus {
     /// The reconciliation mode used for the last successful reconcile.
     #[serde(default)]
     pub last_reconcile_mode: Option<PolicyMode>,
-
-    /// Planned SQL for the last successful plan-mode reconcile.
-    #[serde(default)]
-    pub planned_sql: Option<String>,
-
-    /// Whether `planned_sql` was truncated to fit safely in status.
-    #[serde(default)]
-    pub planned_sql_truncated: bool,
 
     /// Canonical identity of the managed database target.
     #[serde(default)]
@@ -3397,7 +3385,6 @@ params:
         status.observed_generation = generation;
         status.last_attempted_generation = generation;
         status.last_successful_reconcile_time = Some(now_rfc3339());
-        status.last_reconcile_time = Some(now_rfc3339());
         status.change_summary = Some(summary);
         status.last_error = None;
 
@@ -3416,7 +3403,6 @@ params:
 
         // Verify timestamps set
         assert!(status.last_successful_reconcile_time.is_some());
-        assert!(status.last_reconcile_time.is_some());
 
         // Verify summary
         let summary = status.change_summary.as_ref().unwrap();

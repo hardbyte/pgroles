@@ -53,9 +53,6 @@ const SQLSTATE_UNDEFINED_TABLE: &str = "42P01";
 const SQLSTATE_UNDEFINED_FUNCTION: &str = "42883";
 const SQLSTATE_UNDEFINED_OBJECT: &str = "42704";
 
-/// Maximum amount of rendered planned SQL stored in status.
-const MAX_PLANNED_SQL_STATUS_BYTES: usize = 16 * 1024;
-
 enum ReconcileOutcome {
     Reconciled,
     Planned,
@@ -695,8 +692,6 @@ fn mark_reconcile_failure_status(
             && c.condition_type != "Conflict"
     });
     status.change_summary = None;
-    status.planned_sql = None;
-    status.planned_sql_truncated = false;
     if clear_current_plan_ref {
         status.current_plan_ref = None;
     }
@@ -734,8 +729,6 @@ async fn reconcile_apply_inner(
                 .retain(|c| c.condition_type != "Reconciling" && c.condition_type != "Drifted");
             status.last_attempted_generation = generation;
             status.last_error = None;
-            status.planned_sql = None;
-            status.planned_sql_truncated = false;
             status.transient_failure_count = 0;
         })
         .await?;
@@ -789,8 +782,6 @@ async fn reconcile_apply_inner(
                 .conditions
                 .retain(|c| c.condition_type != "Reconciling" && c.condition_type != "Drifted");
             status.change_summary = None;
-            status.planned_sql = None;
-            status.planned_sql_truncated = false;
             status.last_error = Some(conflict_message.clone());
             status.transient_failure_count = 0;
         })
@@ -1026,7 +1017,6 @@ async fn apply_under_lock(
 
     let summary = summarize_changes(&changes);
     let sql_ctx = detect_sql_context(pool, &inspect_config).await?;
-    let (planned_sql, planned_sql_truncated) = render_plan_sql_for_status(&changes, &sql_ctx);
 
     let effective_approval = resource.spec.effective_approval();
 
@@ -1090,7 +1080,6 @@ async fn apply_under_lock(
             plan_ref_name = Some(plan_name);
         }
 
-        // Still write deprecated planned_sql to status for backward compat.
         update_status(ctx, resource, |status| {
             status.set_condition(ready_condition(true, "Planned", &ready_message));
             status.set_condition(drifted_condition(
@@ -1107,11 +1096,8 @@ async fn apply_under_lock(
             status.observed_generation = generation;
             status.last_attempted_generation = generation;
             status.last_successful_reconcile_time = Some(crate::crd::now_rfc3339());
-            status.last_reconcile_time = Some(crate::crd::now_rfc3339());
             status.change_summary = Some(summary.clone());
             status.last_reconcile_mode = Some(PolicyMode::Plan);
-            status.planned_sql = planned_sql.clone();
-            status.planned_sql_truncated = planned_sql_truncated;
             status.last_error = None;
             status.transient_failure_count = 0;
             if let Some(ref plan_name) = plan_ref_name {
@@ -1229,11 +1215,8 @@ async fn apply_under_lock(
                 status.observed_generation = generation;
                 status.last_attempted_generation = generation;
                 status.last_successful_reconcile_time = Some(crate::crd::now_rfc3339());
-                status.last_reconcile_time = Some(crate::crd::now_rfc3339());
                 status.change_summary = Some(summary);
                 status.last_reconcile_mode = Some(PolicyMode::Apply);
-                status.planned_sql = None;
-                status.planned_sql_truncated = false;
                 status.last_error = None;
                 status.applied_password_source_versions = applied_password_source_versions;
                 status.transient_failure_count = 0;
@@ -1335,8 +1318,6 @@ async fn apply_under_lock(
                                 status.last_attempted_generation = generation;
                                 status.change_summary = Some(summary.clone());
                                 status.last_reconcile_mode = Some(PolicyMode::Apply);
-                                status.planned_sql = planned_sql.clone();
-                                status.planned_sql_truncated = planned_sql_truncated;
                                 status.last_error = None;
                                 status.transient_failure_count = 0;
                                 status.current_plan_ref = Some(crate::crd::PlanReference {
@@ -1431,11 +1412,8 @@ async fn apply_under_lock(
                             status.observed_generation = generation;
                             status.last_attempted_generation = generation;
                             status.last_successful_reconcile_time = Some(crate::crd::now_rfc3339());
-                            status.last_reconcile_time = Some(crate::crd::now_rfc3339());
                             status.change_summary = Some(summary);
                             status.last_reconcile_mode = Some(PolicyMode::Apply);
-                            status.planned_sql = None;
-                            status.planned_sql_truncated = false;
                             status.last_error = None;
                             status.applied_password_source_versions =
                                 applied_password_source_versions;
@@ -1512,8 +1490,6 @@ async fn apply_under_lock(
                             });
                             status.last_attempted_generation = generation;
                             status.change_summary = Some(summary.clone());
-                            status.planned_sql = planned_sql.clone();
-                            status.planned_sql_truncated = planned_sql_truncated;
                             status.last_error = None;
                             status.transient_failure_count = 0;
                         })
@@ -1540,11 +1516,8 @@ async fn apply_under_lock(
                     status.observed_generation = generation;
                     status.last_attempted_generation = generation;
                     status.last_successful_reconcile_time = Some(crate::crd::now_rfc3339());
-                    status.last_reconcile_time = Some(crate::crd::now_rfc3339());
                     status.change_summary = Some(summary);
                     status.last_reconcile_mode = Some(PolicyMode::Apply);
-                    status.planned_sql = None;
-                    status.planned_sql_truncated = false;
                     status.last_error = None;
                     status.applied_password_source_versions = applied_password_source_versions;
                     status.transient_failure_count = 0;
@@ -1609,8 +1582,6 @@ async fn apply_under_lock(
                 status.last_attempted_generation = generation;
                 status.change_summary = Some(summary.clone());
                 status.last_reconcile_mode = Some(PolicyMode::Apply);
-                status.planned_sql = planned_sql.clone();
-                status.planned_sql_truncated = planned_sql_truncated;
                 status.last_error = None;
                 status.transient_failure_count = 0;
                 status.current_plan_ref = Some(crate::crd::PlanReference {
@@ -1993,51 +1964,6 @@ pub(crate) async fn detect_sql_context(
         pgroles_core::sql::SqlContext::from_version_num(pg_version.version_num)
             .with_relation_inventory(relation_inventory),
     )
-}
-
-fn render_plan_sql_for_status(
-    changes: &[pgroles_core::diff::Change],
-    sql_ctx: &pgroles_core::sql::SqlContext,
-) -> (Option<String>, bool) {
-    if changes.is_empty() {
-        return (None, false);
-    }
-
-    // Render each change individually so we can redact passwords.
-    let rendered: String = changes
-        .iter()
-        .flat_map(|change| {
-            if let pgroles_core::diff::Change::SetPassword { name, .. } = change {
-                vec![format!(
-                    "ALTER ROLE {} PASSWORD '[REDACTED]';",
-                    pgroles_core::sql::quote_ident(name)
-                )]
-            } else {
-                pgroles_core::sql::render_statements_with_context(change, sql_ctx)
-            }
-        })
-        .collect::<Vec<_>>()
-        .join("\n");
-
-    let (truncated, did_truncate) = truncate_status_text(&rendered, MAX_PLANNED_SQL_STATUS_BYTES);
-    (Some(truncated), did_truncate)
-}
-
-fn truncate_status_text(text: &str, max_bytes: usize) -> (String, bool) {
-    if text.len() <= max_bytes {
-        return (text.to_string(), false);
-    }
-
-    let marker = "\n-- truncated for status --";
-    let target_len = max_bytes.saturating_sub(marker.len());
-    let mut end = target_len.min(text.len());
-    while end > 0 && !text.is_char_boundary(end) {
-        end -= 1;
-    }
-
-    let mut truncated = text[..end].to_string();
-    truncated.push_str(marker);
-    (truncated, true)
 }
 
 /// Emit a plan lifecycle event on the parent policy, logging warnings on failure.
@@ -2682,15 +2608,6 @@ mod tests {
     }
 
     #[test]
-    fn truncate_status_text_marks_truncation() {
-        let text = "x".repeat(MAX_PLANNED_SQL_STATUS_BYTES + 32);
-        let (truncated, did_truncate) = truncate_status_text(&text, MAX_PLANNED_SQL_STATUS_BYTES);
-        assert!(did_truncate);
-        assert!(truncated.len() <= MAX_PLANNED_SQL_STATUS_BYTES);
-        assert!(truncated.ends_with("-- truncated for status --"));
-    }
-
-    #[test]
     fn accumulate_summary_all_change_types() {
         use pgroles_core::diff::Change;
         use pgroles_core::model::RoleState;
@@ -2887,10 +2804,6 @@ mod tests {
                 total: 1,
                 ..Default::default()
             }),
-            planned_sql: Some(
-                "GRANT EXECUTE ON ALL ROUTINES IN SCHEMA \"app\" TO \"reader\";".into(),
-            ),
-            planned_sql_truncated: true,
             last_error: None,
             transient_failure_count: 3,
             current_plan_ref: Some(crate::crd::PlanReference {
@@ -2937,8 +2850,6 @@ mod tests {
             "transient planning and stale conflict conditions should be cleared on degraded status"
         );
         assert!(status.change_summary.is_none());
-        assert!(status.planned_sql.is_none());
-        assert!(!status.planned_sql_truncated);
         assert!(status.current_plan_ref.is_none());
         assert_eq!(status.last_error.as_deref(), Some(message));
         assert_eq!(status.transient_failure_count, 0);
@@ -2950,8 +2861,6 @@ mod tests {
             current_plan_ref: Some(crate::crd::PlanReference {
                 name: "approved-plan".into(),
             }),
-            planned_sql: Some("ALTER ROLE \"app\" LOGIN;".into()),
-            planned_sql_truncated: true,
             transient_failure_count: 2,
             ..Default::default()
         };
@@ -2971,8 +2880,6 @@ mod tests {
                 .map(|plan| plan.name.as_str()),
             Some("approved-plan")
         );
-        assert!(status.planned_sql.is_none());
-        assert!(!status.planned_sql_truncated);
         assert_eq!(
             status.last_error.as_deref(),
             Some("SQL execution error: connection closed")
@@ -3705,70 +3612,6 @@ mod tests {
         assert_eq!(
             retry_action(&resource, &error),
             Action::requeue(Duration::from_secs(10))
-        );
-    }
-
-    #[test]
-    fn render_plan_sql_for_status_redacts_passwords() {
-        let changes = vec![
-            pgroles_core::diff::Change::CreateRole {
-                name: "app-svc".to_string(),
-                state: pgroles_core::model::RoleState {
-                    login: true,
-                    ..pgroles_core::model::RoleState::default()
-                },
-            },
-            pgroles_core::diff::Change::SetPassword {
-                name: "app-svc".to_string(),
-                password: "super_secret_p@ssw0rd!".to_string(),
-            },
-        ];
-
-        let sql_ctx = pgroles_core::sql::SqlContext::default();
-        let (sql, truncated) = render_plan_sql_for_status(&changes, &sql_ctx);
-
-        let sql = sql.expect("expected non-empty planned SQL");
-        assert!(!truncated);
-        assert!(
-            sql.contains("[REDACTED]"),
-            "status SQL should contain [REDACTED], got: {sql}"
-        );
-        assert!(
-            !sql.contains("super_secret_p@ssw0rd!"),
-            "status SQL must NOT contain the actual password, got: {sql}"
-        );
-        assert!(
-            sql.contains("CREATE ROLE"),
-            "status SQL should still contain non-password changes, got: {sql}"
-        );
-    }
-
-    #[test]
-    fn render_plan_sql_for_status_empty_changes_returns_none() {
-        let sql_ctx = pgroles_core::sql::SqlContext::default();
-        let (sql, truncated) = render_plan_sql_for_status(&[], &sql_ctx);
-        assert!(sql.is_none());
-        assert!(!truncated);
-    }
-
-    #[test]
-    fn render_plan_sql_for_status_password_only_plan() {
-        let changes = vec![pgroles_core::diff::Change::SetPassword {
-            name: "db-user".to_string(),
-            password: "my_secret_pw".to_string(),
-        }];
-
-        let sql_ctx = pgroles_core::sql::SqlContext::default();
-        let (sql, _) = render_plan_sql_for_status(&changes, &sql_ctx);
-
-        let sql = sql.expect("expected non-empty planned SQL");
-        assert!(
-            sql.contains("[REDACTED]"),
-            "password-only plan should still show redacted SQL"
-        );
-        assert!(
-            !sql.contains("my_secret_pw"),
-            "password-only plan must NOT leak the password"
         );
     }
 

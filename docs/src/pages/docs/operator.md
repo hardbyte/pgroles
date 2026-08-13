@@ -377,7 +377,7 @@ Generated Secrets are created in the same namespace as the `PostgresPolicy`, own
 
 - Passwords are only allowed on roles with `login: true`.
 - Exactly one of `password.secretRef` or `password.generate` must be set.
-- Password values are redacted in operator logs and the `status.planned_sql` field.
+- Password values are redacted in operator logs and in the SQL preview stored on `PostgresPolicyPlan`.
 - If the referenced Secret or key is missing, the operator sets a `SecretMissing` or `SecretFetchFailed` status condition and retries on the normal interval.
 - Password updates are driven by password-source Secret changes. After a successful `apply`, unchanged password sources do not create permanent drift in later `plan` reconciles.
 - pgroles cannot detect direct password changes made in PostgreSQL outside the operator, because PostgreSQL does not expose comparable password state safely.
@@ -499,8 +499,7 @@ In `plan` mode:
 - the operator connects to the database and computes the full diff normally
 - no PostgreSQL SQL is executed
 - `status.change_summary` records the pending changes
-- `status.planned_sql` stores the rendered SQL, truncated if needed for status size safety
-- `status.current_plan_ref.name` points at the generated `PostgresPolicyPlan`
+- `status.current_plan_ref.name` points at the generated `PostgresPolicyPlan`, which holds the rendered SQL in `status.sqlInline` or, for larger plans, a gzipped ConfigMap referenced by `status.sqlRef`
 - `Ready=True` with reason `Planned`
 - `Drifted=True` when changes are pending, `Drifted=False` when the database is already in sync
 - for `password.generate`, the controller does not create or recreate the generated Kubernetes Secret while running in `plan` mode
@@ -533,12 +532,22 @@ status:
   current_plan_ref:
     name: plan-policy-plan-20260512-090308-118e50e437c9
   last_reconcile_mode: plan
-  planned_sql: |-
-    CREATE ROLE "plan-preview-user" LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE INHERIT NOREPLICATION NOBYPASSRLS;
-    COMMENT ON ROLE "plan-preview-user" IS 'Preview-only role';
-    GRANT CONNECT ON DATABASE "postgres" TO "plan-preview-user";
-  planned_sql_truncated: false
 ```
+
+Read the rendered SQL from the plan the policy points at:
+
+```bash
+kubectl get pgplan plan-policy-plan-20260512-090308-118e50e437c9 -o jsonpath='{.status.sqlInline}'
+```
+
+```text
+CREATE ROLE "plan-preview-user" LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE INHERIT NOREPLICATION NOBYPASSRLS;
+COMMENT ON ROLE "plan-preview-user" IS 'Preview-only role';
+GRANT CONNECT ON DATABASE "postgres" TO "plan-preview-user";
+```
+
+Plans above the inline size limit set `status.sqlRef` instead, naming a ConfigMap
+whose `plan.sql.gz` entry holds the gzipped SQL under `binaryData`.
 
 Use `suspend` when you want the controller to stop reconciling entirely. Use `plan` when you want it to keep inspecting and showing you what it would do.
 
@@ -698,7 +707,7 @@ status:
       message: "Applied 5 changes"
       last_transition_time: "2026-03-06T10:30:00Z"
   observed_generation: 3
-  last_reconcile_time: "2026-03-06T10:30:00Z"
+  last_successful_reconcile_time: "2026-03-06T10:30:00Z"
   lastHandledReconcileAt: "2026-03-06T10:31:00Z"
   transient_failure_count: 0
   change_summary:
