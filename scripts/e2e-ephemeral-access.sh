@@ -571,12 +571,14 @@ kubectl delete pgear ephemeral-denied --wait=true
 echo "Target suspension surfaces status and blocks new activation"
 kubectl patch pgr ephemeral-e2e --type=merge -p '{"spec":{"suspend":true}}'
 wait_access_policy_condition ephemeral-e2e-automatic Suspended True
-# The request has to outlive the whole suspend/unsuspend cycle below, which is
-# bounded by the Suspended probe plus two policy waits rather than by anything
-# this scenario asserts. A duration shorter than that races those waits and the
-# request expires to Ended before it can ever activate. Natural expiry has its
-# own scenario; here the request is deleted explicitly, so a long window is free.
-create_request ephemeral-target-suspended ephemeral-e2e-automatic 10m
+# The request has to outlive the suspend/unsuspend cycle below: its clock starts
+# at creation, but nothing checks it for Active until after the policy has gone
+# Ready again. At 30s it raced that wait and expired to Ended first. 2m is the
+# ceiling here — ephemeral-e2e-automatic sets maximumDuration: 2m in
+# k8s/samples/ephemeral-access-e2e.yaml, and exceeding it is rejected outright
+# rather than clamped. Natural expiry has its own scenario; this request is
+# deleted explicitly, so the wider window costs no wall-clock.
+create_request ephemeral-target-suspended ephemeral-e2e-automatic 2m
 for i in $(seq 1 30); do
   reason="$(kubectl get pgear ephemeral-target-suspended -o jsonpath='{.status.conditions[?(@.type=="Resolved")].reason}' 2>/dev/null || true)"
   [ "$reason" = "Suspended" ] && break
