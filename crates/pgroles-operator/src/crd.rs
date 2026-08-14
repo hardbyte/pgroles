@@ -195,6 +195,10 @@ pub const LABEL_DATABASE_IDENTITY: &str = "pgroles.io/database-identity";
 
 /// Label key for the plan name on SQL storage resources.
 pub const LABEL_PLAN: &str = "pgroles.io/plan";
+/// Routing hint for requests resolved from one access-policy UID.
+pub const LABEL_ACCESS_POLICY_UID: &str = "pgroles.io/access-policy-uid";
+/// Routing hint for requests resolved against one target-policy UID.
+pub const LABEL_TARGET_POLICY_UID: &str = "pgroles.io/target-policy-uid";
 
 impl From<CrdReconciliationMode> for pgroles_core::diff::ReconciliationMode {
     fn from(crd: CrdReconciliationMode) -> Self {

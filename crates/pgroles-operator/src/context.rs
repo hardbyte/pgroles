@@ -16,6 +16,7 @@ use tokio::sync::{Mutex, RwLock};
 
 use crate::crd::{ConnectionAuth, ConnectionSpec, SecretKeySelector};
 use crate::observability::OperatorObservability;
+use crate::request_index::RequestIndex;
 
 /// Minimum pool size required for reconciliation.
 ///
@@ -28,6 +29,25 @@ const POOL_MAX_CONNECTIONS: u32 = 5;
 const POOL_ACQUIRE_TIMEOUT_SECS: u64 = 10;
 
 const _: () = assert!(POOL_MAX_CONNECTIONS >= 2);
+
+/// How long a pooled connection may sit unused before it is closed.
+///
+/// Pools are cached for the operator's lifetime, so without this the operator
+/// holds connections open against every managed database forever. sqlx's
+/// default is 10 minutes — longer than the 5-minute default requeue interval,
+/// so a reconcile always re-touches the pool before the reaper drains it and
+/// the connections are never released. Reconnecting once per reconcile is
+/// cheap next to occupying a backend slot on an idle database around the clock.
+const POOL_IDLE_TIMEOUT_SECS: u64 = 60;
+
+/// Hard ceiling on connection age, independent of activity.
+///
+/// Bounds how long a reconcile can keep using a connection whose server-side
+/// state has drifted (failover, restarted pooler, rotated credentials).
+const POOL_MAX_LIFETIME_SECS: u64 = 30 * 60;
+
+/// Keep no connections open when nothing is reconciling.
+const POOL_MIN_CONNECTIONS: u32 = 0;
 
 const GCP_METADATA_TOKEN_ENDPOINT: &str =
     "http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token";
@@ -388,22 +408,33 @@ pub struct OperatorContext {
     /// Shared health/metrics state.
     pub observability: OperatorObservability,
 
+    /// Watch-fed indexes for relevant ephemeral requests.
+    pub request_index: RequestIndex,
+
+    /// Optional namespace which bounds every operator watch and list.
+    pub watch_namespace: Option<String>,
+
     /// Fetches short-lived provider-backed database passwords.
     gcp_token_provider: Arc<dyn GcpAccessTokenProvider>,
 }
 
 impl OperatorContext {
-    /// Create a new operator context with an empty pool cache.
-    pub fn new(
+    /// Create a context with the request index and watch scope shared by the
+    /// controller runtime.
+    pub fn new_with_runtime_config(
         kube_client: kube::Client,
         observability: OperatorObservability,
         event_recorder: Recorder,
+        request_index: RequestIndex,
+        watch_namespace: Option<String>,
     ) -> Self {
         Self {
             kube_client,
             event_recorder,
             pool_cache: Arc::new(RwLock::new(HashMap::new())),
             observability,
+            request_index,
+            watch_namespace,
             database_locks: Arc::new(Mutex::new(HashMap::new())),
             gcp_token_provider: Arc::new(MetadataGcpAccessTokenProvider::default()),
         }
@@ -750,9 +781,7 @@ impl OperatorContext {
         // connection for PostgreSQL advisory locking and needs additional pool
         // capacity for inspection/apply queries.
         let set_role = resolved.set_role.clone();
-        let pool = PgPoolOptions::new()
-            .max_connections(POOL_MAX_CONNECTIONS)
-            .acquire_timeout(Duration::from_secs(POOL_ACQUIRE_TIMEOUT_SECS))
+        let pool = pool_options()
             .after_connect(move |conn, _meta| {
                 let set_role = set_role.clone();
                 Box::pin(async move {
@@ -770,7 +799,7 @@ impl OperatorContext {
             .map_err(|err| classify_pool_connect_error(resolved.set_role.as_deref(), err))?;
 
         // Cache it (write lock).
-        {
+        let superseded = {
             let mut cache = self.pool_cache.write().await;
             cache.insert(
                 cache_key,
@@ -780,8 +809,9 @@ impl OperatorContext {
                     token_expires_at: resolved.token_expires_at,
                     pool: pool.clone(),
                 },
-            );
-        }
+            )
+        };
+        close_unreachable_pool(superseded);
 
         Ok(pool)
     }
@@ -829,9 +859,38 @@ impl OperatorContext {
     /// Remove a cached pool (e.g. when secret changes or CR is deleted).
     pub async fn evict_pool(&self, namespace: &str, connection: &ConnectionSpec) {
         let cache_key = connection.cache_key(namespace);
-        let mut cache = self.pool_cache.write().await;
-        cache.remove(&cache_key);
+        let evicted = {
+            let mut cache = self.pool_cache.write().await;
+            cache.remove(&cache_key)
+        };
+        close_unreachable_pool(evicted);
     }
+}
+
+/// Connection-pool sizing and lifetime shared by every managed database.
+fn pool_options() -> PgPoolOptions {
+    PgPoolOptions::new()
+        .max_connections(POOL_MAX_CONNECTIONS)
+        .min_connections(POOL_MIN_CONNECTIONS)
+        .acquire_timeout(Duration::from_secs(POOL_ACQUIRE_TIMEOUT_SECS))
+        .idle_timeout(Duration::from_secs(POOL_IDLE_TIMEOUT_SECS))
+        .max_lifetime(Duration::from_secs(POOL_MAX_LIFETIME_SECS))
+}
+
+/// Close a pool that is no longer reachable from the cache.
+///
+/// Dropping a `PgPool` only marks it closed: the backend connections are torn
+/// down when the last handle drops the socket, which PostgreSQL logs as an
+/// unexpected EOF. Closing explicitly sends a proper termination once in-flight
+/// reconciles hand their connections back. The close is spawned because it
+/// waits for those connections, and no caller should block on an eviction.
+fn close_unreachable_pool(cached: Option<CachedPool>) {
+    let Some(cached) = cached else {
+        return;
+    };
+    tokio::spawn(async move {
+        cached.pool.close().await;
+    });
 }
 
 fn database_target_from_url(database_url: &str) -> Result<(String, u16, String), String> {
@@ -931,6 +990,37 @@ impl ContextError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Pools are cached for the operator's lifetime, so the only thing that
+    /// ever closes an unused connection is the idle reaper. If the reap window
+    /// reaches the requeue interval, every reconcile re-touches the pool before
+    /// the reaper runs and the operator sits on open backends against every
+    /// managed database forever — which is what sqlx's 10-minute default did
+    /// against the 5-minute default requeue.
+    #[test]
+    fn idle_connections_are_reaped_between_reconciles() {
+        let options = pool_options();
+
+        assert_eq!(
+            options.get_min_connections(),
+            0,
+            "a floor above zero would hold connections open on an idle database"
+        );
+
+        let idle_timeout = options
+            .get_idle_timeout()
+            .expect("an unset idle timeout never reaps");
+        assert!(
+            idle_timeout < Duration::from_secs(crate::reconciler::DEFAULT_REQUEUE_SECS),
+            "idle timeout {idle_timeout:?} must drain within the {}s requeue interval",
+            crate::reconciler::DEFAULT_REQUEUE_SECS
+        );
+
+        assert!(
+            options.get_max_lifetime().is_some(),
+            "connections need an age ceiling independent of activity"
+        );
+    }
 
     #[test]
     fn database_target_fingerprint_excludes_credentials_and_options() {

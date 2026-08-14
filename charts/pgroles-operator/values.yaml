@@ -6,6 +6,10 @@ nameOverride: ""
 fullnameOverride: ""
 
 operator:
+  # -- Restrict every operator watch/list and its RBAC to one namespace. Empty
+  # means cluster-wide reconciliation.
+  watchNamespace: ""
+
   image:
     # -- Operator container image repository.
     repository: ghcr.io/hardbyte/pgroles-operator

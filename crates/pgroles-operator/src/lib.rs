@@ -13,3 +13,4 @@ pub mod observability;
 pub mod password;
 pub mod plan;
 pub mod reconciler;
+pub mod request_index;

@@ -184,6 +184,9 @@ Apply a namespace `ResourceQuota` for
 `count/ephemeralaccessrequests.pgroles.io` and
 `count/ephemeralaccesspolicies.pgroles.io`; the repository ships
 `k8s/security/ephemeral-access-resource-quota.yaml` as a tunable example.
+For a single-namespace installation, set the Helm value
+`operator.watchNamespace`; this scopes all watches and changes the chart RBAC
+from cluster-wide roles to a namespaced `Role` and `RoleBinding`.
 
 Deleting a request revokes its final-owner memberships through a finalizer.
 Deleting an access policy is revoke-all, while suspension blocks new activation

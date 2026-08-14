@@ -32,7 +32,7 @@ use crate::crd::{
 const FINALIZER: &str = "pgroles.io/finalizer";
 
 /// Default requeue interval when no interval is specified on the CR.
-const DEFAULT_REQUEUE_SECS: u64 = 300; // 5 minutes
+pub(crate) const DEFAULT_REQUEUE_SECS: u64 = 300; // 5 minutes
 
 /// Base requeue delay when lock contention is detected.
 const LOCK_CONTENTION_BASE_SECS: u64 = 10;
@@ -121,6 +121,9 @@ pub enum ReconcileError {
 
     #[error("resource has no namespace")]
     NoNamespace,
+
+    #[error("ephemeral request index unavailable: {0}")]
+    RequestIndexNotReady(#[from] crate::request_index::IndexNotReady),
 
     #[error("waiting for {0} attached ephemeral access policy/policies to be deleted")]
     PendingEphemeralAccessCleanup(usize),
@@ -369,6 +372,8 @@ fn retry_class(error: &finalizer::Error<ReconcileError>) -> RetryClass {
 fn retry_class_for_reconcile_error(error: &ReconcileError) -> RetryClass {
     match error {
         ReconcileError::LockContention(_, _) => RetryClass::LockContention,
+        // The watch resyncs on its own, so this clears without operator action.
+        ReconcileError::RequestIndexNotReady(_) => RetryClass::Transient,
         ReconcileError::PendingEphemeralAccessCleanup(_) => RetryClass::CleanupPending,
         ReconcileError::ManifestExpansion(_)
         | ReconcileError::InvalidInterval(_, _)
@@ -2118,7 +2123,10 @@ async fn detect_policy_conflict(
     identity: &DatabaseIdentity,
     ownership: &crate::crd::OwnershipClaims,
 ) -> Result<Option<String>, ReconcileError> {
-    let api: Api<PostgresPolicy> = Api::all(ctx.kube_client.clone());
+    let api: Api<PostgresPolicy> = match &ctx.watch_namespace {
+        Some(namespace) => Api::namespaced(ctx.kube_client.clone(), namespace),
+        None => Api::all(ctx.kube_client.clone()),
+    };
     let policies = api.list(&Default::default()).await?;
 
     Ok(detect_policy_conflict_in_list(
@@ -2202,6 +2210,7 @@ impl ReconcileError {
             ReconcileError::ConflictingPolicy(_) => "ConflictingPolicy",
             ReconcileError::UnsatisfiableWildcardGrant(_) => "UnsatisfiableWildcardGrant",
             ReconcileError::LockContention(_, _) => "LockContention",
+            ReconcileError::RequestIndexNotReady(_) => "RequestIndexNotReady",
             ReconcileError::Context(context) => match context.as_ref() {
                 ContextError::SecretFetch { .. } => "SecretFetchFailed",
                 ContextError::SecretMissing { .. } => "SecretMissing",

@@ -48,6 +48,17 @@ The operator currently reconciles from four event-driven trigger sources, plus t
 
 Generation and annotation filtering matter. The controller intentionally ignores status-only `PostgresPolicy` updates and unrelated annotation changes as reconcile triggers, otherwise successful status patches and GitOps tracking metadata can create hot loops that starve other policies targeting the same database.
 
+By default these watches cover all namespaces. Setting `WATCH_NAMESPACE` (or
+the Helm value `operator.watchNamespace`) scopes every policy, plan, Secret,
+access-policy, and access-request watch to one namespace. The chart also reduces
+the operator's RBAC to that namespace.
+
+Ephemeral requests share one reflector with a watch-fed index keyed by access
+policy name, resolved access-policy UID, and resolved target-policy UID. The
+index is refreshed atomically after watcher relists. Controller-owned UID labels
+are routing hints for server-side inspection; reconciliation always verifies the
+immutable UIDs stored in `status.resolvedAccess`.
+
 ### Database connection handling
 
 The operator resolves credentials from a Secret in the same namespace as the

@@ -50,11 +50,22 @@ struct Metrics {
     ephemeral_retained_memberships_total: Counter<u64>,
     ephemeral_expiry_lag_ms: Histogram<u64>,
     ephemeral_role_retirement_blocked_total: Counter<u64>,
+    ephemeral_cached_requests: Histogram<u64>,
+    ephemeral_relevant_requests: Histogram<u64>,
+    ephemeral_reconcile_duration_ms: Histogram<u64>,
+    ephemeral_reconcile_inflight: UpDownCounter<i64>,
 }
 
 pub struct ReconcileGuard {
     metrics: Option<Arc<Metrics>>,
     started_at: Instant,
+}
+
+pub struct EphemeralReconcileGuard {
+    metrics: Option<Arc<Metrics>>,
+    started_at: Instant,
+    kind: &'static str,
+    request_count_bucket: &'static str,
 }
 
 impl OperatorObservability {
@@ -263,6 +274,35 @@ impl OperatorObservability {
         }
     }
 
+    pub fn record_ephemeral_relevant_requests(&self, lookup: &'static str, count: usize) {
+        if let Some(metrics) = &self.metrics {
+            metrics
+                .ephemeral_relevant_requests
+                .record(count as u64, &[KeyValue::new("lookup", lookup)]);
+        }
+    }
+
+    pub fn start_ephemeral_reconcile(
+        &self,
+        kind: &'static str,
+        cached_requests: usize,
+    ) -> EphemeralReconcileGuard {
+        if let Some(metrics) = &self.metrics {
+            metrics
+                .ephemeral_cached_requests
+                .record(cached_requests as u64, &[]);
+            metrics
+                .ephemeral_reconcile_inflight
+                .add(1, &[KeyValue::new("kind", kind)]);
+        }
+        EphemeralReconcileGuard {
+            metrics: self.metrics.clone(),
+            started_at: Instant::now(),
+            kind,
+            request_count_bucket: request_count_bucket(cached_requests),
+        }
+    }
+
     pub fn shutdown(&self) -> anyhow::Result<()> {
         if let Some(metrics) = &self.metrics {
             metrics.provider.shutdown()?;
@@ -296,6 +336,33 @@ impl Drop for ReconcileGuard {
         if let Some(metrics) = &self.metrics {
             metrics.reconcile_inflight.add(-1, &[]);
         }
+    }
+}
+
+impl Drop for EphemeralReconcileGuard {
+    fn drop(&mut self) {
+        if let Some(metrics) = &self.metrics {
+            metrics.ephemeral_reconcile_duration_ms.record(
+                self.started_at.elapsed().as_millis() as u64,
+                &[
+                    KeyValue::new("kind", self.kind),
+                    KeyValue::new("request_count", self.request_count_bucket),
+                ],
+            );
+            metrics
+                .ephemeral_reconcile_inflight
+                .add(-1, &[KeyValue::new("kind", self.kind)]);
+        }
+    }
+}
+
+fn request_count_bucket(count: usize) -> &'static str {
+    match count {
+        0 => "0",
+        1..=10 => "1-10",
+        11..=100 => "11-100",
+        101..=1_000 => "101-1000",
+        _ => "1001+",
     }
 }
 
@@ -475,6 +542,23 @@ impl Metrics {
             ephemeral_role_retirement_blocked_total: meter
                 .u64_counter("pgroles.ephemeral_access.role_retirement_blocked")
                 .with_description("Role retirements blocked by active access requests")
+                .build(),
+            ephemeral_cached_requests: meter
+                .u64_histogram("pgroles.ephemeral_access.cached_requests")
+                .with_description("Request-cache size sampled at reconcile start")
+                .build(),
+            ephemeral_relevant_requests: meter
+                .u64_histogram("pgroles.ephemeral_access.relevant_requests")
+                .with_description("Requests returned by an indexed lookup")
+                .build(),
+            ephemeral_reconcile_duration_ms: meter
+                .u64_histogram("pgroles.ephemeral_access.reconcile.duration")
+                .with_unit("ms")
+                .with_description("Ephemeral reconcile duration by kind and request-count bucket")
+                .build(),
+            ephemeral_reconcile_inflight: meter
+                .i64_up_down_counter("pgroles.ephemeral_access.reconcile.inflight")
+                .with_description("In-flight ephemeral reconciliations by resource kind")
                 .build(),
         }
     }
@@ -656,6 +740,8 @@ mod tests {
         observability.record_ephemeral_retained_memberships(2);
         observability.record_ephemeral_expiry_lag(Duration::from_millis(250));
         observability.record_ephemeral_role_retirement_blocked();
+        observability.record_ephemeral_relevant_requests("effective_graph", 3);
+        drop(observability.start_ephemeral_reconcile("access_request", 250));
         guard.record_result("conflict", "ConflictingPolicy");
 
         provider.force_flush().expect("flush should succeed");
@@ -688,6 +774,18 @@ mod tests {
             u64_sum_value(&metrics, "pgroles.ephemeral_access.role_retirement_blocked"),
             Some(1)
         );
+        assert!(metric_exists(
+            &metrics,
+            "pgroles.ephemeral_access.cached_requests"
+        ));
+        assert!(metric_exists(
+            &metrics,
+            "pgroles.ephemeral_access.relevant_requests"
+        ));
+        assert!(metric_exists(
+            &metrics,
+            "pgroles.ephemeral_access.reconcile.duration"
+        ));
         assert_eq!(
             u64_sum_value(&metrics, "pgroles.wildcard.grantability_queries"),
             Some(1)

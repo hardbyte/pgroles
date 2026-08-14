@@ -6,13 +6,13 @@
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
-use futures::{StreamExt, stream};
+use futures::{StreamExt, TryStreamExt, stream};
 use k8s_openapi::api::core::v1::Secret;
 use kube::runtime::events::{Recorder, Reporter};
 use kube::runtime::reflector::ObjectRef;
 use kube::runtime::{Controller, WatchStreamExt, predicates, reflector, watcher};
 use kube::{Api, Client, Resource, ResourceExt};
-use tracing::info;
+use tracing::{info, warn};
 use tracing_subscriber::prelude::*;
 
 use pgroles_operator::context::OperatorContext;
@@ -28,6 +28,7 @@ use pgroles_operator::observability::{
     OperatorObservability, init_log_provider_from_env, serve_health,
 };
 use pgroles_operator::reconciler::{error_policy, reconcile};
+use pgroles_operator::request_index::RequestIndex;
 
 /// Hash for plan annotation changes — triggers parent policy reconciliation
 /// when approval/rejection annotations are added or modified.
@@ -113,15 +114,28 @@ async fn main() -> anyhow::Result<()> {
         },
     );
 
+    let watch_namespace = std::env::var("WATCH_NAMESPACE")
+        .ok()
+        .filter(|namespace| !namespace.trim().is_empty());
+    if let Some(namespace) = &watch_namespace {
+        info!(%namespace, "scoping operator watches to one namespace");
+    }
+    let request_index = RequestIndex::default();
+
     // Create the shared operator context.
-    let ctx = Arc::new(OperatorContext::new(
+    let ctx = Arc::new(OperatorContext::new_with_runtime_config(
         client.clone(),
         observability.clone(),
         event_recorder,
+        request_index.clone(),
+        watch_namespace.clone(),
     ));
 
     // Watch all PostgresPolicy resources across all namespaces.
-    let policies: Api<PostgresPolicy> = Api::all(client.clone());
+    let policies: Api<PostgresPolicy> = match &watch_namespace {
+        Some(namespace) => Api::namespaced(client.clone(), namespace),
+        None => Api::all(client.clone()),
+    };
     let (reader, writer) = reflector::store();
     let policy_stream = watcher(policies.clone(), watcher::Config::default())
         .default_backoff()
@@ -129,75 +143,77 @@ async fn main() -> anyhow::Result<()> {
         .applied_objects()
         .predicate_filter(policy_trigger_hash, Default::default());
     let policy_store = reader.clone();
-    let secret_triggers = watcher(
-        Api::<Secret>::all(client.clone()),
-        watcher::Config::default(),
-    )
-    .default_backoff()
-    .touched_objects()
-    .predicate_filter(predicates::resource_version, Default::default())
-    .filter_map(|secret| async move { secret.ok() })
-    .flat_map(move |secret| {
-        let policy_store = policy_store.clone();
-        let Some(secret_ns) = secret.namespace() else {
-            return stream::iter(Vec::<ObjectRef<PostgresPolicy>>::new());
-        };
-        let secret_name = secret.name_any();
-        let refs = policy_store
-            .state()
-            .into_iter()
-            .filter(|policy| {
-                policy.namespace().as_deref() == Some(secret_ns.as_str())
-                    && policy
-                        .spec
-                        .referenced_secret_names(&policy.name_any())
-                        .contains(&secret_name)
-            })
-            .map(|policy| ObjectRef::from_obj(policy.as_ref()))
-            .collect::<Vec<_>>();
-        stream::iter(refs)
-    });
+    let secrets: Api<Secret> = match &watch_namespace {
+        Some(namespace) => Api::namespaced(client.clone(), namespace),
+        None => Api::all(client.clone()),
+    };
+    let secret_triggers = watcher(secrets, watcher::Config::default())
+        .default_backoff()
+        .touched_objects()
+        .predicate_filter(predicates::resource_version, Default::default())
+        .filter_map(|secret| async move { secret.ok() })
+        .flat_map(move |secret| {
+            let policy_store = policy_store.clone();
+            let Some(secret_ns) = secret.namespace() else {
+                return stream::iter(Vec::<ObjectRef<PostgresPolicy>>::new());
+            };
+            let secret_name = secret.name_any();
+            let refs = policy_store
+                .state()
+                .into_iter()
+                .filter(|policy| {
+                    policy.namespace().as_deref() == Some(secret_ns.as_str())
+                        && policy
+                            .spec
+                            .referenced_secret_names(&policy.name_any())
+                            .contains(&secret_name)
+                })
+                .map(|policy| ObjectRef::from_obj(policy.as_ref()))
+                .collect::<Vec<_>>();
+            stream::iter(refs)
+        });
 
     // Watch PostgresPolicyPlan resources for annotation changes (approval/rejection).
     // When a plan's annotations change, trigger reconciliation of the parent policy.
     let plan_policy_store = reader.clone();
-    let plan_triggers = watcher(
-        Api::<PostgresPolicyPlan>::all(client.clone()),
-        watcher::Config::default(),
-    )
-    .default_backoff()
-    .touched_objects()
-    .predicate_filter(plan_annotation_hash, Default::default())
-    .filter_map(|plan| async move { plan.ok() })
-    .flat_map(move |plan| {
-        let policy_store = plan_policy_store.clone();
-        // Map the plan back to its parent by controller-owner UID.
-        //
-        // This used to compare the plan's `pgroles.io/policy` label against
-        // `metadata.name`, but that label is truncated at the 63-character label
-        // limit while a policy name may be up to 253. For any longer name the
-        // comparison never matched, so plan status changes silently stopped
-        // waking the policy reconciler. The UID is exact at any name length.
-        let parent_policy_uid = plan
-            .metadata
-            .owner_references
-            .as_deref()
-            .unwrap_or_default()
-            .iter()
-            .find(|owner| owner.controller.unwrap_or(false))
-            .map(|owner| owner.uid.clone());
+    let plans: Api<PostgresPolicyPlan> = match &watch_namespace {
+        Some(namespace) => Api::namespaced(client.clone(), namespace),
+        None => Api::all(client.clone()),
+    };
+    let plan_triggers = watcher(plans, watcher::Config::default())
+        .default_backoff()
+        .touched_objects()
+        .predicate_filter(plan_annotation_hash, Default::default())
+        .filter_map(|plan| async move { plan.ok() })
+        .flat_map(move |plan| {
+            let policy_store = plan_policy_store.clone();
+            // Map the plan back to its parent by controller-owner UID.
+            //
+            // This used to compare the plan's `pgroles.io/policy` label against
+            // `metadata.name`, but that label is truncated at the 63-character label
+            // limit while a policy name may be up to 253. For any longer name the
+            // comparison never matched, so plan status changes silently stopped
+            // waking the policy reconciler. The UID is exact at any name length.
+            let parent_policy_uid = plan
+                .metadata
+                .owner_references
+                .as_deref()
+                .unwrap_or_default()
+                .iter()
+                .find(|owner| owner.controller.unwrap_or(false))
+                .map(|owner| owner.uid.clone());
 
-        let refs: Vec<ObjectRef<PostgresPolicy>> = match parent_policy_uid {
-            Some(uid) if !uid.is_empty() => policy_store
-                .state()
-                .into_iter()
-                .filter(|policy| policy.metadata.uid.as_deref() == Some(uid.as_str()))
-                .map(|policy| ObjectRef::from_obj(policy.as_ref()))
-                .collect(),
-            _ => Vec::new(),
-        };
-        stream::iter(refs)
-    });
+            let refs: Vec<ObjectRef<PostgresPolicy>> = match parent_policy_uid {
+                Some(uid) if !uid.is_empty() => policy_store
+                    .state()
+                    .into_iter()
+                    .filter(|policy| policy.metadata.uid.as_deref() == Some(uid.as_str()))
+                    .map(|policy| ObjectRef::from_obj(policy.as_ref()))
+                    .collect(),
+                _ => Vec::new(),
+            };
+            stream::iter(refs)
+        });
 
     info!("starting controllers");
     observability.mark_ready();
@@ -218,34 +234,38 @@ async fn main() -> anyhow::Result<()> {
             }
         });
 
-    let access_policies: Api<EphemeralAccessPolicy> = Api::all(client.clone());
+    let access_policies: Api<EphemeralAccessPolicy> = match &watch_namespace {
+        Some(namespace) => Api::namespaced(client.clone(), namespace),
+        None => Api::all(client.clone()),
+    };
     let (access_policy_reader, access_policy_writer) = reflector::store();
     let access_policy_stream = watcher(access_policies, watcher::Config::default())
         .default_backoff()
         .reflect(access_policy_writer)
         .applied_objects();
     let target_access_policy_store = access_policy_reader.clone();
-    let target_access_policy_triggers = watcher(
-        Api::<PostgresPolicy>::all(client.clone()),
-        watcher::Config::default(),
-    )
-    .default_backoff()
-    .touched_objects()
-    .filter_map(|target| async move { target.ok() })
-    .flat_map(move |target| {
-        let namespace = target.namespace();
-        let target_name = target.name_any();
-        let refs = target_access_policy_store
-            .state()
-            .into_iter()
-            .filter(|policy| {
-                policy.namespace() == namespace
-                    && policy.spec.postgres_policy_ref.name == target_name
-            })
-            .map(|policy| ObjectRef::from_obj(policy.as_ref()))
-            .collect::<Vec<_>>();
-        stream::iter(refs)
-    });
+    let target_policies: Api<PostgresPolicy> = match &watch_namespace {
+        Some(namespace) => Api::namespaced(client.clone(), namespace),
+        None => Api::all(client.clone()),
+    };
+    let target_access_policy_triggers = watcher(target_policies, watcher::Config::default())
+        .default_backoff()
+        .touched_objects()
+        .filter_map(|target| async move { target.ok() })
+        .flat_map(move |target| {
+            let namespace = target.namespace();
+            let target_name = target.name_any();
+            let refs = target_access_policy_store
+                .state()
+                .into_iter()
+                .filter(|policy| {
+                    policy.namespace() == namespace
+                        && policy.spec.postgres_policy_ref.name == target_name
+                })
+                .map(|policy| ObjectRef::from_obj(policy.as_ref()))
+                .collect::<Vec<_>>();
+            stream::iter(refs)
+        });
 
     let access_policy_controller =
         Controller::for_stream(access_policy_stream, access_policy_reader)
@@ -262,34 +282,57 @@ async fn main() -> anyhow::Result<()> {
                 }
             });
 
-    let access_requests: Api<EphemeralAccessRequest> = Api::all(client.clone());
+    let access_requests: Api<EphemeralAccessRequest> = match &watch_namespace {
+        Some(namespace) => Api::namespaced(client.clone(), namespace),
+        None => Api::all(client.clone()),
+    };
     let (access_request_reader, access_request_writer) = reflector::store();
+    let request_index_writer = request_index.clone();
     let access_request_stream = watcher(access_requests, watcher::Config::default())
         .default_backoff()
+        .inspect_ok(move |event| request_index_writer.observe(event))
         .reflect(access_request_writer)
         .applied_objects();
-    let access_policy_request_store = access_request_reader.clone();
-    let access_policy_request_triggers = watcher(
-        Api::<EphemeralAccessPolicy>::all(client.clone()),
-        watcher::Config::default(),
-    )
-    .default_backoff()
-    .touched_objects()
-    .filter_map(|policy| async move { policy.ok() })
-    .flat_map(move |policy| {
-        let namespace = policy.namespace();
-        let policy_name = policy.name_any();
-        let refs = access_policy_request_store
-            .state()
-            .into_iter()
-            .filter(|request| {
-                request.namespace() == namespace
-                    && request.spec.access_policy_ref.name == policy_name
-            })
-            .map(|request| ObjectRef::from_obj(request.as_ref()))
-            .collect::<Vec<_>>();
-        stream::iter(refs)
-    });
+    let access_policy_request_index = request_index.clone();
+    let request_access_policies: Api<EphemeralAccessPolicy> = match &watch_namespace {
+        Some(namespace) => Api::namespaced(client.clone(), namespace),
+        None => Api::all(client.clone()),
+    };
+    let access_policy_request_triggers =
+        watcher(request_access_policies, watcher::Config::default())
+            .default_backoff()
+            .touched_objects()
+            .filter_map(|policy| async move { policy.ok() })
+            .flat_map(move |policy| {
+                let request_index = access_policy_request_index.clone();
+                let namespace = policy.namespace().unwrap_or_default();
+                let policy_name = policy.name_any();
+                stream::once(async move {
+                    // A trigger is an optimization: the request controller also
+                    // requeues on its own. Dropping this fan-out when the index
+                    // is not yet synced delays a reconcile, so it is logged and
+                    // skipped rather than propagated.
+                    match request_index
+                        .for_access_policy_name(&namespace, &policy_name)
+                        .await
+                    {
+                        Ok(requests) => requests
+                            .into_iter()
+                            .map(|request| ObjectRef::from_obj(request.as_ref()))
+                            .collect::<Vec<_>>(),
+                        Err(error) => {
+                            warn!(
+                                %error,
+                                %namespace,
+                                policy = %policy_name,
+                                "skipping access-policy request triggers",
+                            );
+                            Vec::new()
+                        }
+                    }
+                })
+                .flat_map(stream::iter)
+            });
 
     let access_request_controller =
         Controller::for_stream(access_request_stream, access_request_reader)
