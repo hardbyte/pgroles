@@ -4,19 +4,27 @@ description: Request, approve, and revoke bounded PostgreSQL role memberships.
 ---
 
 Ephemeral access grants an existing PostgreSQL identity one predefined bundle of
-role memberships for a bounded duration. `PostgresPolicy` remains the durable
-source of truth; an `EphemeralAccessPolicy` defines a requestable bundle, and an
-immutable `EphemeralAccessRequest` records one request lifecycle.
+role memberships for a bounded duration, then takes it back.
 
-The feature does not issue credentials, implement cloud login, or terminate
-existing sessions. Revoking membership prevents a new `SET ROLE`, but a session
-which already assumed the role can retain it until it resets or disconnects.
+Three resources are involved. A `PostgresPolicy` remains the durable source of
+truth for who has standing access. An `EphemeralAccessPolicy` defines a bundle
+of memberships that may be requested against that policy, and the ceilings on
+how long a grant may last. Each `EphemeralAccessRequest` is one immutable record
+of a single grant: who asked, for which subject, for how long, who approved it,
+and when it ended.
 
-{% callout type="warning" title="Choose a trust model before enabling requests" %}
-Direct Kubernetes API access needs admission enforcement; a trusted broker must
-authenticate callers and be the only non-controller writer. pgroles ships a
-CI-tested Kyverno reference implementation, but Kyverno is not part of the
-operator itself. See [securing ephemeral access](/docs/ephemeral-access-security).
+The operator overlays active grants onto the durable policy's desired role graph
+at reconcile time, so an ephemeral membership is real PostgreSQL state without
+ever being written into the `PostgresPolicy`.
+
+The feature does not issue credentials or implement cloud login — the subject
+must already exist as a PostgreSQL role.
+
+{% callout type="warning" title="Requests need a trust boundary before you enable them" %}
+Anyone who can create requests can grant themselves the bundle, and `Required`
+approval is only a real boundary under admission enforcement or a trusted
+broker. Read [securing ephemeral access](/docs/ephemeral-access-security) before
+allowing requests in a cluster that matters.
 {% /callout %}
 
 ## Define a requestable bundle
@@ -51,10 +59,15 @@ not create a login identity for a request. Ephemeral memberships never include
 another role. Durations are one or more integer/unit pairs using `s`, `m`, or
 `h` (for example `45s` or `1h30m`); unitless values are rejected.
 
-Ephemeral access requires PostgreSQL 16 or later so that `inherit` is enforced
-on each membership. Setting `inherit: false` creates set-role-only access: the
-subject must explicitly run `SET ROLE`, rather than inheriting the granted
-role's privileges immediately.
+Setting `inherit: false` creates set-role-only access: the subject must
+explicitly run `SET ROLE` rather than inheriting the granted role's privileges
+immediately.
+
+Per-membership `inherit` needs PostgreSQL 16 or later. On PostgreSQL 15 and
+earlier the option cannot be encoded per grant, so a membership is accepted only
+when its `inherit` already matches the subject role's global `INHERIT`; a
+mismatch is rejected naming both values. Set-role-only access on those versions
+therefore requires a globally `NOINHERIT` subject.
 
 `pendingRequestTTL` defaults to `15m` when omitted: a request that is not
 approved within that window becomes `ApprovalExpired` and cannot be revived.
@@ -94,13 +107,12 @@ spec:
   justification: Investigating INC-1234
 ```
 
-`requestedBy` is required so every request is self-describing. It is trustworthy
-only when an admission policy derives it from the authenticated Kubernetes
-caller or a trusted broker supplies it after authenticating the requester. The
-supplied Kyverno reference policy replaces the submitted username, UID, and
-groups with admission `userInfo`. Its `use` check authorizes the bundle, not a
-mapping from the caller to `subject.role`; restrict requesters accordingly or
-add that identity mapping in admission.
+`requestedBy` is required so every request is self-describing, but the API
+server does not verify it — a caller writing this YAML can put any name in it.
+It becomes trustworthy only under the enforcement described in
+[securing ephemeral access](/docs/ephemeral-access-security), which also covers
+why holding `use` does not by itself constrain which `subject.role` a requester
+may name.
 
 The request spec is immutable. The operator resolves concrete memberships into
 write-once `status.resolvedAccess`, including the target and access-policy UIDs,
@@ -143,12 +155,36 @@ hash and duration. The condition and `status.decidedBy` are recorded together:
 ]
 ```
 
-The Kyverno reference policy overwrites `decidedBy` with authenticated admission
-`userInfo`. A trusted broker must set it from its authenticated decision maker.
-The CRD makes the decision and identity terminal, while the deployment's
-security boundary determines whether that identity is authoritative. See
-[securing ephemeral access](/docs/ephemeral-access-security) for the required
-controls and tested manifests.
+The CRD makes the decision and the identity terminal — neither can be rewritten
+once set. Whether that identity is *authoritative* is a property of your
+deployment, not of the CRD; see
+[securing ephemeral access](/docs/ephemeral-access-security).
+
+## Request phases
+
+`status.phase` is the single field to read when asking what a request is doing.
+Eleven values, of which six are terminal:
+
+| Phase | Meaning |
+| --- | --- |
+| `Pending` | Created; the operator has not yet resolved the bundle |
+| `PendingApproval` | Resolved, waiting for a decision under `approval.mode: Required` |
+| `Applying` | Approved; membership SQL is being executed |
+| `Active` | Membership granted; `status.expiresAt` holds the absolute deadline |
+| `Revoking` | Expiry or deletion reached; membership is being taken back |
+| `Ended` | Ran to its expiry and was revoked cleanly *(terminal)* |
+| `Revoked` | Revoked before its expiry *(terminal)* |
+| `Cancelled` | Withdrawn before activation began *(terminal)* |
+| `Denied` | A decision maker refused it *(terminal)* |
+| `ApprovalExpired` | No decision within `pendingRequestTTL` *(terminal)* |
+| `Failed` | Activation or revocation failed; see `status.lastError` *(terminal)* |
+
+Alongside the phase, `status` carries `approvalExpiresAt`, `activatedAt`,
+`expiresAt`, `endedAt`, `lastError`, and `retainedMemberships` — the memberships
+deliberately kept at expiry because something else still needs them.
+
+Requests emit their own Kubernetes Events, so `kubectl describe
+ephemeralaccessrequest <name>` shows one request's history directly.
 
 ## Expiry and deletion
 
@@ -164,9 +200,9 @@ fresh duration after restart.
 
 Suspending an access policy blocks new activation while active requests run to
 their existing expiry. Deleting an access policy deletes and revokes its
-requests before the policy finalizer completes. Do not forcibly remove
-finalizers: authoritative reconciliation can later heal a stranded membership,
-but additive mode may leave it indefinitely.
+requests before the policy finalizer completes. Do not force-remove finalizers —
+that is how a membership is left in PostgreSQL with no request remaining to
+revoke it.
 
 Deleting a target `PostgresPolicy` first deletes attached access policies and
 waits for their request finalizers, keeping the database connection available

@@ -22,14 +22,18 @@ cargo test --workspace -- --include-ignored
 # Run a single test
 cargo test -p pgroles-core --lib diff::tests::diff_creates_new_roles -- --exact
 
-# CRD drift check (CI enforces all four committed CRD copies match crdgen output)
+# CRD drift check (CI compares all eight committed copies against crdgen output:
+# the four in the chart, and the four standalone manifests in k8s/)
 scripts/check-crd-drift.sh
 
-# Regenerate CRDs after modifying crd.rs (writes both CRDs; the four committed
-# copies must match, which is what check-crd-drift.sh compares)
+# Regenerate CRDs after modifying crd.rs. crdgen writes all four kinds into the
+# chart; the k8s/ copies are duplicates that must be refreshed by hand, and
+# check-crd-drift.sh fails if any of the eight drifts.
 cargo run --bin crdgen -- --output-dir charts/pgroles-operator/crds/
 cp charts/pgroles-operator/crds/postgrespolicies.pgroles.io.yaml k8s/crd.yaml
 cp charts/pgroles-operator/crds/postgrespolicyplans.pgroles.io.yaml k8s/postgrespolicyplan-crd.yaml
+cp charts/pgroles-operator/crds/ephemeralaccesspolicies.pgroles.io.yaml k8s/ephemeralaccesspolicy-crd.yaml
+cp charts/pgroles-operator/crds/ephemeralaccessrequests.pgroles.io.yaml k8s/ephemeralaccessrequest-crd.yaml
 ```
 
 ### Local PostgreSQL for integration tests
@@ -76,12 +80,15 @@ diff(current, effective desired) → Vec<Change> → sql::render_all_with_contex
 
 ## CI
 
-Five jobs in `.github/workflows/ci.yml`:
-1. **Lint** — `cargo fmt --check`, `clippy -D warnings`, CRD drift check
-2. **Unit Tests** — `cargo test --workspace`
-3. **Integration Tests** — PG 16/17/18 matrix, `cargo test --workspace -- --include-ignored`
-4. **Docker Smoke Tests** — verifies the documented container flows work end-to-end
-5. **E2E** — kind cluster, deploys operator plus an OpenTelemetry Collector, runs happy-path plus conflict/invalid/missing-secret/insufficient-privilege/secret-rotation operator scenarios, verifies larger generated policy convergence at higher object counts, verifies roles in database, and verifies OTLP metrics export
+`.github/workflows/ci.yml` runs:
+
+- **Lint** — `cargo fmt --check`, `clippy -D warnings`, CRD drift check, helm-docs drift check
+- **Unit Tests** — `cargo test --workspace`
+- **Integration Tests** — PG 16/17/18 matrix, `cargo test --workspace -- --include-ignored`
+- **Docker and example smoke tests** — verifies the documented container and example flows work end-to-end
+- **Operator E2E** — kind cluster, deploys the operator plus an OpenTelemetry Collector, runs happy-path plus conflict/invalid/missing-secret/insufficient-privilege/secret-rotation scenarios, verifies larger generated policy convergence at higher object counts, verifies roles in the database, and verifies OTLP metrics export
+- **Plan lifecycle and load E2E** — plan approval flows, and generated-policy plus ephemeral-request load
+- **Ephemeral access E2E** — a two-way matrix over the trusted-writer posture and the Kyverno secure-admission profile in `k8s/security/`
 
 The heavier fairness/load coverage lives in `.github/workflows/operator-fairness-load.yml` and runs on a nightly schedule when `main` has changed.
 

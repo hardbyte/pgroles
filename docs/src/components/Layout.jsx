@@ -16,7 +16,8 @@ const navigation = [
         title: 'Introduction',
         links: [
             {title: 'Getting started', href: '/'},
-            {title: 'Quick start', href: '/docs/quick-start'},
+            {title: 'CLI quick start', href: '/docs/quick-start'},
+            {title: 'Operator quick start', href: '/docs/operator-quick-start'},
         ],
     },
     {

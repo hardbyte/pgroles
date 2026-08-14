@@ -119,6 +119,10 @@ The intended deployment model is operator -> OpenTelemetry Collector -> your met
 | `pgroles.ephemeral_access.retained_memberships` | - | Memberships kept at expiry because they became durable |
 | `pgroles.ephemeral_access.expiry_lag` | - | Milliseconds between expiry and revocation |
 | `pgroles.ephemeral_access.role_retirement_blocked` | - | Role retirements blocked by an in-flight request |
+| `pgroles.ephemeral_access.cached_requests` | - | Request-cache size sampled at reconcile start |
+| `pgroles.ephemeral_access.relevant_requests` | `lookup` | Requests returned by an indexed lookup |
+| `pgroles.ephemeral_access.reconcile.duration` | `kind`, request-count bucket | Ephemeral reconcile wall time |
+| `pgroles.ephemeral_access.reconcile.inflight` | `kind` | Ephemeral reconciles currently running |
 
 Useful alerting signals: `Degraded=True` for reconcile failure (not bare
 `Ready=False`, which is also how a healthy plan-awaiting-approval policy
@@ -146,6 +150,13 @@ Plan lifecycle:
 
 - `PlanCreated`, `PlanApproved`, `PlanRejected`
 - `ApplyStarted`, `ApplySucceeded`, `ApplyFailed`
+
+Ephemeral access requests carry their own Events, recorded on the
+`EphemeralAccessRequest` object rather than on the policy, with the action
+`EphemeralAccessLifecycle`. Terminal failures — `Failed`, `Denied`, and
+`ApprovalExpired` — are `Warning`; every other phase transition is `Normal`. So
+`kubectl describe ephemeralaccessrequest <name>` is where one request's history
+lives, not `kubectl describe pgr`.
 
 Not every failure becomes an Event. `MissingDatabaseObject`,
 `InvalidConnectionParams`, and `UnsatisfiableWildcardGrant` are condition
