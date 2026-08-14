@@ -6,7 +6,7 @@ nameOverride: ""
 fullnameOverride: ""
 
 operator:
-  # Restrict every operator watch/list and its RBAC to one namespace. Empty
+  # -- Restrict every operator watch/list and its RBAC to one namespace. Empty
   # means cluster-wide reconciliation.
   watchNamespace: ""
 
