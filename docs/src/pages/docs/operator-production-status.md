@@ -47,7 +47,7 @@ The operator's safety model — serialized reconciliation, conflict detection, f
 
 **Password drift visibility:**
 
-- PostgreSQL does not expose password material in a way pgroles can compare safely. The operator can detect password source Secret changes and re-apply them, but it cannot detect out-of-band manual password changes made directly in the database.
+- The operator re-applies passwords when the source Secret changes, but cannot detect a password changed directly in the database. See [password drift](/docs/limitations#password-drift) for why PostgreSQL makes this undetectable.
 
 **Managed provider validation:**
 
