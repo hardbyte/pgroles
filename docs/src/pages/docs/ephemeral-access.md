@@ -21,10 +21,11 @@ The feature does not issue credentials or implement cloud login — the subject
 must already exist as a PostgreSQL role.
 
 {% callout type="warning" title="Requests need a trust boundary before you enable them" %}
-Anyone who can create requests can grant themselves the bundle, and `Required`
-approval is only a real boundary under admission enforcement or a trusted
-broker. Read [securing ephemeral access](/docs/ephemeral-access-security) before
-allowing requests in a cluster that matters.
+Under `approval.mode: Automatic`, anyone who can create a request can grant
+themselves the bundle. Under `Required`, approval is a real boundary only with
+admission enforcement or a trusted broker in front of it. Read
+[securing ephemeral access](/docs/ephemeral-access-security) before allowing
+requests in a cluster that matters.
 {% /callout %}
 
 ## Define a requestable bundle
@@ -162,26 +163,36 @@ deployment, not of the CRD; see
 
 ## Request phases
 
-`status.phase` is the single field to read when asking what a request is doing.
-Eleven values, of which six are terminal:
+`status.phase` is the field to read when asking what a request is doing. These
+are the values you can observe on a live object:
 
 | Phase | Meaning |
 | --- | --- |
 | `Pending` | Created; the operator has not yet resolved the bundle |
 | `PendingApproval` | Resolved, waiting for a decision under `approval.mode: Required` |
-| `Applying` | Approved; membership SQL is being executed |
+| `Applying` | Membership SQL is being executed — after approval, or straight from resolution under `approval.mode: Automatic` |
 | `Active` | Membership granted; `status.expiresAt` holds the absolute deadline |
-| `Revoking` | Expiry or deletion reached; membership is being taken back |
-| `Ended` | Ran to its expiry and was revoked cleanly *(terminal)* |
-| `Revoked` | Revoked before its expiry *(terminal)* |
-| `Cancelled` | Withdrawn before activation began *(terminal)* |
+| `Revoking` | The expiry deadline passed; membership is being taken back |
+| `Ended` | Reached its expiry *(terminal)* |
+| `Cancelled` | The access policy changed or was suspended, or the request expired before activation began *(terminal)* |
 | `Denied` | A decision maker refused it *(terminal)* |
 | `ApprovalExpired` | No decision within `pendingRequestTTL` *(terminal)* |
-| `Failed` | Activation or revocation failed; see `status.lastError` *(terminal)* |
+
+Two further phases exist in the API but will not be seen in `status.phase`.
+`Revoked` describes deletion, and is written to the audit stream and the request's
+Events but deliberately not to an object whose finalizer is about to be removed —
+so deletion never passes through `Revoking` either. `Failed` is defined and
+classified as a warning, but no code path currently sets it: an activation or
+revocation error leaves the phase alone and records `status.lastError` while the
+reconcile retries. Alert on `lastError`, not on `phase: Failed`.
+
+`Ended` does not always mean the memberships were revoked. When a membership has
+become part of the durable `PostgresPolicy` in the meantime it is kept and
+recorded in `status.retainedMemberships`; memberships kept because another active
+request still needs them are left in place without being recorded there.
 
 Alongside the phase, `status` carries `approvalExpiresAt`, `activatedAt`,
-`expiresAt`, `endedAt`, `lastError`, and `retainedMemberships` — the memberships
-deliberately kept at expiry because something else still needs them.
+`expiresAt`, `endedAt`, and `lastError`.
 
 Requests emit their own Kubernetes Events, so `kubectl describe
 ephemeralaccessrequest <name>` shows one request's history directly.
@@ -201,8 +212,9 @@ fresh duration after restart.
 Suspending an access policy blocks new activation while active requests run to
 their existing expiry. Deleting an access policy deletes and revokes its
 requests before the policy finalizer completes. Do not force-remove finalizers —
-that is how a membership is left in PostgreSQL with no request remaining to
-revoke it.
+that strands the membership in PostgreSQL with no request left to revoke it.
+Authoritative reconciliation of the durable policy can later remove the stray
+edge; additive mode may leave it indefinitely.
 
 Deleting a target `PostgresPolicy` first deletes attached access policies and
 waits for their request finalizers, keeping the database connection available

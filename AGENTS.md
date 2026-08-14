@@ -86,9 +86,9 @@ diff(current, effective desired) → Vec<Change> → sql::render_all_with_contex
 - **Unit Tests** — `cargo test --workspace`
 - **Integration Tests** — PG 16/17/18 matrix, `cargo test --workspace -- --include-ignored`
 - **Docker and example smoke tests** — verifies the documented container and example flows work end-to-end
-- **Operator E2E** — kind cluster, deploys the operator plus an OpenTelemetry Collector, runs happy-path plus conflict/invalid/missing-secret/insufficient-privilege/secret-rotation scenarios, verifies larger generated policy convergence at higher object counts, verifies roles in the database, and verifies OTLP metrics export
-- **Plan lifecycle and load E2E** — plan approval flows, and generated-policy plus ephemeral-request load
-- **Ephemeral access E2E** — a two-way matrix over the trusted-writer posture and the Kyverno secure-admission profile in `k8s/security/`
+- **Operator E2E** — kind cluster, deploys the operator plus an OpenTelemetry Collector, runs happy-path plus conflict/invalid/missing-secret/insufficient-privilege/secret-rotation scenarios, verifies roles in the database, and verifies OTLP metrics export
+- **Plan lifecycle and load E2E** — plan approval flows, plus generated-policy convergence at higher object counts and ephemeral-request load
+- **Ephemeral access E2E** — runs twice: once for the trusted-writer posture, once for the Kyverno secure-admission profile in `k8s/security/`
 
 The heavier fairness/load coverage lives in `.github/workflows/operator-fairness-load.yml` and runs on a nightly schedule when `main` has changed.
 

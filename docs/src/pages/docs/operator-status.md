@@ -121,7 +121,7 @@ The intended deployment model is operator -> OpenTelemetry Collector -> your met
 | `pgroles.ephemeral_access.role_retirement_blocked` | - | Role retirements blocked by an in-flight request |
 | `pgroles.ephemeral_access.cached_requests` | - | Request-cache size sampled at reconcile start |
 | `pgroles.ephemeral_access.relevant_requests` | `lookup` | Requests returned by an indexed lookup |
-| `pgroles.ephemeral_access.reconcile.duration` | `kind`, request-count bucket | Ephemeral reconcile wall time |
+| `pgroles.ephemeral_access.reconcile.duration` | `kind`, `request_count` | Ephemeral reconcile wall time, bucketed by request count |
 | `pgroles.ephemeral_access.reconcile.inflight` | `kind` | Ephemeral reconciles currently running |
 
 Useful alerting signals: `Degraded=True` for reconcile failure (not bare
