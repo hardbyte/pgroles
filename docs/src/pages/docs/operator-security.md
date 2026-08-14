@@ -9,7 +9,10 @@ What the operator is allowed to do in your cluster. {% .lead %}
 
 ## RBAC
 
-The operator requires a ClusterRole with these permissions:
+The operator requires these permissions. They are granted through a
+`ClusterRole` by default, or a namespaced `Role` when
+[`operator.watchNamespace`](/docs/operator-install) scopes the operator to one
+namespace — the rules themselves are identical either way:
 
 | API group | Resource | Verbs |
 | --- | --- | --- |
@@ -34,6 +37,8 @@ hard-coding a service account identity, which is why the operator holds it
 while holding neither `use` nor `approve`. See
 [securing ephemeral access](/docs/ephemeral-access-security).
 
-The Helm chart creates the ClusterRole, ClusterRoleBinding, and ServiceAccount
-automatically. `charts/pgroles-operator/templates/clusterrole.yaml` is the source
-of truth; check it against this table before hand-writing a role.
+The Helm chart creates the role, its binding, and the ServiceAccount
+automatically — a `ClusterRole` and `ClusterRoleBinding` normally, a `Role` and
+`RoleBinding` in the watched namespace when `operator.watchNamespace` is set.
+`charts/pgroles-operator/templates/clusterrole.yaml` is the source of truth for
+the rules; check it against this table before hand-writing a role.

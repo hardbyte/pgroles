@@ -124,12 +124,15 @@ The intended deployment model is operator -> OpenTelemetry Collector -> your met
 | `pgroles.ephemeral_access.reconcile.duration` | `kind`, `request_count` | Ephemeral reconcile wall time, bucketed by request count |
 | `pgroles.ephemeral_access.reconcile.inflight` | `kind` | Ephemeral reconciles currently running |
 
-Useful alerting signals: `Degraded=True` for reconcile failure (not bare
-`Ready=False`, which is also how a healthy plan-awaiting-approval policy
-reports), sustained `Drifted=True` on an auto-applying policy,
-`pgroles.lock_contention.total` rising steadily, and
-`pgroles.deprecated.approval_unset` as the count of policies still relying on
-the deprecated inference.
+Useful alerting signals: `Degraded=True` for reconcile failure, sustained
+`Drifted=True` on an auto-applying policy, `pgroles.lock_contention.total`
+rising steadily, and `pgroles.deprecated.approval_unset` as the count of
+policies still relying on the deprecated inference.
+
+A policy waiting on plan approval is healthy and reports `Ready=True` with
+reason `Planned`, alongside `Drifted=True`. `Drifted` is what distinguishes it
+from a policy with nothing to do; `Ready=False` always means something is
+wrong.
 
 The operator also emits transition-based Kubernetes Events on the policy.
 Status transitions:

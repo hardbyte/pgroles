@@ -35,8 +35,6 @@ Before typing any YAML, here is the role graph the manifest below describes — 
 Create a file called `pgroles.yaml`:
 
 ```yaml
-default_owner: app_owner
-
 roles:
   - name: analytics
     login: true

@@ -48,17 +48,12 @@ export function RoleGraphDiagram() {
           </div>
         </div>
 
-        <div className="mt-6 grid gap-4 lg:grid-cols-2">
+        <div className="mt-6 grid gap-4">
           <GraphNote title="No membership edges yet">
             This manifest declares no <span className="font-mono">memberships</span>, so{' '}
             <span className="font-mono">analytics</span> holds every privilege directly. When you do
             add one, the edge runs <span className="font-mono">member -&gt; role</span>: the member
             inherits the privileges of the role it is granted, never the other way around.
-          </GraphNote>
-          <GraphNote title="default_owner: app_owner">
-            The default owner is the object-creator context for{' '}
-            <span className="font-mono">ALTER DEFAULT PRIVILEGES</span>. This manifest defines no
-            default privileges yet, so it stays unused until you add them.
           </GraphNote>
         </div>
       </div>

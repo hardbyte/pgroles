@@ -13,9 +13,14 @@ how long a grant may last. Each `EphemeralAccessRequest` is one immutable record
 of a single grant: who asked, for which subject, for how long, who approved it,
 and when it ended.
 
-The operator overlays active grants onto the durable policy's desired role graph
-at reconcile time, so an ephemeral membership is real PostgreSQL state without
-ever being written into the `PostgresPolicy`.
+Two mechanisms are involved, and it is worth keeping them apart. The request
+controller performs the grant itself, executing scoped membership SQL under the
+same per-database locks the durable policy uses — that is what makes the access
+real. Separately, when a `PostgresPolicy` reconciles, active ephemeral
+memberships are composed onto its desired role graph, so authoritative
+reconciliation sees them as intended state instead of revoking them as drift.
+The grant happens without the `PostgresPolicy` ever being edited; the overlay is
+what stops the next reconcile from undoing it.
 
 The feature does not issue credentials or implement cloud login — the subject
 must already exist as a PostgreSQL role.
