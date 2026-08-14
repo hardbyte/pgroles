@@ -14,6 +14,26 @@ jobs:
   release:
     runs-on: ubuntu-latest
     steps:
+      # This workflow runs on the same tag as release.yml but in its own run, so
+      # it cannot depend on that workflow's immutable-release gate. Repeat the
+      # check here rather than pushing a chart into a release whose binaries can
+      # never be attached. Skipped for workflow_dispatch, where re-publishing a
+      # chart for an already-published release is the point.
+      - name: Fail if the release was already published
+        if: github.event_name == 'push'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME}"
+          if is_draft=$(gh release view "$tag" --json isDraft --jq '.isDraft' 2>/dev/null); then
+            if [ "$is_draft" != "true" ]; then
+              echo "::error::GitHub Release ${tag} is already published, so release.yml cannot attach its binaries. Refusing to publish the chart into a half-finished release. Delete the release (the tag can stay) and re-run both workflows."
+              exit 1
+            fi
+          fi
+
       - uses: actions/checkout@v6
 
       - uses: dtolnay/rust-toolchain@stable

@@ -96,7 +96,50 @@ The heavier fairness/load coverage lives in `.github/workflows/operator-fairness
 - Update affected skills when behavior or public workflows change; avoid
   duplicating canonical skill content elsewhere.
 
-## Release and Containers
+## Release Process
+
+**Release by pushing the tag. Never publish a release from the GitHub UI.**
+
+Publishing from the UI creates the tag itself, so `release.yml` arrives to find
+the release already published — and published releases are immutable, so the CLI
+binaries can never be attached. The workflow creates and publishes the release
+itself; the tag is the only manual step.
+
+1. Open a release-prep PR against `main`: bump `version` in `Cargo.toml`
+   (`workspace.package` plus the `pgroles-core` / `pgroles-inspect`
+   path-dependency pins), refresh `Cargo.lock`, set the chart's `version` and
+   `appVersion`, regenerate the chart README (`scripts/check-helm-docs.sh`), and
+   retitle the changelog's `## [Unreleased]` section to `## [X.Y.Z] - <date>`
+   with a fresh empty `## [Unreleased]` above it.
+2. Merge it once CI is green.
+3. Tag that commit and push:
+   ```bash
+   git checkout main && git pull
+   git tag vX.Y.Z && git push origin vX.Y.Z
+   ```
+
+The tag push then drives everything, in this order:
+
+1. **`prepare-github-release`** creates a *draft* release, with the body taken
+   from that version's `CHANGELOG.md` section and GitHub's generated "What's
+   Changed" appended. It runs first and every publishing job waits on it, so a
+   release that was published by hand fails here — while nothing has reached
+   crates.io or GHCR.
+2. **`build-binaries`** cross-compiles the CLI for four targets.
+3. **`publish-crates`**, **`docker-operator`**, **`docker-cli`** publish to
+   crates.io and GHCR.
+4. **`github-release`** attaches the tarballs to the draft and publishes it.
+   Publishing is what freezes the release, so it runs last and acts as the
+   commit point for the whole release.
+
+`helm-chart-release.yml` publishes the chart on the same tag in its own run, and
+repeats the "already published" check for the same reason.
+
+If a release run fails, the release stays a draft: delete the draft, fix the
+cause, and re-run. A tag whose run got as far as crates.io or GHCR cannot be
+reused — those publications are irreversible, so cut the next patch version.
+
+## Containers
 
 - Published container images are multi-arch for `linux/amd64` and `linux/arm64`.
 - `.github/workflows/release.yml` builds Linux binaries first, then assembles container images from those artifacts using `docker/Dockerfile.runtime`.

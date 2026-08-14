@@ -17,11 +17,67 @@ permissions:
 
 jobs:
   # ---------------------------------------------------------------------------
+  # Immutable-release gate
+  # ---------------------------------------------------------------------------
+  # Immutable releases freeze their assets the moment they are published, so the
+  # release has to exist as a draft while the binaries are attached. Publishing
+  # from the GitHub UI creates the tag itself, which means this workflow arrives
+  # to find the release already frozen and cannot attach anything.
+  #
+  # Establishing the draft is therefore the first thing that happens: every
+  # publishing job below waits on it, so that case fails while nothing has
+  # reached crates.io or GHCR. Release by pushing the tag and let this workflow
+  # own the release object.
+  prepare-github-release:
+    name: Prepare draft GitHub Release
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Create or verify draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME}"
+
+          if is_draft=$(gh release view "$tag" --json isDraft --jq '.isDraft' 2>/dev/null); then
+            if [ "$is_draft" != "true" ]; then
+              echo "::error::GitHub Release ${tag} is already published, so its assets are immutable and the release binaries cannot be attached. Delete the release (the tag can stay) and re-run this workflow. Release by pushing the tag — this workflow creates the draft, attaches the binaries, and publishes it."
+              exit 1
+            fi
+            echo "Draft release ${tag} already exists; reusing it."
+            exit 0
+          fi
+
+          # Lead the body with this version's changelog entry, the way releases
+          # read before the process moved into this workflow. GitHub appends its
+          # generated "What's Changed" list after it.
+          awk -v section="## [${tag#v}]" '
+            index($0, section) == 1 { inside = 1; next }
+            inside && /^## \[/ { exit }
+            inside { print }
+          ' CHANGELOG.md > release-notes.md
+
+          release_args=(--verify-tag --title "$tag" --generate-notes --draft)
+          if [ -s release-notes.md ]; then
+            release_args+=(--notes-file release-notes.md)
+          else
+            echo "::warning::No CHANGELOG.md section found for ${tag}; using generated notes only."
+          fi
+          if [[ "$tag" == *-* ]]; then
+            release_args+=(--prerelease)
+          fi
+
+          gh release create "$tag" "${release_args[@]}"
+
+  # ---------------------------------------------------------------------------
   # Build & push Docker images (multi-arch)
   # ---------------------------------------------------------------------------
   docker-operator:
     name: Docker — Operator
-    needs: [build-binaries]
+    needs: [build-binaries, prepare-github-release]
     runs-on: ubuntu-latest
     env:
       IMAGE_NAME: pgroles-operator
@@ -94,7 +150,7 @@ jobs:
 
   docker-cli:
     name: Docker — CLI
-    needs: [build-binaries]
+    needs: [build-binaries, prepare-github-release]
     runs-on: ubuntu-latest
     env:
       IMAGE_NAME: pgroles
@@ -278,33 +334,56 @@ jobs:
           path: docker-dist/${{ matrix.binary }}-${{ matrix.target }}
 
   # ---------------------------------------------------------------------------
-  # Create GitHub Release with binaries
+  # Attach binaries to the draft and publish it
   # ---------------------------------------------------------------------------
+  # Runs last, once every other publication has succeeded: publishing the
+  # release is what freezes it, so it doubles as the commit point for the whole
+  # release. If anything above fails, the release stays a draft and can be
+  # deleted and retried.
   github-release:
     name: GitHub Release
-    needs: [build-binaries]
+    needs:
+      - prepare-github-release
+      - build-binaries
+      - docker-operator
+      - docker-cli
+      - publish-crates
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
-
       - name: Download all artifacts
         uses: actions/download-artifact@v7
         with:
           pattern: binary-*
           merge-multiple: true
 
-      - name: Create release
-        uses: softprops/action-gh-release@v3
-        with:
-          generate_release_notes: true
-          prerelease: ${{ contains(github.ref_name, '-') }}
-          files: "*.tar.gz"
+      - name: Attach binaries to the draft
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          assets=(*.tar.gz)
+          if [ ${#assets[@]} -eq 0 ]; then
+            echo "::error::No release binaries were downloaded; refusing to publish a release with no assets."
+            exit 1
+          fi
+          for asset in "${assets[@]}"; do
+            gh release upload "${GITHUB_REF_NAME}" "$asset" --clobber
+          done
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: gh release edit "${GITHUB_REF_NAME}" --draft=false
 
   # ---------------------------------------------------------------------------
   # Publish to crates.io
   # ---------------------------------------------------------------------------
   publish-crates:
     name: Publish to crates.io
+    needs: [prepare-github-release]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
