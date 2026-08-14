@@ -141,9 +141,19 @@ The tag push then drives everything, in this order:
 `helm-chart-release.yml` publishes the chart on the same tag in its own run, and
 repeats the "already published" check for the same reason.
 
-If a release run fails, the release stays a draft: delete the draft, fix the
-cause, and re-run. A tag whose run got as far as crates.io or GHCR cannot be
-reused — those publications are irreversible, so cut the next patch version.
+When a release run fails, the release stays a draft and nothing is visible to
+users. What to do next depends on how far it got:
+
+- **Failed at `candidate-ci` or `prepare-github-release`** — nothing was
+  published. Delete the draft if one was created, fix the cause, delete and
+  re-push the tag.
+- **Failed after `publish-crates` or a docker job succeeded** — that version is
+  spent. crates.io and GHCR do not allow republishing a version, so re-running
+  the workflow fails on the already-published crates and can never reach
+  `github-release`. Delete the draft and cut the next patch version.
+
+The second case is why the gates run first: everything that can be checked
+cheaply is checked before anything becomes irreversible.
 
 ## Containers
 

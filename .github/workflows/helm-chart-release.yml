@@ -27,11 +27,20 @@ jobs:
         run: |
           set -euo pipefail
           tag="${GITHUB_REF_NAME}"
-          if is_draft=$(gh release view "$tag" --json isDraft --jq '.isDraft' 2>/dev/null); then
+          err="${RUNNER_TEMP}/release-view.err"
+
+          # A missing release is the normal case on a fresh tag and means carry
+          # on. Anything else — auth, rate limiting, a 5xx — must not be read as
+          # "no release exists", or this gate waves through exactly the state it
+          # is meant to catch.
+          if is_draft=$(gh release view "$tag" --json isDraft --jq '.isDraft' 2>"$err"); then
             if [ "$is_draft" != "true" ]; then
               echo "::error::GitHub Release ${tag} is already published, so release.yml cannot attach its binaries. Refusing to publish the chart into a half-finished release. Delete the release (the tag can stay) and re-run both workflows."
               exit 1
             fi
+          elif ! grep -qi 'release not found' "$err"; then
+            echo "::error::Could not determine whether release ${tag} is already published, so refusing to publish the chart: $(cat "$err")"
+            exit 1
           fi
 
       - uses: actions/checkout@v6

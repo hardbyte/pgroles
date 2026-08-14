@@ -75,14 +75,21 @@ jobs:
         run: |
           set -euo pipefail
           tag="${GITHUB_REF_NAME}"
+          err="${RUNNER_TEMP}/release-view.err"
 
-          if is_draft=$(gh release view "$tag" --json isDraft --jq '.isDraft' 2>/dev/null); then
+          # Only an explicit "not found" means there is no release yet. Any other
+          # failure — auth, rate limiting, a 5xx — must not be mistaken for one,
+          # or this gate stops gating.
+          if is_draft=$(gh release view "$tag" --json isDraft --jq '.isDraft' 2>"$err"); then
             if [ "$is_draft" != "true" ]; then
               echo "::error::GitHub Release ${tag} is already published, so its assets are immutable and the release binaries cannot be attached. Delete the release (the tag can stay) and re-run this workflow. Release by pushing the tag — this workflow creates the draft, attaches the binaries, and publishes it."
               exit 1
             fi
             echo "Draft release ${tag} already exists; reusing it."
             exit 0
+          elif ! grep -qi 'release not found' "$err"; then
+            echo "::error::Could not determine whether release ${tag} already exists: $(cat "$err")"
+            exit 1
           fi
 
           # Lead the body with this version's changelog entry, the way releases
