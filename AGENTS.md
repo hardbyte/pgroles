@@ -50,11 +50,13 @@ docker run --rm --name pgroles-pg16 \
 YAML → parse_manifest() → PolicyManifest
      → expand_manifest() → ExpandedManifest (profiles × schemas resolved)
      → RoleGraph::from_expanded() → RoleGraph (desired)
+     → [operator only] compose_effective_graph() → RoleGraph (effective desired)
+       overlays memberships from active EphemeralAccessRequests
 
 DB   → inspect() → RoleGraph (current)
      → detect_pg_version() → SqlContext
 
-diff(current, desired) → Vec<Change> → sql::render_all_with_context() → SQL
+diff(current, effective desired) → Vec<Change> → sql::render_all_with_context() → SQL
 ```
 
 ### Workspace Crates

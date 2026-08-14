@@ -26,12 +26,12 @@ The operator requires a ClusterRole with these permissions:
 | `""` | `configmaps` | get, list, create, update, patch, delete |
 | `events.k8s.io` | `events` | create, patch |
 
-Every rule is load-bearing. `postgrespolicyplans` is required to apply anything
-at all, because each apply goes through a plan; `configmaps` stores plan SQL
-above the inline size limit. The `manage` verb is a logical permission with no
-built-in meaning: admission policy uses it to authorize operator-owned request
-lifecycle changes without hard-coding a service account identity, which is why
-the operator holds it while holding neither `use` nor `approve`. See
+`postgrespolicyplans` is required to apply anything at all, because each apply
+goes through a plan; `configmaps` stores plan SQL above the inline size limit.
+The `manage` verb is a logical permission with no built-in meaning: admission
+policy uses it to authorize operator-owned request lifecycle changes without
+hard-coding a service account identity, which is why the operator holds it
+while holding neither `use` nor `approve`. See
 [securing ephemeral access](/docs/ephemeral-access-security).
 
 The Helm chart creates the ClusterRole, ClusterRoleBinding, and ServiceAccount

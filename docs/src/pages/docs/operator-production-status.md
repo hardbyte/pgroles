@@ -55,9 +55,10 @@ The operator's safety model — serialized reconciliation, conflict detection, f
 
 **Deployment security:**
 
-- The operator requires cluster-scoped controller RBAC with Secret read access;
-  there is no namespace-scoped deployment option. Ephemeral request and
-  approval hardening is covered in [securing ephemeral access](/docs/ephemeral-access-security).
+- The operator requires controller RBAC with Secret read access. It is
+  cluster-scoped by default; `operator.watchNamespace` scopes every watch and
+  the chart's RBAC to a single namespace. Ephemeral request and approval
+  hardening is covered in [securing ephemeral access](/docs/ephemeral-access-security).
 
 **Deletion semantics:**
 
