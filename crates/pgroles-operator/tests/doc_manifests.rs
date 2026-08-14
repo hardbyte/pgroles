@@ -61,17 +61,46 @@ fn markdown_pages() -> Vec<PathBuf> {
     pages
 }
 
-/// Strip the Kubernetes structural-schema extensions that a plain JSON Schema
-/// validator does not understand. `nullable` in particular is OpenAPI, not JSON
-/// Schema, and would otherwise reject legitimate values.
+/// Translate a Kubernetes structural schema into plain JSON Schema.
+///
+/// Two OpenAPI-isms need handling. `x-kubernetes-*` extensions are dropped: a
+/// JSON Schema validator does not understand them. `nullable: true` is
+/// translated rather than dropped — the API server accepts an explicit `null`
+/// for such a field, so dropping it would make the validator reject a manifest
+/// the cluster would take.
+///
+/// The translation widens `type` to include `"null"` instead of wrapping the
+/// schema in an `anyOf`. That keeps `properties` where it is, which matters:
+/// [`pruned_fields`] walks the same schema and would stop descending — silently
+/// checking nothing — if a nullable object's properties moved inside a branch.
 fn to_json_schema(value: &Value) -> Value {
     match value {
-        Value::Object(map) => Value::Object(
-            map.iter()
+        Value::Object(map) => {
+            let nullable = map.get("nullable") == Some(&Value::Bool(true));
+            let mut out: serde_json::Map<String, Value> = map
+                .iter()
                 .filter(|(k, _)| !k.starts_with("x-kubernetes-") && k.as_str() != "nullable")
                 .map(|(k, v)| (k.clone(), to_json_schema(v)))
-                .collect(),
-        ),
+                .collect();
+
+            if nullable {
+                // Every nullable schema the CRDs generate carries a single
+                // string `type`; anything else is left alone rather than
+                // guessed at, since an untyped schema already accepts null.
+                if let Some(Value::String(ty)) = out.get("type") {
+                    let ty = ty.clone();
+                    out.insert("type".to_string(), json!([ty, "null"]));
+                }
+                // A nullable enum must list null, or the enum re-excludes it.
+                if let Some(Value::Array(variants)) = out.get_mut("enum")
+                    && !variants.contains(&Value::Null)
+                {
+                    variants.push(Value::Null);
+                }
+            }
+
+            Value::Object(out)
+        }
         Value::Array(items) => Value::Array(items.iter().map(to_json_schema).collect()),
         other => other.clone(),
     }
@@ -290,6 +319,33 @@ mod regressions {
             pruned,
             vec!["spec.connection.url".to_string()],
             "an undeclared connection field should be reported as pruned"
+        );
+    }
+
+    #[test]
+    fn an_explicit_null_is_accepted_where_the_api_server_accepts_one() {
+        let schemas = schemas();
+        let (validator, _) = schemas
+            .get("PostgresPolicy")
+            .expect("PostgresPolicy schema should exist");
+        // `spec.approval` is `nullable: true` with an enum, so it is the shape
+        // that regresses first if the nullable translation is dropped.
+        let manifest = json!({
+            "apiVersion": "pgroles.io/v1alpha1",
+            "kind": "PostgresPolicy",
+            "metadata": {"name": "example"},
+            "spec": {
+                "connection": {"secretRef": {"name": "db"}, "secretKey": "url"},
+                "approval": Value::Null
+            }
+        });
+        let errors: Vec<_> = validator
+            .iter_errors(&manifest)
+            .map(|error| error.to_string())
+            .collect();
+        assert!(
+            errors.is_empty(),
+            "an explicit null on a nullable field should validate: {errors:?}"
         );
     }
 
