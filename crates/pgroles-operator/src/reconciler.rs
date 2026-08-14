@@ -32,7 +32,7 @@ use crate::crd::{
 const FINALIZER: &str = "pgroles.io/finalizer";
 
 /// Default requeue interval when no interval is specified on the CR.
-const DEFAULT_REQUEUE_SECS: u64 = 300; // 5 minutes
+pub(crate) const DEFAULT_REQUEUE_SECS: u64 = 300; // 5 minutes
 
 /// Base requeue delay when lock contention is detected.
 const LOCK_CONTENTION_BASE_SECS: u64 = 10;
