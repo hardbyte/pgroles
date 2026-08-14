@@ -115,6 +115,9 @@ jobs:
       - name: CRD drift check
         run: scripts/check-crd-drift.sh
 
+      - name: Chart README drift check
+        run: scripts/check-helm-docs.sh
+
       - uses: astral-sh/setup-uv@v9.0.0
 
       - name: Validate Agent Skills
