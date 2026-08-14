@@ -14,8 +14,41 @@ permissions:
   packages: write
   id-token: write
   attestations: write
+  # candidate-ci queries this repository's CI runs.
+  actions: read
 
 jobs:
+  # ---------------------------------------------------------------------------
+  # Exact-commit CI gate
+  # ---------------------------------------------------------------------------
+  # A tag is irreversible the moment crates.io and GHCR are involved, so require
+  # that CI already passed on this exact commit. CI runs automatically on pushes
+  # to main and release/**, so the run this looks for is the one triggered by
+  # merging the release-prep PR — tag that commit once it is green and no manual
+  # dispatch is needed.
+  candidate-ci:
+    name: Verify CI passed on this commit
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require a successful CI run for this SHA
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EXPECTED_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          count=$(gh api -X GET \
+            "repos/${GITHUB_REPOSITORY}/actions/workflows/ci.yml/runs" \
+            -f head_sha="${EXPECTED_SHA}" \
+            -f event=push \
+            -f status=success \
+            -f per_page=100 \
+            --jq '.total_count')
+          if [ "$count" -lt 1 ]; then
+            echo "::error::No successful CI run exists for ${EXPECTED_SHA}. CI runs automatically on pushes to main and release/**; wait for that run to go green and tag that exact commit. A tag on a commit CI has not passed cannot be released."
+            exit 1
+          fi
+          echo "Found ${count} successful CI run(s) for ${EXPECTED_SHA}."
+
   # ---------------------------------------------------------------------------
   # Immutable-release gate
   # ---------------------------------------------------------------------------
@@ -30,6 +63,7 @@ jobs:
   # own the release object.
   prepare-github-release:
     name: Prepare draft GitHub Release
+    needs: [candidate-ci]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
@@ -226,6 +260,7 @@ jobs:
   # ---------------------------------------------------------------------------
   build-binaries:
     name: Build — ${{ matrix.binary }} — ${{ matrix.target }}
+    needs: [candidate-ci]
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
