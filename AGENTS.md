@@ -132,14 +132,23 @@ The tag push then drives everything, in this order:
    Changed" appended. Every publishing job waits on it, so a release that was
    published by hand fails here — while nothing has reached crates.io or GHCR.
 3. **`build-binaries`** cross-compiles the CLI for four targets.
-4. **`publish-crates`**, **`docker-operator`**, **`docker-cli`** publish to
-   crates.io and GHCR.
-5. **`github-release`** attaches the tarballs to the draft and publishes it.
+4. **`docker-operator`** and **`docker-cli`** push, sign, and attest the images.
+5. **`publish-crates`** publishes the four crates, after the images rather than
+   beside them. It is the one step that cannot be undone — a GHCR package
+   version can be deleted and a draft release discarded, but a crates.io version
+   can only be yanked — so it goes as late as possible.
+6. **`github-release`** attaches the tarballs to the draft and publishes it.
    Publishing is what freezes the release, so it runs last and acts as the
    commit point for the whole release.
 
-`helm-chart-release.yml` publishes the chart on the same tag in its own run, and
-repeats the "already published" check for the same reason.
+`helm-chart-release.yml` publishes the chart on the same tag in its own run. It
+cannot depend on the jobs above, so it repeats both gates itself — the CI check
+and the already-published check.
+
+None of this is atomic: crates.io, GHCR, and the chart are three registries, and
+the crates publish four times in sequence. A failure between any two of them
+leaves a gap no workflow can close. The ordering only ensures nothing publishes
+from a commit CI has not passed, and that the irreversible step happens last.
 
 When a release run fails, the release stays a draft and nothing is visible to
 users. What to do next depends on how far it got:
