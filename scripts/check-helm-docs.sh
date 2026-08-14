@@ -75,9 +75,19 @@ if [ -z "$helm_docs" ]; then
   helm_docs="$tmpdir/helm-docs"
 fi
 
+readme="charts/pgroles-operator/README.md"
+
+# Compare against the working-tree content, not the index. The question is
+# whether the README matches the values.yaml and Chart.yaml sitting next to it;
+# whether it has been committed yet is git's business. Diffing against the index
+# would report drift for an uncommitted-but-correct README, so fixing the drift
+# would not clear the check.
+before="$tmpdir/README.md.before"
+cp "$readme" "$before"
+
 "$helm_docs" --chart-search-root charts
 
-if ! git diff --exit-code -- charts/pgroles-operator/README.md; then
-  echo "::error::charts/pgroles-operator/README.md is out of date. Regenerate with: helm-docs --chart-search-root charts"
+if ! diff -u "$before" "$readme"; then
+  echo "::error::${readme} was out of date and has been regenerated. Commit the change, or run: helm-docs --chart-search-root charts"
   exit 1
 fi
