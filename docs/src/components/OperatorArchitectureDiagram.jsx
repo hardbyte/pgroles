@@ -51,7 +51,6 @@ export function OperatorArchitectureDiagram() {
               items={[
                 'PostgresPolicy generation updates',
                 'PostgresPolicyPlan approval changes',
-                'EphemeralAccessRequest lifecycle changes',
                 'Referenced Secret changes',
                 'Interval-based requeues',
               ]}

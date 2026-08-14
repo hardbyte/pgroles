@@ -63,6 +63,7 @@ The operator's safety model — serialized reconciliation, conflict detection, f
 **Deletion semantics:**
 
 - Deleting a `PostgresPolicy` stops reconciliation but does not revert the database. This is by design (stop managing, not undo) but differs from GitOps conventions where deleting a resource reverts its effects.
+- Deleting a policy with `--cascade=orphan` leaves its plans and plan-SQL ConfigMaps behind. They are matched to their policy by owner UID rather than by name, so a recreated policy of the same name does not re-adopt them, and orphan deletion strips the owner references that garbage collection relies on. Prefer the default cascading delete; if you have already orphaned some, delete the leftover `pgplan` objects and `*-sql` ConfigMaps by hand.
 
 ## Path to API stability
 

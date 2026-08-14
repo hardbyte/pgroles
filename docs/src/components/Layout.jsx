@@ -17,7 +17,6 @@ const navigation = [
         links: [
             {title: 'Getting started', href: '/'},
             {title: 'Quick start', href: '/docs/quick-start'},
-            {title: 'Related tools', href: '/docs/alternatives'},
         ],
     },
     {
@@ -48,6 +47,7 @@ const navigation = [
             {title: 'Default privileges', href: '/docs/default-privileges'},
             {title: 'Memberships', href: '/docs/memberships'},
             {title: 'Bundle composition', href: '/docs/bundle-composition'},
+            {title: 'Application access patterns', href: '/docs/tooling'},
             {title: 'Manifest reference', href: '/docs/manifest-reference'},
         ],
     },
@@ -66,7 +66,6 @@ const navigation = [
             {title: 'Install the CLI', href: '/docs/installation'},
             {title: 'CLI commands', href: '/docs/cli'},
             {title: 'CI/CD integration', href: '/docs/ci-cd'},
-            {title: 'Application access patterns', href: '/docs/tooling'},
         ],
     },
     {
@@ -74,6 +73,7 @@ const navigation = [
         links: [
             {title: 'Architecture', href: '/docs/architecture'},
             {title: 'Limitations', href: '/docs/limitations'},
+            {title: 'Related tools', href: '/docs/alternatives'},
         ],
     },
 ]
