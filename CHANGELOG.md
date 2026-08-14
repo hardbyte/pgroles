@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.0] - 2026-08-14
+
 ### Added
 
 - **Bounded, request-driven PostgreSQL memberships in Kubernetes.** `EphemeralAccessPolicy` defines a requestable bundle; immutable `EphemeralAccessRequest` resources resolve, activate, expire, and revoke one grant without touching the durable `PostgresPolicy`. **`approval.mode: Required` is only a real approval boundary under admission enforcement** — approving and otherwise managing a request are the same write to `ephemeralaccessrequests/status`, so RBAC alone cannot separate them. Deploy the CI-tested Kyverno profile in `k8s/security/`, or front the API with a trusted broker, before relying on it: [securing ephemeral access](https://hardbyte.github.io/pgroles/docs/ephemeral-access-security/) sets out the three trust postures. Requires PostgreSQL 16 or later. (#158)
