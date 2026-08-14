@@ -96,7 +96,66 @@ The heavier fairness/load coverage lives in `.github/workflows/operator-fairness
 - Update affected skills when behavior or public workflows change; avoid
   duplicating canonical skill content elsewhere.
 
-## Release and Containers
+## Release Process
+
+**Release by pushing the tag. Never publish a release from the GitHub UI.**
+
+Publishing from the UI creates the tag itself, so `release.yml` arrives to find
+the release already published — and published releases are immutable, so the CLI
+binaries can never be attached. The workflow creates and publishes the release
+itself; the tag is the only manual step.
+
+1. Open a release-prep PR against `main`: bump `version` in `Cargo.toml`
+   (`workspace.package` plus the `pgroles-core` / `pgroles-inspect`
+   path-dependency pins), refresh `Cargo.lock`, set the chart's `version` and
+   `appVersion`, regenerate the chart README (`scripts/check-helm-docs.sh`), and
+   retitle the changelog's `## [Unreleased]` section to `## [X.Y.Z] - <date>`
+   with a fresh empty `## [Unreleased]` above it.
+2. Merge it once CI is green.
+3. **Wait for the CI run that the merge triggered on `main` to pass.** Releasing
+   requires a successful CI run on the exact commit being tagged, and CI runs
+   automatically on pushes to `main` and `release/**`, so this is the run to
+   wait for — no manual dispatch needed.
+4. Tag that green commit and push:
+   ```bash
+   git checkout main && git pull
+   git tag vX.Y.Z && git push origin vX.Y.Z
+   ```
+
+The tag push then drives everything, in this order:
+
+1. **`candidate-ci`** requires a successful CI run for the tagged commit. It
+   runs before anything else, so tagging a commit CI has not passed costs
+   nothing.
+2. **`prepare-github-release`** creates a *draft* release, with the body taken
+   from that version's `CHANGELOG.md` section and GitHub's generated "What's
+   Changed" appended. Every publishing job waits on it, so a release that was
+   published by hand fails here — while nothing has reached crates.io or GHCR.
+3. **`build-binaries`** cross-compiles the CLI for four targets.
+4. **`publish-crates`**, **`docker-operator`**, **`docker-cli`** publish to
+   crates.io and GHCR.
+5. **`github-release`** attaches the tarballs to the draft and publishes it.
+   Publishing is what freezes the release, so it runs last and acts as the
+   commit point for the whole release.
+
+`helm-chart-release.yml` publishes the chart on the same tag in its own run, and
+repeats the "already published" check for the same reason.
+
+When a release run fails, the release stays a draft and nothing is visible to
+users. What to do next depends on how far it got:
+
+- **Failed at `candidate-ci` or `prepare-github-release`** — nothing was
+  published. Delete the draft if one was created, fix the cause, delete and
+  re-push the tag.
+- **Failed after `publish-crates` or a docker job succeeded** — that version is
+  spent. crates.io and GHCR do not allow republishing a version, so re-running
+  the workflow fails on the already-published crates and can never reach
+  `github-release`. Delete the draft and cut the next patch version.
+
+The second case is why the gates run first: everything that can be checked
+cheaply is checked before anything becomes irreversible.
+
+## Containers
 
 - Published container images are multi-arch for `linux/amd64` and `linux/arm64`.
 - `.github/workflows/release.yml` builds Linux binaries first, then assembles container images from those artifacts using `docker/Dockerfile.runtime`.

@@ -2,7 +2,10 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    # release/** so a release branch gets the full suite on its own pushes, and
+    # so the commit a release tag will point at has a successful push run for
+    # release.yml's candidate-ci gate to find.
+    branches: [main, "release/**"]
   pull_request:
     branches: [main]
 
