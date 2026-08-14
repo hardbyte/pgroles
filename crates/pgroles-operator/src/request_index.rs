@@ -8,6 +8,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::RwLock;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
 
 use kube::ResourceExt;
 use kube::runtime::reflector::ObjectRef;
@@ -17,6 +18,23 @@ use tokio::sync::Notify;
 use crate::crd::EphemeralAccessRequest;
 
 type NamespacedKey = (String, String);
+
+/// How long a lookup waits for the initial watch sync before giving up.
+///
+/// `compose_effective_graph` calls into this index from the PostgresPolicy
+/// reconciler *after* both database locks are held. An unbounded wait would
+/// therefore keep a PostgreSQL advisory lock for as long as the request watch
+/// stayed broken, stalling every replica and every policy sharing that
+/// database rather than only the ephemeral paths. Failing the lookup instead
+/// lets the reconcile unwind, drop its locks, and requeue with backoff.
+const READY_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// The request watch had not completed its initial sync in time.
+#[derive(Debug, thiserror::Error)]
+#[error("ephemeral request index did not sync within {waited:?}")]
+pub struct IndexNotReady {
+    waited: Duration,
+}
 
 #[derive(Default)]
 struct IndexState {
@@ -168,53 +186,62 @@ impl RequestIndex {
         }
     }
 
-    async fn wait_ready(&self) {
-        while !self.ready.load(Ordering::Acquire) {
-            let notified = self.ready_notify.notified();
-            if self.ready.load(Ordering::Acquire) {
-                break;
+    async fn wait_ready(&self) -> Result<(), IndexNotReady> {
+        let synced = async {
+            while !self.ready.load(Ordering::Acquire) {
+                // Register interest before re-checking, so an InitDone landing
+                // between the check and the await is not a lost wakeup.
+                let notified = self.ready_notify.notified();
+                if self.ready.load(Ordering::Acquire) {
+                    break;
+                }
+                notified.await;
             }
-            notified.await;
-        }
+        };
+        tokio::time::timeout(READY_TIMEOUT, synced)
+            .await
+            .map_err(|_| IndexNotReady {
+                waited: READY_TIMEOUT,
+            })
     }
 
     pub async fn for_access_policy_name(
         &self,
         namespace: &str,
         name: &str,
-    ) -> Vec<Arc<EphemeralAccessRequest>> {
-        self.wait_ready().await;
+    ) -> Result<Vec<Arc<EphemeralAccessRequest>>, IndexNotReady> {
+        self.wait_ready().await?;
         let state = self.live.read().expect("request index poisoned");
-        state.values_for(
+        Ok(state.values_for(
             &state.by_access_policy_name,
             &(namespace.to_string(), name.to_string()),
-        )
+        ))
     }
 
     pub async fn for_access_policy_uid(
         &self,
         namespace: &str,
         uid: &str,
-    ) -> Vec<Arc<EphemeralAccessRequest>> {
-        self.wait_ready().await;
+    ) -> Result<Vec<Arc<EphemeralAccessRequest>>, IndexNotReady> {
+        self.wait_ready().await?;
         let state = self.live.read().expect("request index poisoned");
-        state.values_for(
+        Ok(state.values_for(
             &state.by_access_policy_uid,
             &(namespace.to_string(), uid.to_string()),
-        )
+        ))
     }
 
     pub async fn for_target_policy_uid(
         &self,
         namespace: &str,
         uid: &str,
-    ) -> Vec<Arc<EphemeralAccessRequest>> {
-        self.wait_ready().await;
+    ) -> Result<Vec<Arc<EphemeralAccessRequest>>, IndexNotReady> {
+        self.wait_ready().await?;
         let state = self.live.read().expect("request index poisoned");
-        state.values_for(
+        Ok(state.values_for(
             &state.by_target_policy_uid,
             &(namespace.to_string(), uid.to_string()),
-        )
+        ))
     }
 
     pub fn len(&self) -> usize {
@@ -289,13 +316,28 @@ mod tests {
         index.observe(&Event::Init);
         index.observe(&Event::InitApply(first.clone()));
         index.observe(&Event::InitDone);
-        assert_eq!(index.for_access_policy_name("ns", "access").await.len(), 1);
         assert_eq!(
-            index.for_access_policy_uid("ns", "access-uid").await.len(),
+            index
+                .for_access_policy_name("ns", "access")
+                .await
+                .unwrap()
+                .len(),
             1
         );
         assert_eq!(
-            index.for_target_policy_uid("ns", "target-uid").await.len(),
+            index
+                .for_access_policy_uid("ns", "access-uid")
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            index
+                .for_target_policy_uid("ns", "target-uid")
+                .await
+                .unwrap()
+                .len(),
             1
         );
 
@@ -304,17 +346,55 @@ mod tests {
         assert_eq!(index.len(), 0);
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn lookups_fail_instead_of_hanging_when_the_watch_never_syncs() {
+        // A request watch that never reaches InitDone previously blocked every
+        // lookup forever. compose_effective_graph runs with both database locks
+        // held, so that hang stranded a PostgreSQL advisory lock and wedged the
+        // other replicas rather than failing this one reconcile.
+        let index = RequestIndex::default();
+        index.observe(&Event::Init);
+        assert!(
+            index
+                .for_target_policy_uid("ns", "target-uid")
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn lookups_unblock_as_soon_as_the_watch_syncs() {
+        let index = RequestIndex::default();
+        let waiter = {
+            let index = index.clone();
+            tokio::spawn(async move { index.for_access_policy_name("ns", "access").await })
+        };
+        tokio::task::yield_now().await;
+        index.observe(&Event::Init);
+        index.observe(&Event::InitApply(request("one", "access", "", "")));
+        index.observe(&Event::InitDone);
+        assert_eq!(waiter.await.expect("waiter panicked").unwrap().len(), 1);
+    }
+
     #[tokio::test]
     async fn unresolved_requests_are_indexed_by_policy_name() {
         let index = RequestIndex::default();
         index.observe(&Event::Init);
         index.observe(&Event::InitApply(request("one", "access", "", "")));
         index.observe(&Event::InitDone);
-        assert_eq!(index.for_access_policy_name("ns", "access").await.len(), 1);
+        assert_eq!(
+            index
+                .for_access_policy_name("ns", "access")
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
         assert!(
             index
                 .for_access_policy_uid("ns", "access-uid")
                 .await
+                .unwrap()
                 .is_empty()
         );
     }
@@ -345,13 +425,17 @@ mod tests {
         index.observe(&Event::InitApply(relevant));
         index.observe(&Event::InitDone);
 
-        let matches = index.for_target_policy_uid("ns", "target-uid").await;
+        let matches = index
+            .for_target_policy_uid("ns", "target-uid")
+            .await
+            .unwrap();
         assert_eq!(matches.len(), 1);
         assert_eq!(matches[0].name_any(), "relevant");
         assert!(
             index
                 .for_target_policy_uid("ns", "forged-uid")
                 .await
+                .unwrap()
                 .is_empty()
         );
     }

@@ -122,6 +122,9 @@ pub enum ReconcileError {
     #[error("resource has no namespace")]
     NoNamespace,
 
+    #[error("ephemeral request index unavailable: {0}")]
+    RequestIndexNotReady(#[from] crate::request_index::IndexNotReady),
+
     #[error("waiting for {0} attached ephemeral access policy/policies to be deleted")]
     PendingEphemeralAccessCleanup(usize),
 
@@ -369,6 +372,8 @@ fn retry_class(error: &finalizer::Error<ReconcileError>) -> RetryClass {
 fn retry_class_for_reconcile_error(error: &ReconcileError) -> RetryClass {
     match error {
         ReconcileError::LockContention(_, _) => RetryClass::LockContention,
+        // The watch resyncs on its own, so this clears without operator action.
+        ReconcileError::RequestIndexNotReady(_) => RetryClass::Transient,
         ReconcileError::PendingEphemeralAccessCleanup(_) => RetryClass::CleanupPending,
         ReconcileError::ManifestExpansion(_)
         | ReconcileError::InvalidInterval(_, _)
@@ -2205,6 +2210,7 @@ impl ReconcileError {
             ReconcileError::ConflictingPolicy(_) => "ConflictingPolicy",
             ReconcileError::UnsatisfiableWildcardGrant(_) => "UnsatisfiableWildcardGrant",
             ReconcileError::LockContention(_, _) => "LockContention",
+            ReconcileError::RequestIndexNotReady(_) => "RequestIndexNotReady",
             ReconcileError::Context(context) => match context.as_ref() {
                 ContextError::SecretFetch { .. } => "SecretFetchFailed",
                 ContextError::SecretMissing { .. } => "SecretMissing",

@@ -79,6 +79,8 @@ pub enum EphemeralError {
     Invalid(String),
     #[error("waiting for {0} request(s) to be revoked")]
     PendingCleanup(usize),
+    #[error("ephemeral request index unavailable: {0}")]
+    RequestIndexNotReady(#[from] crate::request_index::IndexNotReady),
 }
 
 pub async fn reconcile_access_policy(
@@ -357,11 +359,11 @@ async fn reconcile_access_policy_cleanup(
     let mut indexed = ctx
         .request_index
         .for_access_policy_name(&namespace, &policy.name_any())
-        .await;
+        .await?;
     indexed.extend(
         ctx.request_index
             .for_access_policy_uid(&namespace, &policy_uid)
-            .await,
+            .await?,
     );
     indexed.sort_by_key(|request| request.uid().unwrap_or_default());
     indexed.dedup_by_key(|request| request.uid().unwrap_or_default());
@@ -638,7 +640,7 @@ async fn reconcile_access_request_apply(
         if mode == EphemeralApprovalMode::Automatic {
             persist_activation_deadline(&mut status, &resolved)?;
         }
-        patch_request_index_labels(request, ctx, &resolved).await?;
+        patch_request_index_labels(request, ctx, &resolved).await;
         patch_request_status(request, ctx, &status).await?;
         audit_transition(request, ctx, None, &status, "Resolved");
         publish_request_event_best_effort(request, ctx, &status, "Resolved").await;
@@ -935,27 +937,44 @@ async fn reconcile_access_request_apply(
     }
 }
 
+/// Stamp the resolved UIDs onto the request as labels, for server-side routing
+/// and `kubectl` inspection.
+///
+/// Best-effort by design. These labels are never consulted for authorization or
+/// ownership — every such decision reads the immutable UIDs in
+/// `status.resolvedAccess`, and the index is keyed from that same status rather
+/// than from the labels. Failing activation because a cosmetic patch was
+/// rejected would make a convenience feature load-bearing, so a failure is
+/// logged and the reconcile continues.
 async fn patch_request_index_labels(
     request: &EphemeralAccessRequest,
     ctx: &OperatorContext,
     resolved: &ResolvedEphemeralAccess,
-) -> Result<(), EphemeralError> {
+) {
     let namespace = request.namespace().unwrap_or_else(|| "default".to_string());
     let api: Api<EphemeralAccessRequest> = Api::namespaced(ctx.kube_client.clone(), &namespace);
-    api.patch(
-        &request.name_any(),
-        &PatchParams::apply("pgroles-operator"),
-        &Patch::Merge(serde_json::json!({
-            "metadata": {
-                "labels": {
-                    (LABEL_ACCESS_POLICY_UID): resolved.access_policy_uid,
-                    (LABEL_TARGET_POLICY_UID): resolved.target_policy_uid,
+    let patched = api
+        .patch(
+            &request.name_any(),
+            &PatchParams::apply("pgroles-operator"),
+            &Patch::Merge(serde_json::json!({
+                "metadata": {
+                    "labels": {
+                        (LABEL_ACCESS_POLICY_UID): resolved.access_policy_uid,
+                        (LABEL_TARGET_POLICY_UID): resolved.target_policy_uid,
+                    }
                 }
-            }
-        })),
-    )
-    .await?;
-    Ok(())
+            })),
+        )
+        .await;
+    if let Err(error) = patched {
+        tracing::warn!(
+            %error,
+            %namespace,
+            request = %request.name_any(),
+            "could not label request with resolved UIDs; routing falls back to the status index",
+        );
+    }
 }
 
 fn persist_activation_deadline(
@@ -1346,11 +1365,22 @@ pub async fn compose_effective_graph(
     desired: &mut pgroles_core::model::RoleGraph,
 ) -> Result<BTreeSet<String>, ReconcileError> {
     let namespace = policy.namespace().ok_or(ReconcileError::NoNamespace)?;
-    let policy_uid = policy.uid().unwrap_or_default();
+    // An absent UID must not degrade to an empty-string lookup key. That key
+    // matches nothing, so the overlay would come back empty and authoritative
+    // reconciliation would revoke every active ephemeral membership as drift.
+    // A persisted object always carries a UID, so failing here is strictly
+    // better than silently composing an incomplete graph.
+    let policy_uid = policy.uid().ok_or_else(|| {
+        ReconcileError::InvalidSpec(
+            "target policy has no metadata.uid; refusing to compose an ephemeral overlay that \
+             could not be scoped to it"
+                .to_string(),
+        )
+    })?;
     let indexed = ctx
         .request_index
         .for_target_policy_uid(&namespace, &policy_uid)
-        .await;
+        .await?;
     ctx.observability
         .record_ephemeral_relevant_requests("effective_graph", indexed.len());
     let requests: Vec<_> = indexed
@@ -1701,7 +1731,7 @@ async fn apply_scoped_memberships_under_lock(
     let indexed = ctx
         .request_index
         .for_target_policy_uid(&namespace, &resolved.target_policy_uid)
-        .await;
+        .await?;
     ctx.observability
         .record_ephemeral_relevant_requests("scoped_membership", indexed.len());
     let requests: Vec<_> = indexed

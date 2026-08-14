@@ -12,7 +12,7 @@ use kube::runtime::events::{Recorder, Reporter};
 use kube::runtime::reflector::ObjectRef;
 use kube::runtime::{Controller, WatchStreamExt, predicates, reflector, watcher};
 use kube::{Api, Client, Resource, ResourceExt};
-use tracing::info;
+use tracing::{info, warn};
 use tracing_subscriber::prelude::*;
 
 use pgroles_operator::context::OperatorContext;
@@ -308,12 +308,28 @@ async fn main() -> anyhow::Result<()> {
                 let namespace = policy.namespace().unwrap_or_default();
                 let policy_name = policy.name_any();
                 stream::once(async move {
-                    request_index
+                    // A trigger is an optimization: the request controller also
+                    // requeues on its own. Dropping this fan-out when the index
+                    // is not yet synced delays a reconcile, so it is logged and
+                    // skipped rather than propagated.
+                    match request_index
                         .for_access_policy_name(&namespace, &policy_name)
                         .await
-                        .into_iter()
-                        .map(|request| ObjectRef::from_obj(request.as_ref()))
-                        .collect::<Vec<_>>()
+                    {
+                        Ok(requests) => requests
+                            .into_iter()
+                            .map(|request| ObjectRef::from_obj(request.as_ref()))
+                            .collect::<Vec<_>>(),
+                        Err(error) => {
+                            warn!(
+                                %error,
+                                %namespace,
+                                policy = %policy_name,
+                                "skipping access-policy request triggers",
+                            );
+                            Vec::new()
+                        }
+                    }
                 })
                 .flat_map(stream::iter)
             });
