@@ -1,3 +1,4 @@
+pub mod approval;
 pub mod composition;
 pub mod diff;
 pub mod export;

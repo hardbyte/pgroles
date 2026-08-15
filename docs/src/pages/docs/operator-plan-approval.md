@@ -101,8 +101,9 @@ operator.
 What a decision approves is the plan's **change digest**: a versioned hash
 (`pgroles.io/approval-effect/v1`) of the canonical, deterministically ordered
 typed effects — role lifecycle, grants, memberships, ownership and default
-privileges, retirements — bound together with the reconciliation mode, the
-managed scope, and the target identity.
+privileges, retirements — bound together with the reconciliation mode and the
+target identity. (Managed scope joins the binding once it becomes a
+first-class field; today a scope change shows up as a change in effects.)
 
 The applied base is deliberately *not* a digest input. The plan records which
 base it was computed against as provenance, and that record advances whenever

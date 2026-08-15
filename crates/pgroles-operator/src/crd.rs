@@ -1052,11 +1052,26 @@ pub struct PostgresPolicyPlanStatus {
     /// Error message if apply failed.
     #[serde(default)]
     pub last_error: Option<String>,
-    /// SHA-256 hash of the planned SQL, used to detect duplicate plans.
-    /// If a newly computed plan has the same hash as the current pending plan,
-    /// the operator can skip creating a redundant plan.
+    /// SHA-256 hash of the planned SQL. Retained as a diagnostic for the
+    /// preview artifact; it is **not** the approval identity, because rendered
+    /// SQL embeds a freshly salted SCRAM verifier for every password change.
+    /// Use `change_digest` for approval and deduplication.
     #[serde(default)]
     pub sql_hash: Option<String>,
+    /// Canonical semantic digest of the plan's typed effects, bound to the
+    /// reconciliation mode and target database identity.
+    ///
+    /// This is the approval identity: a decision approves these effects, and
+    /// execution proceeds only when the recomputed digest still matches. It is
+    /// stable across recomputation of unchanged effects — notably for password
+    /// changes, which bind the password *source* rather than the derived
+    /// verifier. See `pgroles_core::approval`.
+    #[serde(default)]
+    pub change_digest: Option<String>,
+    /// Version tag of the encoding `change_digest` was computed under. Digests
+    /// from different encodings are never comparable.
+    #[serde(default)]
+    pub change_digest_encoding: Option<String>,
     /// Timestamp when the plan entered Applying phase (for stuck detection).
     #[serde(default)]
     pub applying_since: Option<String>,
@@ -1069,7 +1084,7 @@ pub struct PostgresPolicyPlanStatus {
     #[serde(default)]
     pub sql_statements: Option<i64>,
     /// SHA-256 hash of the redacted SQL preview bytes. This is for storage
-    /// integrity only; approval and deduplication continue to use `sql_hash`.
+    /// integrity only; approval and deduplication use `change_digest`.
     #[serde(default)]
     pub redacted_sql_hash: Option<String>,
     /// Uncompressed byte length of the redacted SQL preview.
