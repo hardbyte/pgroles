@@ -655,7 +655,7 @@
                   },
                   "retirements": {
                     "default": [],
-                    "description": "Explicit role-retirement workflows for roles that should be removed.",
+                    "description": "Explicit role-retirement workflows for roles that should be removed.\n\nKeyed by `role`, which is this list's unique identifier rather than\n`name`. Retiring one role twice was never meaningful, so the key is\nunambiguous.",
                     "items": {
                       "description": "Declarative workflow for retiring an existing role.",
                       "properties": {
@@ -684,11 +684,15 @@
                       ],
                       "type": "object"
                     },
-                    "type": "array"
+                    "type": "array",
+                    "x-kubernetes-list-map-keys": [
+                      "role"
+                    ],
+                    "x-kubernetes-list-type": "map"
                   },
                   "roles": {
                     "default": [],
-                    "description": "One-off role definitions.",
+                    "description": "One-off role definitions.\n\nKeyed by `name`; see `schemas`.",
                     "items": {
                       "description": "A concrete role definition (CRD-compatible version).",
                       "properties": {
@@ -806,11 +810,15 @@
                       ],
                       "type": "object"
                     },
-                    "type": "array"
+                    "type": "array",
+                    "x-kubernetes-list-map-keys": [
+                      "name"
+                    ],
+                    "x-kubernetes-list-type": "map"
                   },
                   "schemas": {
                     "default": [],
-                    "description": "Schema bindings that expand profiles into concrete roles/grants.",
+                    "description": "Schema bindings that expand profiles into concrete roles/grants.\n\nKeyed by `name` so server-side apply merges entries per schema instead\nof replacing the whole list. The API server also rejects duplicate keys.",
                     "items": {
                       "description": "A schema binding — associates a schema with one or more profiles.",
                       "properties": {
@@ -840,7 +848,11 @@
                       ],
                       "type": "object"
                     },
-                    "type": "array"
+                    "type": "array",
+                    "x-kubernetes-list-map-keys": [
+                      "name"
+                    ],
+                    "x-kubernetes-list-type": "map"
                   },
                   "suspend": {
                     "default": false,
