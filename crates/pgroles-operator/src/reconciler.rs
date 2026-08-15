@@ -1309,11 +1309,13 @@ async fn apply_under_lock(
                             identity.as_str(),
                             &applied_password_source_versions,
                         )?;
-                        let digest_matches = current_plan.status.as_ref().is_some_and(|status| {
-                            crate::plan::plan_matches_digest(status, &fresh_digest)
-                        });
+                        let decision = crate::plan::decide_approved_plan(
+                            current_plan.status.as_ref(),
+                            &fresh_digest,
+                            !changes.is_empty(),
+                        );
 
-                        if !digest_matches {
+                        if decision != crate::plan::ApprovedPlanDecision::Execute {
                             // The approved effects are no longer the effects
                             // this policy would produce.
                             let stored_digest = current_plan
@@ -1329,6 +1331,33 @@ async fn apply_under_lock(
 
                             crate::plan::mark_plan_superseded(&ctx.kube_client, &current_plan)
                                 .await?;
+
+                            // The effects did not just move, they vanished —
+                            // someone applied them by hand, or an edit removed
+                            // them. A replacement would hold nothing and still
+                            // demand a second approval.
+                            if decision == crate::plan::ApprovedPlanDecision::Clear {
+                                info!(
+                                    name,
+                                    namespace,
+                                    plan = %current_plan.name_any(),
+                                    "approved plan superseded with no remaining changes"
+                                );
+
+                                mark_reconciled_no_changes(
+                                    ctx,
+                                    resource,
+                                    generation,
+                                    summary.clone(),
+                                    applied_password_source_versions.clone(),
+                                )
+                                .await?;
+
+                                return Ok((
+                                    Action::requeue(requeue_interval),
+                                    ReconcileOutcome::Reconciled,
+                                ));
+                            }
 
                             // Create a new plan with the fresh changes.
                             let new_creation_result = crate::plan::create_or_update_plan(
@@ -1403,7 +1432,8 @@ async fn apply_under_lock(
                             ));
                         }
 
-                        // Hash matches — safe to execute the approved plan.
+                        // The approved effects are still the effects this
+                        // policy would produce — execute what was reviewed.
                         info!(
                             name,
                             namespace,
@@ -1529,7 +1559,124 @@ async fn apply_under_lock(
                         return Ok((Action::requeue(requeue_interval), ReconcileOutcome::Planned));
                     }
                     crate::plan::PlanApprovalState::Pending => {
-                        // Plan exists and is pending — nothing to do, requeue.
+                        // Revalidate the pending plan against the effects the
+                        // policy would produce right now. Without this the plan
+                        // is frozen while awaiting a decision, so the policy can
+                        // report a fresh change summary beside a plan holding
+                        // different content — and a reviewer approves the stale
+                        // one.
+                        let fresh_digest = crate::plan::compute_change_digest(
+                            &changes,
+                            resource.spec.reconciliation_mode,
+                            identity.as_str(),
+                            &applied_password_source_versions,
+                        )?;
+                        let plan_status = current_plan.status.as_ref();
+                        let decision = crate::plan::decide_pending_plan(
+                            plan_status,
+                            &fresh_digest,
+                            !changes.is_empty(),
+                        );
+
+                        if decision != crate::plan::PendingPlanDecision::Retain {
+                            // The effects moved. Supersede rather than leave a
+                            // reviewable plan that no longer describes what
+                            // would happen.
+                            info!(
+                                name,
+                                namespace,
+                                plan = %current_plan.name_any(),
+                                ?decision,
+                                "pending plan superseded while awaiting approval"
+                            );
+
+                            crate::plan::mark_plan_superseded(&ctx.kube_client, &current_plan)
+                                .await?;
+
+                            // The effects did not just move, they vanished. A
+                            // replacement plan here would hold nothing and still
+                            // demand a decision, so leave the policy with no
+                            // pending plan at all.
+                            if decision == crate::plan::PendingPlanDecision::Clear {
+                                mark_reconciled_no_changes(
+                                    ctx,
+                                    resource,
+                                    generation,
+                                    summary.clone(),
+                                    applied_password_source_versions.clone(),
+                                )
+                                .await?;
+
+                                return Ok((
+                                    Action::requeue(requeue_interval),
+                                    ReconcileOutcome::Reconciled,
+                                ));
+                            }
+
+                            let creation_result = crate::plan::create_or_update_plan(
+                                &ctx.kube_client,
+                                resource,
+                                &changes,
+                                &sql_ctx,
+                                &inspect_config,
+                                resource.spec.reconciliation_mode,
+                                identity.as_str(),
+                                &summary,
+                                &applied_password_source_versions,
+                            )
+                            .await?;
+                            let replacement = creation_result.plan_name().to_string();
+
+                            update_status(ctx, resource, |status| {
+                                let msg = format!(
+                                    "Plan {replacement} awaiting approval; {} change(s) pending",
+                                    summary.total,
+                                );
+                                status.set_condition(ready_condition(true, "Planned", &msg));
+                                // Replace implies a non-empty change set; the
+                                // empty case returned above as Clear.
+                                status.set_condition(drifted_condition(
+                                    true,
+                                    "DriftDetected",
+                                    &msg,
+                                ));
+                                status.conditions.retain(|c| {
+                                    c.condition_type != "Reconciling"
+                                        && c.condition_type != "Degraded"
+                                        && c.condition_type != "Conflict"
+                                        && c.condition_type != "Paused"
+                                });
+                                status.last_attempted_generation = generation;
+                                status.change_summary = Some(summary.clone());
+                                status.current_plan_ref = Some(crate::crd::PlanReference {
+                                    name: replacement.clone(),
+                                });
+                                status.last_error = None;
+                                status.transient_failure_count = 0;
+                            })
+                            .await?;
+
+                            return Ok((
+                                Action::requeue(requeue_interval),
+                                ReconcileOutcome::Planned,
+                            ));
+                        }
+
+                        // Effects unchanged — the plan, and any decision on it,
+                        // stand. Record the generation it was confirmed against
+                        // so an effect-neutral policy edit is visible as
+                        // provenance rather than looking like a stale plan.
+                        if plan_status
+                            .is_some_and(|s| crate::plan::needs_revalidation_record(s, generation))
+                        {
+                            crate::plan::record_plan_revalidation(
+                                &ctx.kube_client,
+                                &current_plan,
+                                generation,
+                            )
+                            .await?;
+                        }
+
                         info!(
                             name,
                             namespace,
@@ -1561,6 +1708,12 @@ async fn apply_under_lock(
                             });
                             status.last_attempted_generation = generation;
                             status.change_summary = Some(summary.clone());
+                            // The summary and the plan reference must always
+                            // describe the same effects; the plan was just
+                            // confirmed to still hold them.
+                            status.current_plan_ref = Some(crate::crd::PlanReference {
+                                name: current_plan.name_any(),
+                            });
                             status.last_error = None;
                             status.transient_failure_count = 0;
                         })
@@ -1575,24 +1728,18 @@ async fn apply_under_lock(
             if changes.is_empty() {
                 info!(name, namespace, "no changes needed (manual approval mode)");
 
-                update_status(ctx, resource, |status| {
-                    status.set_condition(ready_condition(true, "Reconciled", "No changes needed"));
-                    status.set_condition(drifted_condition(false, "InSync", "No pending changes"));
-                    status.conditions.retain(|c| {
-                        c.condition_type != "Reconciling"
-                            && c.condition_type != "Degraded"
-                            && c.condition_type != "Conflict"
-                            && c.condition_type != "Paused"
-                    });
-                    status.observed_generation = generation;
-                    status.last_attempted_generation = generation;
-                    status.last_successful_reconcile_time = Some(crate::crd::now_rfc3339());
-                    status.change_summary = Some(summary);
-                    status.last_reconcile_mode = Some(PolicyMode::Apply);
-                    status.last_error = None;
-                    status.applied_password_source_versions = applied_password_source_versions;
-                    status.transient_failure_count = 0;
-                })
+                // Reached only when no actionable plan exists, so the helper
+                // clearing `current_plan_ref` is what this path always meant:
+                // previously it left a reference to whatever plan had been
+                // superseded, which outlived the plan itself once retention
+                // pruned it.
+                mark_reconciled_no_changes(
+                    ctx,
+                    resource,
+                    generation,
+                    summary,
+                    applied_password_source_versions,
+                )
                 .await?;
 
                 return Ok((
@@ -2057,6 +2204,43 @@ async fn emit_plan_event(
 }
 
 /// Patch the status sub-resource of a PostgresPolicy.
+/// Record that the policy is in sync with nothing left to do.
+///
+/// Three paths reach this state under manual approval — no plan and no changes,
+/// a pending plan whose effects vanished, and an approved plan whose effects
+/// vanished — and they must report it identically. Written once here so a field
+/// added later cannot be added to two of the three.
+async fn mark_reconciled_no_changes(
+    ctx: &OperatorContext,
+    resource: &PostgresPolicy,
+    generation: Option<i64>,
+    summary: crate::crd::ChangeSummary,
+    applied_password_source_versions: std::collections::BTreeMap<String, String>,
+) -> Result<(), ReconcileError> {
+    update_status(ctx, resource, |status| {
+        status.set_condition(ready_condition(true, "Reconciled", "No changes needed"));
+        status.set_condition(drifted_condition(false, "InSync", "No pending changes"));
+        status.conditions.retain(|c| {
+            c.condition_type != "Reconciling"
+                && c.condition_type != "Degraded"
+                && c.condition_type != "Conflict"
+                && c.condition_type != "Paused"
+        });
+        status.observed_generation = generation;
+        status.last_attempted_generation = generation;
+        status.last_successful_reconcile_time = Some(crate::crd::now_rfc3339());
+        status.change_summary = Some(summary);
+        status.last_reconcile_mode = Some(PolicyMode::Apply);
+        // Whatever plan was pointed at is gone; leaving the reference behind
+        // strands it on a superseded or pruned object.
+        status.current_plan_ref = None;
+        status.last_error = None;
+        status.applied_password_source_versions = applied_password_source_versions;
+        status.transient_failure_count = 0;
+    })
+    .await
+}
+
 async fn update_status<F>(
     ctx: &OperatorContext,
     resource: &PostgresPolicy,

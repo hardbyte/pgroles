@@ -1072,6 +1072,19 @@ pub struct PostgresPolicyPlanStatus {
     /// from different encodings are never comparable.
     #[serde(default)]
     pub change_digest_encoding: Option<String>,
+    /// The policy generation this plan was most recently confirmed current
+    /// against.
+    ///
+    /// A pending plan is revalidated on every reconcile. When the policy
+    /// changes but the resulting effects do not, the plan — and any decision
+    /// recorded on it — is retained and this advances to the new generation.
+    /// It is provenance, never approval identity: `change_digest` is what a
+    /// decision binds.
+    #[serde(default)]
+    pub revalidated_generation: Option<i64>,
+    /// When the plan was most recently confirmed current.
+    #[serde(default)]
+    pub revalidated_at: Option<String>,
     /// Timestamp when the plan entered Applying phase (for stuck detection).
     #[serde(default)]
     pub applying_since: Option<String>,

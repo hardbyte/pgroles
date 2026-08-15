@@ -352,6 +352,17 @@
                     "nullable": true,
                     "type": "string"
                   },
+                  "revalidatedAt": {
+                    "description": "When the plan was most recently confirmed current.",
+                    "nullable": true,
+                    "type": "string"
+                  },
+                  "revalidatedGeneration": {
+                    "description": "The policy generation this plan was most recently confirmed current\nagainst.\n\nA pending plan is revalidated on every reconcile. When the policy\nchanges but the resulting effects do not, the plan — and any decision\nrecorded on it — is retained and this advances to the new generation.\nIt is provenance, never approval identity: `change_digest` is what a\ndecision binds.",
+                    "format": "int64",
+                    "nullable": true,
+                    "type": "integer"
+                  },
                   "sqlHash": {
                     "description": "SHA-256 hash of the planned SQL. Retained as a diagnostic for the\npreview artifact; it is **not** the approval identity, because rendered\nSQL embeds a freshly salted SCRAM verifier for every password change.\nUse `change_digest` for approval and deduplication.",
                     "nullable": true,
