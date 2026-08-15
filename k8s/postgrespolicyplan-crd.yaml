@@ -92,10 +92,24 @@
                     "description": "Origin of this plan. Omitted for ordinary durable reconciliation plans.",
                     "nullable": true,
                     "properties": {
+                      "contentDigest": {
+                        "description": "Canonical content digest of the originating candidate, and the encoding\nit was computed under.\n\nThis is what binds the reviewed plan to the content that will later be\npromoted. It lives on the origin rather than in an annotation because a\npromotion check that can be edited by anyone holding `patch` is not a\nbinding at all. Both fields are absent for non-candidate origins.",
+                        "nullable": true,
+                        "type": "string"
+                      },
+                      "contentDigestEncoding": {
+                        "nullable": true,
+                        "type": "string"
+                      },
                       "kind": {
                         "type": "string"
                       },
                       "name": {
+                        "type": "string"
+                      },
+                      "policyUid": {
+                        "description": "UID of the `PostgresPolicy` the candidate proposes content for. The\nplan's `spec.policyRef` names it; the UID is what survives a\ndelete-and-recreate of the same name.",
+                        "nullable": true,
                         "type": "string"
                       },
                       "uid": {

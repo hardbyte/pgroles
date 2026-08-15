@@ -11,7 +11,7 @@ use kube::runtime::events::{Event, EventType, Recorder};
 
 use crate::crd::{
     EphemeralAccessRequest, EphemeralAccessRequestPhase, PolicyCondition, PostgresPolicy,
-    PostgresPolicyPlan, PostgresPolicyStatus,
+    PostgresPolicyCandidate, PostgresPolicyPlan, PostgresPolicyStatus,
 };
 
 /// Publish a request lifecycle Event on the request object itself.
@@ -67,6 +67,33 @@ pub async fn publish_policy_warning(
     let reference: ObjectReference = policy.object_ref(&());
     recorder
         .publish(&event(EventType::Warning, reason, action, note), &reference)
+        .await
+}
+
+/// Publish a candidate lifecycle Event on the candidate itself.
+///
+/// On the candidate rather than the policy: a policy may carry many open
+/// proposals, and a stream of their transitions on the policy's Event list
+/// would bury the policy's own. `reason` is the condition reason the same
+/// transition writes, so `kubectl describe` and `kubectl get` agree.
+pub async fn publish_candidate_event(
+    recorder: &Recorder,
+    candidate: &PostgresPolicyCandidate,
+    warning: bool,
+    reason: &str,
+    note: String,
+) -> Result<(), kube::Error> {
+    let reference: ObjectReference = candidate.object_ref(&());
+    let event_type = if warning {
+        EventType::Warning
+    } else {
+        EventType::Normal
+    };
+    recorder
+        .publish(
+            &event(event_type, reason, "CandidateLifecycle", note),
+            &reference,
+        )
         .await
 }
 

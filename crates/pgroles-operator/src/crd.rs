@@ -211,6 +211,21 @@ pub const LABEL_DATABASE_IDENTITY: &str = "pgroles.io/database-identity";
 
 /// Label key for the plan name on SQL storage resources.
 pub const LABEL_PLAN: &str = "pgroles.io/plan";
+/// Label key for the parent candidate name on candidate-origin plans.
+pub const LABEL_CANDIDATE: &str = "pgroles.io/candidate";
+/// Label exempting an object from bounded retention. Set to `"true"` on a
+/// terminal candidate (or plan) to keep it past the retention bound.
+pub const LABEL_KEEP: &str = "pgroles.io/keep";
+
+/// Is this object exempt from bounded retention?
+pub fn is_retention_exempt<K: kube::Resource>(resource: &K) -> bool {
+    resource
+        .meta()
+        .labels
+        .as_ref()
+        .and_then(|labels| labels.get(LABEL_KEEP))
+        .is_some_and(|value| value == "true")
+}
 /// Routing hint for requests resolved from one access-policy UID.
 pub const LABEL_ACCESS_POLICY_UID: &str = "pgroles.io/access-policy-uid";
 /// Routing hint for requests resolved against one target-policy UID.
@@ -1041,6 +1056,22 @@ pub struct PlanOrigin {
     pub kind: String,
     pub name: String,
     pub uid: String,
+    /// Canonical content digest of the originating candidate, and the encoding
+    /// it was computed under.
+    ///
+    /// This is what binds the reviewed plan to the content that will later be
+    /// promoted. It lives on the origin rather than in an annotation because a
+    /// promotion check that can be edited by anyone holding `patch` is not a
+    /// binding at all. Both fields are absent for non-candidate origins.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content_digest: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content_digest_encoding: Option<String>,
+    /// UID of the `PostgresPolicy` the candidate proposes content for. The
+    /// plan's `spec.policyRef` names it; the UID is what survives a
+    /// delete-and-recreate of the same name.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub policy_uid: Option<String>,
 }
 
 /// Scope enforced when executing a non-durable plan.
@@ -1896,99 +1927,140 @@ impl PostgresPolicySpec {
 // Conversion: CRD spec → core manifest types
 // ---------------------------------------------------------------------------
 
+/// Build a core `PolicyManifest` from the shared policy-content fields.
+///
+/// `PostgresPolicySpec` and `PolicyContent` carry the same content by
+/// construction (ADR-001 Decision 1 keeps promotion a pure content copy), so
+/// they must also convert identically — a divergence here would mean a
+/// candidate is planned as something other than what promoting it produces.
+#[allow(clippy::too_many_arguments)]
+fn build_policy_manifest<'a>(
+    default_owner: Option<&str>,
+    profiles: impl Iterator<Item = (&'a String, &'a ProfileSpec)>,
+    schemas: &[SchemaBinding],
+    roles: &[RoleSpec],
+    grants: &[Grant],
+    default_privileges: &[DefaultPrivilege],
+    memberships: &[Membership],
+    retirements: &[RoleRetirement],
+) -> pgroles_core::manifest::PolicyManifest {
+    use pgroles_core::manifest::{
+        DefaultPrivilegeGrant, MemberSpec, PolicyManifest, Profile, ProfileGrant,
+        ProfileObjectTarget, RoleDefinition,
+    };
+
+    let profiles = profiles
+        .map(|(name, spec)| {
+            let profile = Profile {
+                login: spec.login,
+                inherit: spec.inherit,
+                grants: spec
+                    .grants
+                    .iter()
+                    .map(|g| ProfileGrant {
+                        privileges: g.privileges.clone(),
+                        object: ProfileObjectTarget {
+                            object_type: g.object.object_type,
+                            name: g.object.name.clone(),
+                        },
+                    })
+                    .collect(),
+                default_privileges: spec
+                    .default_privileges
+                    .iter()
+                    .map(|dp| DefaultPrivilegeGrant {
+                        role: dp.role.clone(),
+                        privileges: dp.privileges.clone(),
+                        on_type: dp.on_type,
+                    })
+                    .collect(),
+                config: spec.config.clone(),
+            };
+            (name.clone(), profile)
+        })
+        .collect();
+
+    let roles = roles
+        .iter()
+        .map(|r| RoleDefinition {
+            name: r.name.clone(),
+            external: r.external,
+            login: r.login,
+            superuser: r.superuser,
+            createdb: r.createdb,
+            createrole: r.createrole,
+            inherit: r.inherit,
+            replication: r.replication,
+            bypassrls: r.bypassrls,
+            connection_limit: r.connection_limit,
+            comment: r.comment.clone(),
+            password: None, // K8s passwords are resolved separately via Secret refs
+            password_valid_until: r.password_valid_until.clone(),
+            config: r.config.clone(),
+        })
+        .collect();
+
+    let memberships = memberships
+        .iter()
+        .map(|m| pgroles_core::manifest::Membership {
+            role: m.role.clone(),
+            members: m
+                .members
+                .iter()
+                .map(|ms| MemberSpec {
+                    name: ms.name.clone(),
+                    inherit: ms.inherit,
+                    admin: ms.admin,
+                })
+                .collect(),
+        })
+        .collect();
+
+    PolicyManifest {
+        default_owner: default_owner.map(str::to_string),
+        auth_providers: Vec::new(),
+        profiles,
+        schemas: schemas.to_vec(),
+        roles,
+        grants: grants.to_vec(),
+        default_privileges: default_privileges.to_vec(),
+        memberships,
+        retirements: retirements.to_vec(),
+    }
+}
+
+impl PolicyContent {
+    /// Convert candidate content into a `PolicyManifest`.
+    ///
+    /// Identical to [`PostgresPolicySpec::to_policy_manifest`] by construction
+    /// — see [`build_policy_manifest`].
+    pub fn to_policy_manifest(&self) -> pgroles_core::manifest::PolicyManifest {
+        build_policy_manifest(
+            self.default_owner.as_deref(),
+            self.profiles.iter(),
+            &self.schemas,
+            &self.roles,
+            &self.grants,
+            &self.default_privileges,
+            &self.memberships,
+            &self.retirements,
+        )
+    }
+}
+
 impl PostgresPolicySpec {
     /// Convert the CRD spec into a `PolicyManifest` for use with the core library.
     pub fn to_policy_manifest(&self) -> pgroles_core::manifest::PolicyManifest {
-        use pgroles_core::manifest::{
-            DefaultPrivilegeGrant, MemberSpec, PolicyManifest, Profile, ProfileGrant,
-            ProfileObjectTarget, RoleDefinition,
-        };
-
-        let profiles = self
-            .profiles
-            .iter()
-            .map(|(name, spec)| {
-                let profile = Profile {
-                    login: spec.login,
-                    inherit: spec.inherit,
-                    grants: spec
-                        .grants
-                        .iter()
-                        .map(|g| ProfileGrant {
-                            privileges: g.privileges.clone(),
-                            object: ProfileObjectTarget {
-                                object_type: g.object.object_type,
-                                name: g.object.name.clone(),
-                            },
-                        })
-                        .collect(),
-                    default_privileges: spec
-                        .default_privileges
-                        .iter()
-                        .map(|dp| DefaultPrivilegeGrant {
-                            role: dp.role.clone(),
-                            privileges: dp.privileges.clone(),
-                            on_type: dp.on_type,
-                        })
-                        .collect(),
-                    config: spec.config.clone(),
-                };
-                (name.clone(), profile)
-            })
-            .collect();
-
-        let roles = self
-            .roles
-            .iter()
-            .map(|r| RoleDefinition {
-                name: r.name.clone(),
-                external: r.external,
-                login: r.login,
-                superuser: r.superuser,
-                createdb: r.createdb,
-                createrole: r.createrole,
-                inherit: r.inherit,
-                replication: r.replication,
-                bypassrls: r.bypassrls,
-                connection_limit: r.connection_limit,
-                comment: r.comment.clone(),
-                password: None, // K8s passwords are resolved separately via Secret refs
-                password_valid_until: r.password_valid_until.clone(),
-                config: r.config.clone(),
-            })
-            .collect();
-
-        // Memberships need MemberSpec conversion — the core type should
-        // already be compatible since we use it directly in the CRD spec.
-        // But we need to ensure the serde aliases work. Let's rebuild to be safe.
-        let memberships = self
-            .memberships
-            .iter()
-            .map(|m| pgroles_core::manifest::Membership {
-                role: m.role.clone(),
-                members: m
-                    .members
-                    .iter()
-                    .map(|ms| MemberSpec {
-                        name: ms.name.clone(),
-                        inherit: ms.inherit,
-                        admin: ms.admin,
-                    })
-                    .collect(),
-            })
-            .collect();
-
-        PolicyManifest {
-            default_owner: self.default_owner.clone(),
-            auth_providers: Vec::new(),
-            profiles,
-            schemas: self.schemas.clone(),
-            roles,
-            grants: self.grants.clone(),
-            default_privileges: self.default_privileges.clone(),
-            memberships,
-            retirements: self.retirements.clone(),
-        }
+        build_policy_manifest(
+            self.default_owner.as_deref(),
+            self.profiles.iter(),
+            &self.schemas,
+            &self.roles,
+            &self.grants,
+            &self.default_privileges,
+            &self.memberships,
+            &self.retirements,
+        )
     }
 
     /// Derive a conservative ownership claim set from the policy spec.
@@ -2433,6 +2505,78 @@ pub enum CandidatePhase {
     Superseded,
     /// The plan it was reviewed against no longer describes its effects.
     Stale,
+}
+
+impl CandidatePhase {
+    /// A terminal candidate is never planned again.
+    ///
+    /// `Stale` is deliberately *not* terminal: it names a plan that no longer
+    /// describes the candidate's effects, and the next reconcile replans it.
+    /// The docs express supersession-by-replacement and plan denial as
+    /// `Superseded`, which is where terminality lives.
+    pub fn is_terminal(self) -> bool {
+        matches!(self, CandidatePhase::Promoted | CandidatePhase::Superseded)
+    }
+}
+
+/// Condition reasons for a `PostgresPolicyCandidate`.
+///
+/// These are the strings in the conditions table of
+/// `docs/src/pages/docs/operator-candidates.md`; status consumers match on
+/// them, so they are constants rather than literals at each call site.
+pub mod candidate_reason {
+    /// `Ready=True` — a current plan exists for this candidate.
+    pub const PLANNED: &str = "Planned";
+    /// `Ready=True` — the content is already the database's state, so there is
+    /// nothing to review. Not terminal: the content may diverge again.
+    pub const NO_EFFECTS: &str = "NoEffects";
+    /// `Ready=False` — the parent is failing or awaiting its own approval.
+    pub const BLOCKED_BY_ACTIVE_POLICY: &str = "BlockedByActivePolicy";
+    /// `Ready=False` — an ephemeral overlay overlaps this candidate's effects.
+    pub const OVERLAY_OVERLAP: &str = "OverlayOverlap";
+    /// `Ready=False` — the candidate could not be planned at all.
+    pub const PLANNING_FAILED: &str = "PlanningFailed";
+    /// `Superseded=True` — a successor named this candidate in `spec.replaces`.
+    pub const REPLACED: &str = "Replaced";
+    /// `Superseded=True` — replanning produced a different change digest.
+    pub const EFFECTS_CHANGED: &str = "EffectsChanged";
+    /// `Superseded=True` — the candidate's plan was denied (terminal).
+    pub const PLAN_DENIED: &str = "PlanDenied";
+}
+
+/// Condition type recording that a candidate is terminal.
+pub const CONDITION_SUPERSEDED: &str = "Superseded";
+
+/// Set a condition on a bare condition list, preserving the transition time
+/// when the status value is unchanged.
+///
+/// The same rule [`PostgresPolicyStatus::set_condition`] applies, lifted to the
+/// list so candidate and plan statuses share it.
+pub fn set_condition_in(conditions: &mut Vec<PolicyCondition>, new: PolicyCondition) {
+    if let Some(existing) = conditions
+        .iter()
+        .find(|c| c.condition_type == new.condition_type)
+        && existing.status == new.status
+    {
+        let mut updated = new;
+        updated.last_transition_time = existing.last_transition_time.clone();
+        conditions.retain(|c| c.condition_type != updated.condition_type);
+        conditions.push(updated);
+        return;
+    }
+    conditions.retain(|c| c.condition_type != new.condition_type);
+    conditions.push(new);
+}
+
+/// Helper to create a candidate `Superseded` condition.
+pub fn superseded_condition(reason: &str, message: &str) -> PolicyCondition {
+    PolicyCondition {
+        condition_type: CONDITION_SUPERSEDED.to_string(),
+        status: "True".to_string(),
+        reason: Some(reason.to_string()),
+        message: Some(message.to_string()),
+        last_transition_time: Some(now_rfc3339()),
+    }
 }
 
 impl std::fmt::Display for CandidatePhase {

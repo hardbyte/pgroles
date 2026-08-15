@@ -7,11 +7,16 @@ Review what a change would do to production before it becomes the desired state.
 
 ---
 
-{% callout type="warning" title="Design preview" %}
+{% callout type="warning" title="Partly implemented" %}
 This page documents the target design from
-[#173](https://github.com/hardbyte/pgroles/issues/173) ahead of implementation.
-It is written as end-state documentation so the design can be reviewed in the
-form users will meet it. Nothing on this page is released yet.
+[#173](https://github.com/hardbyte/pgroles/issues/173). The kind, the content
+digest, and the operator's **planning** lifecycle — enqueue, plan in the
+parent's context, publish a candidate-owned plan, revalidate, block on an
+unstable parent, supersede on replacement or overlay overlap, retain — are
+implemented. **Promotion is not**: nothing recognises a promoted content digest
+in `PostgresPolicy.spec` yet, so `Promoted=True` is never set, and the
+`pgroles candidate` and `pgroles plan` subcommands do not exist. Read
+[Promotion](#promotion) as design, and everything above it as behaviour.
 {% /callout %}
 
 ## What a candidate is
@@ -262,6 +267,7 @@ approval is not an indefinite authorisation.
 | Condition | Meaning |
 | --- | --- |
 | `Ready=True, reason=Planned` | A current plan exists for this candidate |
+| `Ready=True, reason=NoEffects` | The content is already the database's state, so there is nothing to review. Not terminal — the content may diverge again |
 | `Ready=False, reason=BlockedByActivePolicy` | Parent is failing or awaiting its own approval; will re-plan |
 | `Ready=False, reason=OverlayOverlap` | An ephemeral grant overlaps this candidate's effects; fresh review required |
 | `Superseded=True, reason=Replaced` | A successor candidate named this one in `spec.replaces` |

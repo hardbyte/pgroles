@@ -173,15 +173,28 @@ pub enum ReconcileError {
     PlanSqlStorage(String),
 }
 
+/// What the policy's locked phase hands to candidate planning.
+///
+/// Candidates are planned after the policy's own work, in the policy's
+/// execution context, so they need two things the locked phase computed and
+/// nothing else: the target identity it resolved, and the ephemeral membership
+/// overlay it composed. Passing them out rather than recomputing them keeps
+/// candidate planning on exactly the state the policy just enforced against.
+#[derive(Debug, Default)]
+struct ParentHandoff {
+    overlay_edges: Vec<pgroles_core::model::MembershipEdge>,
+    target_identity: Option<pgroles_core::approval::TargetIdentity>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct ResolvedPassword {
-    cleartext: String,
-    source_version: String,
+pub(crate) struct ResolvedPassword {
+    pub(crate) cleartext: String,
+    pub(crate) source_version: String,
     /// Set when the password was generated in memory because no Secret exists
     /// yet. The Secret is deliberately not written during planning — it is
     /// materialized only once the plan is about to execute, so a plan that is
     /// never approved leaves no credential behind (#181).
-    pending_materialization: Option<PendingGeneratedSecret>,
+    pub(crate) pending_materialization: Option<PendingGeneratedSecret>,
 }
 
 impl ResolvedPassword {
@@ -196,9 +209,9 @@ impl ResolvedPassword {
 
 /// Everything needed to create a generated-password Secret at execution time.
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct PendingGeneratedSecret {
-    role: String,
-    spec: crate::crd::GeneratePasswordSpec,
+pub(crate) struct PendingGeneratedSecret {
+    pub(crate) role: String,
+    pub(crate) spec: crate::crd::GeneratePasswordSpec,
 }
 
 /// Parse a duration string like "5m", "1h", "30s", "2h30m".
@@ -575,7 +588,7 @@ fn is_system_schema(name: &str) -> bool {
 ///
 /// System schemas (`pg_*`, `information_schema`) are excluded from the check
 /// since they always exist but are filtered out of the inspect query.
-async fn validate_referenced_schemas_exist(
+pub(crate) async fn validate_referenced_schemas_exist(
     pool: &sqlx::PgPool,
     expanded: &pgroles_core::manifest::ExpandedManifest,
 ) -> Result<(), ReconcileError> {
@@ -911,6 +924,7 @@ async fn reconcile_apply_inner(
     };
 
     // Wrap the remaining work so the advisory lock is released on all paths.
+    let mut handoff = ParentHandoff::default();
     let result = apply_under_lock(
         resource,
         ctx,
@@ -923,8 +937,38 @@ async fn reconcile_apply_inner(
         &name,
         &namespace,
         identity,
+        &mut handoff,
     )
     .await;
+
+    // Candidates are planned here: after the active policy's own enforcement
+    // or planning has completed, still inside both of its locks, against the
+    // post-enforcement state rather than the drift the policy just removed.
+    // A candidate is a proposal, so nothing it does may break enforcement —
+    // failures are recorded on the candidate and swallowed here.
+    if let Ok((_, outcome)) = &result
+        && let Some(target_identity) = handoff.target_identity.as_ref()
+    {
+        let converged = matches!(
+            outcome,
+            ReconcileOutcome::Reconciled | ReconcileOutcome::Planned
+        );
+        let has_actionable_plan =
+            crate::plan::get_current_actionable_plan(&ctx.kube_client, resource)
+                .await
+                .unwrap_or(None)
+                .is_some();
+        let planning = crate::candidate::CandidatePlanning {
+            pool: &pool,
+            identity,
+            target_identity,
+            overlay_edges: &handoff.overlay_edges,
+            gate: crate::candidate::parent_gate(converged, has_actionable_plan),
+        };
+        if let Err(err) = crate::candidate::reconcile_candidates(ctx, resource, &planning).await {
+            tracing::warn!(name, namespace, %err, "candidate planning failed");
+        }
+    }
 
     // Release advisory lock (always, even on error).
     advisory_lock.release().await;
@@ -932,6 +976,24 @@ async fn reconcile_apply_inner(
     crate::plan::cleanup_old_plans_best_effort(&ctx.kube_client, resource, None).await;
 
     result
+}
+
+/// The membership edges an ephemeral overlay contributed.
+///
+/// Everything the composition added that the policy does not declare. This is
+/// the overlay half of the candidate overlay-overlap rule (ADR-001 Decision 6),
+/// and it is a set difference rather than a second read of the requests so that
+/// the pairs a candidate is compared against are exactly the edges that entered
+/// the graph the policy just enforced.
+fn overlay_edges(
+    declared: &pgroles_core::model::RoleGraph,
+    effective: &pgroles_core::model::RoleGraph,
+) -> Vec<pgroles_core::model::MembershipEdge> {
+    effective
+        .memberships
+        .difference(&declared.memberships)
+        .cloned()
+        .collect()
 }
 
 /// Resolve both halves of the target's identity.
@@ -973,6 +1035,7 @@ async fn apply_under_lock(
     name: &str,
     namespace: &str,
     identity: &DatabaseIdentity,
+    handoff: &mut ParentHandoff,
 ) -> Result<(Action, ReconcileOutcome), ReconcileError> {
     // 5a. Resolve the identity of the database actually on the other end of
     // the connection, under the lock and against the same pool everything
@@ -980,6 +1043,7 @@ async fn apply_under_lock(
     // approval made against one server cannot execute against another even
     // though the Kubernetes reference is unchanged.
     let target_identity = resolve_target_identity(ctx, pool, namespace, resource).await?;
+    handoff.target_identity = Some(target_identity.clone());
     if resource.spec.connection.requires_physical_identity() && !target_identity.has_physical() {
         let reason = pgroles_core::approval::TargetIdentityReason::PhysicalIdentityRequired;
         let message = format!(
@@ -1058,6 +1122,10 @@ async fn apply_under_lock(
     let mut effective_desired = desired.clone();
     let ephemeral_roles =
         crate::ephemeral::compose_effective_graph(ctx, resource, &mut effective_desired).await?;
+    // The overlay itself, as edges: everything the composition added that the
+    // policy does not declare. This is the input to the candidate
+    // overlay-overlap rule (ADR-001 Decision 6).
+    handoff.overlay_edges = overlay_edges(desired, &effective_desired);
 
     // 6. Inspect current state from the database.
     let has_database_grants = expanded
@@ -1190,6 +1258,7 @@ async fn apply_under_lock(
                 &target_identity,
                 &summary,
                 &applied_password_source_versions,
+                None,
             )
             .await?;
             let plan_name = creation_result.plan_name().to_string();
@@ -1308,6 +1377,7 @@ async fn apply_under_lock(
                     &target_identity,
                     &summary,
                     &applied_password_source_versions,
+                    None,
                 )
                 .await?;
                 let plan_name = creation_result.plan_name().to_string();
@@ -1597,6 +1667,7 @@ async fn apply_under_lock(
                                 &target_identity,
                                 &summary,
                                 &applied_password_source_versions,
+                                None,
                             )
                             .await?;
                             let new_plan_name = new_creation_result.plan_name().to_string();
@@ -1908,6 +1979,7 @@ async fn apply_under_lock(
                                 &target_identity,
                                 &summary,
                                 &applied_password_source_versions,
+                                None,
                             )
                             .await?;
                             let replacement = creation_result.plan_name().to_string();
@@ -2045,6 +2117,7 @@ async fn apply_under_lock(
                 &target_identity,
                 &summary,
                 &applied_password_source_versions,
+                None,
             )
             .await?;
             let plan_name = creation_result.plan_name().to_string();
@@ -2125,6 +2198,23 @@ async fn resolve_passwords_from_secrets(
     resource: &PostgresPolicy,
     namespace: &str,
 ) -> Result<std::collections::BTreeMap<String, ResolvedPassword>, ReconcileError> {
+    resolve_passwords_for_roles(ctx, resource, namespace, &resource.spec.roles, true).await
+}
+
+/// Resolve passwords for an arbitrary role set in the parent policy's context.
+///
+/// Candidate planning uses this with the candidate's own roles: generated
+/// Secret names are derived from the *parent policy* name, because that is
+/// what promotion would produce, and `warn_on_missing` is off — a candidate
+/// has no applied history of its own, so "the Secret disappeared" is not a
+/// statement it can make.
+pub(crate) async fn resolve_passwords_for_roles(
+    ctx: &OperatorContext,
+    resource: &PostgresPolicy,
+    namespace: &str,
+    role_specs: &[crate::crd::RoleSpec],
+    warn_on_missing: bool,
+) -> Result<std::collections::BTreeMap<String, ResolvedPassword>, ReconcileError> {
     use k8s_openapi::api::core::v1::Secret;
 
     let mut resolved = std::collections::BTreeMap::new();
@@ -2137,7 +2227,7 @@ async fn resolve_passwords_from_secrets(
     let secrets_api: kube::Api<Secret> = kube::Api::namespaced(ctx.kube_client.clone(), namespace);
 
     // First pass: fetch all referenced Secrets for secretRef roles.
-    for role_spec in &resource.spec.roles {
+    for role_spec in role_specs {
         if role_spec.external {
             continue;
         }
@@ -2159,7 +2249,7 @@ async fn resolve_passwords_from_secrets(
     }
 
     // Second pass: resolve passwords from cache (secretRef) or generate.
-    for role_spec in &resource.spec.roles {
+    for role_spec in role_specs {
         if role_spec.external {
             continue;
         }
@@ -2200,7 +2290,13 @@ async fn resolve_passwords_from_secrets(
                         // real Secret existed and has since been deleted. The
                         // next plan legitimately rotates the password, but that
                         // is worth saying out loud.
-                        if recorded_source_version_was_real(resource, &role_spec.name, &sentinel) {
+                        if warn_on_missing
+                            && recorded_source_version_was_real(
+                                resource,
+                                &role_spec.name,
+                                &sentinel,
+                            )
+                        {
                             emit_policy_warning(
                                 ctx,
                                 resource,
@@ -2403,7 +2499,7 @@ fn resolve_passwords_from_cached_secrets(
     Ok(resolved)
 }
 
-fn select_password_changes(
+pub(crate) fn select_password_changes(
     changes: &[pgroles_core::diff::Change],
     resolved_passwords: &std::collections::BTreeMap<String, ResolvedPassword>,
     status: Option<&PostgresPolicyStatus>,
@@ -2497,7 +2593,7 @@ fn accumulate_summary(summary: &mut ChangeSummary, change: &pgroles_core::diff::
     }
 }
 
-fn summarize_changes(changes: &[pgroles_core::diff::Change]) -> ChangeSummary {
+pub(crate) fn summarize_changes(changes: &[pgroles_core::diff::Change]) -> ChangeSummary {
     let mut summary = ChangeSummary::default();
     for change in changes {
         accumulate_summary(&mut summary, change);
@@ -2967,6 +3063,33 @@ mod tests {
     use std::collections::BTreeMap;
     use std::error::Error as StdError;
     use std::fmt;
+
+    fn edge(role: &str, member: &str) -> pgroles_core::model::MembershipEdge {
+        pgroles_core::model::MembershipEdge {
+            role: role.to_string(),
+            member: member.to_string(),
+            inherit: true,
+            admin: false,
+        }
+    }
+
+    #[test]
+    fn the_overlay_handed_to_candidates_is_only_what_the_overlay_added() {
+        let mut declared = pgroles_core::model::RoleGraph::default();
+        declared.memberships.insert(edge("app_rw", "service"));
+
+        let mut effective = declared.clone();
+        effective.memberships.insert(edge("oncall_admin", "carol"));
+
+        assert_eq!(
+            overlay_edges(&declared, &effective),
+            vec![edge("oncall_admin", "carol")]
+        );
+        // A durable membership the policy declares is not an overlay, even
+        // though an ephemeral request may also want it — attributing it to the
+        // overlay would force fresh review of every candidate that touches it.
+        assert!(overlay_edges(&declared, &declared).is_empty());
+    }
 
     #[test]
     fn a_failed_plan_held_in_backoff_is_not_reported_as_awaiting_approval() {

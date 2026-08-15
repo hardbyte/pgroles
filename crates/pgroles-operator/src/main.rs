@@ -17,8 +17,8 @@ use tracing_subscriber::prelude::*;
 
 use pgroles_operator::context::OperatorContext;
 use pgroles_operator::crd::{
-    EphemeralAccessPolicy, EphemeralAccessRequest, PostgresPolicy, PostgresPolicyPlan,
-    REQUESTED_RECONCILE_ANNOTATION,
+    EphemeralAccessPolicy, EphemeralAccessRequest, PostgresPolicy, PostgresPolicyCandidate,
+    PostgresPolicyPlan, REQUESTED_RECONCILE_ANNOTATION,
 };
 use pgroles_operator::ephemeral::{
     access_policy_error_policy, access_request_error_policy, reconcile_access_policy,
@@ -46,6 +46,25 @@ fn plan_decision_hash(plan: &PostgresPolicyPlan) -> Option<u64> {
         }
         format!("{}", status.phase).hash(&mut hasher);
     }
+    Some(hasher.finish())
+}
+
+/// Hash identifying a candidate's *spec* state.
+///
+/// Deliberately not the resource version: the operator writes candidate status
+/// on every reconcile, and waking the parent on our own status write would
+/// spin. A candidate spec is immutable, so in practice this fires on creation
+/// and deletion — which is exactly when the parent has new work.
+fn candidate_trigger_hash(candidate: &PostgresPolicyCandidate) -> Option<u64> {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    candidate.meta().uid.hash(&mut hasher);
+    candidate.meta().generation.hash(&mut hasher);
+    candidate
+        .meta()
+        .deletion_timestamp
+        .as_ref()
+        .map(|timestamp| timestamp.0.to_string())
+        .hash(&mut hasher);
     Some(hasher.finish())
 }
 
@@ -214,12 +233,49 @@ async fn main() -> anyhow::Result<()> {
             stream::iter(refs)
         });
 
+    // Watch PostgresPolicyCandidate resources and enqueue the *parent policy*.
+    // Candidates have no reconciler of their own: they are planned inside the
+    // parent's reconcile, under its lock and in its execution context, so the
+    // parent is the only correct unit of work.
+    let candidate_policy_store = reader.clone();
+    let candidates: Api<PostgresPolicyCandidate> = match &watch_namespace {
+        Some(namespace) => Api::namespaced(client.clone(), namespace),
+        None => Api::all(client.clone()),
+    };
+    let candidate_triggers = watcher(candidates, watcher::Config::default())
+        .default_backoff()
+        .touched_objects()
+        .predicate_filter(candidate_trigger_hash, Default::default())
+        .filter_map(|candidate| async move { candidate.ok() })
+        .flat_map(move |candidate| {
+            let policy_store = candidate_policy_store.clone();
+            let Some(namespace) = candidate.namespace() else {
+                return stream::iter(Vec::<ObjectRef<PostgresPolicy>>::new());
+            };
+            // Resolved by `spec.policyRef` rather than by owner reference: the
+            // controller stamps the owner reference on first touch, so a brand
+            // new candidate — the case that most needs to wake the parent —
+            // does not have one yet.
+            let policy_name = candidate.spec.policy_ref.name.clone();
+            let refs = policy_store
+                .state()
+                .into_iter()
+                .filter(|policy| {
+                    policy.namespace().as_deref() == Some(namespace.as_str())
+                        && policy.name_any() == policy_name
+                })
+                .map(|policy| ObjectRef::from_obj(policy.as_ref()))
+                .collect::<Vec<_>>();
+            stream::iter(refs)
+        });
+
     info!("starting controllers");
     observability.mark_ready();
 
     let policy_controller = Controller::for_stream(policy_stream, reader)
         .reconcile_on(secret_triggers)
         .reconcile_on(plan_triggers)
+        .reconcile_on(candidate_triggers)
         .shutdown_on_signal()
         .run(reconcile, error_policy, ctx.clone())
         .for_each(|result| async move {

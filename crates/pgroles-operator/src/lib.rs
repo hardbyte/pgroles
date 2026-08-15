@@ -4,6 +4,7 @@
 //! grants, default privileges, and memberships against live databases.
 
 pub mod advisory;
+pub mod candidate;
 pub mod context;
 pub mod crd;
 pub mod ephemeral;

@@ -7,6 +7,7 @@ pub mod export;
 pub mod guc;
 pub mod manifest;
 pub mod model;
+pub mod overlap;
 pub mod ownership;
 pub mod report;
 pub mod scram;

@@ -2085,6 +2085,9 @@ async fn create_scoped_plan(
                 kind: "EphemeralAccessRequest".to_string(),
                 name: request.name_any(),
                 uid: request.uid().unwrap_or_default(),
+                content_digest: None,
+                content_digest_encoding: None,
+                policy_uid: None,
             }),
             scope: Some(PlanScope {
                 kind: "MembershipBundle".to_string(),
@@ -2420,6 +2423,9 @@ mod tests {
                     kind: "EphemeralAccessRequest".into(),
                     name: "request".into(),
                     uid: "request-uid".into(),
+                    content_digest: None,
+                    content_digest_encoding: None,
+                    policy_uid: None,
                 }),
                 scope: Some(PlanScope {
                     kind: "MembershipBundle".into(),

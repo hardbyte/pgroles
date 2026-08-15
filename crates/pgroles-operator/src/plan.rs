@@ -20,9 +20,10 @@ use sha2::{Digest, Sha256};
 use tracing::info;
 
 use crate::crd::{
-    ChangeSummary, CrdReconciliationMode, LABEL_DATABASE_IDENTITY, LABEL_PLAN, LABEL_POLICY,
-    PlanPhase, PlanReference, PolicyCondition, PolicyPlanRef, PostgresPolicy, PostgresPolicyPlan,
-    PostgresPolicyPlanSpec, PostgresPolicyPlanStatus, SqlCompression, SqlRef,
+    ChangeSummary, CrdReconciliationMode, LABEL_CANDIDATE, LABEL_DATABASE_IDENTITY, LABEL_PLAN,
+    LABEL_POLICY, PlanOrigin, PlanPhase, PlanReference, PolicyCondition, PolicyPlanRef,
+    PostgresPolicy, PostgresPolicyCandidate, PostgresPolicyPlan, PostgresPolicyPlanSpec,
+    PostgresPolicyPlanStatus, SqlCompression, SqlRef, is_retention_exempt,
 };
 use crate::k8s_names::{LabelValue, truncate_name_prefix};
 use crate::reconciler::ReconcileError;
@@ -252,6 +253,92 @@ pub fn check_plan_approval(plan: &PostgresPolicyPlan) -> PlanApprovalState {
 // Plan creation
 // ---------------------------------------------------------------------------
 
+/// Binding that turns an ordinary policy plan into a candidate-origin plan.
+///
+/// A candidate plan is the reviewable artifact for a proposal that is not the
+/// desired state yet, so it is owned by the candidate (ADR-001 Decision 3) and
+/// carries the identity a later promotion is checked against: the candidate's
+/// name and UID, its content digest and encoding, and the parent policy's UID.
+/// The rest of the binding — reconciliation mode, target identity and the
+/// semantic change digest — is what every plan already records.
+#[derive(Debug, Clone, Copy)]
+pub struct CandidatePlanBinding<'a> {
+    pub candidate: &'a PostgresPolicyCandidate,
+    pub content_digest: &'a str,
+    pub content_digest_encoding: &'a str,
+}
+
+/// The plan-identity binding a candidate-origin plan records.
+///
+/// Everything a later promotion has to be checked against that is not already
+/// on the plan: which candidate produced it, that candidate's content digest
+/// and the encoding it was computed under, and the parent policy's UID. The
+/// remaining halves of the binding — reconciliation mode, target identity and
+/// the approval-effect change digest — are plan fields every plan carries.
+pub(crate) fn candidate_plan_origin(
+    binding: CandidatePlanBinding<'_>,
+    policy: &PostgresPolicy,
+) -> PlanOrigin {
+    PlanOrigin {
+        kind: PostgresPolicyCandidate::kind(&()).to_string(),
+        name: binding.candidate.name_any(),
+        uid: binding.candidate.metadata.uid.clone().unwrap_or_default(),
+        content_digest: Some(binding.content_digest.to_string()),
+        content_digest_encoding: Some(binding.content_digest_encoding.to_string()),
+        policy_uid: policy.metadata.uid.clone(),
+    }
+}
+
+/// Which object owns a plan and the artifacts beneath it.
+///
+/// Ownership is the exact filter for every list, dedup, supersede and delete
+/// path in this module, so it is threaded as one value rather than re-derived
+/// from the policy at each site.
+#[derive(Debug, Clone, Copy)]
+enum PlanOwner<'a> {
+    Policy(&'a PostgresPolicy),
+    Candidate(&'a PostgresPolicyCandidate),
+}
+
+impl PlanOwner<'_> {
+    fn uid(&self) -> Option<&str> {
+        match self {
+            PlanOwner::Policy(policy) => policy.metadata.uid.as_deref(),
+            PlanOwner::Candidate(candidate) => candidate.metadata.uid.as_deref(),
+        }
+    }
+
+    fn name(&self) -> String {
+        match self {
+            PlanOwner::Policy(policy) => policy.name_any(),
+            PlanOwner::Candidate(candidate) => candidate.name_any(),
+        }
+    }
+
+    fn owner_reference(&self) -> OwnerReference {
+        match self {
+            PlanOwner::Policy(policy) => build_owner_reference(policy),
+            PlanOwner::Candidate(candidate) => OwnerReference {
+                api_version: PostgresPolicyCandidate::api_version(&()).to_string(),
+                kind: PostgresPolicyCandidate::kind(&()).to_string(),
+                name: candidate.name_any(),
+                uid: candidate.metadata.uid.clone().unwrap_or_default(),
+                controller: Some(true),
+                block_owner_deletion: Some(true),
+            },
+        }
+    }
+
+    fn owns<K: Resource>(&self, resource: &K) -> bool {
+        // An owner with no UID cannot prove ownership of anything; refuse to
+        // match rather than treat an empty UID as a wildcard.
+        let Some(uid) = self.uid() else {
+            return false;
+        };
+        is_owned_by_uid(resource, uid)
+    }
+}
+
 /// Create or deduplicate a `PostgresPolicyPlan` for the given policy and changes.
 ///
 /// Returns the name of the plan resource (either existing or newly created).
@@ -276,10 +363,19 @@ pub async fn create_or_update_plan(
     target_identity: &TargetIdentity,
     change_summary: &ChangeSummary,
     password_source_versions: &BTreeMap<String, String>,
+    candidate: Option<CandidatePlanBinding<'_>>,
 ) -> Result<PlanCreationResult, ReconcileError> {
     let namespace = policy.namespace().ok_or(ReconcileError::NoNamespace)?;
     let policy_name = policy.name_any();
     let generation = policy.metadata.generation.unwrap_or(0);
+    // Everything below is keyed on the owner, not the policy: a candidate plan
+    // is owned by its candidate so that deleting the proposal prunes the plan
+    // and its SQL artifact with it.
+    let owner = match candidate {
+        Some(binding) => PlanOwner::Candidate(binding.candidate),
+        None => PlanOwner::Policy(policy),
+    };
+    let owner_name = owner.name();
 
     // 1. Render the full executable SQL (not redacted). This is a review
     //    artifact only — never an execution payload, and never the approval
@@ -307,18 +403,25 @@ pub async fn create_or_update_plan(
     // 5. Render redacted SQL for display (passwords masked).
     let redacted_sql = render_redacted_sql(changes, sql_context);
 
-    cleanup_old_plans_best_effort(client, policy, None).await;
+    // Candidate plans are pruned by candidate retention (their owner cascades),
+    // never by the policy's plan retention, which would not see them anyway.
+    if candidate.is_none() {
+        cleanup_old_plans_best_effort(client, policy, None).await;
+    }
 
     let plans_api: Api<PostgresPolicyPlan> = Api::namespaced(client.clone(), &namespace);
 
-    // 4. List existing plans for this policy.
-    let selector = policy_selector(&policy_name);
+    // 4. List existing plans for this owner.
+    let selector = match candidate {
+        Some(binding) => candidate_selector(&binding.candidate.name_any()),
+        None => policy_selector(&policy_name),
+    };
     // The label narrows server-side; owner UID is the exact filter.
     let existing_plans: Vec<PostgresPolicyPlan> = plans_api
         .list(&ListParams::default().labels_from(&selector))
         .await?
         .into_iter()
-        .filter(|plan| is_owned_by_policy(plan, policy))
+        .filter(|plan| owner.owns(plan))
         .collect();
 
     // 5. Check for duplicate pending plan with the same effects.
@@ -386,13 +489,13 @@ pub async fn create_or_update_plan(
 
     // 6. Generate a plan name using timestamp plus SQL hash. The hash suffix
     // makes same-second retries after content persistence failures idempotent.
-    let plan_name = generate_plan_name(&policy_name, &sql_hash);
+    let plan_name = generate_plan_name(&owner_name, &sql_hash);
     let prepared_sql = prepare_plan_sql(&plan_name, &redacted_sql)?;
 
     // 7. Persist SQL content before materialising the visible plan resource.
     let sql_configmap_name = create_plan_sql_configmap(
         client,
-        policy,
+        owner,
         &namespace,
         &policy_name,
         database_identity,
@@ -400,8 +503,8 @@ pub async fn create_or_update_plan(
     )
     .await?;
 
-    // 8. Build ownerReference pointing to the parent policy.
-    let owner_ref = build_owner_reference(policy);
+    // 8. Build ownerReference pointing to the owning policy or candidate.
+    let owner_ref = owner.owner_reference();
 
     // 9. Create the plan resource.
     let plan = PostgresPolicyPlan::new(
@@ -415,20 +518,27 @@ pub async fn create_or_update_plan(
             owned_roles: inspect_config.managed_roles.clone(),
             owned_schemas: inspect_config.managed_schemas.clone(),
             managed_database_identity: database_identity.to_string(),
-            origin: None,
+            origin: candidate.map(|binding| candidate_plan_origin(binding, policy)),
             scope: None,
         },
     );
     let mut plan = plan;
     plan.metadata.namespace = Some(namespace.clone());
     plan.metadata.owner_references = Some(vec![owner_ref.clone()]);
-    plan.metadata.labels = Some(BTreeMap::from([
+    let mut plan_labels = BTreeMap::from([
         (LABEL_POLICY.to_string(), sanitize_label_value(&policy_name)),
         (
             LABEL_DATABASE_IDENTITY.to_string(),
             sanitize_label_value(database_identity),
         ),
-    ]));
+    ]);
+    if let Some(binding) = candidate {
+        plan_labels.insert(
+            LABEL_CANDIDATE.to_string(),
+            sanitize_label_value(&binding.candidate.name_any()),
+        );
+    }
+    plan.metadata.labels = Some(plan_labels);
 
     // Annotations for quick visibility in kubectl describe / Lens.
     let sql_preview = redacted_sql.lines().take(5).collect::<Vec<_>>().join("\n");
@@ -471,7 +581,7 @@ pub async fn create_or_update_plan(
                 // 215-byte-truncated policy prefix, so two policies sharing that
                 // prefix can in principle collide, and this is otherwise the one
                 // mutation site the owner-UID discipline does not cover.
-                if !is_owned_by_policy(&existing, policy) {
+                if !owner.owns(&existing) {
                     // Roll back only the ConfigMap this reconcile created. The
                     // orphan reaper would collect it eventually — it carries our
                     // UID — but leaving it is a pointless transient orphan. One
@@ -479,7 +589,7 @@ pub async fn create_or_update_plan(
                     rollback_plan_sql_configmap(client, &namespace, sql_configmap_name.as_ref())
                         .await;
                     return Err(ReconcileError::PlanSqlStorage(format!(
-                        "plan {plan_name} already exists and is owned by another policy"
+                        "plan {plan_name} already exists and is owned by another object"
                     )));
                 }
                 if !should_patch_existing_plan_status(&existing) {
@@ -570,7 +680,7 @@ pub async fn create_or_update_plan(
     supersede_stale_plans(
         &plans_api,
         &existing_plans,
-        &policy_name,
+        &owner_name,
         &plan_name,
         &change_digest,
     )
@@ -830,7 +940,7 @@ struct PlanSqlConfigMap {
 
 async fn create_plan_sql_configmap(
     client: &Client,
-    policy: &PostgresPolicy,
+    owner: PlanOwner<'_>,
     namespace: &str,
     policy_name: &str,
     database_identity: &str,
@@ -846,7 +956,7 @@ async fn create_plan_sql_configmap(
     };
 
     let configmap = build_plan_sql_configmap_object(
-        policy,
+        owner,
         namespace,
         policy_name,
         database_identity,
@@ -870,9 +980,9 @@ async fn create_plan_sql_configmap(
             // adopting would then share one artifact between two policies,
             // whose lifetime is tied to the *other* policy's garbage
             // collection.
-            if is_owned_by_another_policy(&existing, policy) {
+            if is_owned_by_another(&existing, owner) {
                 return Err(ReconcileError::PlanSqlStorage(format!(
-                    "plan SQL ConfigMap {configmap_name} is owned by another policy"
+                    "plan SQL ConfigMap {configmap_name} is owned by another object"
                 )));
             }
             validate_existing_sql_configmap(&existing, prepared_sql)?;
@@ -886,7 +996,7 @@ async fn create_plan_sql_configmap(
 }
 
 fn build_plan_sql_configmap_object(
-    policy: &PostgresPolicy,
+    owner: PlanOwner<'_>,
     namespace: &str,
     policy_name: &str,
     database_identity: &str,
@@ -907,7 +1017,7 @@ fn build_plan_sql_configmap_object(
         metadata: k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta {
             name: Some(configmap_name.clone()),
             namespace: Some(namespace.to_string()),
-            owner_references: Some(vec![build_owner_reference(policy)]),
+            owner_references: Some(vec![owner.owner_reference()]),
             labels: Some(BTreeMap::from([
                 (LABEL_POLICY.to_string(), sanitize_label_value(policy_name)),
                 (
@@ -1076,8 +1186,11 @@ pub async fn cleanup_old_plans(
     }
 
     // Collect terminal plans sorted by creation timestamp (oldest first).
+    // `pgroles.io/keep=true` exempts an object from the bound: retention is a
+    // cap on unbounded growth, not a policy about what an operator may keep.
     let mut terminal_plans: Vec<&PostgresPolicyPlan> = existing_plans
         .iter()
+        .filter(|plan| !is_retention_exempt(*plan))
         .filter(|plan| {
             plan.status
                 .as_ref()
@@ -1425,6 +1538,18 @@ fn policy_selector(policy_name: &str) -> Selector {
     Expression::Equal(LABEL_POLICY.to_string(), sanitize_label_value(policy_name)).into()
 }
 
+/// Label selector matching every plan produced for one candidate.
+///
+/// Lossy in exactly the way [`policy_selector`] is, and paired with the same
+/// owner-UID check.
+fn candidate_selector(candidate_name: &str) -> Selector {
+    Expression::Equal(
+        LABEL_CANDIDATE.to_string(),
+        sanitize_label_value(candidate_name),
+    )
+    .into()
+}
+
 /// Is `resource` owned by `policy`, by controller-owner UID?
 ///
 /// The exact ownership test. The `pgroles.io/policy` label is lossy, and a
@@ -1442,13 +1567,18 @@ fn is_owned_by_policy<K: Resource>(resource: &K, policy: &PostgresPolicy) -> boo
         // treat an empty UID as a wildcard.
         return false;
     };
+    is_owned_by_uid(resource, policy_uid)
+}
+
+/// Is `resource` controlled by the object with this UID?
+pub(crate) fn is_owned_by_uid<K: Resource>(resource: &K, uid: &str) -> bool {
     resource
         .meta()
         .owner_references
         .as_deref()
         .unwrap_or_default()
         .iter()
-        .any(|owner| owner.uid == policy_uid && owner.controller.unwrap_or(false))
+        .any(|owner| owner.uid == uid && owner.controller.unwrap_or(false))
 }
 
 /// Does `resource` carry a controller owner that is *not* `policy`?
@@ -1460,8 +1590,8 @@ fn is_owned_by_policy<K: Resource>(resource: &K, policy: &PostgresPolicy) -> boo
 ///
 /// Fails closed: a policy with no UID cannot prove ownership of anything, so
 /// every owned object counts as another's.
-fn is_owned_by_another_policy<K: Resource>(resource: &K, policy: &PostgresPolicy) -> bool {
-    let policy_uid = policy.metadata.uid.as_deref();
+fn is_owned_by_another<K: Resource>(resource: &K, owner_object: PlanOwner<'_>) -> bool {
+    let policy_uid = owner_object.uid();
     resource
         .meta()
         .owner_references
@@ -1934,9 +2064,103 @@ pub async fn record_plan_revalidation(
 mod tests {
     use super::*;
     use crate::crd::CrdReconciliationMode;
+    use crate::crd::{LocalObjectReference, PolicyContent, PostgresPolicyCandidateSpec};
     use base64::Engine as _;
     use flate2::read::GzDecoder;
     use std::io::Read;
+
+    fn test_plan_spec() -> PostgresPolicyPlanSpec {
+        PostgresPolicyPlanSpec {
+            policy_ref: PolicyPlanRef {
+                name: "orders".to_string(),
+            },
+            policy_generation: 1,
+            reconciliation_mode: CrdReconciliationMode::Authoritative,
+            owned_roles: Vec::new(),
+            owned_schemas: Vec::new(),
+            managed_database_identity: "default/db/DATABASE_URL".to_string(),
+            origin: None,
+            scope: None,
+        }
+    }
+
+    fn test_candidate(name: &str, uid: &str) -> PostgresPolicyCandidate {
+        let mut candidate = PostgresPolicyCandidate::new(
+            name,
+            PostgresPolicyCandidateSpec {
+                policy_ref: LocalObjectReference {
+                    name: "orders".to_string(),
+                },
+                replaces: None,
+                target: None,
+                content: PolicyContent::default(),
+            },
+        );
+        candidate.metadata.namespace = Some("default".to_string());
+        candidate.metadata.uid = Some(uid.to_string());
+        candidate
+    }
+
+    #[test]
+    fn a_candidate_plan_binds_the_candidate_the_content_and_the_policy() {
+        let mut policy = PostgresPolicy::new("orders", test_policy_spec());
+        policy.metadata.uid = Some("policy-uid".to_string());
+        let candidate = test_candidate("orders-change-x7k2p", "candidate-uid");
+
+        let origin = candidate_plan_origin(
+            CandidatePlanBinding {
+                candidate: &candidate,
+                content_digest: "sha256:abc",
+                content_digest_encoding: pgroles_core::candidate::CANDIDATE_CONTENT_ENCODING_V1,
+            },
+            &policy,
+        );
+
+        assert_eq!(origin.kind, "PostgresPolicyCandidate");
+        assert_eq!(origin.name, "orders-change-x7k2p");
+        assert_eq!(origin.uid, "candidate-uid");
+        assert_eq!(origin.content_digest.as_deref(), Some("sha256:abc"));
+        assert_eq!(
+            origin.content_digest_encoding.as_deref(),
+            Some(pgroles_core::candidate::CANDIDATE_CONTENT_ENCODING_V1)
+        );
+        // The policy's UID, not its name: a delete-and-recreate of the same
+        // name is a different policy, and a plan reviewed against the old one
+        // must not read as bound to the new one.
+        assert_eq!(origin.policy_uid.as_deref(), Some("policy-uid"));
+    }
+
+    #[test]
+    fn a_candidate_plan_is_owned_by_the_candidate_not_the_policy() {
+        // ADR-001 Decision 3: plan pruning cascades from candidate deletion.
+        let mut policy = PostgresPolicy::new("orders", test_policy_spec());
+        policy.metadata.uid = Some("policy-uid".to_string());
+        let candidate = test_candidate("orders-change-x7k2p", "candidate-uid");
+
+        let owner = PlanOwner::Candidate(&candidate).owner_reference();
+        assert_eq!(owner.kind, "PostgresPolicyCandidate");
+        assert_eq!(owner.uid, "candidate-uid");
+        assert_eq!(owner.controller, Some(true));
+        assert_eq!(owner.block_owner_deletion, Some(true));
+
+        let mut plan = PostgresPolicyPlan::new("plan", test_plan_spec());
+        plan.metadata.owner_references = Some(vec![owner]);
+        assert!(PlanOwner::Candidate(&candidate).owns(&plan));
+        // The policy's own retention loop filters by its UID, so a candidate
+        // plan is invisible to it — which is what keeps it alive for review.
+        assert!(!is_owned_by_policy(&plan, &policy));
+    }
+
+    #[test]
+    fn the_keep_label_exempts_a_terminal_object_from_retention() {
+        let mut plan = PostgresPolicyPlan::new("plan", test_plan_spec());
+        assert!(!crate::crd::is_retention_exempt(&plan));
+        plan.metadata.labels = Some(BTreeMap::from([(
+            crate::crd::LABEL_KEEP.to_string(),
+            "true".to_string(),
+        )]));
+        assert!(crate::crd::is_retention_exempt(&plan));
+    }
 
     /// A minimal spec — the ownership tests only care about metadata.
     fn test_policy_spec() -> crate::crd::PostgresPolicySpec {
@@ -2008,22 +2232,22 @@ mod tests {
 
         let mut ours = test_plan("plan-1", PlanPhase::Pending, None);
         ours.metadata.owner_references = Some(vec![build_owner_reference(&mine)]);
-        assert!(!is_owned_by_another_policy(&ours, &mine));
+        assert!(!is_owned_by_another(&ours, PlanOwner::Policy(&mine)));
 
         let mut rival = test_plan("plan-2", PlanPhase::Pending, None);
         rival.metadata.owner_references = Some(vec![build_owner_reference(&theirs)]);
-        assert!(is_owned_by_another_policy(&rival, &mine));
+        assert!(is_owned_by_another(&rival, PlanOwner::Policy(&mine)));
 
         // An orphan belongs to nobody, so it does not block us.
         let orphan = test_plan("plan-3", PlanPhase::Pending, None);
-        assert!(!is_owned_by_another_policy(&orphan, &mine));
+        assert!(!is_owned_by_another(&orphan, PlanOwner::Policy(&mine)));
 
         // A non-controller owner reference is not a claim either.
         let mut non_controller = build_owner_reference(&theirs);
         non_controller.controller = Some(false);
         let mut referenced = test_plan("plan-4", PlanPhase::Pending, None);
         referenced.metadata.owner_references = Some(vec![non_controller]);
-        assert!(!is_owned_by_another_policy(&referenced, &mine));
+        assert!(!is_owned_by_another(&referenced, PlanOwner::Policy(&mine)));
     }
 
     /// Fail closed: without a UID we cannot prove anything is ours, so every
@@ -2036,11 +2260,11 @@ mod tests {
 
         let mut claimed = test_plan("plan-1", PlanPhase::Pending, None);
         claimed.metadata.owner_references = Some(vec![build_owner_reference(&owner)]);
-        assert!(is_owned_by_another_policy(&claimed, &no_uid));
+        assert!(is_owned_by_another(&claimed, PlanOwner::Policy(&no_uid)));
 
         // ...but an orphan is still nobody's.
         let orphan = test_plan("plan-2", PlanPhase::Pending, None);
-        assert!(!is_owned_by_another_policy(&orphan, &no_uid));
+        assert!(!is_owned_by_another(&orphan, PlanOwner::Policy(&no_uid)));
     }
 
     #[test]
