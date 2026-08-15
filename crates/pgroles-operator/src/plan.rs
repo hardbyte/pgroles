@@ -1393,14 +1393,13 @@ fn set_plan_condition(
         message: Some(message.to_string()),
         last_transition_time: transition_time,
     };
-    if let Some(existing) = conditions
-        .iter_mut()
-        .find(|c| c.condition_type == condition_type)
-    {
-        *existing = condition;
-    } else {
-        conditions.push(condition);
-    }
+    // Collapse to exactly one entry per condition type. Replacing only the
+    // first match would leave a duplicate in place, and a second `Approved`
+    // that this never touches makes the CRD's terminality rule see the
+    // decision set grow — rejecting the operator's own writes and stranding
+    // the plan. A malformed status should not be able to do that.
+    conditions.retain(|c| c.condition_type != condition_type);
+    conditions.push(condition);
 }
 
 /// Update the parent policy's `current_plan_ref` in status.
@@ -2897,6 +2896,49 @@ mod tests {
             decide_approved_plan(Some(&approved_empty), &empty_digest, false),
             ApprovedPlanDecision::Execute,
         );
+    }
+
+    /// A status carrying a duplicate condition type must collapse to one.
+    ///
+    /// Replacing only the first match left the second in place, and a second
+    /// `Approved=True` makes the terminality rule see the true-decision set
+    /// grow — which rejects the operator's own write and strands the plan.
+    #[test]
+    fn setting_a_condition_leaves_exactly_one_of_that_type() {
+        let mut conditions = vec![
+            PolicyCondition {
+                condition_type: "Computed".to_string(),
+                status: "True".to_string(),
+                reason: None,
+                message: None,
+                last_transition_time: None,
+            },
+            PolicyCondition {
+                condition_type: "Approved".to_string(),
+                status: "False".to_string(),
+                reason: Some("PendingApproval".to_string()),
+                message: None,
+                last_transition_time: None,
+            },
+            PolicyCondition {
+                condition_type: "Approved".to_string(),
+                status: "True".to_string(),
+                reason: Some("ApprovedByReviewer".to_string()),
+                message: None,
+                last_transition_time: None,
+            },
+        ];
+
+        set_plan_condition(&mut conditions, "Approved", "True", "Reason", "Message");
+
+        let approved: Vec<_> = conditions
+            .iter()
+            .filter(|c| c.condition_type == "Approved")
+            .collect();
+        assert_eq!(approved.len(), 1, "duplicate Approved conditions survived");
+        assert_eq!(approved[0].status, "True");
+        // Unrelated conditions are untouched.
+        assert!(conditions.iter().any(|c| c.condition_type == "Computed"));
     }
 
     /// Planning must never persist password material, in any field.
