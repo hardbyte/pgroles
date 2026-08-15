@@ -351,6 +351,42 @@ mod tests {
         assert!(hex.chars().all(|c| c.is_ascii_hexdigit()));
     }
 
+    /// Pin the exact canonical bytes for a fixed input.
+    ///
+    /// The digest is only stable if the serialization is. `serde_json` emits
+    /// object keys in declaration order by default, but its `preserve_order`
+    /// feature switches to insertion order — and any dependency in the graph
+    /// can enable it, silently changing every digest without changing
+    /// `APPROVAL_EFFECT_ENCODING_V1`. Pending approvals would then be
+    /// superseded across an unrelated dependency bump.
+    ///
+    /// Note the object keys come out *alphabetically*, not in struct
+    /// declaration order, because effects round-trip through
+    /// `serde_json::Value`, whose `Object` is `BTreeMap`-backed. That is a
+    /// useful property — reordering fields in `Change` cannot change a digest
+    /// — and `preserve_order` is exactly what would take it away.
+    ///
+    /// If this test fails, the encoding changed: bump the encoding constant
+    /// deliberately rather than updating the expected bytes in place.
+    #[test]
+    fn canonical_bytes_are_pinned_for_a_fixed_input() {
+        let versions = versions(&[("app", "role-passwords:app:7")]);
+        let changes = [
+            grant("reporting"),
+            set_password("app", "SCRAM-SHA-256$4096:salt$stored:server"),
+        ];
+
+        let bytes = canonical_change_set_bytes(&changes, &inputs(&versions)).expect("bytes");
+        let encoded = String::from_utf8(bytes).expect("canonical bytes are UTF-8 JSON");
+
+        assert_eq!(
+            encoded,
+            r#"{"effect_encoding":"pgroles.io/approval-effect/v1","reconciliation_mode":"Authoritative","target":"default/postgres-credentials:url","effects":[{"Grant":{"name":"orders","object_type":"table","privileges":["SELECT"],"role":"reporting","schema":"inventory"}},{"SetPassword":{"name":"app","password_source":"role-passwords:app:7"}}]}"#,
+            "canonical encoding changed; bump APPROVAL_EFFECT_ENCODING_V1 rather than \
+             editing this fixture"
+        );
+    }
+
     #[test]
     fn the_digest_never_contains_password_material() {
         let versions = versions(&[("app", "role-passwords:app:7")]);

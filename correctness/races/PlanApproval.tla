@@ -38,6 +38,8 @@ EXTENDS FiniteSets, Naturals
 
 CONSTANTS
     SqlHashApproval,     \* TRUE reproduces the #174 rendered-SQL gate
+    LockDuringApply,     \* TRUE models verification and execution happening
+                         \* under one lock hold with no unlock window
     HasPasswordChange,   \* TRUE when the change set contains a SetPassword
     MaxDrifts            \* Bound on external database drift, so the system
                          \* eventually quiesces and liveness is meaningful
@@ -62,10 +64,16 @@ VARIABLES
     approved,         \* A reviewer has recorded approval of this exact plan
     dbEffects,        \* Effects the policy would produce against the live database
     driftsLeft,       \* Remaining external database changes
-    appliedEffects    \* Effects that actually executed (for safety checking)
+    appliedEffects,   \* Effects that actually executed (for safety checking)
+    appliedInSync     \* Whether, *at the moment of execution*, the executed
+                      \* effects still matched the live database. Recorded as a
+                      \* witness because the database may legitimately drift
+                      \* again afterwards — a plain state invariant comparing
+                      \* appliedEffects to dbEffects would fire on that normal
+                      \* post-apply drift instead of on a stale execution.
 
 vars == <<planPhase, planEffects, planRenderStale, approved, dbEffects,
-          driftsLeft, appliedEffects>>
+          driftsLeft, appliedEffects, appliedInSync>>
 
 TypeOK ==
     /\ planPhase \in {NoPlan, Pending, Applying, Applied}
@@ -75,6 +83,7 @@ TypeOK ==
     /\ dbEffects \in Effects
     /\ driftsLeft \in 0..MaxDrifts
     /\ appliedEffects \in Effects \cup {NoEffects}
+    /\ appliedInSync \in BOOLEAN
 
 \* --- The approval gate ---
 
@@ -98,11 +107,16 @@ NoUnreviewedExecution ==
 ExecutedWhatWasApproved ==
     (planPhase = Applied) => appliedEffects = planEffects
 
-\* Approval never carries across a change in effects: if the database moved
-\* away from the reviewed effects, nothing from that plan executed.
+\* What executed matches the database state it was verified against — no drift
+\* slipped in between the gate check and execution.
+\*
+\* Note this compares against `dbEffects`, not `planEffects`: comparing to
+\* `planEffects` would merely restate ExecutedWhatWasApproved and could never
+\* observe drift. This is the property that requires verification and execution
+\* to share one lock hold; with LockDuringApply = FALSE, TLC finds the stale
+\* apply (see PlanApproval_unlocked.cfg).
 NoStaleExecution ==
-    (planPhase = Applied /\ appliedEffects /= NoEffects) =>
-        appliedEffects = planEffects
+    (planPhase = Applied /\ appliedEffects /= NoEffects) => appliedInSync
 
 \* --- Liveness ---
 
@@ -118,19 +132,25 @@ Init ==
     /\ dbEffects = "e1"
     /\ driftsLeft = MaxDrifts
     /\ appliedEffects = NoEffects
+    /\ appliedInSync = TRUE
 
 \* --- Actions ---
 
 \* External modification to the database changes what the policy would do.
 \* Bounded by MaxDrifts so the system eventually quiesces.
+\*
+\* While the operator is executing it holds the database and advisory locks, so
+\* nothing can change underneath it — the design's "no unlock window" between
+\* pre-execution verification and execution.
 DatabaseDrifts ==
+    /\ LockDuringApply => planPhase /= Applying
     /\ driftsLeft > 0
     /\ \E e \in Effects:
         /\ e /= dbEffects
         /\ dbEffects' = e
     /\ driftsLeft' = driftsLeft - 1
     /\ UNCHANGED <<planPhase, planEffects, planRenderStale, approved,
-                    appliedEffects>>
+                    appliedEffects, appliedInSync>>
 
 \* The operator computes a plan for the current effects.
 OperatorCreatesPlan ==
@@ -139,7 +159,7 @@ OperatorCreatesPlan ==
     /\ planEffects' = dbEffects
     /\ planRenderStale' = FALSE   \* Freshly rendered and stored together
     /\ approved' = FALSE
-    /\ UNCHANGED <<dbEffects, driftsLeft, appliedEffects>>
+    /\ UNCHANGED <<dbEffects, driftsLeft, appliedEffects, appliedInSync>>
 
 \* A reviewer approves the pending plan.
 UserApproves ==
@@ -147,7 +167,7 @@ UserApproves ==
     /\ ~approved
     /\ approved' = TRUE
     /\ UNCHANGED <<planPhase, planEffects, planRenderStale, dbEffects,
-                    driftsLeft, appliedEffects>>
+                    driftsLeft, appliedEffects, appliedInSync>>
 
 \* Before executing, the operator recomputes the diff and re-renders the SQL.
 \*
@@ -161,7 +181,7 @@ OperatorRevalidates ==
     /\ HasPasswordChange
     /\ planRenderStale' = TRUE
     /\ UNCHANGED <<planPhase, planEffects, approved, dbEffects, driftsLeft,
-                    appliedEffects>>
+                    appliedEffects, appliedInSync>>
 
 \* The gate passes: execute the reviewed effects.
 OperatorExecutes ==
@@ -171,7 +191,7 @@ OperatorExecutes ==
     /\ GatePasses
     /\ planPhase' = Applying
     /\ UNCHANGED <<planEffects, planRenderStale, approved, dbEffects,
-                    driftsLeft, appliedEffects>>
+                    driftsLeft, appliedEffects, appliedInSync>>
 
 \* The gate fails: supersede the reviewed plan and start a fresh one.
 \*
@@ -187,12 +207,15 @@ OperatorSupersedes ==
     /\ planEffects' = dbEffects
     /\ planRenderStale' = FALSE
     /\ approved' = FALSE          \* The replacement needs its own decision
-    /\ UNCHANGED <<dbEffects, driftsLeft, appliedEffects>>
+    /\ UNCHANGED <<dbEffects, driftsLeft, appliedEffects, appliedInSync>>
 
 ApplySucceeds ==
     /\ planPhase = Applying
     /\ planPhase' = Applied
     /\ appliedEffects' = planEffects
+    \* The witness: did the database still hold the verified state when the
+    \* statements ran? Under a single lock hold it must have.
+    /\ appliedInSync' = (planEffects = dbEffects)
     /\ UNCHANGED <<planEffects, planRenderStale, approved, dbEffects,
                     driftsLeft>>
 

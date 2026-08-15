@@ -217,10 +217,10 @@ pub async fn create_or_update_plan(
     // 3. Hash the rendered SQL for preview diagnostics.
     let sql_hash = compute_sql_hash(&full_sql);
 
-    // 3. Count SQL statements (after wildcard expansion).
+    // 4. Count SQL statements (after wildcard expansion).
     let sql_statement_count = full_sql.lines().filter(|l| !l.trim().is_empty()).count() as i64;
 
-    // 4. Render redacted SQL for display (passwords masked).
+    // 5. Render redacted SQL for display (passwords masked).
     let redacted_sql = render_redacted_sql(changes, sql_context);
 
     cleanup_old_plans_best_effort(client, policy, None).await;
@@ -254,10 +254,11 @@ pub async fn create_or_update_plan(
         }
     }
 
-    // 5b. Check for recently-failed plan with the same hash. If a plan with
-    // this exact SQL already failed within the dedup window, creating another
-    // identical one is pointless — it would produce the same error. The window
-    // ensures we don't block retries after the user fixes the environment.
+    // 5b. Check for a recently-failed plan with the same change digest. If a
+    // plan with these exact effects already failed within the dedup window,
+    // creating another identical one is pointless — it would produce the same
+    // error. The window ensures we don't block retries after the user fixes
+    // the environment.
     //
     // Uses `status.failed_at` (not `creation_timestamp`) so that plans which
     // waited for approval before failing are measured from the failure time.

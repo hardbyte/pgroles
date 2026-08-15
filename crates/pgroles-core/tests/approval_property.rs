@@ -105,7 +105,7 @@ fn object_type(rng: &mut Rng) -> ObjectType {
 /// One arbitrary change. Covers every variant that carries semantics an
 /// approval must bind.
 fn change(rng: &mut Rng) -> Change {
-    match rng.usize(14) {
+    match rng.usize(17) {
         0 => Change::CreateRole {
             name: role(rng),
             state: RoleState {
@@ -187,6 +187,16 @@ fn change(rng: &mut Rng) -> Change {
             to_role: role(rng),
         },
         12 => Change::DropRole { name: role(rng) },
+        // DropOwned and TerminateSessions both carry a single `role` field,
+        // so they are the likeliest pair to flatten to the same encoded shape
+        // — exactly the collision this suite exists to rule out.
+        13 => Change::DropOwned { role: role(rng) },
+        14 => Change::TerminateSessions { role: role(rng) },
+        15 => Change::EnsureSchemaOwnerPrivileges {
+            name: SCHEMAS[rng.usize(SCHEMAS.len())].to_string(),
+            owner: role(rng),
+            privileges: privileges(rng),
+        },
         _ => Change::SetPassword {
             name: role(rng),
             // Stands in for a freshly salted SCRAM verifier.

@@ -39,9 +39,25 @@ Verifies what an approval actually binds, by separating two things
 The constant `SqlHashApproval` selects the approval gate:
 
 ```sh
-./run-tlc.sh races/PlanApproval.tla races/PlanApproval.cfg        # digest gate: passes
-./run-tlc.sh races/PlanApproval.tla races/PlanApproval_buggy.cfg  # SQL-hash gate: liveness violated
+./run-tlc.sh races/PlanApproval.tla races/PlanApproval.cfg           # passes
+./run-tlc.sh races/PlanApproval.tla races/PlanApproval_buggy.cfg     # liveness violated (#174)
+./run-tlc.sh races/PlanApproval.tla races/PlanApproval_unlocked.cfg  # NoStaleExecution violated
 ```
+
+Each configuration demonstrates a distinct requirement:
+
+| Config | `SqlHashApproval` | `LockDuringApply` | Result |
+| --- | --- | --- | --- |
+| `PlanApproval.cfg` | FALSE | TRUE | passes |
+| `PlanApproval_buggy.cfg` | TRUE | TRUE | `EventuallyApplies` violated |
+| `PlanApproval_unlocked.cfg` | FALSE | FALSE | `NoStaleExecution` violated |
+
+`PlanApproval_unlocked.cfg` shows why verification and execution must share one
+lock hold: with drift permitted while a plan is `Applying`, what executes no
+longer matches the state it was verified against. `NoStaleExecution` records a
+witness at apply time rather than comparing `appliedEffects` to `dbEffects` as a
+state invariant — the database may legitimately drift again after a successful
+apply, and a plain comparison would fire on that instead of on a stale one.
 
 The buggy configuration reproduces issue #174. A `SetPassword` change embeds a
 SCRAM verifier built with a fresh random salt on every computation, so a
