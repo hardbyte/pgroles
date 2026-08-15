@@ -348,7 +348,7 @@
                     "type": "string"
                   },
                   "redactedSqlHash": {
-                    "description": "SHA-256 hash of the redacted SQL preview bytes. This is for storage\nintegrity only; approval and deduplication continue to use `sql_hash`.",
+                    "description": "SHA-256 hash of the redacted SQL preview bytes. This is for storage\nintegrity only; approval and deduplication use `change_digest`.",
                     "nullable": true,
                     "type": "string"
                   },
