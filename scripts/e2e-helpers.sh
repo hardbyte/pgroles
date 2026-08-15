@@ -316,14 +316,42 @@ wait_for_plan_phase() {
   return 1
 }
 
+# Record a terminal decision on a plan's status subresource.
+#
+# The decision and the deciding identity must land in one write: CEL rejects a
+# decision condition without `decidedBy`. In a cluster running the Kyverno
+# reference policy the `decidedBy` sent here is overwritten with the caller's
+# authenticated identity; without that policy it stands as written, which is
+# exactly the trust boundary documented in operator-plan-approval.md.
+decide_plan() {
+  local plan="$1" condition="$2" reason="$3"
+  local now
+  now="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  kubectl patch pgplan "$plan" --subresource=status --type=merge -p "$(cat <<JSON
+{
+  "status": {
+    "conditions": [
+      {
+        "type": "$condition",
+        "status": "True",
+        "reason": "$reason",
+        "message": "recorded by e2e",
+        "lastTransitionTime": "$now"
+      }
+    ],
+    "decidedBy": { "username": "e2e-reviewer" }
+  }
+}
+JSON
+)"
+}
+
 approve_plan() {
-  local plan="$1"
-  kubectl annotate pgplan "$plan" pgroles.io/approved=true --overwrite
+  decide_plan "$1" Approved ApprovedByReviewer
 }
 
 reject_plan() {
-  local plan="$1"
-  kubectl annotate pgplan "$plan" pgroles.io/rejected=true --overwrite
+  decide_plan "$1" Denied DeniedByReviewer
 }
 
 get_plan_sql() {

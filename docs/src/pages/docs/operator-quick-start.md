@@ -143,11 +143,23 @@ produce either.
 
 ## 5. Approve and verify
 
-Approve exactly the plan you reviewed:
+Approve exactly the plan you reviewed. The decision is a terminal condition on
+the plan's status, written together with the identity that decided — the two
+must land in one write, and neither can be changed afterwards:
 
 ```bash
-kubectl annotate pgplan "$PLAN" --namespace "$NAMESPACE" \
-  pgroles.io/approved=true --overwrite
+kubectl patch pgplan "$PLAN" --namespace "$NAMESPACE" \
+  --subresource=status --type=merge -p '{
+    "status": {
+      "conditions": [{
+        "type": "Approved", "status": "True",
+        "reason": "ApprovedByReviewer",
+        "message": "reviewed change summary",
+        "lastTransitionTime": "'"$(date -u +%Y-%m-%dT%H:%M:%SZ)"'"
+      }],
+      "decidedBy": {"username": "'"$(kubectl auth whoami -o jsonpath='{.status.userInfo.username}')"'"}
+    }
+  }'
 
 kubectl wait --namespace "$NAMESPACE" \
   --for=jsonpath='{.status.phase}'=Applied "pgplan/$PLAN" \
@@ -160,6 +172,41 @@ kubectl get pgplan "$PLAN" --namespace "$NAMESPACE"
 The policy should now show `DRIFT=False`; the plan phase should be `Applied`.
 The operator re-inspects and re-renders before execution, so it will supersede
 an approved plan rather than run it if the database diff changed during review.
+
+To reject a plan instead, write `Denied` in place of `Approved`. The operator
+moves the plan to `Rejected` and creates a fresh plan on the next reconcile:
+
+```bash
+kubectl patch pgplan "$PLAN" --namespace "$NAMESPACE" \
+  --subresource=status --type=merge -p '{
+    "status": {
+      "conditions": [{
+        "type": "Denied", "status": "True",
+        "reason": "DeniedByReviewer",
+        "message": "not approving this change",
+        "lastTransitionTime": "'"$(date -u +%Y-%m-%dT%H:%M:%SZ)"'"
+      }],
+      "decidedBy": {"username": "'"$(kubectl auth whoami -o jsonpath='{.status.userInfo.username}')"'"}
+    }
+  }'
+```
+
+A decision is terminal: it cannot be changed, reversed, or paired with the
+opposite decision. Iterating means a new plan, not an edited decision.
+
+{% callout type="warning" title="decidedBy is only as good as your admission layer" %}
+The CRD's validation rules make a decision terminal and force it to carry a
+`decidedBy`, but Kubernetes CEL cannot see the authenticated user, so the API
+server cannot check that `decidedBy` names the account that actually wrote it —
+above, you are typing your own username into the field.
+
+Install `k8s/security/plan-decision-kyverno.yaml` to make it verified. It
+overwrites `decidedBy` from the authenticated admission request and requires
+the `approve` verb on the parent `PostgresPolicy`, so patching a plan's status
+is no longer by itself authority to approve a database change. Without it, any
+account that can patch `postgrespolicyplans/status` can approve, under any name
+it chooses.
+{% /callout %}
 
 ## 6. Make a second change
 

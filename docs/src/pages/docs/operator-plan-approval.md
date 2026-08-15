@@ -7,12 +7,20 @@ Seeing what the operator would do before it does it. {% .lead %}
 
 ---
 
-{% callout type="warning" title="Design preview" %}
-This page documents the target design from
-[#173](https://github.com/hardbyte/pgroles/issues/173) ahead of implementation:
-`mode: observe` (renamed from `plan`), the semantic change digest, write-once
-plan decisions, and tiered target identity. Released behaviour still uses
-`mode: plan`, approval annotations, and SQL-hash matching.
+{% callout type="warning" title="Partly a design preview" %}
+Shipped and described accurately below: the semantic change digest as approval
+identity, revalidation of pending plans, and write-once plan decisions with
+`decidedBy` — including the annotation removal.
+
+**Not yet built**, though this page describes them: `mode: observe` (today it is
+still `mode: plan`), tiered target identity and `requirePhysicalIdentity`
+([#180](https://github.com/hardbyte/pgroles/issues/180)), deferring generated
+password Secrets until after approval
+([#181](https://github.com/hardbyte/pgroles/issues/181)), the
+`PostgresPolicyCandidate` CRD, and every `pgroles plan ...` /
+`pgroles candidate ...` command shown here — the CLI has no such subcommands
+yet. Use `kubectl` for anything you need to do today; see the
+[quick start](/docs/operator-quick-start) for the exact commands.
 {% /callout %}
 
 ## Observe mode
@@ -145,9 +153,12 @@ changed once written. ("Rejected" is the phase; `Denied` is the condition —
 they always travel together.) A candidate whose plan is denied is terminal
 too, reporting `Superseded=True, reason=PlanDenied`.
 
-The CLI patches the plan's status subresource; raw `kubectl patch
---subresource=status` works identically. The approval annotations from
-earlier releases are removed.
+Decisions are written to the plan's status subresource with `kubectl patch
+--subresource=status` (the CLI wrapper is not built yet). The
+`pgroles.io/approved` and `pgroles.io/rejected` annotations that earlier
+releases used have been removed outright: setting them now does nothing at all,
+which is deliberate — a retired approval mechanism that still worked would be a
+silent bypass of everything below.
 
 The trust model has two layers, and both matter:
 

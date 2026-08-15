@@ -190,12 +190,6 @@ impl PostgresPolicySpec {
 // Well-known annotations and labels
 // ---------------------------------------------------------------------------
 
-/// Annotation key used to approve a `PostgresPolicyPlan`.
-pub const PLAN_APPROVED_ANNOTATION: &str = "pgroles.io/approved";
-
-/// Annotation key used to reject a `PostgresPolicyPlan`.
-pub const PLAN_REJECTED_ANNOTATION: &str = "pgroles.io/rejected";
-
 /// Annotation key used to request an immediate `PostgresPolicy` reconcile.
 pub const REQUESTED_RECONCILE_ANNOTATION: &str = "reconcile.pgroles.io/requestedAt";
 
@@ -1021,15 +1015,43 @@ pub struct PolicyPlanRef {
 }
 
 /// Status of a `PostgresPolicyPlan` resource.
-#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+///
+/// The decision rules below are the same grammar `EphemeralAccessRequest`
+/// uses: a decision is terminal, `Approved` and `Denied` cannot both be true,
+/// and the deciding identity is recorded in the same admitted write. What CEL
+/// cannot do is check *who* is writing — see [`DecisionActor`].
+#[derive(KubeSchema, Debug, Clone, Default, Serialize, Deserialize)]
+#[x_kube(
+    validation = Rule::new(
+        "!(self.conditions.exists(c, c.type == 'Approved' && c.status == 'True') && self.conditions.exists(c, c.type == 'Denied' && c.status == 'True'))"
+    ).message("Approved=True and Denied=True are mutually exclusive"),
+    validation = Rule::new(
+        "oldSelf.conditions.filter(c, (c.type == 'Approved' || c.type == 'Denied') && c.status == 'True').size() == 0 || self.conditions.filter(c, (c.type == 'Approved' || c.type == 'Denied') && c.status == 'True') == oldSelf.conditions.filter(c, (c.type == 'Approved' || c.type == 'Denied') && c.status == 'True')"
+    ).message("plan decisions are terminal"),
+    validation = Rule::new(
+        "!has(oldSelf.decidedBy) || (has(self.decidedBy) && self.decidedBy == oldSelf.decidedBy)"
+    ).message("decision identity is write-once"),
+    validation = Rule::new(
+        "self.conditions.exists(c, (c.type == 'Approved' || c.type == 'Denied') && c.status == 'True') == has(self.decidedBy)"
+    ).message("a terminal plan decision and decidedBy identity must be recorded together")
+)]
 #[serde(rename_all = "camelCase")]
 pub struct PostgresPolicyPlanStatus {
     /// Phase: Pending, Approved, Applying, Applied, Failed, Superseded.
     #[serde(default)]
     pub phase: PlanPhase,
-    /// Standard conditions: Computed, Approved, Applied.
+    /// Standard conditions: Computed, Applied, and the terminal decision
+    /// conditions `Approved` / `Denied`.
     #[serde(default)]
     pub conditions: Vec<PolicyCondition>,
+    /// Kubernetes identity which approved or denied this plan.
+    ///
+    /// Written in the same status update as the terminal decision, and
+    /// write-once thereafter. The supplied Kyverno reference policy overwrites
+    /// it from authenticated admission `userInfo`; without that admission layer
+    /// it is an assertion by whoever wrote the status, not a verified identity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub decided_by: Option<DecisionActor>,
     /// Summary of changes in this plan.
     #[serde(default)]
     pub change_summary: Option<ChangeSummary>,
@@ -1271,7 +1293,7 @@ pub struct EphemeralAccessRequestSpec {
     pub subject: EphemeralAccessSubject,
     /// Kubernetes identity which created the request. The supplied Kyverno
     /// reference policy overwrites this from authenticated admission `userInfo`.
-    pub requested_by: EphemeralAccessActor,
+    pub requested_by: DecisionActor,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(length(max = 64), regex(pattern = r"^([0-9]+[smh])+$"))]
     pub requested_duration: Option<String>,
@@ -1286,14 +1308,19 @@ pub struct EphemeralAccessSubject {
     pub role: String,
 }
 
-/// Authenticated Kubernetes identity associated with an access action.
+/// Authenticated Kubernetes identity associated with a decision or request.
 ///
-/// The supplied Kyverno reference policy replaces these values from the
-/// admission request's `userInfo`. Without admission enforcement they are
-/// assertions by the trusted request or approval broker.
+/// Shared by `EphemeralAccessRequest` and `PostgresPolicyPlan` so both
+/// lifecycles record who decided in one vocabulary.
+///
+/// **This is only as trustworthy as the admission layer.** CEL validation
+/// cannot see `request.userInfo`, so the API server alone cannot tell a real
+/// identity from an asserted one. The supplied Kyverno reference policy
+/// overwrites these values from the admission request's authenticated
+/// `userInfo`; without it, they are whatever the client claimed.
 #[derive(KubeSchema, Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
-pub struct EphemeralAccessActor {
+pub struct DecisionActor {
     #[schemars(length(min = 1, max = 512))]
     pub username: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1338,7 +1365,7 @@ pub struct EphemeralAccessRequestStatus {
     /// Kyverno reference policy overwrites this from authenticated admission
     /// `userInfo` in the same status update as the terminal decision.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub decided_by: Option<EphemeralAccessActor>,
+    pub decided_by: Option<DecisionActor>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(length(max = 64))]
     pub approval_expires_at: Option<String>,

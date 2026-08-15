@@ -30,21 +30,20 @@ use pgroles_operator::observability::{
 use pgroles_operator::reconciler::{error_policy, reconcile};
 use pgroles_operator::request_index::RequestIndex;
 
-/// Hash for plan annotation changes — triggers parent policy reconciliation
-/// when approval/rejection annotations are added or modified.
-fn plan_annotation_hash(plan: &PostgresPolicyPlan) -> Option<u64> {
+/// Hash for plan decision changes — triggers parent policy reconciliation when
+/// a reviewer records a decision, or the operator moves the plan's phase.
+///
+/// Decisions live in the status subresource, so this hashes the terminal
+/// decision conditions rather than annotations.
+fn plan_decision_hash(plan: &PostgresPolicyPlan) -> Option<u64> {
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    // Hash the approval-related annotations so we trigger on changes.
-    if let Some(annotations) = &plan.metadata.annotations {
-        annotations
-            .get(pgroles_operator::crd::PLAN_APPROVED_ANNOTATION)
-            .hash(&mut hasher);
-        annotations
-            .get(pgroles_operator::crd::PLAN_REJECTED_ANNOTATION)
-            .hash(&mut hasher);
-    }
-    // Also hash the plan's status phase to detect operator-driven transitions.
     if let Some(status) = &plan.status {
+        for condition in &status.conditions {
+            if condition.condition_type == "Approved" || condition.condition_type == "Denied" {
+                condition.condition_type.hash(&mut hasher);
+                condition.status.hash(&mut hasher);
+            }
+        }
         format!("{}", status.phase).hash(&mut hasher);
     }
     Some(hasher.finish())
@@ -183,7 +182,7 @@ async fn main() -> anyhow::Result<()> {
     let plan_triggers = watcher(plans, watcher::Config::default())
         .default_backoff()
         .touched_objects()
-        .predicate_filter(plan_annotation_hash, Default::default())
+        .predicate_filter(plan_decision_hash, Default::default())
         .filter_map(|plan| async move { plan.ok() })
         .flat_map(move |plan| {
             let policy_store = plan_policy_store.clone();

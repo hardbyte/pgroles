@@ -2383,7 +2383,7 @@ mod tests {
                 subject: crate::crd::EphemeralAccessSubject {
                     role: "alice".into(),
                 },
-                requested_by: crate::crd::EphemeralAccessActor {
+                requested_by: crate::crd::DecisionActor {
                     username: "requester@example.com".into(),
                     uid: Some("requester-uid".into()),
                     groups: vec!["developers".into()],
