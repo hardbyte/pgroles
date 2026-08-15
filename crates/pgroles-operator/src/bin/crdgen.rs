@@ -8,6 +8,7 @@ use std::path::PathBuf;
 use kube::CustomResourceExt;
 use pgroles_operator::crd::{
     EphemeralAccessPolicy, EphemeralAccessRequest, PostgresPolicy, PostgresPolicyPlan,
+    postgres_policy_candidate_crd,
 };
 
 struct CrdOutput {
@@ -26,6 +27,14 @@ fn generate() -> Vec<CrdOutput> {
             filename: "postgrespolicyplans.pgroles.io.yaml",
             json: serde_json::to_string_pretty(&PostgresPolicyPlan::crd())
                 .expect("PostgresPolicyPlan CRD should serialize"),
+        },
+        // Generated through `postgres_policy_candidate_crd()`, not
+        // `PostgresPolicyCandidate::crd()`: the candidate's `spec.content`
+        // must carry no OpenAPI defaults (ADR-001, Decision 2).
+        CrdOutput {
+            filename: "postgrespolicycandidates.pgroles.io.yaml",
+            json: serde_json::to_string_pretty(&postgres_policy_candidate_crd())
+                .expect("PostgresPolicyCandidate CRD should serialize"),
         },
         CrdOutput {
             filename: "ephemeralaccesspolicies.pgroles.io.yaml",
@@ -68,6 +77,7 @@ mod tests {
     use kube::CustomResourceExt;
     use pgroles_operator::crd::{
         EphemeralAccessPolicy, EphemeralAccessRequest, PostgresPolicy, PostgresPolicyPlan,
+        postgres_policy_candidate_crd,
     };
 
     #[test]
@@ -85,6 +95,15 @@ mod tests {
         assert!(json.contains("\"apiVersion\""));
         assert!(json.contains("\"PostgresPolicyPlan\""));
         assert!(json.contains("\"pgplan\""));
+    }
+
+    #[test]
+    fn candidate_crd_serializes_to_json() {
+        let json = serde_json::to_string_pretty(&postgres_policy_candidate_crd())
+            .expect("CRD should serialize");
+        assert!(json.contains("\"PostgresPolicyCandidate\""));
+        assert!(json.contains("\"pgcand\""));
+        assert!(json.contains("self == oldSelf"));
     }
 
     #[test]

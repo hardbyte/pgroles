@@ -22,16 +22,17 @@ cargo test --workspace -- --include-ignored
 # Run a single test
 cargo test -p pgroles-core --lib diff::tests::diff_creates_new_roles -- --exact
 
-# CRD drift check (CI compares all eight committed copies against crdgen output:
-# the four in the chart, and the four standalone manifests in k8s/)
+# CRD drift check (CI compares all ten committed copies against crdgen output:
+# the five in the chart, and the five standalone manifests in k8s/)
 scripts/check-crd-drift.sh
 
-# Regenerate CRDs after modifying crd.rs. crdgen writes all four kinds into the
+# Regenerate CRDs after modifying crd.rs. crdgen writes all five kinds into the
 # chart; the k8s/ copies are duplicates that must be refreshed by hand, and
-# check-crd-drift.sh fails if any of the eight drifts.
+# check-crd-drift.sh fails if any of the ten drifts.
 cargo run --bin crdgen -- --output-dir charts/pgroles-operator/crds/
 cp charts/pgroles-operator/crds/postgrespolicies.pgroles.io.yaml k8s/crd.yaml
 cp charts/pgroles-operator/crds/postgrespolicyplans.pgroles.io.yaml k8s/postgrespolicyplan-crd.yaml
+cp charts/pgroles-operator/crds/postgrespolicycandidates.pgroles.io.yaml k8s/postgrespolicycandidate-crd.yaml
 cp charts/pgroles-operator/crds/ephemeralaccesspolicies.pgroles.io.yaml k8s/ephemeralaccesspolicy-crd.yaml
 cp charts/pgroles-operator/crds/ephemeralaccessrequests.pgroles.io.yaml k8s/ephemeralaccessrequest-crd.yaml
 ```

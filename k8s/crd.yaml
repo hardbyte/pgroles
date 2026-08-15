@@ -123,10 +123,14 @@
                             "properties": {
                               "key": {
                                 "description": "Key within the Secret.",
+                                "maxLength": 253,
+                                "minLength": 1,
                                 "type": "string"
                               },
                               "name": {
                                 "description": "Name of the Secret.",
+                                "maxLength": 253,
+                                "minLength": 1,
                                 "type": "string"
                               }
                             },
@@ -147,10 +151,14 @@
                             "properties": {
                               "key": {
                                 "description": "Key within the Secret.",
+                                "maxLength": 253,
+                                "minLength": 1,
                                 "type": "string"
                               },
                               "name": {
                                 "description": "Name of the Secret.",
+                                "maxLength": 253,
+                                "minLength": 1,
                                 "type": "string"
                               }
                             },
@@ -171,10 +179,14 @@
                             "properties": {
                               "key": {
                                 "description": "Key within the Secret.",
+                                "maxLength": 253,
+                                "minLength": 1,
                                 "type": "string"
                               },
                               "name": {
                                 "description": "Name of the Secret.",
+                                "maxLength": 253,
+                                "minLength": 1,
                                 "type": "string"
                               }
                             },
@@ -198,10 +210,14 @@
                             "properties": {
                               "key": {
                                 "description": "Key within the Secret.",
+                                "maxLength": 253,
+                                "minLength": 1,
                                 "type": "string"
                               },
                               "name": {
                                 "description": "Name of the Secret.",
+                                "maxLength": 253,
+                                "minLength": 1,
                                 "type": "string"
                               }
                             },
@@ -228,10 +244,14 @@
                             "properties": {
                               "key": {
                                 "description": "Key within the Secret.",
+                                "maxLength": 253,
+                                "minLength": 1,
                                 "type": "string"
                               },
                               "name": {
                                 "description": "Name of the Secret.",
+                                "maxLength": 253,
+                                "minLength": 1,
                                 "type": "string"
                               }
                             },
@@ -252,10 +272,14 @@
                             "properties": {
                               "key": {
                                 "description": "Key within the Secret.",
+                                "maxLength": 253,
+                                "minLength": 1,
                                 "type": "string"
                               },
                               "name": {
                                 "description": "Name of the Secret.",
+                                "maxLength": 253,
+                                "minLength": 1,
                                 "type": "string"
                               }
                             },
@@ -284,6 +308,8 @@
                         "properties": {
                           "name": {
                             "description": "Name of the Secret.",
+                            "maxLength": 253,
+                            "minLength": 1,
                             "type": "string"
                           }
                         },
@@ -297,6 +323,8 @@
                   },
                   "default_owner": {
                     "description": "Default owner for ALTER DEFAULT PRIVILEGES (e.g. \"app_owner\").",
+                    "maxLength": 63,
+                    "minLength": 1,
                     "nullable": true,
                     "type": "string"
                   },
@@ -343,10 +371,14 @@
                                   ],
                                   "type": "string"
                                 },
+                                "maxItems": 16,
+                                "minItems": 1,
                                 "type": "array"
                               },
                               "role": {
                                 "description": "The role receiving the default privilege. Only used in top-level default_privileges\n(in profiles, the role is determined by expansion).",
+                                "maxLength": 63,
+                                "minLength": 1,
                                 "nullable": true,
                                 "type": "string"
                               }
@@ -357,14 +389,19 @@
                             ],
                             "type": "object"
                           },
+                          "maxItems": 16,
                           "type": "array"
                         },
                         "owner": {
                           "description": "The role that owns newly created objects. If omitted, uses manifest's default_owner.",
+                          "maxLength": 63,
+                          "minLength": 1,
                           "nullable": true,
                           "type": "string"
                         },
                         "schema": {
+                          "maxLength": 63,
+                          "minLength": 1,
                           "type": "string"
                         }
                       },
@@ -374,6 +411,7 @@
                       ],
                       "type": "object"
                     },
+                    "maxItems": 512,
                     "type": "array"
                   },
                   "grants": {
@@ -387,11 +425,15 @@
                           "properties": {
                             "name": {
                               "description": "Object name, or \"*\" for all objects. Omit for schema-level grants.",
+                              "maxLength": 256,
+                              "minLength": 1,
                               "nullable": true,
                               "type": "string"
                             },
                             "schema": {
                               "description": "Schema name. Required for most object types except database.",
+                              "maxLength": 63,
+                              "minLength": 1,
                               "nullable": true,
                               "type": "string"
                             },
@@ -434,9 +476,13 @@
                             ],
                             "type": "string"
                           },
+                          "maxItems": 16,
+                          "minItems": 1,
                           "type": "array"
                         },
                         "role": {
+                          "maxLength": 63,
+                          "minLength": 1,
                           "type": "string"
                         }
                       },
@@ -447,6 +493,7 @@
                       ],
                       "type": "object"
                     },
+                    "maxItems": 4096,
                     "type": "array"
                   },
                   "interval": {
@@ -475,6 +522,8 @@
                                 "type": "boolean"
                               },
                               "name": {
+                                "maxLength": 63,
+                                "minLength": 1,
                                 "type": "string"
                               }
                             },
@@ -483,9 +532,12 @@
                             ],
                             "type": "object"
                           },
+                          "maxItems": 256,
                           "type": "array"
                         },
                         "role": {
+                          "maxLength": 63,
+                          "minLength": 1,
                           "type": "string"
                         }
                       },
@@ -495,6 +547,7 @@
                       ],
                       "type": "object"
                     },
+                    "maxItems": 512,
                     "type": "array"
                   },
                   "mode": {
@@ -513,9 +566,11 @@
                         "config": {
                           "additionalProperties": {
                             "description": "A role configuration parameter value.\n\nValues are always strings — quote numbers and booleans (e.g.\n`statement_timeout: \"30000\"`, `jit: \"off\"`). The Kubernetes CRD schema\ntypes config values as strings, and the CLI enforces the same rule so a\nmanifest means the same thing whether it is applied with `pgroles` or\n`kubectl`. PostgreSQL coerces the string to the parameter's type.",
+                            "maxLength": 256,
                             "type": "string"
                           },
                           "description": "Role-level configuration parameter defaults for generated roles,\napplied via `ALTER ROLE ... SET parameter = value`. Values support the\n`{schema}` and `{profile}` placeholders, substituted per `schema x\nprofile` expansion (e.g. `search_path: \"{schema}\"`).",
+                          "maxProperties": 32,
                           "type": "object"
                         },
                         "default_privileges": {
@@ -556,9 +611,13 @@
                                   ],
                                   "type": "string"
                                 },
+                                "maxItems": 16,
+                                "minItems": 1,
                                 "type": "array"
                               },
                               "role": {
+                                "maxLength": 63,
+                                "minLength": 1,
                                 "nullable": true,
                                 "type": "string"
                               }
@@ -569,6 +628,7 @@
                             ],
                             "type": "object"
                           },
+                          "maxItems": 32,
                           "type": "array"
                         },
                         "grants": {
@@ -580,6 +640,8 @@
                                 "description": "Object target within a profile.",
                                 "properties": {
                                   "name": {
+                                    "maxLength": 256,
+                                    "minLength": 1,
                                     "nullable": true,
                                     "type": "string"
                                   },
@@ -622,6 +684,8 @@
                                   ],
                                   "type": "string"
                                 },
+                                "maxItems": 16,
+                                "minItems": 1,
                                 "type": "array"
                               }
                             },
@@ -631,6 +695,7 @@
                             ],
                             "type": "object"
                           },
+                          "maxItems": 64,
                           "type": "array"
                         },
                         "inherit": {
@@ -646,6 +711,7 @@
                     },
                     "default": {},
                     "description": "Reusable privilege profiles.",
+                    "maxProperties": 64,
                     "type": "object"
                   },
                   "reconciliation_mode": {
@@ -671,11 +737,15 @@
                         },
                         "reassign_owned_to": {
                           "description": "Optional successor role for `REASSIGN OWNED BY ... TO ...`.",
+                          "maxLength": 63,
+                          "minLength": 1,
                           "nullable": true,
                           "type": "string"
                         },
                         "role": {
                           "description": "The role to retire and ultimately drop.",
+                          "maxLength": 63,
+                          "minLength": 1,
                           "type": "string"
                         },
                         "terminate_sessions": {
@@ -689,6 +759,7 @@
                       ],
                       "type": "object"
                     },
+                    "maxItems": 512,
                     "type": "array",
                     "x-kubernetes-list-map-keys": [
                       "role"
@@ -706,15 +777,18 @@
                           "type": "boolean"
                         },
                         "comment": {
+                          "maxLength": 256,
                           "nullable": true,
                           "type": "string"
                         },
                         "config": {
                           "additionalProperties": {
                             "description": "A role configuration parameter value.\n\nValues are always strings — quote numbers and booleans (e.g.\n`statement_timeout: \"30000\"`, `jit: \"off\"`). The Kubernetes CRD schema\ntypes config values as strings, and the CLI enforces the same rule so a\nmanifest means the same thing whether it is applied with `pgroles` or\n`kubectl`. PostgreSQL coerces the string to the parameter's type.",
+                            "maxLength": 256,
                             "type": "string"
                           },
                           "description": "Role-level configuration parameter defaults, applied via\n`ALTER ROLE ... SET parameter = value` (e.g. `role: combined`,\n`search_path: app`). Settings present on the role in the database but\nabsent here are RESET in authoritative mode.",
+                          "maxProperties": 32,
                           "type": "object"
                         },
                         "connection_limit": {
@@ -744,6 +818,8 @@
                           "type": "boolean"
                         },
                         "name": {
+                          "maxLength": 63,
+                          "minLength": 1,
                           "type": "string"
                         },
                         "password": {
@@ -763,11 +839,15 @@
                                 },
                                 "secretKey": {
                                   "description": "Key within the generated Secret. Defaults to `password`.",
+                                  "maxLength": 253,
+                                  "minLength": 1,
                                   "nullable": true,
                                   "type": "string"
                                 },
                                 "secretName": {
                                   "description": "Override the generated Secret name. Defaults to `{policy}-pgr-{role}`.",
+                                  "maxLength": 253,
+                                  "minLength": 1,
                                   "nullable": true,
                                   "type": "string"
                                 }
@@ -776,6 +856,8 @@
                             },
                             "secretKey": {
                               "description": "Key within the referenced Secret. Defaults to the role name.\nOnly used with `secretRef`.",
+                              "maxLength": 253,
+                              "minLength": 1,
                               "nullable": true,
                               "type": "string"
                             },
@@ -785,6 +867,8 @@
                               "properties": {
                                 "name": {
                                   "description": "Name of the Secret.",
+                                  "maxLength": 253,
+                                  "minLength": 1,
                                   "type": "string"
                                 }
                               },
@@ -798,6 +882,7 @@
                         },
                         "password_valid_until": {
                           "description": "Password expiration timestamp (ISO 8601, e.g. \"2025-12-31T00:00:00Z\").",
+                          "maxLength": 64,
                           "nullable": true,
                           "type": "string"
                         },
@@ -815,6 +900,7 @@
                       ],
                       "type": "object"
                     },
+                    "maxItems": 1024,
                     "type": "array",
                     "x-kubernetes-list-map-keys": [
                       "name"
@@ -825,26 +911,35 @@
                     "default": [],
                     "description": "Schema bindings that expand profiles into concrete roles/grants.\n\nKeyed by `name` so server-side apply merges entries per schema instead\nof replacing the whole list. The API server also rejects duplicate keys.",
                     "items": {
-                      "description": "A schema binding — associates a schema with one or more profiles.",
+                      "description": "A schema binding — associates a schema with one or more profiles.\n\nField bounds come from [`crate::bounds`]; see that module for why they\nexist and where else they are enforced.",
                       "properties": {
                         "name": {
+                          "maxLength": 63,
+                          "minLength": 1,
                           "type": "string"
                         },
                         "owner": {
                           "description": "Override default_owner for this schema's default privileges.",
+                          "maxLength": 63,
+                          "minLength": 1,
                           "nullable": true,
                           "type": "string"
                         },
                         "profiles": {
                           "default": [],
                           "items": {
+                            "maxLength": 63,
+                            "minLength": 1,
                             "type": "string"
                           },
+                          "maxItems": 64,
                           "type": "array"
                         },
                         "role_pattern": {
                           "default": "{schema}-{profile}",
                           "description": "Role naming pattern. Supports `{schema}` and `{profile}` placeholders.\nDefaults to `\"{schema}-{profile}\"`.",
+                          "maxLength": 128,
+                          "minLength": 1,
                           "type": "string"
                         }
                       },
@@ -853,6 +948,7 @@
                       ],
                       "type": "object"
                     },
+                    "maxItems": 256,
                     "type": "array",
                     "x-kubernetes-list-map-keys": [
                       "name"

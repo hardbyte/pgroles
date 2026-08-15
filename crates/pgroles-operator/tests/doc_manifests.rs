@@ -18,6 +18,7 @@ use jsonschema::Validator;
 use kube::CustomResourceExt;
 use pgroles_operator::crd::{
     EphemeralAccessPolicy, EphemeralAccessRequest, PostgresPolicy, PostgresPolicyPlan,
+    postgres_policy_candidate_crd,
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -111,6 +112,7 @@ fn schemas() -> BTreeMap<String, (Validator, Value)> {
     let crds = [
         PostgresPolicy::crd(),
         PostgresPolicyPlan::crd(),
+        postgres_policy_candidate_crd(),
         EphemeralAccessPolicy::crd(),
         EphemeralAccessRequest::crd(),
     ];

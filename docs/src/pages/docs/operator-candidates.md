@@ -275,6 +275,17 @@ terminal.
 
 ## Limits
 
-`spec.content` collections carry explicit size bounds (required by the
-whole-spec immutability rule's CEL cost budget). Policies too large to embed
-can pass content by reference; the digest binding is identical either way.
+`spec.content` collections carry explicit size bounds — 1024 roles, 4096
+grants, 63-character identifiers and the rest of the table in the [manifest
+reference](/docs/manifest-reference#size-limits). They are required by the
+whole-spec immutability rule's CEL cost budget, and they apply to
+`PostgresPolicy` too. Policies too large to embed can pass content by
+reference; the digest binding is identical either way.
+
+`spec.content` also emits no OpenAPI defaults, unlike `PostgresPolicy.spec`.
+An API-server default is written into the stored object, so if a default value
+ever changed, a stored candidate would keep the old value while the identical
+source YAML would now mean the new one — and the stored object's content
+digest would no longer match the digest CI computed from that YAML. Omitted
+content fields are resolved by the operator instead, identically for policies
+and candidates.

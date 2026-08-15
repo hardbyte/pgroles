@@ -27,6 +27,18 @@ rules:
   - apiGroups: ["pgroles.io"]
     resources: ["postgrespolicyplans/status"]
     verbs: ["get", "patch", "update"]
+  # Watch and manage PostgresPolicyCandidate CRDs. The operator reads
+  # candidates and owns their status; it never writes their spec, which the
+  # API server holds immutable anyway.
+  - apiGroups: ["pgroles.io"]
+    resources: ["postgrespolicycandidates"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["pgroles.io"]
+    resources: ["postgrespolicycandidates/status"]
+    verbs: ["get", "patch", "update"]
+  - apiGroups: ["pgroles.io"]
+    resources: ["postgrespolicycandidates/finalizers"]
+    verbs: ["update"]
   # Ephemeral access lifecycle. The operator is not an approver; a validating
   # admission policy protects Approved/Denied condition mutations.
   - apiGroups: ["pgroles.io"]
