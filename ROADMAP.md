@@ -82,6 +82,7 @@ The following landed recently and shape the next release line:
 
 - Carry the current controller semantics into the next CRD revision instead of leaving them as implementation-only conventions.
 - Promote beyond `v1alpha1` only once compatibility, upgrade, and rollback expectations are explicit.
+- `PostgresPolicyCandidate` API mechanics (schema bounds, defaults, ownership, RBAC) are settled in [ADR-001](docs/design/adr-001-candidate-api-shakedown.md).
 - Keep status, Events, and OTLP metrics aligned as the CRD evolves.
 
 ### 4. Compatibility and validation
