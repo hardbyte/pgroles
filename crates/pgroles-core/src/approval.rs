@@ -91,6 +91,22 @@ pub fn compute_change_digest(
     changes: &[Change],
     inputs: &EffectDigestInputs<'_>,
 ) -> Result<String, ApprovalDigestError> {
+    Ok(sha256_prefixed(&canonical_change_set_bytes(
+        changes, inputs,
+    )?))
+}
+
+/// The exact bytes [`compute_change_digest`] hashes.
+///
+/// Exposed for two reasons: diagnosing *why* two digests differ without
+/// re-deriving the encoding by hand, and letting tests assert on what actually
+/// enters the hash. Asserting on the digest alone cannot show that password
+/// material was excluded — a hash never contains its input literally, so such
+/// a check passes whether or not the exclusion works.
+pub fn canonical_change_set_bytes(
+    changes: &[Change],
+    inputs: &EffectDigestInputs<'_>,
+) -> Result<Vec<u8>, ApprovalDigestError> {
     let mut effects = Vec::with_capacity(changes.len());
     for change in changes {
         effects.push(canonical_effect(change, inputs.password_source_versions)?);
@@ -100,15 +116,13 @@ pub fn compute_change_digest(
     // of effects are the same approval regardless of emission order.
     effects.sort_by_cached_key(ToString::to_string);
 
-    let bytes = serde_json::to_vec(&CanonicalChangeSet {
+    Ok(serde_json::to_vec(&CanonicalChangeSet {
         effect_encoding: APPROVAL_EFFECT_ENCODING_V1,
         reconciliation_mode: inputs.reconciliation_mode,
         target: inputs.target,
         effects,
     })
-    .expect("canonical change set is serializable");
-
-    Ok(sha256_prefixed(&bytes))
+    .expect("canonical change set is serializable"))
 }
 
 /// Project one change onto its canonical, stable form.

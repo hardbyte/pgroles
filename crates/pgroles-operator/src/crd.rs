@@ -1084,7 +1084,7 @@ pub struct PostgresPolicyPlanStatus {
     #[serde(default)]
     pub sql_statements: Option<i64>,
     /// SHA-256 hash of the redacted SQL preview bytes. This is for storage
-    /// integrity only; approval and deduplication continue to use `sql_hash`.
+    /// integrity only; approval and deduplication use `change_digest`.
     #[serde(default)]
     pub redacted_sql_hash: Option<String>,
     /// Uncompressed byte length of the redacted SQL preview.

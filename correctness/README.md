@@ -25,6 +25,37 @@ Races modeled:
 4. Database drift changes between plan creation and approval
 5. Hash dedup skips identical plans
 
+### `races/PlanApproval.tla`
+
+Verifies what an approval actually binds, by separating two things
+`PlanLifecycle.tla` conflates: the *semantic effects* of a plan, and the
+*rendered SQL* those effects produce.
+
+- Nothing executes without a recorded approval of the plan being executed
+- What executed is what was reviewed, never a different set of effects
+- An approval never carries across a change in effects
+- **Liveness**: once drift stops, a plan is eventually applied
+
+The constant `SqlHashApproval` selects the approval gate:
+
+```sh
+./run-tlc.sh races/PlanApproval.tla races/PlanApproval.cfg        # digest gate: passes
+./run-tlc.sh races/PlanApproval.tla races/PlanApproval_buggy.cfg  # SQL-hash gate: liveness violated
+```
+
+The buggy configuration reproduces issue #174. A `SetPassword` change embeds a
+SCRAM verifier built with a fresh random salt on every computation, so a
+rendered-SQL gate can never be satisfied: at approve time the operator
+re-renders, the hash differs, the reviewed plan is superseded, and the
+replacement has the same problem. TLC reports a violation of
+`EventuallyApplies` with a `Back to state ... OperatorSupersedes` lasso — the
+endless approve/supersede cycle.
+
+Note that every *safety* invariant still holds in the buggy configuration.
+Nothing unsafe executes; the workflow simply never converges. That is why the
+bug survived a safety-focused test suite, and why this model checks a temporal
+property rather than only invariants.
+
 ### `races/PlanStorage.tla`
 
 Verifies the Kubernetes persistence ordering around plan SQL previews:
