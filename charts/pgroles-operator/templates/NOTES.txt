@@ -16,6 +16,31 @@ reconciliation. Do not point a default policy at an existing database. Set the
 mode, approval, and reconciliation_mode fields explicitly, and review the plan
 before applying database changes.
 
+{{ if .Values.admissionPolicies.enabled -}}
+Kyverno admission policies are installed.
+{{ if not (and .Values.admissionPolicies.planDecision.enabled .Values.admissionPolicies.ephemeralAccess.enabled) }}Only some of them: check admissionPolicies.planDecision.enabled and
+admissionPolicies.ephemeralAccess.enabled. A lifecycle whose policy is not
+installed has unattributed decisions.
+{{ end }}The operator is exempted as:
+
+  system:serviceaccount:{{ .Release.Namespace }}:{{ include "pgroles-operator.serviceAccountName" . }}
+
+These resources are cluster-scoped and use fixed names. Enable them from one
+release per cluster.
+{{- else -}}
+Warning: admission policies are NOT installed (admissionPolicies.enabled is
+false). Without them, `decidedBy` on a PostgresPolicyPlan or an
+EphemeralAccessRequest is whatever the client typed, and anyone who can patch
+`.../status` can approve. Approvals are unattributed and
+`approval.mode: Required` is not an approval boundary.
+
+Install Kyverno, then upgrade with:
+
+  --set admissionPolicies.enabled=true
+
+  https://hardbyte.github.io/pgroles/docs/ephemeral-access-security/
+{{- end }}
+
 Operator documentation:
 
   https://hardbyte.github.io/pgroles/docs/operator/

@@ -1,7 +1,9 @@
-# Chart-less mirror. The canonical copy is
-# charts/pgroles-operator/files/kyverno-ephemeral-access.yaml, rendered by the
-# Helm chart when `admissionPolicies.enabled=true`. Prefer it. This file exists
-# for installs that do not use the chart; keep it in sync with the chart copy.
+# Admission policies for the ephemeral-access decision lifecycle, rendered by
+# the pgroles-operator Helm chart when `admissionPolicies.enabled` is true.
+#
+# This file is the canonical copy, read verbatim by
+# templates/admission-policies.yaml.
+# `k8s/security/ephemeral-access-kyverno.yaml` is a chart-less mirror of it.
 #
 # Allow Kyverno's reports controller to resolve the CRDs referenced by the
 # admission policies. Aggregation keeps this separate from Kyverno's managed
