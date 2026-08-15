@@ -1806,8 +1806,11 @@ async fn apply_under_lock(
                         crate::plan::mark_plan_approved(
                             &ctx.kube_client,
                             &current_plan,
+                            // Only reached for a plan with no decision on it,
+                            // which the manual path cannot produce — the
+                            // reviewer's own decision is preserved instead.
                             "ManuallyApproved",
-                            "Plan approved via annotation",
+                            "Plan approved by a reviewer",
                         )
                         .await?;
 

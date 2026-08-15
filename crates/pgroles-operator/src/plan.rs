@@ -1839,6 +1839,14 @@ pub async fn mark_plan_failed(
 ///
 /// Callers provide `reason` and `message` to distinguish auto-approval from
 /// manual approval in the plan's conditions.
+///
+/// When a terminal decision is already recorded — a reviewer approved this
+/// plan, which is the whole of the manual path and of an adopted candidate
+/// plan — only the phase advances. The decision, its reason and message, and
+/// `decidedBy` are the reviewer's record: rewriting them would overwrite what
+/// a human said with the operator's own boilerplate, and resending the whole
+/// array from a watch-backed read could drop a decision that landed after that
+/// read. This is the same reasoning as [`mark_plan_rejected`].
 pub async fn mark_plan_approved(
     client: &Client,
     plan: &PostgresPolicyPlan,
@@ -1849,7 +1857,20 @@ pub async fn mark_plan_approved(
     let plan_name = plan.name_any();
     let plans_api: Api<PostgresPolicyPlan> = Api::namespaced(client.clone(), &namespace);
 
-    let mut status = plan.status.clone().unwrap_or_default();
+    let existing = plan.status.clone().unwrap_or_default();
+    if has_terminal_decision(&existing) {
+        let patch = serde_json::json!({ "status": { "phase": PlanPhase::Approved } });
+        plans_api
+            .patch_status(
+                &plan_name,
+                &PatchParams::apply("pgroles-operator"),
+                &Patch::Merge(&patch),
+            )
+            .await?;
+        return Ok(());
+    }
+
+    let mut status = existing;
     status.phase = PlanPhase::Approved;
     set_plan_condition(&mut status.conditions, "Approved", "True", reason, message);
     // Under `approval: auto` the operator itself is the decider, and the CEL
