@@ -1589,19 +1589,11 @@ pub async fn mark_plan_rejected(
     let plan_name = plan.name_any();
     let plans_api: Api<PostgresPolicyPlan> = Api::namespaced(client.clone(), &namespace);
 
-    let mut status = plan.status.clone().unwrap_or_default();
-    status.phase = PlanPhase::Rejected;
-    // The reviewer's `Denied=True` is the decision and is terminal; this only
-    // records that the operator has observed it and moved the plan's phase.
-    set_plan_condition(
-        &mut status.conditions,
-        "Approved",
-        "False",
-        "DeniedByReviewer",
-        "Plan denied by a reviewer",
-    );
-
-    let patch = serde_json::json!({ "status": status });
+    // Patch the phase alone. The reviewer's `Denied=True` is the decision and
+    // is terminal, so there is nothing here for the operator to add to the
+    // conditions — and resending the whole array from a watch-backed read
+    // could drop a decision that landed after that read.
+    let patch = serde_json::json!({ "status": { "phase": PlanPhase::Rejected } });
     plans_api
         .patch_status(
             &plan_name,
