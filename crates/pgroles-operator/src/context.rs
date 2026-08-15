@@ -1,6 +1,8 @@
 //! Shared operator context — database pool cache, metrics, and configuration.
 
 use std::collections::HashMap;
+use std::fmt::Write;
+use std::str::FromStr;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
@@ -8,11 +10,13 @@ use futures::future::{BoxFuture, FutureExt};
 use kube::runtime::events::Recorder;
 use serde::{Deserialize, Serialize};
 
-use sqlx::postgres::{PgPool, PgPoolOptions};
+use sha2::{Digest, Sha256};
+use sqlx::postgres::{PgConnectOptions, PgPool, PgPoolOptions};
 use tokio::sync::{Mutex, RwLock};
 
 use crate::crd::{ConnectionAuth, ConnectionSpec, SecretKeySelector};
 use crate::observability::OperatorObservability;
+use crate::request_index::RequestIndex;
 
 /// Minimum pool size required for reconciliation.
 ///
@@ -25,6 +29,25 @@ const POOL_MAX_CONNECTIONS: u32 = 5;
 const POOL_ACQUIRE_TIMEOUT_SECS: u64 = 10;
 
 const _: () = assert!(POOL_MAX_CONNECTIONS >= 2);
+
+/// How long a pooled connection may sit unused before it is closed.
+///
+/// Pools are cached for the operator's lifetime, so without this the operator
+/// holds connections open against every managed database forever. sqlx's
+/// default is 10 minutes — longer than the 5-minute default requeue interval,
+/// so a reconcile always re-touches the pool before the reaper drains it and
+/// the connections are never released. Reconnecting once per reconcile is
+/// cheap next to occupying a backend slot on an idle database around the clock.
+const POOL_IDLE_TIMEOUT_SECS: u64 = 60;
+
+/// Hard ceiling on connection age, independent of activity.
+///
+/// Bounds how long a reconcile can keep using a connection whose server-side
+/// state has drifted (failover, restarted pooler, rotated credentials).
+const POOL_MAX_LIFETIME_SECS: u64 = 30 * 60;
+
+/// Keep no connections open when nothing is reconciling.
+const POOL_MIN_CONNECTIONS: u32 = 0;
 
 const GCP_METADATA_TOKEN_ENDPOINT: &str =
     "http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token";
@@ -385,22 +408,33 @@ pub struct OperatorContext {
     /// Shared health/metrics state.
     pub observability: OperatorObservability,
 
+    /// Watch-fed indexes for relevant ephemeral requests.
+    pub request_index: RequestIndex,
+
+    /// Optional namespace which bounds every operator watch and list.
+    pub watch_namespace: Option<String>,
+
     /// Fetches short-lived provider-backed database passwords.
     gcp_token_provider: Arc<dyn GcpAccessTokenProvider>,
 }
 
 impl OperatorContext {
-    /// Create a new operator context with an empty pool cache.
-    pub fn new(
+    /// Create a context with the request index and watch scope shared by the
+    /// controller runtime.
+    pub fn new_with_runtime_config(
         kube_client: kube::Client,
         observability: OperatorObservability,
         event_recorder: Recorder,
+        request_index: RequestIndex,
+        watch_namespace: Option<String>,
     ) -> Self {
         Self {
             kube_client,
             event_recorder,
             pool_cache: Arc::new(RwLock::new(HashMap::new())),
             observability,
+            request_index,
+            watch_namespace,
             database_locks: Arc::new(Mutex::new(HashMap::new())),
             gcp_token_provider: Arc::new(MetadataGcpAccessTokenProvider::default()),
         }
@@ -462,6 +496,78 @@ impl OperatorContext {
             .resolve_connection_url_with_metadata(namespace, connection)
             .await?
             .database_url)
+    }
+
+    /// Resolve a stable, non-secret fingerprint of the database target.
+    ///
+    /// Credentials and connection options are deliberately excluded so that
+    /// password and token rotation do not invalidate active access. Host,
+    /// port, or database changes do invalidate it, preventing cleanup from
+    /// revoking an identically named role in a different database.
+    pub async fn resolve_database_target_fingerprint(
+        &self,
+        namespace: &str,
+        connection: &ConnectionSpec,
+    ) -> Result<String, ContextError> {
+        let (host, port, database) = if let Some(ref secret_ref) = connection.secret_ref {
+            let database_url = self
+                .fetch_secret_value(
+                    namespace,
+                    &secret_ref.name,
+                    connection.effective_secret_key(),
+                )
+                .await?;
+            database_target_from_url(&database_url)
+                .map_err(|detail| ContextError::InvalidDatabaseUrl { detail })?
+        } else if let Some(ref params) = connection.params {
+            let host = self
+                .resolve_param(namespace, &params.host, &params.host_secret)
+                .await?
+                .ok_or_else(|| ContextError::EmptyResolvedValue {
+                    field: "host".to_string(),
+                })?;
+            let port = match self
+                .resolve_param(
+                    namespace,
+                    &params.port.map(|port| port.to_string()),
+                    &params.port_secret,
+                )
+                .await?
+            {
+                Some(value) => {
+                    value
+                        .parse::<u16>()
+                        .map_err(|_| ContextError::InvalidResolvedPort {
+                            value: value.clone(),
+                        })?
+                }
+                None => 5432,
+            };
+            let database = self
+                .resolve_param(namespace, &params.dbname, &params.dbname_secret)
+                .await?
+                .ok_or_else(|| ContextError::EmptyResolvedValue {
+                    field: "dbname".to_string(),
+                })?;
+            (host.to_ascii_lowercase(), port, database)
+        } else {
+            return Err(ContextError::SecretMissing {
+                name: "connection".to_string(),
+                key: "neither secretRef nor params is set".to_string(),
+            });
+        };
+
+        if host.trim().is_empty() {
+            return Err(ContextError::EmptyResolvedValue {
+                field: "host".to_string(),
+            });
+        }
+        if database.trim().is_empty() {
+            return Err(ContextError::EmptyResolvedValue {
+                field: "dbname".to_string(),
+            });
+        }
+        Ok(database_target_fingerprint(&host, port, &database))
     }
 
     async fn resolve_connection_url_with_metadata(
@@ -675,9 +781,7 @@ impl OperatorContext {
         // connection for PostgreSQL advisory locking and needs additional pool
         // capacity for inspection/apply queries.
         let set_role = resolved.set_role.clone();
-        let pool = PgPoolOptions::new()
-            .max_connections(POOL_MAX_CONNECTIONS)
-            .acquire_timeout(Duration::from_secs(POOL_ACQUIRE_TIMEOUT_SECS))
+        let pool = pool_options()
             .after_connect(move |conn, _meta| {
                 let set_role = set_role.clone();
                 Box::pin(async move {
@@ -695,7 +799,7 @@ impl OperatorContext {
             .map_err(|err| classify_pool_connect_error(resolved.set_role.as_deref(), err))?;
 
         // Cache it (write lock).
-        {
+        let superseded = {
             let mut cache = self.pool_cache.write().await;
             cache.insert(
                 cache_key,
@@ -705,8 +809,9 @@ impl OperatorContext {
                     token_expires_at: resolved.token_expires_at,
                     pool: pool.clone(),
                 },
-            );
-        }
+            )
+        };
+        close_unreachable_pool(superseded);
 
         Ok(pool)
     }
@@ -754,9 +859,61 @@ impl OperatorContext {
     /// Remove a cached pool (e.g. when secret changes or CR is deleted).
     pub async fn evict_pool(&self, namespace: &str, connection: &ConnectionSpec) {
         let cache_key = connection.cache_key(namespace);
-        let mut cache = self.pool_cache.write().await;
-        cache.remove(&cache_key);
+        let evicted = {
+            let mut cache = self.pool_cache.write().await;
+            cache.remove(&cache_key)
+        };
+        close_unreachable_pool(evicted);
     }
+}
+
+/// Connection-pool sizing and lifetime shared by every managed database.
+fn pool_options() -> PgPoolOptions {
+    PgPoolOptions::new()
+        .max_connections(POOL_MAX_CONNECTIONS)
+        .min_connections(POOL_MIN_CONNECTIONS)
+        .acquire_timeout(Duration::from_secs(POOL_ACQUIRE_TIMEOUT_SECS))
+        .idle_timeout(Duration::from_secs(POOL_IDLE_TIMEOUT_SECS))
+        .max_lifetime(Duration::from_secs(POOL_MAX_LIFETIME_SECS))
+}
+
+/// Close a pool that is no longer reachable from the cache.
+///
+/// Dropping a `PgPool` only marks it closed: the backend connections are torn
+/// down when the last handle drops the socket, which PostgreSQL logs as an
+/// unexpected EOF. Closing explicitly sends a proper termination once in-flight
+/// reconciles hand their connections back. The close is spawned because it
+/// waits for those connections, and no caller should block on an eviction.
+fn close_unreachable_pool(cached: Option<CachedPool>) {
+    let Some(cached) = cached else {
+        return;
+    };
+    tokio::spawn(async move {
+        cached.pool.close().await;
+    });
+}
+
+fn database_target_from_url(database_url: &str) -> Result<(String, u16, String), String> {
+    let options = PgConnectOptions::from_str(database_url).map_err(|source| source.to_string())?;
+    Ok((
+        options.get_host().to_ascii_lowercase(),
+        options.get_port(),
+        options
+            .get_database()
+            .unwrap_or_else(|| options.get_username())
+            .to_string(),
+    ))
+}
+
+fn database_target_fingerprint(host: &str, port: u16, database: &str) -> String {
+    let digest = Sha256::digest(format!("{}\0{port}\0{database}", host.to_ascii_lowercase()));
+    let mut fingerprint = String::with_capacity(7 + digest.len() * 2);
+    fingerprint.push_str("sha256:");
+    for byte in digest {
+        write!(&mut fingerprint, "{byte:02x}")
+            .expect("writing a database target fingerprint cannot fail");
+    }
+    fingerprint
 }
 
 /// Errors from operator context operations.
@@ -780,6 +937,12 @@ pub enum ContextError {
 
     #[error("connection param \"{field}\" resolved to an empty or whitespace-only value")]
     EmptyResolvedValue { field: String },
+
+    #[error("connection URL is invalid: {detail}")]
+    InvalidDatabaseUrl { detail: String },
+
+    #[error("connection port resolved to invalid value \"{value}\"")]
+    InvalidResolvedPort { value: String },
 
     #[error(
         "connection param sslMode resolved to invalid value \"{value}\" (expected one of: disable, allow, prefer, require, verify-ca, verify-full)"
@@ -827,6 +990,67 @@ impl ContextError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Pools are cached for the operator's lifetime, so the only thing that
+    /// ever closes an unused connection is the idle reaper. If the reap window
+    /// reaches the requeue interval, every reconcile re-touches the pool before
+    /// the reaper runs and the operator sits on open backends against every
+    /// managed database forever — which is what sqlx's 10-minute default did
+    /// against the 5-minute default requeue.
+    #[test]
+    fn idle_connections_are_reaped_between_reconciles() {
+        let options = pool_options();
+
+        assert_eq!(
+            options.get_min_connections(),
+            0,
+            "a floor above zero would hold connections open on an idle database"
+        );
+
+        let idle_timeout = options
+            .get_idle_timeout()
+            .expect("an unset idle timeout never reaps");
+        assert!(
+            idle_timeout < Duration::from_secs(crate::reconciler::DEFAULT_REQUEUE_SECS),
+            "idle timeout {idle_timeout:?} must drain within the {}s requeue interval",
+            crate::reconciler::DEFAULT_REQUEUE_SECS
+        );
+
+        assert!(
+            options.get_max_lifetime().is_some(),
+            "connections need an age ceiling independent of activity"
+        );
+    }
+
+    #[test]
+    fn database_target_fingerprint_excludes_credentials_and_options() {
+        let first = database_target_from_url(
+            "postgresql://alice:first@DB.EXAMPLE:6432/inventory?sslmode=require",
+        )
+        .expect("first URL");
+        let second = database_target_from_url(
+            "postgresql://bob:second@db.example:6432/inventory?application_name=test",
+        )
+        .expect("second URL");
+
+        assert_eq!(
+            database_target_fingerprint(&first.0, first.1, &first.2),
+            database_target_fingerprint(&second.0, second.1, &second.2)
+        );
+    }
+
+    #[test]
+    fn database_target_fingerprint_changes_on_retarget() {
+        let original = database_target_fingerprint("db.example", 5432, "inventory");
+        assert_ne!(
+            original,
+            database_target_fingerprint("db.example", 5432, "billing")
+        );
+        assert_ne!(
+            original,
+            database_target_fingerprint("other.example", 5432, "inventory")
+        );
+    }
 
     #[test]
     fn build_set_role_stmt_quotes_identifier() {

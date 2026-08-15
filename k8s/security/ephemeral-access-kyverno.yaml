@@ -1,0 +1,431 @@
+# Allow Kyverno's reports controller to resolve the CRDs referenced by the
+# admission policies. Aggregation keeps this separate from Kyverno's managed
+# installation roles.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: pgroles-ephemeral-access-kyverno-reports
+  labels:
+    rbac.kyverno.io/aggregate-to-reports-controller: "true"
+rules:
+  - apiGroups: [pgroles.io]
+    resources:
+      - ephemeralaccesspolicies
+      - ephemeralaccessrequests
+      - ephemeralaccessrequests/status
+    verbs: [get, list, watch]
+---
+# Kyverno's CEL ValidatingPolicy environment does not expose Kubernetes'
+# `authorizer` variable. Keep the structural checks in CEL, and use the
+# documented API-call context to perform real SubjectAccessReviews for the
+# logical `use` and `approve` verbs.
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: pgroles-ephemeral-access-authorization
+  labels:
+    app.kubernetes.io/name: pgroles-operator
+    app.kubernetes.io/component: admission-policy
+spec:
+  validationFailureAction: Enforce
+  background: false
+  rules:
+    # Bind the persisted requester to authenticated admission userInfo. This
+    # deliberately replaces any client-supplied assertion before validation.
+    - name: record-authenticated-requester
+      match:
+        any:
+          - resources:
+              kinds: [pgroles.io/v1alpha1/EphemeralAccessRequest]
+              operations: [CREATE]
+      mutate:
+        patchStrategicMerge:
+          spec:
+            requestedBy:
+              username: "{{ request.userInfo.username }}"
+              uid: "{{ request.userInfo.uid || '' }}"
+              groups: "{{ request.userInfo.groups }}"
+
+    - name: require-use-on-access-policy
+      match:
+        any:
+          - resources:
+              kinds: [pgroles.io/v1alpha1/EphemeralAccessRequest]
+              operations: [CREATE]
+      context:
+        - name: subjectaccessreview
+          apiCall:
+            urlPath: /apis/authorization.k8s.io/v1/subjectaccessreviews
+            method: POST
+            data:
+              - key: kind
+                value: SubjectAccessReview
+              - key: apiVersion
+                value: authorization.k8s.io/v1
+              - key: spec
+                value:
+                  resourceAttributes:
+                    group: pgroles.io
+                    resource: ephemeralaccesspolicies
+                    namespace: "{{ request.namespace }}"
+                    name: "{{ request.object.spec.accessPolicyRef.name }}"
+                    verb: use
+                  user: "{{ request.userInfo.username }}"
+                  groups: "{{ request.userInfo.groups }}"
+      validate:
+        message: >-
+          creating a request requires the use verb on the referenced
+          EphemeralAccessPolicy
+        deny:
+          conditions:
+            any:
+              - key: "{{ subjectaccessreview.status.allowed }}"
+                operator: NotEquals
+                value: true
+
+    # A requester may cancel their own request. Deleting a request created by
+    # another identity is a lifecycle-management action. This check relies on
+    # record-authenticated-requester making requestedBy authoritative.
+    - name: require-manage-to-delete-another-request
+      match:
+        any:
+          - resources:
+              kinds: [pgroles.io/v1alpha1/EphemeralAccessRequest]
+              operations: [DELETE]
+      context:
+        # Namespace deletion is already authorized at the namespace boundary.
+        # Do not prevent the namespace controller from completing teardown.
+        - name: requestnamespace
+          apiCall:
+            urlPath: "/api/v1/namespaces/{{ request.namespace }}"
+        - name: subjectaccessreview
+          apiCall:
+            urlPath: /apis/authorization.k8s.io/v1/subjectaccessreviews
+            method: POST
+            data:
+              - key: kind
+                value: SubjectAccessReview
+              - key: apiVersion
+                value: authorization.k8s.io/v1
+              - key: spec
+                value:
+                  resourceAttributes:
+                    group: pgroles.io
+                    resource: ephemeralaccesspolicies
+                    namespace: "{{ request.namespace }}"
+                    name: "{{ request.oldObject.spec.accessPolicyRef.name }}"
+                    verb: manage
+                  user: "{{ request.userInfo.username }}"
+                  groups: "{{ request.userInfo.groups }}"
+      preconditions:
+        all:
+          - key: "{{ request.oldObject.spec.requestedBy.username }}"
+            operator: NotEquals
+            value: "{{ request.userInfo.username }}"
+          - key: "{{ requestnamespace.status.phase }}"
+            operator: NotEquals
+            value: Terminating
+      validate:
+        message: deleting another request requires lifecycle management permission
+        deny:
+          conditions:
+            any:
+              - key: "{{ subjectaccessreview.status.allowed }}"
+                operator: NotEquals
+                value: true
+
+    # The controller owns request finalizers. Reject client-supplied finalizers
+    # at creation so a requester cannot hold quota with an undeletable object.
+    - name: reject-client-supplied-request-finalizers
+      match:
+        any:
+          - resources:
+              kinds: [pgroles.io/v1alpha1/EphemeralAccessRequest]
+              operations: [CREATE]
+      validate:
+        message: EphemeralAccessRequest finalizers are controller-owned
+        deny:
+          conditions:
+            any:
+              - key: "{{ length(request.object.metadata.finalizers || `[]`) }}"
+                operator: GreaterThan
+                value: 0
+
+    # Record the authenticated identity in the same status mutation as the
+    # first terminal approval decision. CRD transition rules make it
+    # write-once after admission persists it.
+    - name: record-authenticated-decision-maker
+      match:
+        any:
+          - resources:
+              kinds: [pgroles.io/v1alpha1/EphemeralAccessRequest/status]
+              operations: [UPDATE]
+      preconditions:
+        any:
+          - key: >-
+              {{ to_string(request.object.status.conditions[?type == 'Approved'] || `[]`) }}
+            operator: NotEquals
+            value: >-
+              {{ to_string(request.oldObject.status.conditions[?type == 'Approved'] || `[]`) }}
+          - key: >-
+              {{ to_string(request.object.status.conditions[?type == 'Denied'] || `[]`) }}
+            operator: NotEquals
+            value: >-
+              {{ to_string(request.oldObject.status.conditions[?type == 'Denied'] || `[]`) }}
+      mutate:
+        patchStrategicMerge:
+          status:
+            decidedBy:
+              username: "{{ request.userInfo.username }}"
+              uid: "{{ request.userInfo.uid || '' }}"
+              groups: "{{ request.userInfo.groups }}"
+
+    - name: require-approve-on-decision-change
+      match:
+        any:
+          - resources:
+              kinds: [pgroles.io/v1alpha1/EphemeralAccessRequest/status]
+              operations: [UPDATE]
+      preconditions:
+        any:
+          - key: >-
+              {{ to_string(request.object.status.conditions[?type == 'Approved'] || `[]`) }}
+            operator: NotEquals
+            value: >-
+              {{ to_string(request.oldObject.status.conditions[?type == 'Approved'] || `[]`) }}
+          - key: >-
+              {{ to_string(request.object.status.conditions[?type == 'Denied'] || `[]`) }}
+            operator: NotEquals
+            value: >-
+              {{ to_string(request.oldObject.status.conditions[?type == 'Denied'] || `[]`) }}
+      context:
+        - name: subjectaccessreview
+          apiCall:
+            urlPath: /apis/authorization.k8s.io/v1/subjectaccessreviews
+            method: POST
+            data:
+              - key: kind
+                value: SubjectAccessReview
+              - key: apiVersion
+                value: authorization.k8s.io/v1
+              - key: spec
+                value:
+                  resourceAttributes:
+                    group: pgroles.io
+                    resource: ephemeralaccesspolicies
+                    namespace: "{{ request.namespace }}"
+                    name: "{{ request.object.spec.accessPolicyRef.name }}"
+                    verb: approve
+                  user: "{{ request.userInfo.username }}"
+                  groups: "{{ request.userInfo.groups }}"
+      validate:
+        message: >-
+          changing Approved or Denied requires the approve verb on the referenced
+          EphemeralAccessPolicy
+        deny:
+          conditions:
+            any:
+              - key: "{{ subjectaccessreview.status.allowed }}"
+                operator: NotEquals
+                value: true
+
+    # Approvers share the CRD's /status endpoint with the operator, but own
+    # only Approved/Denied. Any other status mutation requires the logical
+    # `manage` verb, which is granted to the operator controller role.
+    - name: require-manage-on-lifecycle-status-change
+      match:
+        any:
+          - resources:
+              kinds: [pgroles.io/v1alpha1/EphemeralAccessRequest/status]
+              operations: [UPDATE]
+      preconditions:
+        any:
+          - key: "{{ request.object.status.phase || '' }}"
+            operator: NotEquals
+            value: "{{ request.oldObject.status.phase || '' }}"
+          - key: "{{ to_string(request.object.status.resolvedAccess || `{}`) }}"
+            operator: NotEquals
+            value: "{{ to_string(request.oldObject.status.resolvedAccess || `{}`) }}"
+          - key: "{{ request.object.status.approvalExpiresAt || '' }}"
+            operator: NotEquals
+            value: "{{ request.oldObject.status.approvalExpiresAt || '' }}"
+          - key: "{{ request.object.status.activatedAt || '' }}"
+            operator: NotEquals
+            value: "{{ request.oldObject.status.activatedAt || '' }}"
+          - key: "{{ request.object.status.expiresAt || '' }}"
+            operator: NotEquals
+            value: "{{ request.oldObject.status.expiresAt || '' }}"
+          - key: "{{ request.object.status.endedAt || '' }}"
+            operator: NotEquals
+            value: "{{ request.oldObject.status.endedAt || '' }}"
+          - key: "{{ request.object.status.lastError || '' }}"
+            operator: NotEquals
+            value: "{{ request.oldObject.status.lastError || '' }}"
+          - key: "{{ to_string(request.object.status.retainedMemberships || `[]`) }}"
+            operator: NotEquals
+            value: "{{ to_string(request.oldObject.status.retainedMemberships || `[]`) }}"
+          # The request CRD rejects undeclared condition types. Compare each
+          # operator-owned type explicitly so appending Approved/Denied never
+          # creates an ordering-sensitive false positive.
+          - key: >-
+              {{ to_string(request.object.status.conditions[?type == 'Resolved'] || `[]`) }}
+            operator: NotEquals
+            value: >-
+              {{ to_string(request.oldObject.status.conditions[?type == 'Resolved'] || `[]`) }}
+          - key: >-
+              {{ to_string(request.object.status.conditions[?type == 'Ready'] || `[]`) }}
+            operator: NotEquals
+            value: >-
+              {{ to_string(request.oldObject.status.conditions[?type == 'Ready'] || `[]`) }}
+          - key: >-
+              {{ to_string(request.object.status.conditions[?type == 'Applied'] || `[]`) }}
+            operator: NotEquals
+            value: >-
+              {{ to_string(request.oldObject.status.conditions[?type == 'Applied'] || `[]`) }}
+      context:
+        - name: subjectaccessreview
+          apiCall:
+            urlPath: /apis/authorization.k8s.io/v1/subjectaccessreviews
+            method: POST
+            data:
+              - key: kind
+                value: SubjectAccessReview
+              - key: apiVersion
+                value: authorization.k8s.io/v1
+              - key: spec
+                value:
+                  resourceAttributes:
+                    group: pgroles.io
+                    resource: ephemeralaccesspolicies
+                    namespace: "{{ request.namespace }}"
+                    name: "{{ request.object.spec.accessPolicyRef.name }}"
+                    verb: manage
+                  user: "{{ request.userInfo.username }}"
+                  groups: "{{ request.userInfo.groups }}"
+      validate:
+        message: >-
+          changing operator-owned EphemeralAccessRequest status requires the
+          manage verb on the referenced EphemeralAccessPolicy
+        deny:
+          conditions:
+            any:
+              - key: "{{ subjectaccessreview.status.allowed }}"
+                operator: NotEquals
+                value: true
+
+    - name: require-manage-to-remove-request-finalizer
+      match:
+        any:
+          - resources:
+              kinds: [pgroles.io/v1alpha1/EphemeralAccessRequest]
+              operations: [UPDATE]
+      preconditions:
+        all:
+          - key: >-
+              {{ contains(request.oldObject.metadata.finalizers || `[]`, 'ephemeralaccessrequest.pgroles.io/finalizer') && !contains(request.object.metadata.finalizers || `[]`, 'ephemeralaccessrequest.pgroles.io/finalizer') }}
+            operator: Equals
+            value: true
+      context:
+        - name: subjectaccessreview
+          apiCall:
+            urlPath: /apis/authorization.k8s.io/v1/subjectaccessreviews
+            method: POST
+            data:
+              - key: kind
+                value: SubjectAccessReview
+              - key: apiVersion
+                value: authorization.k8s.io/v1
+              - key: spec
+                value:
+                  resourceAttributes:
+                    group: pgroles.io
+                    resource: ephemeralaccesspolicies
+                    namespace: "{{ request.namespace }}"
+                    name: "{{ request.object.spec.accessPolicyRef.name }}"
+                    verb: manage
+                  user: "{{ request.userInfo.username }}"
+                  groups: "{{ request.userInfo.groups }}"
+      validate:
+        message: removing the request finalizer requires lifecycle management permission
+        deny:
+          conditions:
+            any:
+              - key: "{{ subjectaccessreview.status.allowed }}"
+                operator: NotEquals
+                value: true
+
+    - name: require-manage-to-remove-policy-finalizer
+      match:
+        any:
+          - resources:
+              kinds: [pgroles.io/v1alpha1/EphemeralAccessPolicy]
+              operations: [UPDATE]
+      preconditions:
+        all:
+          - key: >-
+              {{ contains(request.oldObject.metadata.finalizers || `[]`, 'ephemeralaccesspolicy.pgroles.io/finalizer') && !contains(request.object.metadata.finalizers || `[]`, 'ephemeralaccesspolicy.pgroles.io/finalizer') }}
+            operator: Equals
+            value: true
+      context:
+        - name: subjectaccessreview
+          apiCall:
+            urlPath: /apis/authorization.k8s.io/v1/subjectaccessreviews
+            method: POST
+            data:
+              - key: kind
+                value: SubjectAccessReview
+              - key: apiVersion
+                value: authorization.k8s.io/v1
+              - key: spec
+                value:
+                  resourceAttributes:
+                    group: pgroles.io
+                    resource: ephemeralaccesspolicies
+                    namespace: "{{ request.namespace }}"
+                    name: "{{ request.object.metadata.name }}"
+                    verb: manage
+                  user: "{{ request.userInfo.username }}"
+                  groups: "{{ request.userInfo.groups }}"
+      validate:
+        message: removing the access-policy finalizer requires lifecycle management permission
+        deny:
+          conditions:
+            any:
+              - key: "{{ subjectaccessreview.status.allowed }}"
+                operator: NotEquals
+                value: true
+---
+apiVersion: policies.kyverno.io/v1
+kind: ValidatingPolicy
+metadata:
+  name: pgroles-ephemeral-access-decision-integrity
+  labels:
+    app.kubernetes.io/name: pgroles-operator
+    app.kubernetes.io/component: admission-policy
+spec:
+  failurePolicy: Fail
+  validationActions: [Deny]
+  evaluation:
+    admission:
+      enabled: true
+    background:
+      enabled: false
+  matchConstraints:
+    resourceRules:
+      - apiGroups: [pgroles.io]
+        apiVersions: [v1alpha1]
+        operations: [UPDATE]
+        resources: [ephemeralaccessrequests/status]
+  variables:
+    - name: newDecisions
+      expression: >-
+        object.?status.conditions.orValue([]).filter(c,
+          c.type in ['Approved', 'Denied'] && c.status == 'True')
+  validations:
+    - message: approval decisions must attest to the resolved bundle and duration
+      expression: >-
+        variables.newDecisions.all(c,
+          has(object.status.resolvedAccess) &&
+          has(c.bundleHash) && c.bundleHash == object.status.resolvedAccess.bundleHash &&
+          has(c.grantedDuration) &&
+            c.grantedDuration == object.status.resolvedAccess.grantedDuration)

@@ -6,9 +6,11 @@
 pub mod advisory;
 pub mod context;
 pub mod crd;
+pub mod ephemeral;
 pub mod events;
 pub mod k8s_names;
 pub mod observability;
 pub mod password;
 pub mod plan;
 pub mod reconciler;
+pub mod request_index;

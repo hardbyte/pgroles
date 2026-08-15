@@ -32,7 +32,7 @@ use crate::crd::{
 const FINALIZER: &str = "pgroles.io/finalizer";
 
 /// Default requeue interval when no interval is specified on the CR.
-const DEFAULT_REQUEUE_SECS: u64 = 300; // 5 minutes
+pub(crate) const DEFAULT_REQUEUE_SECS: u64 = 300; // 5 minutes
 
 /// Base requeue delay when lock contention is detected.
 const LOCK_CONTENTION_BASE_SECS: u64 = 10;
@@ -52,9 +52,6 @@ const SQLSTATE_INVALID_SCHEMA_NAME: &str = "3F000";
 const SQLSTATE_UNDEFINED_TABLE: &str = "42P01";
 const SQLSTATE_UNDEFINED_FUNCTION: &str = "42883";
 const SQLSTATE_UNDEFINED_OBJECT: &str = "42704";
-
-/// Maximum amount of rendered planned SQL stored in status.
-const MAX_PLANNED_SQL_STATUS_BYTES: usize = 16 * 1024;
 
 enum ReconcileOutcome {
     Reconciled,
@@ -97,6 +94,7 @@ impl ReconcileOutcome {
 enum RetryClass {
     Slow,
     LockContention,
+    CleanupPending,
     Transient,
 }
 
@@ -123,6 +121,12 @@ pub enum ReconcileError {
 
     #[error("resource has no namespace")]
     NoNamespace,
+
+    #[error("ephemeral request index unavailable: {0}")]
+    RequestIndexNotReady(#[from] crate::request_index::IndexNotReady),
+
+    #[error("waiting for {0} attached ephemeral access policy/policies to be deleted")]
+    PendingEphemeralAccessCleanup(usize),
 
     #[error("invalid interval \"{0}\": {1}")]
     InvalidInterval(String, String),
@@ -265,6 +269,15 @@ fn retry_action(resource: &PostgresPolicy, error: &finalizer::Error<ReconcileErr
             );
             Action::requeue(delay)
         }
+        RetryClass::CleanupPending => {
+            let delay = Duration::from_secs(10);
+            tracing::info!(
+                delay_secs = delay.as_secs(),
+                error = %error,
+                "waiting for ephemeral access finalizers"
+            );
+            Action::requeue(delay)
+        }
         RetryClass::Transient => {
             let attempts = next_transient_failure_count(resource);
             let delay = transient_backoff_delay(attempts);
@@ -345,6 +358,9 @@ fn retry_class(error: &finalizer::Error<ReconcileError>) -> RetryClass {
         finalizer::Error::ApplyFailed(reconcile_error) => {
             retry_class_for_reconcile_error(reconcile_error)
         }
+        finalizer::Error::CleanupFailed(ReconcileError::PendingEphemeralAccessCleanup(_)) => {
+            RetryClass::CleanupPending
+        }
         finalizer::Error::CleanupFailed(_)
         | finalizer::Error::AddFinalizer(_)
         | finalizer::Error::RemoveFinalizer(_)
@@ -356,6 +372,9 @@ fn retry_class(error: &finalizer::Error<ReconcileError>) -> RetryClass {
 fn retry_class_for_reconcile_error(error: &ReconcileError) -> RetryClass {
     match error {
         ReconcileError::LockContention(_, _) => RetryClass::LockContention,
+        // The watch resyncs on its own, so this clears without operator action.
+        ReconcileError::RequestIndexNotReady(_) => RetryClass::Transient,
+        ReconcileError::PendingEphemeralAccessCleanup(_) => RetryClass::CleanupPending,
         ReconcileError::ManifestExpansion(_)
         | ReconcileError::InvalidInterval(_, _)
         | ReconcileError::InvalidSpec(_)
@@ -395,6 +414,8 @@ fn retry_class_for_reconcile_error(error: &ReconcileError) -> RetryClass {
             // a permission/config issue, not a transient connectivity blip.
             ContextError::SetRoleFailed { .. } => RetryClass::Slow,
             ContextError::EmptyResolvedValue { .. }
+            | ContextError::InvalidDatabaseUrl { .. }
+            | ContextError::InvalidResolvedPort { .. }
             | ContextError::InvalidResolvedSslMode { .. } => RetryClass::Slow,
         },
         ReconcileError::Inspect(error) => {
@@ -676,8 +697,6 @@ fn mark_reconcile_failure_status(
             && c.condition_type != "Conflict"
     });
     status.change_summary = None;
-    status.planned_sql = None;
-    status.planned_sql_truncated = false;
     if clear_current_plan_ref {
         status.current_plan_ref = None;
     }
@@ -715,8 +734,6 @@ async fn reconcile_apply_inner(
                 .retain(|c| c.condition_type != "Reconciling" && c.condition_type != "Drifted");
             status.last_attempted_generation = generation;
             status.last_error = None;
-            status.planned_sql = None;
-            status.planned_sql_truncated = false;
             status.transient_failure_count = 0;
         })
         .await?;
@@ -728,6 +745,25 @@ async fn reconcile_apply_inner(
     }
 
     info!(name, namespace, "starting reconciliation");
+
+    // Reported here, before any fallible work, so a policy that relies on the
+    // deprecated inference is counted even when this reconcile later fails on
+    // an unrelated problem — otherwise the remaining exposure looks smaller
+    // than it is. The condition itself is applied in `update_status`.
+    if resource.spec.approval.is_none() {
+        let inferred = match resource.spec.effective_approval() {
+            crate::crd::ApprovalMode::Auto => "auto",
+            crate::crd::ApprovalMode::Manual => "manual",
+        };
+        tracing::warn!(
+            name,
+            namespace,
+            inferred,
+            "spec.approval is not set and is being inferred from spec.mode; this inference is \
+             deprecated and will become an error in a future release"
+        );
+        ctx.observability.record_deprecated_approval_unset(inferred);
+    }
 
     // Update status to "Reconciling".
     // Note: do NOT clear last_error here — it should persist until a successful
@@ -770,8 +806,6 @@ async fn reconcile_apply_inner(
                 .conditions
                 .retain(|c| c.condition_type != "Reconciling" && c.condition_type != "Drifted");
             status.change_summary = None;
-            status.planned_sql = None;
-            status.planned_sql_truncated = false;
             status.last_error = Some(conflict_message.clone());
             status.transient_failure_count = 0;
         })
@@ -918,6 +952,14 @@ async fn apply_under_lock(
         }
     }
 
+    // Ephemeral overlays are deliberately resolved only after both database
+    // locks are held. Resolving them before lock acquisition would allow an
+    // activation or expiry transition to change membership ownership while an
+    // ordinary reconcile waits for the lock.
+    let mut effective_desired = desired.clone();
+    let ephemeral_roles =
+        crate::ephemeral::compose_effective_graph(ctx, resource, &mut effective_desired).await?;
+
     // 6. Inspect current state from the database.
     let has_database_grants = expanded
         .grants
@@ -930,7 +972,8 @@ async fn apply_under_lock(
                     .retirements
                     .iter()
                     .map(|retirement| retirement.role.clone()),
-            );
+            )
+            .with_additional_roles(ephemeral_roles);
     let inspection = pgroles_inspect::inspect_with_diagnostics(pool, &inspect_config).await?;
     ctx.observability.record_inspection(&inspection.stats);
     // Unsatisfiable wildcard grants mean the desired state cannot be reliably
@@ -964,7 +1007,7 @@ async fn apply_under_lock(
     tracing::info!(%reconciliation_mode, "reconciliation mode");
     let mut changes = pgroles_core::diff::filter_changes(
         pgroles_core::diff::apply_role_retirements(
-            pgroles_core::diff::diff(&current, desired),
+            pgroles_core::diff::diff(&current, &effective_desired),
             &manifest.retirements,
         ),
         reconciliation_mode,
@@ -998,7 +1041,6 @@ async fn apply_under_lock(
 
     let summary = summarize_changes(&changes);
     let sql_ctx = detect_sql_context(pool, &inspect_config).await?;
-    let (planned_sql, planned_sql_truncated) = render_plan_sql_for_status(&changes, &sql_ctx);
 
     let effective_approval = resource.spec.effective_approval();
 
@@ -1027,6 +1069,9 @@ async fn apply_under_lock(
 
         // Create a PostgresPolicyPlan resource for changes (if any).
         let mut plan_ref_name = None;
+        // Tracks a plan that someone approved even though this policy never
+        // executes, so the pointless approval is reported rather than ignored.
+        let mut ignored_approval_plan = None;
         if drift_detected {
             let creation_result = crate::plan::create_or_update_plan(
                 &ctx.kube_client,
@@ -1041,15 +1086,16 @@ async fn apply_under_lock(
             .await?;
             let plan_name = creation_result.plan_name().to_string();
 
+            let plans_api: Api<PostgresPolicyPlan> =
+                Api::namespaced(ctx.kube_client.clone(), namespace);
+            let plan = plans_api.get(&plan_name).await?;
+
             // Only emit PlanCreated event for genuinely new plans, not dedup hits.
             if creation_result.is_created() {
-                let plans_api: Api<PostgresPolicyPlan> =
-                    Api::namespaced(ctx.kube_client.clone(), namespace);
-                let created_plan = plans_api.get(&plan_name).await?;
                 emit_plan_event(
                     ctx,
                     resource,
-                    &created_plan,
+                    &plan,
                     PlanEventType::Created {
                         change_count: summary.total,
                     },
@@ -1057,13 +1103,37 @@ async fn apply_under_lock(
                 .await;
             }
 
+            // Plan mode returns without ever consulting spec.approval, so an
+            // approval annotation here is inert. Left unreported it looks like
+            // the operator is stuck rather than working as designed.
+            if matches!(
+                crate::plan::check_plan_approval(&plan),
+                crate::plan::PlanApprovalState::Approved
+            ) {
+                tracing::warn!(
+                    name,
+                    namespace,
+                    plan = %plan_name,
+                    "plan is approved but spec.mode is `plan`; approval has no effect and no SQL \
+                     will run"
+                );
+                ignored_approval_plan = Some(plan_name.clone());
+            }
+
             crate::plan::update_policy_plan_ref(&ctx.kube_client, resource, &plan_name).await?;
 
             plan_ref_name = Some(plan_name);
         }
 
-        // Still write deprecated planned_sql to status for backward compat.
         update_status(ctx, resource, |status| {
+            match &ignored_approval_plan {
+                Some(plan) => {
+                    status.set_condition(crate::crd::approval_ignored_condition(plan));
+                }
+                None => status
+                    .conditions
+                    .retain(|c| c.condition_type != crate::crd::CONDITION_APPROVAL_IGNORED),
+            }
             status.set_condition(ready_condition(true, "Planned", &ready_message));
             status.set_condition(drifted_condition(
                 drift_detected,
@@ -1079,11 +1149,8 @@ async fn apply_under_lock(
             status.observed_generation = generation;
             status.last_attempted_generation = generation;
             status.last_successful_reconcile_time = Some(crate::crd::now_rfc3339());
-            status.last_reconcile_time = Some(crate::crd::now_rfc3339());
             status.change_summary = Some(summary.clone());
             status.last_reconcile_mode = Some(PolicyMode::Plan);
-            status.planned_sql = planned_sql.clone();
-            status.planned_sql_truncated = planned_sql_truncated;
             status.last_error = None;
             status.transient_failure_count = 0;
             if let Some(ref plan_name) = plan_ref_name {
@@ -1201,11 +1268,8 @@ async fn apply_under_lock(
                 status.observed_generation = generation;
                 status.last_attempted_generation = generation;
                 status.last_successful_reconcile_time = Some(crate::crd::now_rfc3339());
-                status.last_reconcile_time = Some(crate::crd::now_rfc3339());
                 status.change_summary = Some(summary);
                 status.last_reconcile_mode = Some(PolicyMode::Apply);
-                status.planned_sql = None;
-                status.planned_sql_truncated = false;
                 status.last_error = None;
                 status.applied_password_source_versions = applied_password_source_versions;
                 status.transient_failure_count = 0;
@@ -1307,8 +1371,6 @@ async fn apply_under_lock(
                                 status.last_attempted_generation = generation;
                                 status.change_summary = Some(summary.clone());
                                 status.last_reconcile_mode = Some(PolicyMode::Apply);
-                                status.planned_sql = planned_sql.clone();
-                                status.planned_sql_truncated = planned_sql_truncated;
                                 status.last_error = None;
                                 status.transient_failure_count = 0;
                                 status.current_plan_ref = Some(crate::crd::PlanReference {
@@ -1403,11 +1465,8 @@ async fn apply_under_lock(
                             status.observed_generation = generation;
                             status.last_attempted_generation = generation;
                             status.last_successful_reconcile_time = Some(crate::crd::now_rfc3339());
-                            status.last_reconcile_time = Some(crate::crd::now_rfc3339());
                             status.change_summary = Some(summary);
                             status.last_reconcile_mode = Some(PolicyMode::Apply);
-                            status.planned_sql = None;
-                            status.planned_sql_truncated = false;
                             status.last_error = None;
                             status.applied_password_source_versions =
                                 applied_password_source_versions;
@@ -1484,8 +1543,6 @@ async fn apply_under_lock(
                             });
                             status.last_attempted_generation = generation;
                             status.change_summary = Some(summary.clone());
-                            status.planned_sql = planned_sql.clone();
-                            status.planned_sql_truncated = planned_sql_truncated;
                             status.last_error = None;
                             status.transient_failure_count = 0;
                         })
@@ -1512,11 +1569,8 @@ async fn apply_under_lock(
                     status.observed_generation = generation;
                     status.last_attempted_generation = generation;
                     status.last_successful_reconcile_time = Some(crate::crd::now_rfc3339());
-                    status.last_reconcile_time = Some(crate::crd::now_rfc3339());
                     status.change_summary = Some(summary);
                     status.last_reconcile_mode = Some(PolicyMode::Apply);
-                    status.planned_sql = None;
-                    status.planned_sql_truncated = false;
                     status.last_error = None;
                     status.applied_password_source_versions = applied_password_source_versions;
                     status.transient_failure_count = 0;
@@ -1581,8 +1635,6 @@ async fn apply_under_lock(
                 status.last_attempted_generation = generation;
                 status.change_summary = Some(summary.clone());
                 status.last_reconcile_mode = Some(PolicyMode::Apply);
-                status.planned_sql = planned_sql.clone();
-                status.planned_sql_truncated = planned_sql_truncated;
                 status.last_error = None;
                 status.transient_failure_count = 0;
                 status.current_plan_ref = Some(crate::crd::PlanReference {
@@ -1853,6 +1905,15 @@ async fn reconcile_cleanup(
 
     info!(name, namespace, "cleaning up (resource deleted)");
 
+    // A target policy must remain addressable until every attached access
+    // policy has run its own finalizer and revoked its active requests. This
+    // preserves the existing PostgresPolicy deletion contract (durable grants
+    // are not revoked) while preventing ephemeral overlays from being stranded.
+    let remaining = crate::ephemeral::delete_access_policies_for_target(resource, ctx).await?;
+    if remaining > 0 {
+        return Err(ReconcileError::PendingEphemeralAccessCleanup(remaining));
+    }
+
     // Evict any cached pool for this resource's connection.
     ctx.evict_pool(&namespace, &resource.spec.connection).await;
 
@@ -1940,7 +2001,7 @@ fn parse_rfc3339_to_epoch_secs(timestamp: &str) -> Option<u64> {
     Some(days_since_epoch * 86400 + hours * 3600 + minutes * 60 + seconds)
 }
 
-async fn detect_sql_context(
+pub(crate) async fn detect_sql_context(
     pool: &sqlx::PgPool,
     inspect_config: &pgroles_inspect::InspectConfig,
 ) -> Result<pgroles_core::sql::SqlContext, ReconcileError> {
@@ -1956,51 +2017,6 @@ async fn detect_sql_context(
         pgroles_core::sql::SqlContext::from_version_num(pg_version.version_num)
             .with_relation_inventory(relation_inventory),
     )
-}
-
-fn render_plan_sql_for_status(
-    changes: &[pgroles_core::diff::Change],
-    sql_ctx: &pgroles_core::sql::SqlContext,
-) -> (Option<String>, bool) {
-    if changes.is_empty() {
-        return (None, false);
-    }
-
-    // Render each change individually so we can redact passwords.
-    let rendered: String = changes
-        .iter()
-        .flat_map(|change| {
-            if let pgroles_core::diff::Change::SetPassword { name, .. } = change {
-                vec![format!(
-                    "ALTER ROLE {} PASSWORD '[REDACTED]';",
-                    pgroles_core::sql::quote_ident(name)
-                )]
-            } else {
-                pgroles_core::sql::render_statements_with_context(change, sql_ctx)
-            }
-        })
-        .collect::<Vec<_>>()
-        .join("\n");
-
-    let (truncated, did_truncate) = truncate_status_text(&rendered, MAX_PLANNED_SQL_STATUS_BYTES);
-    (Some(truncated), did_truncate)
-}
-
-fn truncate_status_text(text: &str, max_bytes: usize) -> (String, bool) {
-    if text.len() <= max_bytes {
-        return (text.to_string(), false);
-    }
-
-    let marker = "\n-- truncated for status --";
-    let target_len = max_bytes.saturating_sub(marker.len());
-    let mut end = target_len.min(text.len());
-    while end > 0 && !text.is_char_boundary(end) {
-        end -= 1;
-    }
-
-    let mut truncated = text[..end].to_string();
-    truncated.push_str(marker);
-    (truncated, true)
 }
 
 /// Emit a plan lifecycle event on the parent policy, logging warnings on failure.
@@ -2039,6 +2055,14 @@ where
     let mut status = old_status.clone().unwrap_or_default();
 
     mutate(&mut status);
+    // Applied centrally rather than at each caller: every status write passes
+    // through here, so the condition cannot be missed on one path or go stale
+    // once the field is finally set.
+    // Read the spec from `latest`, not the reconcile's snapshot: if the field
+    // was set while this reconcile ran, the snapshot would re-add a condition
+    // that no longer applies.
+    apply_approval_deprecation_condition(&latest, &mut status);
+    clear_stale_approval_ignored_condition(&latest, &mut status);
 
     let patch = serde_json::json!({
         "status": status
@@ -2060,13 +2084,49 @@ where
     Ok(())
 }
 
+/// Report whether this policy relies on `spec.approval` being inferred from
+/// `spec.mode`. The inference is deprecated and becomes an error in a future
+/// release, so a policy depending on it carries a condition until the field is
+/// written down. Setting the field clears the condition on the next write.
+fn apply_approval_deprecation_condition(
+    resource: &PostgresPolicy,
+    status: &mut PostgresPolicyStatus,
+) {
+    if resource.spec.approval.is_some() {
+        status
+            .conditions
+            .retain(|condition| condition.condition_type != crate::crd::CONDITION_APPROVAL_UNSET);
+        return;
+    }
+    status.set_condition(crate::crd::approval_unset_condition(
+        resource.spec.effective_approval(),
+    ));
+}
+
+/// Clear `ApprovalIgnored` for any policy that is not in plan mode. The plan
+/// path maintains the condition itself; this only stops a stale one surviving a
+/// switch to `mode: apply`, where an approval is no longer ignored.
+fn clear_stale_approval_ignored_condition(
+    resource: &PostgresPolicy,
+    status: &mut PostgresPolicyStatus,
+) {
+    if resource.spec.mode != PolicyMode::Plan {
+        status
+            .conditions
+            .retain(|condition| condition.condition_type != crate::crd::CONDITION_APPROVAL_IGNORED);
+    }
+}
+
 async fn detect_policy_conflict(
     ctx: &OperatorContext,
     resource: &PostgresPolicy,
     identity: &DatabaseIdentity,
     ownership: &crate::crd::OwnershipClaims,
 ) -> Result<Option<String>, ReconcileError> {
-    let api: Api<PostgresPolicy> = Api::all(ctx.kube_client.clone());
+    let api: Api<PostgresPolicy> = match &ctx.watch_namespace {
+        Some(namespace) => Api::namespaced(ctx.kube_client.clone(), namespace),
+        None => Api::all(ctx.kube_client.clone()),
+    };
     let policies = api.list(&Default::default()).await?;
 
     Ok(detect_policy_conflict_in_list(
@@ -2150,6 +2210,7 @@ impl ReconcileError {
             ReconcileError::ConflictingPolicy(_) => "ConflictingPolicy",
             ReconcileError::UnsatisfiableWildcardGrant(_) => "UnsatisfiableWildcardGrant",
             ReconcileError::LockContention(_, _) => "LockContention",
+            ReconcileError::RequestIndexNotReady(_) => "RequestIndexNotReady",
             ReconcileError::Context(context) => match context.as_ref() {
                 ContextError::SecretFetch { .. } => "SecretFetchFailed",
                 ContextError::SecretMissing { .. } => "SecretMissing",
@@ -2159,6 +2220,8 @@ impl ReconcileError {
                 ContextError::DatabaseConnect { .. } => "DatabaseConnectionFailed",
                 ContextError::SetRoleFailed { .. } => "SetRoleFailed",
                 ContextError::EmptyResolvedValue { .. } => "InvalidConnectionParams",
+                ContextError::InvalidDatabaseUrl { .. }
+                | ContextError::InvalidResolvedPort { .. } => "InvalidConnectionParams",
                 ContextError::InvalidResolvedSslMode { .. } => "InvalidConnectionParams",
             },
             ReconcileError::Inspect(error) => match error {
@@ -2182,6 +2245,7 @@ impl ReconcileError {
             ReconcileError::PlanSqlStorage(_) => "PlanSqlStorageFailed",
             ReconcileError::Kube(_) => "KubernetesApiError",
             ReconcileError::NoNamespace => "InvalidResource",
+            ReconcileError::PendingEphemeralAccessCleanup(_) => "EphemeralAccessCleanupPending",
         }
     }
 }
@@ -2367,6 +2431,119 @@ mod tests {
                 approval: None,
             },
         )
+    }
+
+    fn approval_condition(status: &PostgresPolicyStatus) -> Option<&crate::crd::PolicyCondition> {
+        status
+            .conditions
+            .iter()
+            .find(|c| c.condition_type == crate::crd::CONDITION_APPROVAL_UNSET)
+    }
+
+    #[test]
+    fn approval_deprecation_condition_reports_inference_per_mode() {
+        for (mode, expected) in [(PolicyMode::Apply, "auto"), (PolicyMode::Plan, "manual")] {
+            let mut policy = valid_role_policy("p", "app", "s");
+            policy.spec.mode = mode;
+            policy.spec.approval = None;
+
+            let mut status = PostgresPolicyStatus::default();
+            apply_approval_deprecation_condition(&policy, &mut status);
+
+            let cond = approval_condition(&status)
+                .unwrap_or_else(|| panic!("{mode:?} without approval should set the condition"));
+            assert_eq!(cond.status, "True");
+            assert!(
+                cond.message
+                    .as_deref()
+                    .is_some_and(|m| m.contains(&format!("inferred as {expected}"))),
+                "condition should name the mode-specific inference for {mode:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn approval_deprecation_condition_absent_when_field_is_explicit() {
+        for approval in [
+            crate::crd::ApprovalMode::Auto,
+            crate::crd::ApprovalMode::Manual,
+        ] {
+            let mut policy = valid_role_policy("p", "app", "s");
+            policy.spec.approval = Some(approval);
+
+            let mut status = PostgresPolicyStatus::default();
+            apply_approval_deprecation_condition(&policy, &mut status);
+
+            assert!(
+                approval_condition(&status).is_none(),
+                "an explicit approval mode must not be reported as unset"
+            );
+        }
+    }
+
+    #[test]
+    fn approval_deprecation_condition_is_cleared_once_the_field_is_set() {
+        // The condition is written by an earlier reconcile and must not linger
+        // on the object after the user acts on it.
+        let mut policy = valid_role_policy("p", "app", "s");
+        policy.spec.approval = None;
+        let mut status = PostgresPolicyStatus::default();
+        apply_approval_deprecation_condition(&policy, &mut status);
+        assert!(approval_condition(&status).is_some());
+
+        policy.spec.approval = Some(crate::crd::ApprovalMode::Auto);
+        apply_approval_deprecation_condition(&policy, &mut status);
+        assert!(
+            approval_condition(&status).is_none(),
+            "stale condition should be removed when approval becomes explicit"
+        );
+    }
+
+    #[test]
+    fn stale_approval_ignored_condition_cleared_when_leaving_plan_mode() {
+        let mut policy = valid_role_policy("p", "app", "s");
+        policy.spec.mode = PolicyMode::Plan;
+        let mut status = PostgresPolicyStatus::default();
+        status.set_condition(crate::crd::approval_ignored_condition("p-plan-1"));
+
+        // Still in plan mode: the plan path owns the condition, leave it alone.
+        clear_stale_approval_ignored_condition(&policy, &mut status);
+        assert!(
+            status
+                .conditions
+                .iter()
+                .any(|c| c.condition_type == crate::crd::CONDITION_APPROVAL_IGNORED),
+            "plan mode must keep the condition the plan path maintains"
+        );
+
+        // Switched to apply: an approval is honoured now, so the warning is wrong.
+        policy.spec.mode = PolicyMode::Apply;
+        clear_stale_approval_ignored_condition(&policy, &mut status);
+        assert!(
+            !status
+                .conditions
+                .iter()
+                .any(|c| c.condition_type == crate::crd::CONDITION_APPROVAL_IGNORED),
+            "leaving plan mode must clear the stale warning"
+        );
+    }
+
+    #[test]
+    fn approval_deprecation_condition_preserves_other_conditions() {
+        let mut policy = valid_role_policy("p", "app", "s");
+        policy.spec.approval = Some(crate::crd::ApprovalMode::Auto);
+        let mut status = PostgresPolicyStatus::default();
+        status.set_condition(ready_condition(true, "Reconciled", "All changes applied"));
+
+        apply_approval_deprecation_condition(&policy, &mut status);
+
+        assert!(
+            status
+                .conditions
+                .iter()
+                .any(|c| c.condition_type == "Ready"),
+            "clearing the deprecation condition must not disturb other conditions"
+        );
     }
 
     fn invalid_profile_policy(name: &str, secret_name: &str) -> PostgresPolicy {
@@ -2642,15 +2819,6 @@ mod tests {
     }
 
     #[test]
-    fn truncate_status_text_marks_truncation() {
-        let text = "x".repeat(MAX_PLANNED_SQL_STATUS_BYTES + 32);
-        let (truncated, did_truncate) = truncate_status_text(&text, MAX_PLANNED_SQL_STATUS_BYTES);
-        assert!(did_truncate);
-        assert!(truncated.len() <= MAX_PLANNED_SQL_STATUS_BYTES);
-        assert!(truncated.ends_with("-- truncated for status --"));
-    }
-
-    #[test]
     fn accumulate_summary_all_change_types() {
         use pgroles_core::diff::Change;
         use pgroles_core::model::RoleState;
@@ -2847,10 +3015,6 @@ mod tests {
                 total: 1,
                 ..Default::default()
             }),
-            planned_sql: Some(
-                "GRANT EXECUTE ON ALL ROUTINES IN SCHEMA \"app\" TO \"reader\";".into(),
-            ),
-            planned_sql_truncated: true,
             last_error: None,
             transient_failure_count: 3,
             current_plan_ref: Some(crate::crd::PlanReference {
@@ -2897,8 +3061,6 @@ mod tests {
             "transient planning and stale conflict conditions should be cleared on degraded status"
         );
         assert!(status.change_summary.is_none());
-        assert!(status.planned_sql.is_none());
-        assert!(!status.planned_sql_truncated);
         assert!(status.current_plan_ref.is_none());
         assert_eq!(status.last_error.as_deref(), Some(message));
         assert_eq!(status.transient_failure_count, 0);
@@ -2910,8 +3072,6 @@ mod tests {
             current_plan_ref: Some(crate::crd::PlanReference {
                 name: "approved-plan".into(),
             }),
-            planned_sql: Some("ALTER ROLE \"app\" LOGIN;".into()),
-            planned_sql_truncated: true,
             transient_failure_count: 2,
             ..Default::default()
         };
@@ -2931,8 +3091,6 @@ mod tests {
                 .map(|plan| plan.name.as_str()),
             Some("approved-plan")
         );
-        assert!(status.planned_sql.is_none());
-        assert!(!status.planned_sql_truncated);
         assert_eq!(
             status.last_error.as_deref(),
             Some("SQL execution error: connection closed")
@@ -3657,66 +3815,14 @@ mod tests {
     }
 
     #[test]
-    fn render_plan_sql_for_status_redacts_passwords() {
-        let changes = vec![
-            pgroles_core::diff::Change::CreateRole {
-                name: "app-svc".to_string(),
-                state: pgroles_core::model::RoleState {
-                    login: true,
-                    ..pgroles_core::model::RoleState::default()
-                },
-            },
-            pgroles_core::diff::Change::SetPassword {
-                name: "app-svc".to_string(),
-                password: "super_secret_p@ssw0rd!".to_string(),
-            },
-        ];
-
-        let sql_ctx = pgroles_core::sql::SqlContext::default();
-        let (sql, truncated) = render_plan_sql_for_status(&changes, &sql_ctx);
-
-        let sql = sql.expect("expected non-empty planned SQL");
-        assert!(!truncated);
-        assert!(
-            sql.contains("[REDACTED]"),
-            "status SQL should contain [REDACTED], got: {sql}"
-        );
-        assert!(
-            !sql.contains("super_secret_p@ssw0rd!"),
-            "status SQL must NOT contain the actual password, got: {sql}"
-        );
-        assert!(
-            sql.contains("CREATE ROLE"),
-            "status SQL should still contain non-password changes, got: {sql}"
-        );
-    }
-
-    #[test]
-    fn render_plan_sql_for_status_empty_changes_returns_none() {
-        let sql_ctx = pgroles_core::sql::SqlContext::default();
-        let (sql, truncated) = render_plan_sql_for_status(&[], &sql_ctx);
-        assert!(sql.is_none());
-        assert!(!truncated);
-    }
-
-    #[test]
-    fn render_plan_sql_for_status_password_only_plan() {
-        let changes = vec![pgroles_core::diff::Change::SetPassword {
-            name: "db-user".to_string(),
-            password: "my_secret_pw".to_string(),
-        }];
-
-        let sql_ctx = pgroles_core::sql::SqlContext::default();
-        let (sql, _) = render_plan_sql_for_status(&changes, &sql_ctx);
-
-        let sql = sql.expect("expected non-empty planned SQL");
-        assert!(
-            sql.contains("[REDACTED]"),
-            "password-only plan should still show redacted SQL"
-        );
-        assert!(
-            !sql.contains("my_secret_pw"),
-            "password-only plan must NOT leak the password"
+    fn cleanup_pending_keeps_finalizer_and_uses_bounded_retry() {
+        let resource = test_policy("2s", 0);
+        let error =
+            finalizer::Error::CleanupFailed(ReconcileError::PendingEphemeralAccessCleanup(1));
+        assert_eq!(retry_class(&error), RetryClass::CleanupPending);
+        assert_eq!(
+            retry_action(&resource, &error),
+            Action::requeue(Duration::from_secs(10))
         );
     }
 

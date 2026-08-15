@@ -1,0 +1,76 @@
+apiVersion: pgroles.io/v1alpha1
+kind: PostgresPolicy
+metadata:
+  name: ephemeral-e2e
+spec:
+  connection:
+    secretRef:
+      name: postgres-credentials
+  interval: 2s
+  mode: apply
+  reconciliation_mode: authoritative
+  roles:
+    - name: ephemeral_e2e_subject
+      login: false
+    - name: ephemeral_e2e_editor
+      login: false
+    - name: ephemeral_e2e_auditor
+      login: false
+    - name: ephemeral_e2e_session_user
+      login: true
+---
+apiVersion: pgroles.io/v1alpha1
+kind: EphemeralAccessPolicy
+metadata:
+  name: ephemeral-e2e-automatic
+spec:
+  postgresPolicyRef:
+    name: ephemeral-e2e
+  memberships:
+    - role: ephemeral_e2e_editor
+      inherit: false
+    - role: ephemeral_e2e_auditor
+      inherit: false
+  maximumDuration: 2m
+  defaultDuration: 45s
+  pendingRequestTTL: 1m
+  justification:
+    required: true
+  approval:
+    mode: Automatic
+---
+apiVersion: pgroles.io/v1alpha1
+kind: EphemeralAccessPolicy
+metadata:
+  name: ephemeral-e2e-required
+spec:
+  postgresPolicyRef:
+    name: ephemeral-e2e
+  memberships:
+    - role: ephemeral_e2e_editor
+      inherit: false
+  maximumDuration: 2m
+  defaultDuration: 60s
+  pendingRequestTTL: 1m
+  justification:
+    required: true
+  approval:
+    mode: Required
+---
+apiVersion: pgroles.io/v1alpha1
+kind: EphemeralAccessPolicy
+metadata:
+  name: ephemeral-e2e-session
+spec:
+  postgresPolicyRef:
+    name: ephemeral-e2e
+  memberships:
+    - role: ephemeral_e2e_editor
+      inherit: false
+  maximumDuration: 2m
+  defaultDuration: 1m
+  pendingRequestTTL: 1m
+  justification:
+    required: true
+  approval:
+    mode: Automatic

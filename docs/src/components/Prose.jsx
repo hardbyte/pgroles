@@ -12,6 +12,8 @@ export function Prose({ as: Component = 'div', className, ...props }) {
         'prose-lead:text-stone-600 dark:prose-lead:text-stone-400',
         // links
         'prose-a:font-semibold prose-a:text-stone-900 dark:prose-a:text-stone-100',
+        // inline code (Tailwind Typography adds literal backtick pseudo-elements by default)
+        'prose-code:before:content-none prose-code:after:content-none',
         // link underline
         'prose-a:no-underline prose-a:shadow-[inset_0_-2px_0_0_var(--tw-prose-background,#fff),inset_0_calc(-1*(var(--tw-prose-underline-size,4px)+2px))_0_0_var(--tw-prose-underline,theme(colors.amber.300))] hover:prose-a:[--tw-prose-underline-size:6px] dark:[--tw-prose-background:theme(colors.stone.950)] dark:prose-a:shadow-[inset_0_calc(-1*var(--tw-prose-underline-size,2px))_0_0_var(--tw-prose-underline,theme(colors.amber.700))] dark:hover:prose-a:[--tw-prose-underline-size:6px]',
         // pre

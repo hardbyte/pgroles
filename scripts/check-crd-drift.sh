@@ -30,6 +30,8 @@ done
 # k8s/ copies
 check_drift "k8s/crd.yaml" "$tmpdir/postgrespolicies.pgroles.io.yaml"
 check_drift "k8s/postgrespolicyplan-crd.yaml" "$tmpdir/postgrespolicyplans.pgroles.io.yaml"
+check_drift "k8s/ephemeralaccesspolicy-crd.yaml" "$tmpdir/ephemeralaccesspolicies.pgroles.io.yaml"
+check_drift "k8s/ephemeralaccessrequest-crd.yaml" "$tmpdir/ephemeralaccessrequests.pgroles.io.yaml"
 
 if [ "$failed" -ne 0 ]; then
   exit 1

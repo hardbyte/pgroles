@@ -2,7 +2,10 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    # release/** so a release branch gets the full suite on its own pushes, and
+    # so the commit a release tag will point at has a successful push run for
+    # release.yml's candidate-ci gate to find.
+    branches: [main, "release/**"]
   pull_request:
     branches: [main]
 
@@ -114,6 +117,9 @@ jobs:
 
       - name: CRD drift check
         run: scripts/check-crd-drift.sh
+
+      - name: Chart README drift check
+        run: scripts/check-helm-docs.sh
 
       - uses: astral-sh/setup-uv@v9.0.0
 
@@ -312,10 +318,15 @@ jobs:
           kubectl apply -f k8s/samples/disjoint-policy.yaml
           wait_for_ready_true disjoint-policy
           assert_role_exists analytics
+          # This fixture deliberately omits spec.approval, so it must report the
+          # deprecation condition while the inference still exists.
+          wait_for_condition_status disjoint-policy ApprovalUnset True
 
           pg_query 'DROP SCHEMA IF EXISTS operator_owned_schema CASCADE; DROP ROLE IF EXISTS operator_schema_owner;'
           kubectl apply -f k8s/samples/schema-owner-policy.yaml
           wait_for_ready_true schema-owner-policy
+          # ...whereas this one sets it explicitly and must stay quiet.
+          assert_condition_absent schema-owner-policy ApprovalUnset
           assert_role_exists operator_schema_owner
           assert_schema_exists operator_owned_schema
           assert_schema_owner operator_owned_schema operator_schema_owner
@@ -354,9 +365,20 @@ jobs:
           wait_for_ready_status_reason plan-policy True Planned
           wait_for_drift_status plan-policy True
           kubectl get pgr plan-policy -o jsonpath='{.status.last_reconcile_mode}' | grep -qx "plan"
-          kubectl get pgr plan-policy -o jsonpath='{.status.planned_sql}' | grep -q 'CREATE ROLE \"plan-preview-user\"'
+          plan_preview_plan="$(wait_for_current_plan_ref plan-policy)"
+          get_plan_sql "$plan_preview_plan" | grep -q 'CREATE ROLE \"plan-preview-user\"'
           assert_role_absent plan-preview-user
           wait_for_event_reason plan-policy DriftDetected
+
+          # Approving a plan-mode plan can never execute. The policy must say so
+          # rather than look stalled, and must still not touch the database.
+          assert_condition_absent plan-policy ApprovalIgnored
+          approve_plan "$plan_preview_plan"
+          wait_for_condition_status plan-policy ApprovalIgnored True
+          wait_for_event_reason plan-policy ApprovalIgnored
+          assert_role_absent plan-preview-user
+          kubectl annotate pgplan "$plan_preview_plan" pgroles.io/approved- --overwrite
+          wait_for_condition_absent plan-policy ApprovalIgnored
 
           upsert_secret rotating-postgres-credentials \
             DATABASE_URL='postgres://postgres:devpassword@postgres.default.svc.cluster.local:5432/postgres'
@@ -592,6 +614,9 @@ jobs:
           pg_query "SELECT has_schema_privilege('loadb_01-editor', 'loadb_01', 'USAGE')" loadtest | grep -qx "t"
           pg_query "SELECT has_table_privilege('loadb_10-viewer', 'loadb_10.items', 'SELECT')" loadtest | grep -qx "t"
           pg_query "SELECT has_sequence_privilege('loadb_05-editor', 'loadb_05.audit_seq', 'USAGE')" loadtest | grep -qx "t"
+
+      - name: Run ephemeral request cache regression
+        run: scripts/e2e-ephemeral-request-load.sh
 
       - name: Cleanup
         if: always()
@@ -1032,3 +1057,101 @@ jobs:
       - name: Cleanup
         if: always()
         run: kind delete cluster --name pgroles-e2e-plans
+
+  # ---------------------------------------------------------------------------
+  # Job 7: Ephemeral access — lifecycle plus secure Kyverno admission boundary
+  # ---------------------------------------------------------------------------
+  e2e-ephemeral-access:
+    name: Ephemeral Access E2E (${{ matrix.secure == 'true' && 'Kyverno' || 'trusted-writer' }})
+    needs: stack-gate
+    if: needs.stack-gate.outputs.run_heavy == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 50
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - secure: "false"
+            cluster: pgroles-e2e-ephemeral-trusted
+          - secure: "true"
+            cluster: pgroles-e2e-ephemeral-secure
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - uses: ./.github/actions/setup-e2e
+        with:
+          cluster-name: ${{ matrix.cluster }}
+
+      - name: Install ephemeral access test identities
+        run: |
+          kubectl apply -f k8s/security/ephemeral-access-rbac.yaml
+          kubectl apply -f k8s/security/ephemeral-access-e2e-rbac.yaml
+
+      - name: Install Kyverno secure admission boundary
+        if: matrix.secure == 'true'
+        run: |
+          curl -fsSL -o /tmp/kyverno-install.yaml \
+            https://github.com/kyverno/kyverno/releases/download/v1.18.2/install.yaml
+          echo "3dcd43eaf11f0719084217148cd0c82a8fa49faa9b1a783ea5bea2cf84041bda  /tmp/kyverno-install.yaml" \
+            | sha256sum -c -
+          kubectl create -f /tmp/kyverno-install.yaml
+          kubectl wait --for=condition=Established \
+            crd/clusterpolicies.kyverno.io \
+            crd/validatingpolicies.policies.kyverno.io \
+            --timeout=120s
+          kubectl -n kyverno wait --for=condition=Available \
+            deployment/kyverno-admission-controller \
+            deployment/kyverno-background-controller \
+            deployment/kyverno-cleanup-controller \
+            deployment/kyverno-reports-controller \
+            --timeout=240s
+          # A Deployment can become Available just before the admission
+          # process starts serving its policy webhooks. Applying the policy is
+          # the end-to-end readiness probe, so retry only transient webhook
+          # startup failures and fail immediately for a malformed policy.
+          policy_apply_log="$(mktemp)"
+          trap 'rm -f "$policy_apply_log"' EXIT
+          policy_applied=false
+          for attempt in $(seq 1 30); do
+            if kubectl apply -f k8s/security/ephemeral-access-kyverno.yaml \
+              >"$policy_apply_log" 2>&1; then
+              cat "$policy_apply_log"
+              policy_applied=true
+              break
+            fi
+            cat "$policy_apply_log"
+            if ! grep -Eq \
+              'failed calling webhook|no endpoints available|connection refused|context deadline exceeded' \
+              "$policy_apply_log"; then
+              exit 1
+            fi
+            if [ "$attempt" -eq 30 ]; then
+              break
+            fi
+            echo "Kyverno admission webhook is not serving yet (attempt $attempt/30)"
+            sleep 2
+          done
+          if [ "$policy_applied" != true ]; then
+            echo "::error::Kyverno admission webhook did not become ready"
+            exit 1
+          fi
+          kubectl wait --for=jsonpath='{.status.conditionStatus.ready}'=true \
+            validatingpolicy/pgroles-ephemeral-access-decision-integrity \
+            --timeout=120s
+
+      - name: Run ephemeral access lifecycle E2E
+        run: scripts/e2e-ephemeral-access.sh "${{ matrix.secure }}"
+
+      - name: Diagnostics
+        if: failure()
+        run: |
+          kubectl get pgr,pgeap,pgear,pgplan -A -o wide || true
+          kubectl -n pgroles-system logs deployment/pgroles-operator --tail=500 || true
+          kubectl -n pgroles-system logs deployment/otel-collector --tail=500 || true
+          kubectl -n kyverno logs deployment/kyverno-admission-controller --tail=300 || true
+
+      - name: Cleanup
+        if: always()
+        run: kind delete cluster --name "${{ matrix.cluster }}"

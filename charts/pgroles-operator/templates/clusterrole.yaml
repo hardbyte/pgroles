@@ -1,7 +1,10 @@
 apiVersion: rbac.authorization.k8s.io/v1
-kind: ClusterRole
+kind: {{ if .Values.operator.watchNamespace }}Role{{ else }}ClusterRole{{ end }}
 metadata:
   name: {{ include "pgroles-operator.fullname" . }}
+  {{- with .Values.operator.watchNamespace }}
+  namespace: {{ . | quote }}
+  {{- end }}
   labels:
     {{- include "pgroles-operator.labels" . | nindent 4 }}
 rules:
@@ -22,6 +25,23 @@ rules:
   - apiGroups: ["pgroles.io"]
     resources: ["postgrespolicyplans/status"]
     verbs: ["get", "patch", "update"]
+  # Reconcile ephemeral access definitions and runtime requests. Approval is
+  # intentionally absent: secure deployments authorize decision-condition
+  # mutations through admission policy, not this controller role.
+  - apiGroups: ["pgroles.io"]
+    resources: ["ephemeralaccesspolicies", "ephemeralaccessrequests"]
+    verbs: ["get", "list", "watch", "patch", "update", "delete"]
+  - apiGroups: ["pgroles.io"]
+    resources: ["ephemeralaccesspolicies/status", "ephemeralaccessrequests/status"]
+    verbs: ["get", "patch", "update"]
+  - apiGroups: ["pgroles.io"]
+    resources: ["ephemeralaccesspolicies/finalizers", "ephemeralaccessrequests/finalizers"]
+    verbs: ["update"]
+  # Logical verb used by admission policy to authorize operator-owned request
+  # lifecycle status and finalizer changes without hard-coding an SA identity.
+  - apiGroups: ["pgroles.io"]
+    resources: ["ephemeralaccesspolicies"]
+    verbs: ["manage"]
   # Read Secrets for database connection strings and password references;
   # create/update Secrets for operator-generated passwords.
   - apiGroups: [""]

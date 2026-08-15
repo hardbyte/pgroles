@@ -5,36 +5,17 @@ Namespace: {{ .Release.Namespace }}
 
 The operator is watching for PostgresPolicy resources cluster-wide.
 
-To create a policy, first create a Secret with your database connection string:
+Start with the operator quick start. It creates a connection Secret without
+putting the password in shell history, previews a safe additive policy, and
+requires manual approval before executing SQL:
 
-  kubectl create secret generic postgres-credentials \
-    --from-literal=DATABASE_URL='postgres://user:pass@host:5432/dbname'
+  https://hardbyte.github.io/pgroles/docs/operator-quick-start/
 
-Then apply a PostgresPolicy resource:
+Important: a PostgresPolicy defaults to apply mode with authoritative
+reconciliation. Do not point a default policy at an existing database. Set the
+mode, approval, and reconciliation_mode fields explicitly, and review the plan
+before applying database changes.
 
-  cat <<EOF | kubectl apply -f -
-  apiVersion: pgroles.io/v1alpha1
-  kind: PostgresPolicy
-  metadata:
-    name: my-policy
-  spec:
-    connection:
-      secretRef:
-        name: postgres-credentials
-    roles:
-      - name: app-reader
-        login: false
-    grants:
-      - role: app-reader
-        object: { type: schema, name: public }
-        privileges: [USAGE]
-      - role: app-reader
-        object: { type: table, schema: public, name: "*" }
-        privileges: [SELECT]
-  EOF
+Operator documentation:
 
-Check the status:
-
-  kubectl get pgr
-
-Documentation: https://github.com/hardbyte/pgroles
+  https://hardbyte.github.io/pgroles/docs/operator/

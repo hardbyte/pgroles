@@ -31,30 +31,50 @@ The important difference is that the operator has to do this continuously, safel
 
 - Secret-based connection lookup
 - reconciliation interval
-- reconciliation mode (`apply` or `plan`)
+- execution mode (`apply` or `plan`) and approval mode (`auto` or `manual`)
+- reconciliation mode (`authoritative`, `additive`, or `adopt`)
 - suspend/pause behavior
 
 The controller converts the CRD into the same manifest types used by the CLI, so both paths share expansion, diffing, and SQL rendering semantics.
 
 ### Watch sources
 
-The operator currently reconciles from three primary trigger sources:
+The operator currently reconciles from four event-driven trigger sources, plus the periodic interval:
 
 - `PostgresPolicy` generation changes
 - `PostgresPolicy` `reconcile.pgroles.io/requestedAt` annotation changes
 - Secret `resourceVersion` changes for referenced database credentials
+- `PostgresPolicyPlan` changes, mapped back to the owning policy by controller-owner UID — this is what makes an approval or rejection annotation take effect immediately rather than at the next interval
 
 Generation and annotation filtering matter. The controller intentionally ignores status-only `PostgresPolicy` updates and unrelated annotation changes as reconcile triggers, otherwise successful status patches and GitOps tracking metadata can create hot loops that starve other policies targeting the same database.
 
+By default these watches cover all namespaces. Setting `WATCH_NAMESPACE` (or
+the Helm value `operator.watchNamespace`) scopes every policy, plan, Secret,
+access-policy, and access-request watch to one namespace. The chart also reduces
+the operator's RBAC to that namespace.
+
+Ephemeral requests share one reflector with a watch-fed index keyed by access
+policy name, resolved access-policy UID, and resolved target-policy UID. The
+index is refreshed atomically after watcher relists. Controller-owned UID labels
+are routing hints for server-side inspection; reconciliation always verifies the
+immutable UIDs stored in `status.resolvedAccess`.
+
 ### Database connection handling
 
-The operator reads `DATABASE_URL` from a Secret in the same namespace as the policy. It caches `sqlx::PgPool` instances by:
+The operator resolves credentials from a Secret in the same namespace as the
+policy — either a whole connection URL via `connection.secretRef`, or individual
+`connection.params` fields, each of which may be a literal or its own Secret
+reference. It caches `sqlx::PgPool` instances. In URL mode the cache identity is:
 
 ```text
 namespace / secret name / secret key
 ```
 
-When the Secret changes, the controller refetches it and refreshes the cached pool on the next reconcile. This is what enables credential rotation and recovery without restarting the operator.
+In `connection.params` mode the key covers every connection field, and the
+operator additionally fingerprints the `resourceVersion` of all referenced
+Secrets.
+
+When any referenced Secret changes, the controller refetches it and refreshes the cached pool on the next reconcile. This is what enables credential rotation and recovery without restarting the operator.
 
 ### Reconcile engine
 
@@ -112,6 +132,8 @@ The operator writes status conditions and summaries back to the `PostgresPolicy`
 - `Degraded`
 - `Conflict`
 - `Paused`
+- `ApprovalUnset` and `ApprovalIgnored`, which are advisory: they report a
+  configuration that will not behave as it looks, not a failed reconcile
 
 It also records:
 
@@ -124,9 +146,10 @@ It also records:
 - transient failure count
 - change summary
 - last reconcile mode
-- planned SQL (truncated when needed for status size safety)
+- current plan reference
 
-This is the main operator-facing debugging surface for SREs.
+This is the main operator-facing debugging surface for SREs. The rendered SQL
+lives on the referenced `PostgresPolicyPlan`.
 
 ## Observability
 
@@ -143,33 +166,19 @@ pgroles-operator -> OpenTelemetry Collector -> metrics backend
 
 The operator deliberately does not default to a built-in Prometheus scrape endpoint.
 
+Ephemeral access uses the same database and advisory locks as durable
+reconciliation. Request-owned scoped plans establish execution provenance, and
+their active membership edges are composed into the single effective desired
+graph before diffing. See [ephemeral access](/docs/ephemeral-access) for the
+request, approval, expiry, and session contracts, and
+[securing ephemeral access](/docs/ephemeral-access-security) for the deployment
+trust and audit boundaries.
+
 For object-local debugging, the controller also emits transition-based Kubernetes Events for notable status changes such as conflicts, suspend/resume, plan-mode drift detection, recovery, secret failures, database connectivity failures, and insufficient privileges. The intended split is:
 
 - status: current state of the policy
 - Events: notable transitions visible in `kubectl describe`
 - OTLP metrics: fleet-level trends and alerting
-
-## CI coverage
-
-CI covers:
-
-- happy-path reconciliation in kind
-- same-database disjoint policies
-- same-database disjoint policies recovering through shared-secret churn
-- same-database conflicting policies
-- invalid specs
-- missing secrets
-- insufficient database privileges
-- secret rotation and recovery
-- Kubernetes Event delivery for warning and recovery transitions
-- plan-mode drift detection without SQL execution
-- OTLP metrics export through an in-cluster Collector
-- generated load policies across 2 databases with 30 schemas / 60 generated roles
-- scheduled fairness/load coverage across 5 policies, 3 databases, 100 schemas, and 200 generated roles with repeated secret churn
-
-Further hardening work:
-
-- broader scale and long-run validation beyond the scheduled workflow profile
 
 ## Relationship to the CLI
 

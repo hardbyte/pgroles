@@ -104,10 +104,11 @@ metadata:
   name: app
 spec:
   connection:
-    url:
-      secretName: app-db
-      secretKey: url
+    secretRef:
+      name: app-db
+    secretKey: url
   mode: apply
+  approval: auto
   # ... paste the rendered manifest body here:
   default_owner: app_owner
   profiles:

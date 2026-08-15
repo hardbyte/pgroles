@@ -44,6 +44,10 @@ spec:
               valueFrom:
                 fieldRef:
                   fieldPath: metadata.name
+          {{- with .Values.operator.watchNamespace }}
+            - name: WATCH_NAMESPACE
+              value: {{ . | quote }}
+          {{- end }}
           {{- with .Values.operator.env }}
             {{- toYaml . | nindent 12 }}
           {{- end }}

@@ -1,59 +1,90 @@
 # Default values for pgroles-operator
 
+# -- Replaces the generated name in resource names, keeping the release prefix.
 nameOverride: ""
+# -- Replaces the full generated name in resource names.
 fullnameOverride: ""
 
-# If false, CRDs must be installed separately before installing the chart.
-installCRDs: true
-
 operator:
+  # -- Restrict every operator watch/list and its RBAC to one namespace. Empty
+  # means cluster-wide reconciliation.
+  watchNamespace: ""
+
   image:
+    # -- Operator container image repository.
     repository: ghcr.io/hardbyte/pgroles-operator
+    # -- Image pull policy for the operator container.
     pullPolicy: IfNotPresent
-    # Overrides the image tag whose default is the chart appVersion.
+    # -- Overrides the image tag whose default is the chart appVersion.
     tag: ""
 
+  # -- Image pull secrets for private registries.
   imagePullSecrets: []
 
   serviceAccount:
-    # Specifies whether a service account should be created.
+    # -- Specifies whether a service account should be created.
     create: true
-    # Annotations to add to the service account.
+    # -- Annotations to add to the service account. Required for GKE Workload
+    # Identity: set `iam.gke.io/gcp-service-account` here when using Cloud SQL
+    # IAM authentication.
     annotations: {}
-    # Override the service account name. If unset, uses the fullname template.
+    # -- Override the service account name. If unset, uses the fullname template.
     name: ""
 
-  # Additional environment variables for the operator container.
+  # -- Additional environment variables for the operator container. This is also
+  # where operator-wide settings live, since the operator is configured by
+  # environment rather than by flags. Notable variables:
+  # `OTEL_EXPORTER_OTLP_ENDPOINT` enables OTLP metrics and logs, including
+  # structured ephemeral-access audit events; `OTEL_LOGS_EXPORTER=none` disables
+  # the log half when another agent already ships container logs off-cluster;
+  # `EPHEMERAL_ACCESS_MAXIMUM_DURATION` (default `24h`) and
+  # `EPHEMERAL_ACCESS_MAX_PENDING_TTL` (default `1h`) are the only cluster-wide
+  # ceilings on ephemeral access, and an access policy exceeding either is
+  # rejected with `Accepted=False`.
   env:
     - name: RUST_LOG
       value: "info,pgroles_operator=debug"
-    # Enable OTLP metrics export by setting one of the standard OpenTelemetry endpoints.
     # - name: OTEL_EXPORTER_OTLP_ENDPOINT
     #   value: http://otel-collector.observability.svc.cluster.local:4317
     # - name: OTEL_METRICS_EXPORTER
     #   value: otlp
+    # - name: OTEL_LOGS_EXPORTER
+    #   value: otlp
+    # - name: EPHEMERAL_ACCESS_MAXIMUM_DURATION
+    #   value: 24h
+    # - name: EPHEMERAL_ACCESS_MAX_PENDING_TTL
+    #   value: 1h
 
+  # -- Annotations to add to the operator pod.
   podAnnotations: {}
 
   http:
+    # -- Port serving the `/livez` and `/readyz` probes.
     port: 8080
 
   probes:
+    # -- Liveness probe timing. The operator holds a per-database advisory lock
+    # while reconciling, so a probe aggressive enough to restart it mid-reconcile
+    # trades a transient failure for a lock wait.
     liveness:
       initialDelaySeconds: 5
       periodSeconds: 10
       timeoutSeconds: 2
       failureThreshold: 3
+    # -- Readiness probe timing.
     readiness:
       initialDelaySeconds: 2
       periodSeconds: 10
       timeoutSeconds: 2
       failureThreshold: 3
 
+  # -- Pod-level security context.
   podSecurityContext:
     seccompProfile:
       type: RuntimeDefault
 
+  # -- Container-level security context. The operator runs as `nobody` with a
+  # read-only root filesystem and no capabilities.
   securityContext:
     allowPrivilegeEscalation: false
     readOnlyRootFilesystem: true
@@ -62,6 +93,7 @@ operator:
     capabilities:
       drop: ["ALL"]
 
+  # -- Resource requests and limits for the operator container.
   resources:
     requests:
       cpu: 50m
@@ -70,6 +102,9 @@ operator:
       cpu: 200m
       memory: 128Mi
 
+  # -- Node selector for operator pod scheduling.
   nodeSelector: {}
+  # -- Tolerations for operator pod scheduling.
   tolerations: []
+  # -- Affinity rules for operator pod scheduling.
   affinity: {}

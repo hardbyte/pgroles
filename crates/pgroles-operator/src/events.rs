@@ -9,7 +9,37 @@ use k8s_openapi::api::core::v1::ObjectReference;
 use kube::Resource;
 use kube::runtime::events::{Event, EventType, Recorder};
 
-use crate::crd::{PolicyCondition, PostgresPolicy, PostgresPolicyPlan, PostgresPolicyStatus};
+use crate::crd::{
+    EphemeralAccessRequest, EphemeralAccessRequestPhase, PolicyCondition, PostgresPolicy,
+    PostgresPolicyPlan, PostgresPolicyStatus,
+};
+
+/// Publish a request lifecycle Event on the request object itself.
+pub async fn publish_ephemeral_request_event(
+    recorder: &Recorder,
+    request: &EphemeralAccessRequest,
+    phase: EphemeralAccessRequestPhase,
+    reason: &str,
+    note: String,
+) -> Result<(), kube::Error> {
+    let reference: ObjectReference = request.object_ref(&());
+    let event_type = if matches!(
+        phase,
+        EphemeralAccessRequestPhase::Failed
+            | EphemeralAccessRequestPhase::Denied
+            | EphemeralAccessRequestPhase::ApprovalExpired
+    ) {
+        EventType::Warning
+    } else {
+        EventType::Normal
+    };
+    recorder
+        .publish(
+            &event(event_type, reason, "EphemeralAccessLifecycle", note),
+            &reference,
+        )
+        .await
+}
 
 /// Publish Kubernetes Events for notable status transitions.
 pub async fn publish_status_events(
@@ -160,6 +190,32 @@ fn derive_status_events(
         let note = condition_message(new_status, "Ready")
             .unwrap_or_else(|| "Policy reconciled successfully".to_string());
         events.push(event(EventType::Normal, reason, "StatusTransition", note));
+    }
+
+    if transitioned_to_true(
+        old_status,
+        new_status,
+        crate::crd::CONDITION_APPROVAL_IGNORED,
+    ) {
+        let note = condition_message(new_status, crate::crd::CONDITION_APPROVAL_IGNORED)
+            .unwrap_or_else(|| "Plan approval has no effect in plan mode".to_string());
+        events.push(event(
+            EventType::Warning,
+            "ApprovalIgnored",
+            "StatusTransition",
+            note,
+        ));
+    }
+
+    if transitioned_to_true(old_status, new_status, crate::crd::CONDITION_APPROVAL_UNSET) {
+        let note = condition_message(new_status, crate::crd::CONDITION_APPROVAL_UNSET)
+            .unwrap_or_else(|| "spec.approval is not set and is being inferred".to_string());
+        events.push(event(
+            EventType::Warning,
+            "ApprovalUnset",
+            "StatusTransition",
+            note,
+        ));
     }
 
     if let Some(reason) = noteworthy_failure_reason(old_status, new_status) {
@@ -447,6 +503,62 @@ mod tests {
         assert_eq!(reasons(&events), vec!["GcpAuthFailed"]);
         assert!(matches!(events[0].type_, EventType::Warning));
         assert_eq!(events[0].note.as_deref(), Some("token request rejected"));
+    }
+
+    #[test]
+    fn emits_approval_ignored_warning_once_on_transition() {
+        let mut new_status = PostgresPolicyStatus::default();
+        new_status.set_condition(crate::crd::approval_ignored_condition("policy-plan-123"));
+
+        let events = derive_status_events(None, &new_status);
+        let ignored = events
+            .iter()
+            .find(|e| e.reason == "ApprovalIgnored")
+            .expect("expected an ApprovalIgnored event");
+        assert!(matches!(ignored.type_, EventType::Warning));
+        assert!(
+            ignored.note.as_deref().is_some_and(
+                |note| note.contains("policy-plan-123") && note.contains("mode: apply")
+            ),
+            "the note should name the plan and the combination that does execute"
+        );
+
+        let events = derive_status_events(Some(&new_status), &new_status);
+        assert!(
+            !reasons(&events).contains(&"ApprovalIgnored"),
+            "steady state should not keep re-emitting the warning"
+        );
+    }
+
+    #[test]
+    fn emits_approval_unset_warning_once_on_transition() {
+        let mut new_status = PostgresPolicyStatus::default();
+        new_status.set_condition(crate::crd::approval_unset_condition(
+            crate::crd::ApprovalMode::Auto,
+        ));
+
+        let events = derive_status_events(None, &new_status);
+        assert!(reasons(&events).contains(&"ApprovalUnset"));
+        let approval_event = events
+            .iter()
+            .find(|e| e.reason == "ApprovalUnset")
+            .expect("expected an ApprovalUnset event");
+        assert!(matches!(approval_event.type_, EventType::Warning));
+        assert!(
+            approval_event
+                .note
+                .as_deref()
+                .is_some_and(|note| note.contains("approval: auto")),
+            "the event note should carry the remediation, not just the warning"
+        );
+
+        // A deprecation nag must not re-fire on every reconcile: with the
+        // condition already present, the transition has already been reported.
+        let events = derive_status_events(Some(&new_status), &new_status);
+        assert!(
+            !reasons(&events).contains(&"ApprovalUnset"),
+            "steady state should not keep emitting the deprecation event"
+        );
     }
 
     #[test]

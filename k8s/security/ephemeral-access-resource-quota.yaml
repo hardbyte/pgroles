@@ -1,0 +1,13 @@
+# Namespace-level hard stop for persisted ephemeral-access control-plane
+# objects. Copy this ResourceQuota into every namespace where access policies
+# and requests may be created, and tune the values for that namespace's normal
+# request volume and retention period.
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: pgroles-ephemeral-access
+  namespace: pgroles-system
+spec:
+  hard:
+    count/ephemeralaccesspolicies.pgroles.io: "50"
+    count/ephemeralaccessrequests.pgroles.io: "500"

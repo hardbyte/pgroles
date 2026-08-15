@@ -8,6 +8,7 @@ spec:
   connection:
     secretRef:
       name: postgres-credentials
+  approval: auto
   interval: "5m"
 
   schemas:

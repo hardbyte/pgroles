@@ -301,6 +301,8 @@ pub async fn create_or_update_plan(
             owned_roles: inspect_config.managed_roles.clone(),
             owned_schemas: inspect_config.managed_schemas.clone(),
             managed_database_identity: database_identity.to_string(),
+            origin: None,
+            scope: None,
         },
     );
     let mut plan = plan;
@@ -801,7 +803,7 @@ fn validate_existing_sql_configmap(
 /// Execute SQL changes in a database transaction.
 ///
 /// Returns the number of statements executed on success.
-async fn execute_changes_in_transaction(
+pub(crate) async fn execute_changes_in_transaction(
     pool: &sqlx::PgPool,
     changes: &[pgroles_core::diff::Change],
     sql_context: &pgroles_core::sql::SqlContext,
@@ -1763,6 +1765,8 @@ mod tests {
                 owned_roles: vec!["role-a".to_string()],
                 owned_schemas: vec!["public".to_string()],
                 managed_database_identity: "default/db/DATABASE_URL".to_string(),
+                origin: None,
+                scope: None,
             },
         );
         plan.metadata.namespace = Some("default".to_string());
@@ -2187,6 +2191,21 @@ mod tests {
         assert!(redacted.contains("[REDACTED]"));
         assert!(!redacted.contains("super_secret"));
         assert!(redacted.contains("CREATE ROLE"));
+    }
+
+    #[test]
+    fn render_redacted_sql_password_only_plan() {
+        // A plan whose only change is a password rotation still has to redact:
+        // there is no surrounding DDL to dilute a leak.
+        let changes = vec![pgroles_core::diff::Change::SetPassword {
+            name: "db-user".to_string(),
+            password: "my_secret_pw".to_string(),
+        }];
+        let ctx = pgroles_core::sql::SqlContext::default();
+        let redacted = render_redacted_sql(&changes, &ctx);
+
+        assert!(redacted.contains("[REDACTED]"));
+        assert!(!redacted.contains("my_secret_pw"));
     }
 
     #[test]
