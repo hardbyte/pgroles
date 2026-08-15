@@ -137,6 +137,12 @@ pgroles candidate show orders-change-x7k2p     # plan summary, effects, digests
 pgroles plan approve orders-change-x7k2p-plan-9f21c4
 ```
 
+Neither command exists yet — like the rest of this page they are part of the
+proposed design. Plan decisions themselves *are* shipped, as a status-subresource
+write; see [Deciding a
+plan](/docs/operator-plan-approval#deciding-a-plan) for the `kubectl` form that
+works today.
+
 Rejection lands on the plan, not the candidate: the plan records
 `Denied=True` (phase `Rejected`) and is terminal. The candidate is terminal
 too — it has no other plan coming — and reports `Superseded=True` with reason

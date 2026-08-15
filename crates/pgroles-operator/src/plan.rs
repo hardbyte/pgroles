@@ -144,6 +144,64 @@ impl PreparedPlanSql {
 // Plan approval check
 // ---------------------------------------------------------------------------
 
+/// Why a plan is being retired.
+///
+/// The `Approved=False` condition a supersede writes is often the only record a
+/// reviewer sees of why the plan they were looking at disappeared. A single
+/// fixed message ("database state changed") named the least common cause and
+/// misdescribed the rest — an effect-neutral policy edit, effects that vanished
+/// before a decision, a moved target — so every call site names its own.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SupersedeCause {
+    /// The effects this plan described are not the effects the policy would
+    /// produce now.
+    EffectsChanged,
+    /// The effects are gone entirely: applied out of band, or edited away.
+    /// No replacement plan is opened.
+    EffectsCleared,
+    /// A newer plan holds the current effects; this one is redundant.
+    ReplacedByNewerPlan,
+    /// The database the plan was computed against is not the one it would now
+    /// execute against. Carries the specific target-identity verdict.
+    TargetChanged(pgroles_core::approval::TargetIdentityReason),
+    /// The policy stopped pointing at this plan — it moved out of a planning
+    /// state, or its pending changes were resolved another way.
+    PolicyStoppedPlanning,
+}
+
+impl SupersedeCause {
+    /// Condition `reason` string. Kept to the existing `Superseded` value for
+    /// the generic causes so status consumers keep matching; a target change
+    /// reports the identity reason, which is what an operator must act on.
+    pub fn reason(self) -> &'static str {
+        match self {
+            SupersedeCause::TargetChanged(reason) => reason.as_str(),
+            _ => "Superseded",
+        }
+    }
+
+    /// Human-readable condition `message`.
+    pub fn message(self) -> &'static str {
+        match self {
+            SupersedeCause::EffectsChanged => {
+                "the policy's effects changed since this plan was computed, so it no longer \
+                 describes what would happen"
+            }
+            SupersedeCause::EffectsCleared => {
+                "the changes this plan described are no longer pending, so there is nothing left \
+                 to execute"
+            }
+            SupersedeCause::ReplacedByNewerPlan => {
+                "a newer plan holds the current effects and replaces this one"
+            }
+            SupersedeCause::TargetChanged(reason) => reason.message(),
+            SupersedeCause::PolicyStoppedPlanning => {
+                "the policy no longer references this plan, so it will never be executed"
+            }
+        }
+    }
+}
+
 /// Result of checking a plan's approval annotations.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PlanApprovalState {
@@ -581,8 +639,8 @@ async fn supersede_stale_plans(
                 &mut superseded_status.conditions,
                 "Approved",
                 "False",
-                "Superseded",
-                "Database state changed since plan was approved",
+                SupersedeCause::ReplacedByNewerPlan.reason(),
+                SupersedeCause::ReplacedByNewerPlan.message(),
             );
         }
         let patch = serde_json::json!({ "status": superseded_status });
@@ -1708,10 +1766,12 @@ pub async fn mark_plan_rejected(
     Ok(())
 }
 
-/// Mark a plan as Superseded (database state changed since approval).
+/// Mark a plan as Superseded, recording `cause` on the `Approved=False`
+/// condition so the reason the plan was retired survives on the object.
 pub async fn mark_plan_superseded(
     client: &Client,
     plan: &PostgresPolicyPlan,
+    cause: SupersedeCause,
 ) -> Result<(), ReconcileError> {
     let namespace = plan.namespace().ok_or(ReconcileError::NoNamespace)?;
     let plan_name = plan.name_any();
@@ -1723,8 +1783,8 @@ pub async fn mark_plan_superseded(
         &mut status.conditions,
         "Approved",
         "False",
-        "Superseded",
-        "Database state changed since plan was approved",
+        cause.reason(),
+        cause.message(),
     );
 
     let patch = serde_json::json!({ "status": status });
@@ -2177,6 +2237,60 @@ mod tests {
         ]);
         let plan = test_plan("plan-1", PlanPhase::Pending, Some(annotations));
         assert_eq!(check_plan_approval(&plan), PlanApprovalState::Pending);
+    }
+
+    /// The supersede condition is often the only trace a reviewer sees of why
+    /// the plan they were looking at vanished. Every cause must describe
+    /// itself; the previous single message claimed the database had changed
+    /// even when it was an effect-neutral policy edit that retired the plan.
+    #[test]
+    fn every_supersede_cause_names_its_own_reason() {
+        use pgroles_core::approval::TargetIdentityReason;
+
+        let causes = [
+            SupersedeCause::EffectsChanged,
+            SupersedeCause::EffectsCleared,
+            SupersedeCause::ReplacedByNewerPlan,
+            SupersedeCause::PolicyStoppedPlanning,
+            SupersedeCause::TargetChanged(TargetIdentityReason::TargetChanged),
+        ];
+
+        let mut messages = std::collections::BTreeSet::new();
+        for cause in causes {
+            let message = cause.message();
+            assert!(!message.is_empty(), "{cause:?} has no message");
+            assert!(
+                messages.insert(message),
+                "{cause:?} reuses another cause's message"
+            );
+            assert!(
+                !message.contains("Database state changed since plan was approved"),
+                "{cause:?} still carries the old catch-all message"
+            );
+        }
+    }
+
+    /// The generic causes keep reporting `Superseded` so status consumers and
+    /// runbooks matching on that reason keep working. A target change is the
+    /// exception: it is a distinct operational fault and reports the identity
+    /// verdict a human has to act on.
+    #[test]
+    fn supersede_reasons_stay_stable_except_for_a_moved_target() {
+        use pgroles_core::approval::TargetIdentityReason;
+
+        for cause in [
+            SupersedeCause::EffectsChanged,
+            SupersedeCause::EffectsCleared,
+            SupersedeCause::ReplacedByNewerPlan,
+            SupersedeCause::PolicyStoppedPlanning,
+        ] {
+            assert_eq!(cause.reason(), "Superseded", "{cause:?}");
+        }
+
+        assert_eq!(
+            SupersedeCause::TargetChanged(TargetIdentityReason::TargetIdentityUnavailable).reason(),
+            "TargetIdentityUnavailable"
+        );
     }
 
     #[test]

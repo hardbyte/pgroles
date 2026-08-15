@@ -44,7 +44,7 @@ The operator currently reconciles from four event-driven trigger sources, plus t
 - `PostgresPolicy` generation changes
 - `PostgresPolicy` `reconcile.pgroles.io/requestedAt` annotation changes
 - Secret `resourceVersion` changes for referenced database credentials
-- `PostgresPolicyPlan` changes, mapped back to the owning policy by controller-owner UID — this is what makes an approval or rejection annotation take effect immediately rather than at the next interval
+- `PostgresPolicyPlan` changes, mapped back to the owning policy by controller-owner UID — this is what makes an approval or rejection recorded on a plan's status take effect immediately rather than at the next interval
 
 Generation and annotation filtering matter. The controller intentionally ignores status-only `PostgresPolicy` updates and unrelated annotation changes as reconcile triggers, otherwise successful status patches and GitOps tracking metadata can create hot loops that starve other policies targeting the same database.
 

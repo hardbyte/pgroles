@@ -151,12 +151,30 @@ Before approving a plan:
 
 Approve or reject the current plan explicitly:
 
+A decision is a write to the plan's status subresource: one terminal `Approved`
+or `Denied` condition plus the deciding identity, in the same write. There are
+no approval annotations — setting `pgroles.io/approved` does nothing.
+
 ```bash
-kubectl -n <namespace> annotate pgplan <plan-name> \
-  pgroles.io/approved=true --overwrite
-kubectl -n <namespace> annotate pgplan <plan-name> \
-  pgroles.io/rejected=true --overwrite
+kubectl -n <namespace> patch pgplan <plan-name> \
+  --subresource=status --type=merge -p '{
+    "status": {
+      "conditions": [{
+        "type": "Approved", "status": "True",
+        "reason": "ApprovedByReviewer",
+        "message": "reviewed change summary",
+        "lastTransitionTime": "'"$(date -u +%Y-%m-%dT%H:%M:%SZ)"'"
+      }],
+      "decidedBy": {"username": "'"$(kubectl auth whoami -o jsonpath='{.status.userInfo.username}')"'"}
+    }
+  }'
 ```
+
+Reject by writing `Denied` with reason `DeniedByReviewer` in place of
+`Approved`. A merge patch replaces the whole `conditions` array — never append a
+second `Approved` entry alongside the `Approved=False` a plan is created with,
+or the CRD's terminality rule wedges the plan. A decision is terminal and
+write-once; iterating means a new plan, not an edited decision.
 
 After approval, wait for `Applied` and then verify the parent policy's convergence
 conditions. A plan object supports review and recent history, but is not

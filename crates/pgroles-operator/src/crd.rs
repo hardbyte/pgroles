@@ -164,7 +164,8 @@ pub enum CrdReconciliationMode {
 /// future release will reject a policy that omits this field.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 pub enum ApprovalMode {
-    /// Plans require explicit approval annotation before execution.
+    /// Plans require an explicit terminal `Approved` decision on the plan's
+    /// status subresource before execution.
     #[serde(rename = "manual")]
     Manual,
     /// Plans are approved and applied automatically.
@@ -979,6 +980,7 @@ pub struct ChangeSummary {
     printcolumn = r#"{"name":"SQL Stmts","type":"integer","jsonPath":".status.sqlStatements","priority":1}"#,
     printcolumn = r#"{"name":"Phase","type":"string","jsonPath":".status.phase"}"#,
     printcolumn = r#"{"name":"SQL","type":"string","jsonPath":".status.sqlRef.name","priority":1}"#,
+    printcolumn = r#"{"name":"Digest","type":"string","jsonPath":".status.changeDigest","priority":1}"#,
     printcolumn = r#"{"name":"Hash","type":"string","jsonPath":".status.sqlHash","priority":1}"#,
     printcolumn = r#"{"name":"Age","type":"date","jsonPath":".metadata.creationTimestamp"}"#
 )]

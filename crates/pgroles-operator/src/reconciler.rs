@@ -1511,6 +1511,26 @@ async fn apply_under_lock(
                         }
 
                         if decision != crate::plan::ApprovedPlanDecision::Execute {
+                            // Name the actual cause on the condition. A moved
+                            // target reads as an effects change through the
+                            // digest alone, and telling a reviewer their
+                            // effects changed when the database moved sends
+                            // them to inspect the wrong thing.
+                            let supersede_cause = match verdict {
+                                pgroles_core::approval::TargetIdentityVerdict::Superseded(
+                                    reason,
+                                )
+                                | pgroles_core::approval::TargetIdentityVerdict::Blocked(reason) => {
+                                    crate::plan::SupersedeCause::TargetChanged(reason)
+                                }
+                                pgroles_core::approval::TargetIdentityVerdict::Proceed => {
+                                    if decision == crate::plan::ApprovedPlanDecision::Clear {
+                                        crate::plan::SupersedeCause::EffectsCleared
+                                    } else {
+                                        crate::plan::SupersedeCause::EffectsChanged
+                                    }
+                                }
+                            };
                             // The approved effects are no longer the effects
                             // this policy would produce.
                             let stored_digest = current_plan
@@ -1543,8 +1563,12 @@ async fn apply_under_lock(
                                 // Superseded and the reference behind, which
                                 // the next reconcile clears through the same
                                 // helper.
-                                crate::plan::mark_plan_superseded(&ctx.kube_client, &current_plan)
-                                    .await?;
+                                crate::plan::mark_plan_superseded(
+                                    &ctx.kube_client,
+                                    &current_plan,
+                                    supersede_cause,
+                                )
+                                .await?;
 
                                 mark_reconciled_no_changes(
                                     ctx,
@@ -1788,7 +1812,7 @@ async fn apply_under_lock(
                             name,
                             namespace,
                             plan = %current_plan.name_any(),
-                            "plan rejected via annotation"
+                            "plan rejected by a terminal Denied decision"
                         );
 
                         // Update status to reflect rejection, but don't create a new plan
@@ -1851,8 +1875,12 @@ async fn apply_under_lock(
                             if decision == crate::plan::PendingPlanDecision::Clear {
                                 // Nothing replaces this plan, so it is retired
                                 // here rather than after a create.
-                                crate::plan::mark_plan_superseded(&ctx.kube_client, &current_plan)
-                                    .await?;
+                                crate::plan::mark_plan_superseded(
+                                    &ctx.kube_client,
+                                    &current_plan,
+                                    crate::plan::SupersedeCause::EffectsCleared,
+                                )
+                                .await?;
 
                                 mark_reconciled_no_changes(
                                     ctx,
@@ -2662,7 +2690,13 @@ async fn supersede_referenced_plan_if_pending(
         return;
     }
 
-    if let Err(err) = crate::plan::mark_plan_superseded(&ctx.kube_client, &plan).await {
+    if let Err(err) = crate::plan::mark_plan_superseded(
+        &ctx.kube_client,
+        &plan,
+        crate::plan::SupersedeCause::PolicyStoppedPlanning,
+    )
+    .await
+    {
         tracing::warn!(
             plan = %plan_ref.name,
             error = %err,

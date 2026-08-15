@@ -1,48 +1,53 @@
 ---
 title: Plan and approval
-description: Preview changes with observe mode and gate execution behind a reviewed, approved plan.
+description: Preview changes with plan mode and gate execution behind a reviewed, approved plan.
 ---
 
 Seeing what the operator would do before it does it. {% .lead %}
 
 ---
 
-{% callout type="warning" title="Partly a design preview" %}
-Shipped and described accurately below: the semantic change digest as approval
-identity, revalidation of pending plans, write-once plan decisions with
-`decidedBy` — including the annotation removal — deferring generated
-password Secrets until after approval
-([#181](https://github.com/hardbyte/pgroles/issues/181)), and dual target
-identity with `requirePhysicalIdentity`
-([#180](https://github.com/hardbyte/pgroles/issues/180)).
+Everything on this page describes shipped behaviour and works today, with one
+exception: the four items in the callout below, which are marked inline where
+they appear.
 
-**Not yet built**, though this page describes them: `mode: observe` (today it is
-still `mode: plan`), the `PostgresPolicyCandidate` CRD, and every `pgroles plan ...` /
-`pgroles candidate ...` command shown here — the CLI has no such subcommands
-yet. Use `kubectl` for anything you need to do today; see the
-[quick start](/docs/operator-quick-start) for the exact commands.
+{% callout type="note" title="Not built yet" %}
+These are the only forward-looking items on this page:
+
+- **The `PostgresPolicyCandidate` CRD** — proposing a change without editing
+  the enforcing policy. See [candidates and
+  promotion](/docs/operator-candidates), which is a design preview in full.
+- **`pgroles plan ...` and `pgroles candidate ...` CLI subcommands** — the CLI
+  has no such commands. `pgroles plan` is an alias of `pgroles diff` and works
+  against a database directly, not against a cluster. Use `kubectl` for
+  everything on this page.
+- **Renaming `mode: plan` to `mode: observe`** — so that "plan" names exactly
+  one thing, the `PostgresPolicyPlan` resource. The field value today is
+  `plan`, and that is what this page uses throughout.
+- **An `approvedChangeDigest` token on the decision** — pinning the digest a
+  reviewer saw into the decision write itself. Today the binding is the plan
+  object: a decision applies to whatever digest that plan holds, and a
+  supersede retires the plan rather than mutating it.
 {% /callout %}
 
-## Observe mode
+## Plan mode
 
-Set `mode: observe` to let the operator inspect the database, compute the
-diff, and publish the planned SQL without executing it. (`observe` is the mode
-previously named `plan` — renamed so that "plan" means exactly one thing: the
-`PostgresPolicyPlan` resource.)
+Set `mode: plan` to let the operator inspect the database, compute the diff,
+and publish the planned SQL without executing it.
 
 ```yaml
 spec:
   connection:
     secretRef:
       name: postgres-credentials
-  mode: observe
+  mode: plan
   approval: manual
   roles:
     - name: preview-user
       login: true
 ```
 
-In `observe` mode:
+In `plan` mode:
 
 - the operator connects to the database and computes the full diff normally
 - no mutating PostgreSQL SQL is executed and no Kubernetes Secrets are created
@@ -52,11 +57,11 @@ In `observe` mode:
   gzipped ConfigMap referenced by `status.sqlRef`
 - `Ready=True` with reason `Planned`; `Drifted=True` while changes are pending
 
-Be clear about what `observe` is not: it is a mutable spec field, not a
+Be clear about what `plan` mode is not: it is a mutable spec field, not a
 security boundary. Anyone who can edit the policy can switch it to `apply`,
 and the operator still holds whatever database credential it was given. For
 deployments where the operator must never write, the guarantee is a
-**read-only PostgreSQL credential** — `observe` is what makes running under
+**read-only PostgreSQL credential** — `mode: plan` is what makes running under
 one coherent (drift visibility without a stream of permission-denied errors).
 For a reviewed apply, use `mode: apply` with `approval: manual`. Use `suspend`
 to stop reconciling entirely.
@@ -81,11 +86,11 @@ kubectl get configmap "$CM" -o jsonpath="{.binaryData['plan\.sql\.gz']}" |
   base64 -d | gunzip
 ```
 
-`pgroles plan show <plan>` follows whichever branch applies. A plan whose
-compressed preview would still exceed the ConfigMap limit sets no `sqlRef`,
-and `sqlInline` carries a truncated preview ending in a `-- truncated: ... --`
-marker. The preview is a review artifact in every case: **pgroles never
-executes stored SQL**.
+A plan whose compressed preview would still exceed the ConfigMap limit sets no
+`sqlRef`, and `sqlInline` carries a truncated preview ending in a
+`-- truncated: ... --` marker; `status.sqlTruncated` is `true` in that case.
+The preview is a review artifact in every case: **pgroles never executes stored
+SQL**.
 
 ## What executes: mode and approval together
 
@@ -95,23 +100,30 @@ order. Only the last one is about human review:
 | `suspend` | `mode` | `approval` | Plan created? | Mutating SQL executed? |
 |---|---|---|---|---|
 | `true` | — | — | no | no — nothing reconciles at all |
-| `false` | `observe` | *ignored* | yes | **never** |
+| `false` | `plan` | *ignored* | yes | **never** |
 | `false` | `apply` | `auto` | yes | immediately, plan auto-approved |
 | `false` | `apply` | `manual` | yes | only once approved *and* still current |
 
-`approval` has no effect in `observe` mode; a decision recorded on an
-observe-mode plan is accepted and does nothing, and the policy reports an
-`ApprovalIgnored` condition so this is distinguishable from a stalled
-operator.
+`approval` has no effect in `plan` mode; a decision recorded on a plan-mode
+plan is accepted and does nothing, and the policy reports an `ApprovalIgnored`
+condition so this is distinguishable from a stalled operator.
+
+Under `approval: auto` the operator approves its own plan and records
+`status.decidedBy.username` as `system:pgroles-operator(auto-approval)`, so an
+audit trail never shows an unattributed approval.
 
 ## Approval identity: the change digest
 
-What a decision approves is the plan's **change digest**: a versioned hash
-(`pgroles.io/approval-effect/v2`) of the canonical, deterministically ordered
-typed effects — role lifecycle, grants, memberships, ownership and default
-privileges, retirements — bound together with the reconciliation mode and the
-[target identity](#target-identity), physical and logical. (Managed scope joins the binding once it becomes a
-first-class field; today a scope change shows up as a change in effects.)
+What a decision approves is the plan's **change digest**: a versioned hash of
+the canonical, deterministically ordered typed effects — role lifecycle,
+grants, memberships, ownership and default privileges, retirements — bound
+together with the reconciliation mode and the [target
+identity](#target-identity), physical and logical. The encoding in force is
+recorded on the plan as `status.changeDigestEncoding`, currently
+`pgroles.io/approval-effect/v2`; digests computed under different encodings are
+never comparable, so a plan carrying an older tag is superseded rather than
+matched. (Managed scope joins the binding once it becomes a first-class field;
+today a scope change shows up as a change in effects.)
 
 The applied base is deliberately *not* a digest input. The plan records which
 base it was computed against as provenance, and that record advances whenever
@@ -136,29 +148,118 @@ activity re-plans to an identical digest and the pending plan — including a
 decision already recorded on it — is retained, with the revalidated
 generation noted on its status.
 
-## Deciding a plan
+## Plan status fields
 
-A decision is a status write on the plan — one terminal condition and
-`status.decidedBy`, recorded together, exactly as `EphemeralAccessRequest`
-decisions work:
+The fields on `PostgresPolicyPlan.status` that a reviewer or a runbook reads:
+
+| Field | Meaning |
+| --- | --- |
+| `phase` | `Pending`, `Approved`, `Applying`, `Applied`, `Failed`, `Superseded`, `Rejected` |
+| `conditions` | `Computed`, `Applied`, and the terminal decision conditions `Approved` / `Denied` |
+| `decidedBy` | Kubernetes identity (`username`, `uid`, `groups`) that decided the plan. Write-once, and truthful only under the admission layer below |
+| `changeDigest` | **The approval identity.** Canonical semantic digest of the typed effects, bound to reconciliation mode and target identity |
+| `changeDigestEncoding` | Version tag the digest was computed under — `pgroles.io/approval-effect/v2`. Digests from different encodings never compare equal |
+| `targetPhysicalIdentity` | `pg_control_system().system_identifier` read at plan time — the storage lineage the approval is bound to. Absent on engines that do not expose it |
+| `targetLogicalFingerprint` | Fingerprint of the resolved connection endpoint (host, port, database) the plan was computed against |
+| `physicalIdentityAvailable` | Whether the physical identity was *readable* at plan time. Recorded explicitly so "could not be read" is distinguishable from "this plan predates the field" — the difference is what makes a later downgrade fail closed |
+| `revalidatedGeneration` | Policy generation the plan was most recently confirmed current against. Provenance, never approval identity |
+| `revalidatedAt` | When that confirmation last happened |
+| `sqlHash` | SHA-256 of the rendered SQL. A diagnostic for the preview only — never the approval gate |
+| `sqlInline` / `sqlRef` / `sqlTruncated` | Where the redacted SQL preview lives, and whether it was truncated |
+| `changeSummary` / `sqlStatements` | Counts. `sqlStatements` can far exceed `changeSummary.total` when wildcard grants expand |
+| `computedAt` / `appliedAt` / `applyingSince` / `failedAt` | Lifecycle timestamps |
+| `lastError` | Failure detail when `phase` is `Failed` |
+
+`kubectl get pgplan` shows the phase, the `Approved` condition and the change
+counts; `-o wide` adds the change digest, the SQL hash and the statement count:
 
 ```bash
-pgroles plan approve orders-plan-9f21c4      # or: pgroles plan reject ...
+kubectl get pgplan -o wide
 ```
 
-There is one rejection model across the product. A rejected plan records
-`Denied=True` with reason `DeniedByReviewer` and moves to phase `Rejected`;
-`Approved=True` and `Denied=True` are mutually exclusive and neither can be
-changed once written. ("Rejected" is the phase; `Denied` is the condition —
-they always travel together.) A candidate whose plan is denied is terminal
-too, reporting `Superseded=True, reason=PlanDenied`.
+## Deciding a plan
 
-Decisions are written to the plan's status subresource with `kubectl patch
---subresource=status` (the CLI wrapper is not built yet). The
-`pgroles.io/approved` and `pgroles.io/rejected` annotations that earlier
-releases used have been removed outright: setting them now does nothing at all,
-which is deliberate — a retired approval mechanism that still worked would be a
-silent bypass of everything below.
+A decision is a **write to the plan's status subresource**: one terminal
+condition — `Approved` or `Denied` — and `status.decidedBy`, recorded in the
+same write. There are no approval annotations. The `pgroles.io/approved` and
+`pgroles.io/rejected` annotations earlier releases used have been removed
+outright: setting them now does nothing at all, which is deliberate — a retired
+approval mechanism that still worked would be a silent bypass of everything
+below.
+
+Approve the plan you reviewed:
+
+```bash
+kubectl patch pgplan "$PLAN" --namespace "$NAMESPACE" \
+  --subresource=status --type=merge -p '{
+    "status": {
+      "conditions": [{
+        "type": "Approved", "status": "True",
+        "reason": "ApprovedByReviewer",
+        "message": "reviewed change summary",
+        "lastTransitionTime": "'"$(date -u +%Y-%m-%dT%H:%M:%SZ)"'"
+      }],
+      "decidedBy": {"username": "'"$(kubectl auth whoami -o jsonpath='{.status.userInfo.username}')"'"}
+    }
+  }'
+```
+
+Reject it by writing `Denied` in place of `Approved`:
+
+```bash
+kubectl patch pgplan "$PLAN" --namespace "$NAMESPACE" \
+  --subresource=status --type=merge -p '{
+    "status": {
+      "conditions": [{
+        "type": "Denied", "status": "True",
+        "reason": "DeniedByReviewer",
+        "message": "not approving this change",
+        "lastTransitionTime": "'"$(date -u +%Y-%m-%dT%H:%M:%SZ)"'"
+      }],
+      "decidedBy": {"username": "'"$(kubectl auth whoami -o jsonpath='{.status.userInfo.username}')"'"}
+    }
+  }'
+```
+
+Two mechanics of these commands are worth knowing:
+
+- **A merge patch replaces the whole `conditions` array.** That is harmless
+  here — the operator rewrites its own conditions on the next reconcile — but
+  it means you must not append a second `Approved` entry alongside the
+  `Approved=False` a plan is created with. Two `Approved` entries make the
+  terminality rule compare `['Approved','Approved']` against `['Approved']` and
+  reject the operator's next write, wedging the plan. If you prefer to preserve
+  the operator's other conditions, read the array, drop any `Approved`/`Denied`
+  entry, append yours, and write the result back — that is what
+  `scripts/e2e-helpers.sh` does.
+- **`decidedBy` must land in the same write.** A decision condition without it
+  is rejected at admission.
+
+### After a decision
+
+Approval does not execute a stored artifact. On the next reconcile — which the
+status write triggers immediately, via the plan watch — the operator takes the
+advisory lock, re-inspects, recomputes the effects, and compares the recomputed
+change digest and target identity against what the plan bound. On a match it
+executes; on any divergence it supersedes the plan before the first statement.
+The plan moves `Approved` → `Applying` → `Applied`, and the policy reports
+`Drifted=False`.
+
+A rejection is terminal in the same way. The plan records `Denied=True` with
+reason `DeniedByReviewer` and moves to phase `Rejected`; `Approved=True` and
+`Denied=True` are mutually exclusive and neither can be changed once written.
+("Rejected" is the phase; `Denied` is the condition — they always travel
+together.) The policy's `status.current_plan_ref` is cleared, and the
+replacement plan is created on the *next* reconcile rather than immediately,
+which keeps a rejected plan from spinning in a reject-recreate loop. Iterating
+means a new plan, not an edited decision.
+
+A rejected or superseded plan leaves **no generated password Secret behind**.
+For `password.generate` roles the operator synthesizes material in memory while
+planning and creates the Kubernetes Secret only during post-approval execution
+— see [Passwords and planning](#passwords-and-planning).
+
+### Who may decide
 
 The trust model has two layers, and both matter:
 
@@ -169,14 +270,23 @@ The trust model has two layers, and both matter:
 - **Actor identity requires the admission layer.** CEL cannot see the
   requesting user, so `decidedBy` is truthful only when the shipped Kyverno
   reference policy (or an equivalent mutating webhook) overwrites it from
-  admission `userInfo`. Without that layer, `decidedBy` is whatever the
-  client asserted. Deploy the reference policy anywhere approvals are a
-  control you rely on.
+  admission `userInfo`. That policy also requires the logical `approve` verb on
+  the parent `PostgresPolicy`, so patch access to `postgrespolicyplans/status`
+  is not by itself authority to approve a database change. Without that layer,
+  `decidedBy` is whatever the client asserted and anyone who can patch plan
+  status can approve, under any name.
 
-Approval RBAC is per-kind: granting a team create on policies or candidates
-grants nothing on plan status. Execution settings (`approval`, managed scope)
-are platform-controlled — protect them with an admission policy so a policy
-author cannot weaken them in the same edit that introduces a change.
+Install it through the chart (`admissionPolicies.enabled=true`, Kyverno 1.18 or
+later), which generates the operator's own exemption from the values you
+installed with; `k8s/security/plan-decision-kyverno.yaml` is the same policy for
+chart-less installs, pinned to the `pgroles-system` namespace and the
+`pgroles-operator` ServiceAccount. Bind the `pgroles-plan-approver` ClusterRole
+to the humans or groups permitted to authorise changes.
+
+Approval RBAC is per-kind: granting a team create on policies grants nothing on
+plan status. Execution settings (`approval`, managed scope) are
+platform-controlled — protect them with an admission policy so a policy author
+cannot weaken them in the same edit that introduces a change.
 
 ## Plans stay current while awaiting review
 
@@ -184,21 +294,29 @@ A pending plan is revalidated on every reconcile — there is no frozen-plan
 window. When the policy, database, target, or overlays change while a plan
 awaits a decision:
 
-- **effects unchanged** (identical change digest): the plan is retained, the
-  revalidated generation recorded; the policy's change summary and
-  `current_plan_ref` always describe the same plan.
+- **effects unchanged** (identical change digest): the plan is retained and
+  `revalidatedGeneration` / `revalidatedAt` advance; the policy's change
+  summary and `current_plan_ref` always describe the same plan.
 - **effects changed**: the plan is superseded with an explicit condition and
   Event, and a fresh plan is created for review.
+- **effects gone**: the plan is superseded and *no* replacement is created — a
+  replacement would hold nothing and still demand a decision.
 
 Approving a plan therefore approves what the plan currently shows. If a
 supersede races your approval, the decision lands on a plan that is no longer
 current and nothing executes — the fresh plan awaits its own decision.
 
-Rejecting a plan — `Denied=True`, phase `Rejected`, as above — clears
-`status.current_plan_ref` on the policy. The replacement is created on the
-next reconcile rather than immediately, which keeps a rejected plan from
-spinning in a reject-recreate loop. For a candidate's plan there is no
-replacement: fix the proposal by filing a successor candidate.
+A supersede writes `Approved=False` and names the cause in the condition
+message, so the reason a plan you were reviewing disappeared survives on the
+object:
+
+| Cause | Condition reason | What happened |
+| --- | --- | --- |
+| Effects changed | `Superseded` | the policy would now produce different effects; a fresh plan is opened |
+| Effects cleared | `Superseded` | the changes are no longer pending — applied out of band, or edited away. No replacement |
+| Replaced by a newer plan | `Superseded` | a newer plan already holds the current effects |
+| Policy stopped planning | `Superseded` | the policy no longer references this plan |
+| Target moved | `TargetChanged` and friends (see [below](#target-identity)) | the plan would execute against a different database than the one reviewed |
 
 ## Target identity
 
@@ -207,14 +325,14 @@ replacement: fix the proposal by filing a successor candidate.
 leaves plan, conflict and lock identity untouched, so the approval identity
 binds the database itself, in both of the forms that mean something:
 
-1. **Physical**: `pg_control_system().system_identifier`. It answers *same
-   storage lineage?* — it survives failover to a streaming replica, and it
-   catches a restore taken from a different cluster behind an unchanged
-   endpoint.
+1. **Physical**: `pg_control_system().system_identifier`, recorded on the plan
+   as `status.targetPhysicalIdentity`. It answers *same storage lineage?* — it
+   survives failover to a streaming replica, and it catches a restore taken
+   from a different cluster behind an unchanged endpoint.
 2. **Logical**: the resolved connection fingerprint — host, port, database
-   name. It answers *same endpoint?* — which is what catches a clone, a
-   branch, or a replica, since those all inherit the parent's
-   `system_identifier`.
+   name — recorded as `status.targetLogicalFingerprint`. It answers *same
+   endpoint?* — which is what catches a clone, a branch, or a replica, since
+   those all inherit the parent's `system_identifier`.
 
 Neither is sufficient alone, so both are bound and a change in either fails
 closed. The logical half is fooled by connection poolers and DNS; the physical
@@ -283,11 +401,12 @@ recomputed against the state observed under that lock; any divergence aborts
 before the first statement and supersedes the plan.
 
 To review proposed changes *without* editing the active policy at all, see
-[Candidates and promotion](/docs/operator-candidates).
+[Candidates and promotion](/docs/operator-candidates) — a design preview, not
+yet released.
 
 {% callout type="warning" title="Set `spec.approval` explicitly" %}
 `spec.approval` decides whether a human gates SQL execution. When omitted the
-operator still infers it from `spec.mode` — `apply` implies `auto`, `observe`
+operator still infers it from `spec.mode` — `apply` implies `auto`, `plan`
 implies `manual` — which leaves the gate invisible on the object. That
 inference is deprecated: a policy relying on it reports an `ApprovalUnset`
 condition, emits a warning Event, and counts toward

@@ -59,6 +59,12 @@
             "type": "string"
           },
           {
+            "jsonPath": ".status.changeDigest",
+            "name": "Digest",
+            "priority": 1,
+            "type": "string"
+          },
+          {
             "jsonPath": ".status.sqlHash",
             "name": "Hash",
             "priority": 1,
