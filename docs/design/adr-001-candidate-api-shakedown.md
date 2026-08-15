@@ -1,28 +1,38 @@
 # ADR-001: PostgresPolicyCandidate API shakedown
 
-- **Status:** Accepted (gates Phase 1 of [#182](https://github.com/hardbyte/pgroles/issues/182); parent [#173](https://github.com/hardbyte/pgroles/issues/173))
+- **Status:** Accepted
 - **Date:** 2026-08-15
 - **Deciders:** pgroles maintainers
 - **Supersedes / superseded by:** —
 
-This is the first ADR in the repo. Format: status/date, context, one section per
-decision (each with the decision, the reasoning, and its consequences), then
-open questions. Keep ADRs decision-dense; specification prose belongs in
-`docs/src/pages/docs/`.
+This is the first ADR in the repo. An ADR records a decision, not a design or a
+task list: the problem and constraints, the chosen approach, why it won, the
+rejected alternatives, and the consequences — including operational risks and
+follow-up work — and it distinguishes the intended steady state from the
+migration path. Specification prose belongs in `docs/src/pages/docs/`; ADRs
+must stay legible without access to the issue tracker.
 
-## Context
+## Context and constraints
 
-[#173](https://github.com/hardbyte/pgroles/issues/173) commits to a
-spec-immutable `PostgresPolicyCandidate` whose `spec.content` carries proposed
-policy content, planned by the operator in the parent policy's execution
-context. [#182](https://github.com/hardbyte/pgroles/issues/182) gates
-implementation on this shakedown. The end-state behaviour is already specified
-in `docs/src/pages/docs/operator-candidates.md`; this ADR settles only the API
+pgroles plans to add a user-created, spec-immutable `PostgresPolicyCandidate`
+kind: `spec.content` carries proposed policy content, the operator plans it in
+the parent policy's execution context, and a reviewed plan gates GitOps
+promotion into `PostgresPolicy.spec`. The end-state behaviour is specified in
+`docs/src/pages/docs/operator-candidates.md`. This ADR settles only the API
 mechanics that are expensive to change after the kind ships.
 
-pgroles is pre-1.0 with a single production user (Partly). Breaking changes are
-acceptable and are preferred over compatibility scar tissue. Optimise for the
-long-term API and DX.
+Constraints in force at decision time:
+
+- pgroles is pre-1.0 with a single production user (Partly). Breaking changes
+  are acceptable and preferred over compatibility scar tissue; optimise for the
+  long-term API and DX.
+- Immutability must hold against the object's own author — reviewers must never
+  adjudicate "which version did I approve". Whole-spec CEL immutability
+  (`self == oldSelf`) requires every list/map/string in the transitive schema
+  to carry explicit bounds for the API server's static cost estimator.
+- Promotion integrity rests on a content digest computed over canonical content
+  bytes; anything that makes stored content diverge from the authored manifest
+  (schema defaulting, type conversion) undermines it.
 
 Relevant current state, verified:
 
@@ -53,7 +63,7 @@ So bounded schemas are already the house style for every kind added after
 policy-content type. Domain-derived `maxLength`/`maxItems`/`maxProperties`
 bounds are added to that shared type, and therefore apply to `PostgresPolicy`
 too. Whole-spec `self == oldSelf` immutability is applied to
-`PostgresPolicyCandidate.spec`, matching `crd.rs:1294`.
+`PostgresPolicyCandidate.spec`, matching the ephemeral kinds' existing rule.
 
 ### Cost-budget math
 
@@ -67,13 +77,14 @@ Upstream limits (Kubernetes `apiextensions-apiserver` / `apiserver`):
 | `RuntimeCELCostBudget` | 10,000,000 | actual runtime cost per custom-resource request |
 
 Sources: `k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/validation`
-(static limits) and `k8s.io/apiserver/pkg/apis/cel/config.go` (runtime limits);
-background in [KEP-2876](https://github.com/kubernetes/enhancements/tree/master/keps/sig-api-machinery/2876-crd-validation-expression-language)
+(static limits), `k8s.io/apiserver/pkg/apis/cel/config.go` (runtime limits),
+the CRD validation-rules KEP
+(<https://github.com/kubernetes/enhancements/tree/master/keps/sig-api-machinery/2876-crd-validation-expression-language>)
 and <https://kubernetes.io/docs/reference/using-api/cel/>.
 
 The static estimate for object equality is driven by the schema's declared
 bounds: list cost ≈ `maxItems × element cost`; string equality ≈ `maxLength / 8`
-cost units. Proposed bounds and their estimated contribution to the single
+cost units. Chosen bounds and their estimated contribution to the single
 `self == oldSelf` expression:
 
 | Collection | Bound | Rationale | Est. cost |
@@ -97,7 +108,9 @@ on UPDATE — which for an immutable, create-once kind means only on rejected
 edits.
 
 **These numbers are an estimate.** The upstream estimator is known to be
-pessimistic in specific cases (kubernetes#120973, #126239), so the estimate is
+pessimistic in specific cases
+(<https://github.com/kubernetes/kubernetes/issues/120973>,
+<https://github.com/kubernetes/kubernetes/issues/126239>), so the estimate is
 not a proof. It is, however, cheaply falsifiable: the API server rejects the
 CRD outright at create time if the expression exceeds 10M. **Required gate:**
 a CI test that applies the generated candidate CRD to a real API server (the
@@ -120,7 +133,7 @@ the bounds only behind that test.
    like. This is the strongest argument. A forked type reintroduces a conversion
    step precisely at the moment the digest must be trusted.
 
-### Why not fork
+### Rejected alternative: fork the content type
 
 The content types are shared with the CLI's manifest model
 (`pgroles-core/src/manifest.rs`) — a fork is not one duplicated struct but a
@@ -135,23 +148,28 @@ leave `PostgresPolicy` unbounded, which we do not want.
    weakens to "operator-enforced".
 2. **Digest-in-status + admission**: stamp `status.contentDigest` on first
    reconcile and reject spec updates in Kyverno. Weighed and rejected as the
-   *primary* mechanism because the chart now ships Kyverno **default-off**, so
-   this makes immutability depend on an optional component — acceptable for
-   `decidedBy` attribution (which CEL genuinely cannot do: CEL has no
-   `request.userInfo`), not acceptable for the integrity of the reviewed
-   artifact.
+   *primary* mechanism because the chart ships the Kyverno policies
+   **default-off**, so this makes immutability depend on an optional
+   component — acceptable for `decidedBy` attribution (which CEL genuinely
+   cannot do: CEL has no `request.userInfo`), not acceptable for the integrity
+   of the reviewed artifact.
 
-**Consequences.** Existing `PostgresPolicy` objects above the new bounds are
-rejected on next apply — a breaking change, accepted pre-1.0, with bounds set
-far above real usage. Bounds must land on the shared type and in the CLI's
-validation in the same release as the candidate kind.
+**Steady state.** One bounded content type, shared by CLI, policy and
+candidate; whole-spec CEL immutability on the candidate; bounds documented as
+part of the API contract.
+
+**Migration path and operational risk.** Existing `PostgresPolicy` objects
+above the new bounds are rejected on their next apply — a breaking change,
+accepted pre-1.0, with bounds set far above observed usage. Bounds must land on
+the shared type and in the CLI's validation in the same release as the
+candidate kind, and the release notes must call out the new limits.
 
 ## Decision 2 — No OpenAPI defaults anywhere under `spec.content`
 
-**Verified, and it contradicts the assumption in #173** that "serde-level
-defaults are irrelevant to admission". With the current schemars/kube-derive
-setup, `#[serde(default)]` **does** emit OpenAPI `default` into the CRD —
-including function-path defaults:
+An earlier working assumption in the candidate design held that serde-level
+defaults are invisible to admission. **Verified false**: with the current
+schemars/kube-derive setup, `#[serde(default)]` **does** emit OpenAPI `default`
+into the CRD — including function-path defaults:
 
 - `interval` → `"default": "5m"` (from `#[serde(default = "default_interval")]`,
   `crd.rs:56`)
@@ -180,11 +198,14 @@ digest* of a stored candidate would no longer match the digest CI computed from
 the same YAML. Optionality must be expressed by `nullable` + resolution in the
 operator, never by API-server defaulting.
 
-**Consequences.** Content semantics for omitted fields are defined once, in the
-operator/core resolution layer, and must be identical for `PostgresPolicy` and
-candidates. Longer term the same treatment should extend to `PostgresPolicy`
-content fields so that promotion is byte-stable in both directions; that is a
-follow-up, not a Phase 1 blocker (a policy has no `self == oldSelf` rule).
+**Steady state.** Content semantics for omitted fields are defined once, in the
+operator/core resolution layer, and are identical for `PostgresPolicy` and
+candidates.
+
+**Migration path.** Suppress default emission on content fields when the
+candidate kind is introduced; extending the same treatment to `PostgresPolicy`
+content fields (so promotion is byte-stable in both directions) is follow-up
+work, not a blocker — a policy has no `self == oldSelf` rule today.
 
 ## Decision 3 — Ownership, retention, cascade
 
@@ -200,8 +221,9 @@ follow-up, not a Phase 1 blocker (a policy has no `self == oldSelf` rule).
 - Cross-namespace refs are not supported: `spec.policyRef` resolves in the
   candidate's own namespace (an owner reference cannot cross namespaces anyway).
 
-**Consequence.** Deleting a policy silently deletes open candidates and their
-plans. Acceptable: a candidate has no meaning without its base.
+**Consequence / operational risk.** Deleting a policy silently deletes open
+candidates and their plans. Accepted: a candidate has no meaning without its
+base.
 
 ## Decision 4 — RBAC and admission boundaries
 
@@ -212,18 +234,19 @@ plans. Acceptable: a candidate has no meaning without its base.
 | GitOps controller | `create`/`update` on `postgrespolicies`; no decision verbs |
 | operator | full on plans and candidate status; read on policies |
 
-Three cooperating mechanisms, as in #173: per-kind RBAC (above), CEL write-once
-terminality on the decision, and Kyverno-stamped `decidedBy`. The Kyverno
-reference policies extend to candidates with exactly two rules: deny `UPDATE` of
-`spec` (defence in depth behind the CEL rule) and deny `create` of a candidate
-whose `spec.content` sets platform-controlled execution settings. Because the
-chart ships Kyverno **default-off**, the docs must state plainly: without the
-admission layer, `decidedBy` is advisory and the author/approver split rests on
-RBAC alone.
+Separation of duties rests on three cooperating mechanisms: per-kind RBAC
+(above), CEL write-once terminality on the decision, and admission-stamped
+`decidedBy` (Kyverno). The Kyverno reference policies extend to candidates with
+exactly two rules: deny `UPDATE` of `spec` (defence in depth behind the CEL
+rule) and deny `create` of a candidate whose `spec.content` sets
+platform-controlled execution settings. Because the chart ships the Kyverno
+policies **default-off**, the docs must state plainly: without the admission
+layer, `decidedBy` is advisory and the author/approver split rests on RBAC
+alone.
 
 ## Decision 5 — Content-by-reference threshold
 
-**Decision.** Inline content is the only supported form in Phase 1.
+**Decision.** Inline content is the only supported form in the first release.
 `spec.contentRef` (ConfigMap + `spec.contentDigest`) is specified but not
 implemented, with the trigger stated as a rule rather than a byte count: inline
 content is supported up to the schema bounds in Decision 1, which fit
@@ -257,28 +280,35 @@ so adding `contentRef` later changes transport only.
 
 Comparison is on this pair set, not on the change digest: overlays legitimately
 change the digest, and the rule must be narrower than "digest changed" so that
-policies with continuous ephemeral traffic stay reviewable (the acceptance
-criterion in #182).
+policies with continuous ephemeral traffic stay reviewable — blanket
+invalidation would make candidates unusable wherever review latency exceeds the
+overlay-change interval.
 
 **Consequence.** Wildcard expansion makes overlap dependent on observed database
 state, so the same candidate can flip to `OverlayOverlap` when a new object
 appears. Correct — that is a genuine change in reviewed effects.
 
-## Open questions, with recommendations
+## Related decisions recorded here, with recommendations
 
-- **`mode: plan` → `mode: observe`** (#173). *Recommendation: do it, in the same
+- **Rename `mode: plan` → `mode: observe`.** *Recommendation: do it, in the same
   breaking release as candidates.* One release absorbs one rename; "plan" then
   names exactly one artifact (`PostgresPolicyPlan`). No shim, no alias, pre-1.0.
   It is a change to `PostgresPolicySpec.mode` (`crd.rs:65`), touching docs,
   samples and E2E — cheap now, expensive after GA.
-- **#91 Bundle/Fragment in-cluster?** *Recommendation: composition stays a
-  CLI/CI concern that emits a single candidate or policy.* This removes two
+- **Bundle/fragment composition in-cluster?** *Recommendation: composition stays
+  a CLI/CI concern that emits a single candidate or policy.* This removes two
   kinds from the target set, keeps the operator free of Git fetching, and keeps
   the content digest computed over one artifact. Recorded as a strong lean, not
-  a decision — formal resolution belongs to #91.
-- Still open elsewhere: the `spec.approvedChangeDigest` promotion token, the
-  canonical `approval-effect/v1` encoding, and whether any managed provider
-  blocks `pg_control_system()`.
-- Open here: whether `PostgresPolicy` content should also drop OpenAPI defaults
-  (Decision 2 follow-up), and confirmation of the estimated CEL cost by the CI
-  gate — if it fails, Decision 1's fallback 1 applies and this ADR is amended.
+  a decision — formal resolution belongs with the composition design.
+
+## Follow-up work and open items
+
+- Confirm the estimated CEL cost via the CI gate in Decision 1; if the gate
+  fails, fallback 1 (per-field immutability + digest) applies and this ADR is
+  amended.
+- Decide whether `PostgresPolicy` content should also drop OpenAPI defaults
+  (Decision 2 follow-up).
+- Still open elsewhere in the candidate design: the promotion-token variant of
+  approval (a digest recorded in `PostgresPolicy.spec`, moving the
+  approver/promoter boundary to Git branch protection), and the canonical
+  encoding details of the semantic change digest.
