@@ -32,6 +32,23 @@ rules:
       - postgrespolicyplans/status
     verbs: [get, list, watch]
 ---
+# The `approve`-verb check below posts a SubjectAccessReview using the Kyverno
+# admission controller's own credentials. Without this it cannot, and because
+# the policy is enforcing, a failed context lookup blocks every decision write.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: pgroles-plan-decision-kyverno-sar
+  labels:
+    rbac.kyverno.io/aggregate-to-admission-controller: "true"
+rules:
+  - apiGroups: [authorization.k8s.io]
+    resources: [subjectaccessreviews]
+    verbs: [create]
+  - apiGroups: [pgroles.io]
+    resources: [postgrespolicies, postgrespolicyplans]
+    verbs: [get, list, watch]
+---
 apiVersion: kyverno.io/v1
 kind: ClusterPolicy
 metadata:
@@ -53,17 +70,25 @@ spec:
               kinds: [pgroles.io/v1alpha1/PostgresPolicyPlan/status]
               operations: [UPDATE]
       preconditions:
-        any:
+        all:
+          # Only a *newly true* decision counts. The operator's own writes —
+          # creating a plan with Approved=False, recording a rejection it
+          # observed, auto-approving under `approval: auto` — must not be
+          # treated as a reviewer decision, or the operator would need the
+          # approve verb and would have its own decidedBy overwritten.
           - key: >-
-              {{ to_string(request.object.status.conditions[?type == 'Approved'] || `[]`) }}
-            operator: NotEquals
+              {{ length(request.object.status.conditions[?(type == 'Approved' || type == 'Denied') && status == 'True']) }}
+            operator: GreaterThan
             value: >-
-              {{ to_string(request.oldObject.status.conditions[?type == 'Approved'] || `[]`) }}
-          - key: >-
-              {{ to_string(request.object.status.conditions[?type == 'Denied'] || `[]`) }}
+              {{ length(request.oldObject.status.conditions[?(type == 'Approved' || type == 'Denied') && status == 'True'] || `[]`) }}
+          # EDIT THIS if you install the operator under a different namespace
+          # or ServiceAccount name (Helm: `operator.serviceAccount.name`,
+          # `--namespace`). Kyverno cannot resolve it for you, and getting it
+          # wrong means the operator's own status writes are treated as
+          # reviewer decisions and rejected.
+          - key: "{{ request.userInfo.username }}"
             operator: NotEquals
-            value: >-
-              {{ to_string(request.oldObject.status.conditions[?type == 'Denied'] || `[]`) }}
+            value: "system:serviceaccount:pgroles-system:pgroles-operator"
       mutate:
         patchStrategicMerge:
           status:
@@ -82,17 +107,25 @@ spec:
               kinds: [pgroles.io/v1alpha1/PostgresPolicyPlan/status]
               operations: [UPDATE]
       preconditions:
-        any:
+        all:
+          # Only a *newly true* decision counts. The operator's own writes —
+          # creating a plan with Approved=False, recording a rejection it
+          # observed, auto-approving under `approval: auto` — must not be
+          # treated as a reviewer decision, or the operator would need the
+          # approve verb and would have its own decidedBy overwritten.
           - key: >-
-              {{ to_string(request.object.status.conditions[?type == 'Approved'] || `[]`) }}
-            operator: NotEquals
+              {{ length(request.object.status.conditions[?(type == 'Approved' || type == 'Denied') && status == 'True']) }}
+            operator: GreaterThan
             value: >-
-              {{ to_string(request.oldObject.status.conditions[?type == 'Approved'] || `[]`) }}
-          - key: >-
-              {{ to_string(request.object.status.conditions[?type == 'Denied'] || `[]`) }}
+              {{ length(request.oldObject.status.conditions[?(type == 'Approved' || type == 'Denied') && status == 'True'] || `[]`) }}
+          # EDIT THIS if you install the operator under a different namespace
+          # or ServiceAccount name (Helm: `operator.serviceAccount.name`,
+          # `--namespace`). Kyverno cannot resolve it for you, and getting it
+          # wrong means the operator's own status writes are treated as
+          # reviewer decisions and rejected.
+          - key: "{{ request.userInfo.username }}"
             operator: NotEquals
-            value: >-
-              {{ to_string(request.oldObject.status.conditions[?type == 'Denied'] || `[]`) }}
+            value: "system:serviceaccount:pgroles-system:pgroles-operator"
       context:
         - name: subjectaccessreview
           apiCall:

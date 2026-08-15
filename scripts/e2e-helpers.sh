@@ -327,21 +327,15 @@ decide_plan() {
   local plan="$1" condition="$2" reason="$3"
   local now
   now="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-  kubectl patch pgplan "$plan" --subresource=status --type=merge -p "$(cat <<JSON
-{
-  "status": {
-    "conditions": [
-      {
-        "type": "$condition",
-        "status": "True",
-        "reason": "$reason",
-        "message": "recorded by e2e",
-        "lastTransitionTime": "$now"
-      }
-    ],
-    "decidedBy": { "username": "e2e-reviewer" }
-  }
-}
+  # Append rather than merge: a merge patch replaces `status.conditions`
+  # wholesale and would delete the operator's Computed condition.
+  kubectl patch pgplan "$plan" --subresource=status --type=json -p "$(cat <<JSON
+[
+  {"op": "add", "path": "/status/conditions/-",
+   "value": {"type": "$condition", "status": "True", "reason": "$reason",
+             "message": "recorded by e2e", "lastTransitionTime": "$now"}},
+  {"op": "add", "path": "/status/decidedBy", "value": {"username": "e2e-reviewer"}}
+]
 JSON
 )"
 }

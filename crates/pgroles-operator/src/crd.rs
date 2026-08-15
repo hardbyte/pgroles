@@ -1025,8 +1025,13 @@ pub struct PolicyPlanRef {
     validation = Rule::new(
         "!(self.conditions.exists(c, c.type == 'Approved' && c.status == 'True') && self.conditions.exists(c, c.type == 'Denied' && c.status == 'True'))"
     ).message("Approved=True and Denied=True are mutually exclusive"),
+    // Compares the *decision types* that are true, not whole condition
+    // objects. The operator rewrites this array on every status write, so
+    // comparing objects would reject a later write that only refreshed a
+    // timestamp or message — while the decision itself was unchanged. What
+    // must not change is which decisions are true.
     validation = Rule::new(
-        "oldSelf.conditions.filter(c, (c.type == 'Approved' || c.type == 'Denied') && c.status == 'True').size() == 0 || self.conditions.filter(c, (c.type == 'Approved' || c.type == 'Denied') && c.status == 'True') == oldSelf.conditions.filter(c, (c.type == 'Approved' || c.type == 'Denied') && c.status == 'True')"
+        "oldSelf.conditions.filter(c, (c.type == 'Approved' || c.type == 'Denied') && c.status == 'True').map(c, c.type) == self.conditions.filter(c, (c.type == 'Approved' || c.type == 'Denied') && c.status == 'True').map(c, c.type) || oldSelf.conditions.filter(c, (c.type == 'Approved' || c.type == 'Denied') && c.status == 'True').size() == 0"
     ).message("plan decisions are terminal"),
     validation = Rule::new(
         "!has(oldSelf.decidedBy) || (has(self.decidedBy) && self.decidedBy == oldSelf.decidedBy)"
@@ -1043,6 +1048,7 @@ pub struct PostgresPolicyPlanStatus {
     /// Standard conditions: Computed, Applied, and the terminal decision
     /// conditions `Approved` / `Denied`.
     #[serde(default)]
+    #[schemars(length(max = 16))]
     pub conditions: Vec<PolicyCondition>,
     /// Kubernetes identity which approved or denied this plan.
     ///

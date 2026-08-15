@@ -321,6 +321,7 @@
                       ],
                       "type": "object"
                     },
+                    "maxItems": 16,
                     "type": "array"
                   },
                   "decidedBy": {
@@ -461,7 +462,7 @@
                   },
                   {
                     "message": "plan decisions are terminal",
-                    "rule": "oldSelf.conditions.filter(c, (c.type == 'Approved' || c.type == 'Denied') && c.status == 'True').size() == 0 || self.conditions.filter(c, (c.type == 'Approved' || c.type == 'Denied') && c.status == 'True') == oldSelf.conditions.filter(c, (c.type == 'Approved' || c.type == 'Denied') && c.status == 'True')"
+                    "rule": "oldSelf.conditions.filter(c, (c.type == 'Approved' || c.type == 'Denied') && c.status == 'True').map(c, c.type) == self.conditions.filter(c, (c.type == 'Approved' || c.type == 'Denied') && c.status == 'True').map(c, c.type) || oldSelf.conditions.filter(c, (c.type == 'Approved' || c.type == 'Denied') && c.status == 'True').size() == 0"
                   },
                   {
                     "message": "decision identity is write-once",
