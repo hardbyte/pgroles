@@ -88,6 +88,10 @@ Verifies what an approval actually binds, by separating two things
 - Nothing executes without a recorded approval of the plan being executed
 - What executed is what was reviewed, never a different set of effects
 - An approval never carries across a change in effects
+- No generated password Secret is created by a reconcile that is not executing
+  an approved plan
+- Every password the database holds is readable from a Secret
+- A settled policy costs at most one human decision
 - **Liveness**: once drift stops, a plan is eventually applied
 
 The constant `SqlHashApproval` selects the approval gate:
@@ -99,6 +103,19 @@ The constant `SqlHashApproval` selects the approval gate:
 ./run-tlc.sh races/PlanApproval.tla races/PlanApproval_no_password.cfg # passes
 ```
 
+The same model also covers where a *generated password Secret* is created, and
+which source version the policy records once it has been — issue #181. A
+generated password's source version is derived from the Secret holding it, with
+a `<secret>:<key>:missing` sentinel standing in while no Secret exists.
+
+```sh
+./run-tlc.sh races/PlanApproval.tla races/PlanApproval_secret_deferral.cfg    # passes
+./run-tlc.sh races/PlanApproval.tla races/PlanApproval_secret_eager.cfg       # NoSecretBeforeApproval violated (#181)
+./run-tlc.sh races/PlanApproval.tla races/PlanApproval_secret_sentinel.cfg    # ApprovalsBounded violated
+./run-tlc.sh races/PlanApproval.tla races/PlanApproval_secret_first_crash.cfg # passes
+./run-tlc.sh races/PlanApproval.tla races/PlanApproval_sql_first_crash.cfg    # PasswordRecoverable violated
+```
+
 Each configuration demonstrates a distinct requirement:
 
 | Config | `SqlHashApproval` | `LockDuringApply` | `HasPasswordChange` | Result |
@@ -107,6 +124,38 @@ Each configuration demonstrates a distinct requirement:
 | `PlanApproval_buggy.cfg` | TRUE | TRUE | TRUE | `EventuallyApplies` violated |
 | `PlanApproval_unlocked.cfg` | FALSE | FALSE | TRUE | `NoStaleExecution` violated |
 | `PlanApproval_no_password.cfg` | FALSE | TRUE | FALSE | passes |
+
+All five run with `DeferSecretMaterialization = TRUE`,
+`RecordMaterializedVersion = TRUE` and `SecretBeforeSql = TRUE` — the shipped
+design — and no crashes. The Secret configurations vary those instead:
+
+| Config | `Defer…` | `Record…` | `SecretBeforeSql` | `MaxCrashes` | Result |
+| --- | --- | --- | --- | --- | --- |
+| `PlanApproval_secret_deferral.cfg` | TRUE | TRUE | TRUE | 0 | passes |
+| `PlanApproval_secret_eager.cfg` | FALSE | TRUE | TRUE | 0 | `NoSecretBeforeApproval` violated |
+| `PlanApproval_secret_sentinel.cfg` | TRUE | FALSE | TRUE | 0 | `ApprovalsBounded` violated |
+| `PlanApproval_secret_first_crash.cfg` | TRUE | TRUE | TRUE | 1 | passes |
+| `PlanApproval_sql_first_crash.cfg` | TRUE | TRUE | FALSE | 1 | `PasswordRecoverable` violated |
+
+`secret_eager` is pgroles before #181: resolving a `password.generate` role
+created the Secret during reconciliation, so the credential existed while the
+plan was still pending and outlived a plan that was rejected or never approved.
+
+`secret_sentinel` is the deferral done naively — materialize at execution, but
+record the planning-time sentinel as the applied source version. It is not a
+loop and nothing unsafe executes; it costs exactly one extra human approval,
+because the next reconcile compares a recorded `missing` against a now-real
+version and plans a password change for work already done. Only
+`ApprovalsBounded`, checked with `MaxDrifts = 0` so that a second decision can
+have no legitimate cause, can see the difference. Threading the
+post-materialization version back out of execution is the fix.
+
+The two crash configurations settle the *order* of execution's two writes. With
+the Secret written first, a crash leaves an inert Secret that the next reconcile
+adopts. With the SQL written first, the transaction commits a password that was
+never stored anywhere readable — `PasswordRecoverable` violated, and
+unrecoverable in production. `ApprovalsBounded` is deliberately not checked in
+either: a crash costs a re-approval by design.
 
 `PlanApproval_no_password.cfg` passes, like the shipped configuration — it earns
 its place by what it catches when the model is *wrong*. Under
