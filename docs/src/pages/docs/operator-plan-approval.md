@@ -10,14 +10,14 @@ Seeing what the operator would do before it does it. {% .lead %}
 {% callout type="warning" title="Partly a design preview" %}
 Shipped and described accurately below: the semantic change digest as approval
 identity, revalidation of pending plans, write-once plan decisions with
-`decidedBy` — including the annotation removal — and deferring generated
+`decidedBy` — including the annotation removal — deferring generated
 password Secrets until after approval
-([#181](https://github.com/hardbyte/pgroles/issues/181)).
+([#181](https://github.com/hardbyte/pgroles/issues/181)), and dual target
+identity with `requirePhysicalIdentity`
+([#180](https://github.com/hardbyte/pgroles/issues/180)).
 
 **Not yet built**, though this page describes them: `mode: observe` (today it is
-still `mode: plan`), tiered target identity and `requirePhysicalIdentity`
-([#180](https://github.com/hardbyte/pgroles/issues/180)), the
-`PostgresPolicyCandidate` CRD, and every `pgroles plan ...` /
+still `mode: plan`), the `PostgresPolicyCandidate` CRD, and every `pgroles plan ...` /
 `pgroles candidate ...` command shown here — the CLI has no such subcommands
 yet. Use `kubectl` for anything you need to do today; see the
 [quick start](/docs/operator-quick-start) for the exact commands.
@@ -107,10 +107,10 @@ operator.
 ## Approval identity: the change digest
 
 What a decision approves is the plan's **change digest**: a versioned hash
-(`pgroles.io/approval-effect/v1`) of the canonical, deterministically ordered
+(`pgroles.io/approval-effect/v2`) of the canonical, deterministically ordered
 typed effects — role lifecycle, grants, memberships, ownership and default
 privileges, retirements — bound together with the reconciliation mode and the
-target identity. (Managed scope joins the binding once it becomes a
+[target identity](#target-identity), physical and logical. (Managed scope joins the binding once it becomes a
 first-class field; today a scope change shows up as a change in effects.)
 
 The applied base is deliberately *not* a digest input. The plan records which
@@ -202,25 +202,60 @@ replacement: fix the proposal by filing a successor candidate.
 
 ## Target identity
 
-Every plan binds the identity of the database it was computed against, at the
-strongest tier available:
+`DatabaseIdentity` — the Secret name and key a policy points at — says which
+*reference* was followed, not which database answered. Repointing that Secret
+leaves plan, conflict and lock identity untouched, so the approval identity
+binds the database itself, in both of the forms that mean something:
 
-1. **Physical**: `pg_control_system().system_identifier`, when the server
-   exposes it.
+1. **Physical**: `pg_control_system().system_identifier`. It answers *same
+   storage lineage?* — it survives failover to a streaming replica, and it
+   catches a restore taken from a different cluster behind an unchanged
+   endpoint.
 2. **Logical**: the resolved connection fingerprint — host, port, database
-   name — plus the connection Secret's version.
+   name. It answers *same endpoint?* — which is what catches a clone, a
+   branch, or a replica, since those all inherit the parent's
+   `system_identifier`.
 
-Execution fails closed on a *mismatch* at either tier, and on a *tier
-downgrade* (the identifier was readable at approval but not at execution).
-Repointing the connection Secret at a different server therefore invalidates
-every approval made against the old one, even though the Kubernetes reference
-is unchanged. Environments where the physical identifier is consistently
-unavailable run on the logical tier; set `requirePhysicalIdentity: true` to
-refuse execution without tier 1.
+Neither is sufficient alone, so both are bound and a change in either fails
+closed. The logical half is fooled by connection poolers and DNS; the physical
+half is a *lineage* identifier, not an instance one. Credentials are
+deliberately excluded from both, so rotating a password or a token does not
+invalidate an open approval.
 
-A target change is not an error to work around — it flows through the
-ordinary supersede-and-review path. The fresh approval is the sanctioned
+These are not tiers with a fallback. On the research: no mainstream managed
+PostgreSQL blocks `pg_control_system()` — it has been executable by `PUBLIC`
+since PostgreSQL 9.6, and monitoring tooling such as Datadog's Postgres
+integration and `pgmetrics` calls it unconditionally on RDS, Aurora and Cloud
+SQL. What lacks it are engines that merely speak the PostgreSQL protocol —
+CockroachDB, Spanner's PostgreSQL interface, Redshift, Aurora DSQL — plus
+YugabyteDB, where the value carries no meaning. Those targets run on the
+logical identity, which is an ordinary configuration rather than a degraded
+one. Set `connection.requirePhysicalIdentity: true` where a real PostgreSQL is
+expected: the policy then reports `TargetIdentityBlocked` and makes no
+progress at all rather than proceeding on the logical answer alone.
+
+Between approval and execution the operator re-reads both identities under the
+same lock and compares them to what the plan bound. Anything other than a
+match stops the plan before any SQL runs, with an explicit reason on the
+condition and a Warning Event:
+
+| Observed | Reason | Result |
+| --- | --- | --- |
+| Either identity reads differently | `TargetChanged` | plan superseded, fresh plan for review |
+| An identity readable at approval is unreadable now | `TargetIdentityUnavailable` | plan superseded — a downgrade is never treated as a match |
+| An identity unavailable at approval is readable now | `TargetIdentityAppeared` | plan superseded once; the approval was never bound to it |
+| `requirePhysicalIdentity` set, physical identity missing | `PhysicalIdentityRequired` | `TargetIdentityBlocked`; no plan progresses |
+
+A target change is not an error to work around — it flows through the ordinary
+supersede-and-review path, and the fresh approval *is* the sanctioned
 acknowledgement that the target moved.
+
+Two routine operations move the physical identity legitimately, and both will
+invalidate approvals open across them: a **major version upgrade**, because
+`pg_upgrade` runs a fresh `initdb` and mints a new `system_identifier`, and a
+**blue-green cutover**, where the new colour is a different cluster. This is
+the design working: the plan was reviewed against the old database. Re-approve
+the plan the operator opens afterwards.
 
 ## Passwords and planning
 

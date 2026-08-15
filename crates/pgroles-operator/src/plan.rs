@@ -26,7 +26,7 @@ use crate::crd::{
 };
 use crate::k8s_names::{LabelValue, truncate_name_prefix};
 use crate::reconciler::ReconcileError;
-use pgroles_core::approval::APPROVAL_EFFECT_ENCODING_V1;
+use pgroles_core::approval::{APPROVAL_EFFECT_ENCODING_V2, TargetIdentity};
 
 /// Result of plan creation — distinguishes genuinely new plans from
 /// deduplication hits so callers can decide whether to emit events.
@@ -215,6 +215,7 @@ pub async fn create_or_update_plan(
     inspect_config: &pgroles_inspect::InspectConfig,
     reconciliation_mode: CrdReconciliationMode,
     database_identity: &str,
+    target_identity: &TargetIdentity,
     change_summary: &ChangeSummary,
     password_source_versions: &BTreeMap<String, String>,
 ) -> Result<PlanCreationResult, ReconcileError> {
@@ -235,6 +236,7 @@ pub async fn create_or_update_plan(
         changes,
         reconciliation_mode,
         database_identity,
+        target_identity,
         password_source_versions,
     )?;
 
@@ -473,7 +475,10 @@ pub async fn create_or_update_plan(
         last_error: None,
         sql_hash: Some(sql_hash),
         change_digest: Some(change_digest.clone()),
-        change_digest_encoding: Some(APPROVAL_EFFECT_ENCODING_V1.to_string()),
+        change_digest_encoding: Some(APPROVAL_EFFECT_ENCODING_V2.to_string()),
+        target_physical_identity: target_identity.physical.clone(),
+        target_logical_fingerprint: target_identity.logical.clone(),
+        physical_identity_available: Some(target_identity.has_physical()),
         revalidated_generation: Some(generation),
         revalidated_at: Some(crate::crd::now_rfc3339()),
         applying_since: None,
@@ -1252,6 +1257,7 @@ pub(crate) fn compute_change_digest(
     changes: &[pgroles_core::diff::Change],
     reconciliation_mode: CrdReconciliationMode,
     database_identity: &str,
+    target_identity: &TargetIdentity,
     password_source_versions: &BTreeMap<String, String>,
 ) -> Result<String, ReconcileError> {
     Ok(pgroles_core::approval::compute_change_digest(
@@ -1259,9 +1265,24 @@ pub(crate) fn compute_change_digest(
         &pgroles_core::approval::EffectDigestInputs {
             reconciliation_mode: reconciliation_mode.into(),
             target: database_identity,
+            target_identity,
             password_source_versions,
         },
     )?)
+}
+
+/// The target identity a stored plan was computed against.
+///
+/// A plan written before this field existed reports neither identity and no
+/// availability marker; it cannot match anything observed now, and its digest
+/// encoding is older too, so it supersedes rather than executing.
+pub(crate) fn plan_target_identity(
+    status: &crate::crd::PostgresPolicyPlanStatus,
+) -> TargetIdentity {
+    TargetIdentity {
+        physical: status.target_physical_identity.clone(),
+        logical: status.target_logical_fingerprint.clone(),
+    }
 }
 
 /// Whether a stored plan status carries the given change digest under the
@@ -1275,7 +1296,7 @@ pub(crate) fn plan_matches_digest(
     status: &crate::crd::PostgresPolicyPlanStatus,
     change_digest: &str,
 ) -> bool {
-    status.change_digest_encoding.as_deref() == Some(APPROVAL_EFFECT_ENCODING_V1)
+    status.change_digest_encoding.as_deref() == Some(APPROVAL_EFFECT_ENCODING_V2)
         && status.change_digest.as_deref() == Some(change_digest)
 }
 
@@ -1866,6 +1887,7 @@ mod tests {
                 }),
                 secret_key: Some("DATABASE_URL".to_string()),
                 params: None,
+                require_physical_identity: None,
             },
             interval: "5m".to_string(),
             suspend: false,
@@ -2658,6 +2680,13 @@ mod tests {
         }
     }
 
+    fn test_target_identity() -> TargetIdentity {
+        TargetIdentity {
+            physical: Some("7412330000000000001".to_string()),
+            logical: Some("sha256:endpoint".to_string()),
+        }
+    }
+
     fn digest_for(
         changes: &[pgroles_core::diff::Change],
         versions: &BTreeMap<String, String>,
@@ -2666,6 +2695,7 @@ mod tests {
             changes,
             CrdReconciliationMode::default(),
             "default/db-credentials:DATABASE_URL",
+            &test_target_identity(),
             versions,
         )
         .expect("digest")
@@ -2759,7 +2789,7 @@ mod tests {
         let pending = PostgresPolicyPlanStatus {
             phase: PlanPhase::Pending,
             change_digest: Some(planned.clone()),
-            change_digest_encoding: Some(APPROVAL_EFFECT_ENCODING_V1.to_string()),
+            change_digest_encoding: Some(APPROVAL_EFFECT_ENCODING_V2.to_string()),
             revalidated_generation: Some(1),
             ..Default::default()
         };
@@ -2790,7 +2820,7 @@ mod tests {
         let pending = PostgresPolicyPlanStatus {
             phase: PlanPhase::Pending,
             change_digest: Some(old_digest.clone()),
-            change_digest_encoding: Some(APPROVAL_EFFECT_ENCODING_V1.to_string()),
+            change_digest_encoding: Some(APPROVAL_EFFECT_ENCODING_V2.to_string()),
             ..Default::default()
         };
         // At most one plan may await a decision, so a pending plan is retired
@@ -2808,7 +2838,7 @@ mod tests {
         let approved = PostgresPolicyPlanStatus {
             phase: PlanPhase::Approved,
             change_digest: Some(approved_digest.clone()),
-            change_digest_encoding: Some(APPROVAL_EFFECT_ENCODING_V1.to_string()),
+            change_digest_encoding: Some(APPROVAL_EFFECT_ENCODING_V2.to_string()),
             ..Default::default()
         };
 
@@ -2877,7 +2907,7 @@ mod tests {
 
         let current = PostgresPolicyPlanStatus {
             change_digest: Some(digest.clone()),
-            change_digest_encoding: Some(APPROVAL_EFFECT_ENCODING_V1.to_string()),
+            change_digest_encoding: Some(APPROVAL_EFFECT_ENCODING_V2.to_string()),
             ..Default::default()
         };
         assert!(plan_matches_digest(&current, &digest));
@@ -2899,7 +2929,7 @@ mod tests {
 
         let different_effects = PostgresPolicyPlanStatus {
             change_digest: Some("sha256:0000".to_string()),
-            change_digest_encoding: Some(APPROVAL_EFFECT_ENCODING_V1.to_string()),
+            change_digest_encoding: Some(APPROVAL_EFFECT_ENCODING_V2.to_string()),
             ..Default::default()
         };
         assert!(!plan_matches_digest(&different_effects, &digest));
@@ -2915,7 +2945,7 @@ mod tests {
         let pending = PostgresPolicyPlanStatus {
             phase: PlanPhase::Pending,
             change_digest: Some(planned),
-            change_digest_encoding: Some(APPROVAL_EFFECT_ENCODING_V1.to_string()),
+            change_digest_encoding: Some(APPROVAL_EFFECT_ENCODING_V2.to_string()),
             ..Default::default()
         };
         let empty_digest = digest_for(&[], &versions);
@@ -2930,7 +2960,7 @@ mod tests {
         let empty_plan = PostgresPolicyPlanStatus {
             phase: PlanPhase::Pending,
             change_digest: Some(empty_digest.clone()),
-            change_digest_encoding: Some(APPROVAL_EFFECT_ENCODING_V1.to_string()),
+            change_digest_encoding: Some(APPROVAL_EFFECT_ENCODING_V2.to_string()),
             ..Default::default()
         };
         assert_eq!(
@@ -2947,7 +2977,7 @@ mod tests {
         let pending = PostgresPolicyPlanStatus {
             phase: PlanPhase::Pending,
             change_digest: Some(digest_for(&original, &versions)),
-            change_digest_encoding: Some(APPROVAL_EFFECT_ENCODING_V1.to_string()),
+            change_digest_encoding: Some(APPROVAL_EFFECT_ENCODING_V2.to_string()),
             ..Default::default()
         };
 
@@ -2987,7 +3017,7 @@ mod tests {
         let approved = PostgresPolicyPlanStatus {
             phase: PlanPhase::Approved,
             change_digest: Some(approved_digest.clone()),
-            change_digest_encoding: Some(APPROVAL_EFFECT_ENCODING_V1.to_string()),
+            change_digest_encoding: Some(APPROVAL_EFFECT_ENCODING_V2.to_string()),
             ..Default::default()
         };
 
@@ -3025,6 +3055,72 @@ mod tests {
         }
     }
 
+    /// Repointing the connection at a different database must invalidate the
+    /// approval, even though every effect and the Kubernetes reference are
+    /// unchanged. This is the #180 gap: `DatabaseIdentity` names a Secret and
+    /// key, and both survive the repointing.
+    #[test]
+    fn an_approval_does_not_carry_over_to_a_moved_target() {
+        let versions = BTreeMap::new();
+        let changes = [grant_change("reporting")];
+
+        let approved = PostgresPolicyPlanStatus {
+            change_digest: Some(digest_for(&changes, &versions)),
+            change_digest_encoding: Some(APPROVAL_EFFECT_ENCODING_V2.to_string()),
+            target_physical_identity: test_target_identity().physical,
+            target_logical_fingerprint: test_target_identity().logical,
+            physical_identity_available: Some(true),
+            ..Default::default()
+        };
+
+        // Same Secret, same key, same effects — different endpoint behind it.
+        let moved = TargetIdentity {
+            logical: Some("sha256:other-endpoint".to_string()),
+            ..test_target_identity()
+        };
+        let fresh_digest = compute_change_digest(
+            &changes,
+            CrdReconciliationMode::default(),
+            "default/db-credentials:DATABASE_URL",
+            &moved,
+            &versions,
+        )
+        .expect("digest");
+
+        assert_eq!(
+            decide_approved_plan(Some(&approved), &fresh_digest, true),
+            ApprovedPlanDecision::Replace,
+        );
+        assert_eq!(
+            pgroles_core::approval::evaluate_target_identity(
+                &plan_target_identity(&approved),
+                &moved,
+                false,
+            ),
+            pgroles_core::approval::TargetIdentityVerdict::Superseded(
+                pgroles_core::approval::TargetIdentityReason::TargetChanged
+            ),
+        );
+    }
+
+    /// A plan written before the identity fields existed reports neither, so
+    /// it can never be shown to hold the current target — which is the
+    /// fail-closed direction, and matches its older digest encoding.
+    #[test]
+    fn a_plan_without_recorded_identities_matches_nothing_observed() {
+        let legacy = PostgresPolicyPlanStatus::default();
+
+        assert_eq!(plan_target_identity(&legacy), TargetIdentity::default());
+        assert_ne!(
+            pgroles_core::approval::evaluate_target_identity(
+                &plan_target_identity(&legacy),
+                &test_target_identity(),
+                false,
+            ),
+            pgroles_core::approval::TargetIdentityVerdict::Proceed,
+        );
+    }
+
     /// The same no-op trap as the pending arm: if the approved effects are
     /// applied by hand before the plan executes, superseding it must not leave
     /// a zero-change replacement demanding a second approval.
@@ -3034,7 +3130,7 @@ mod tests {
         let approved = PostgresPolicyPlanStatus {
             phase: PlanPhase::Approved,
             change_digest: Some(digest_for(&[grant_change("reporting")], &versions)),
-            change_digest_encoding: Some(APPROVAL_EFFECT_ENCODING_V1.to_string()),
+            change_digest_encoding: Some(APPROVAL_EFFECT_ENCODING_V2.to_string()),
             ..Default::default()
         };
         let empty_digest = digest_for(&[], &versions);
@@ -3050,7 +3146,7 @@ mod tests {
         let approved_empty = PostgresPolicyPlanStatus {
             phase: PlanPhase::Approved,
             change_digest: Some(empty_digest.clone()),
-            change_digest_encoding: Some(APPROVAL_EFFECT_ENCODING_V1.to_string()),
+            change_digest_encoding: Some(APPROVAL_EFFECT_ENCODING_V2.to_string()),
             ..Default::default()
         };
         assert_eq!(
@@ -3120,6 +3216,7 @@ mod tests {
             &pgroles_core::approval::EffectDigestInputs {
                 reconciliation_mode: CrdReconciliationMode::default().into(),
                 target: "default/db-credentials:DATABASE_URL",
+                target_identity: &test_target_identity(),
                 password_source_versions: &versions,
             },
         )

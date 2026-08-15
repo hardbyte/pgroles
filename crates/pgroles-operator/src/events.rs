@@ -110,6 +110,12 @@ pub async fn publish_plan_event(
             "PlanLifecycle",
             format!("Plan {plan_name} applied successfully"),
         ),
+        PlanEventType::TargetIdentityChanged { reason, detail } => event(
+            EventType::Warning,
+            &reason,
+            "TargetIdentity",
+            format!("Plan {plan_name} cannot execute: {detail}"),
+        ),
         PlanEventType::ApplyFailed { error } => event(
             EventType::Warning,
             "ApplyFailed",
@@ -134,6 +140,10 @@ pub enum PlanEventType {
     ApplySucceeded,
     /// Plan execution failed.
     ApplyFailed { error: String },
+    /// The database the plan was approved against is not the one it would now
+    /// execute against, or an identity bound at approval can no longer be
+    /// read. `reason` is the machine-readable condition reason.
+    TargetIdentityChanged { reason: String, detail: String },
 }
 
 fn derive_status_events(

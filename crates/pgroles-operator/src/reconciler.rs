@@ -59,6 +59,10 @@ enum ReconcileOutcome {
     Suspended,
     Conflict,
     LockContention,
+    /// The target cannot answer an identity the deployment requires. Nothing
+    /// converges until that is fixed, so this is not a drift or a failure to
+    /// retry into success.
+    TargetIdentityBlocked,
 }
 
 impl ReconcileOutcome {
@@ -68,6 +72,7 @@ impl ReconcileOutcome {
             ReconcileOutcome::Planned => "planned",
             ReconcileOutcome::Suspended => "suspended",
             ReconcileOutcome::Conflict => "conflict",
+            ReconcileOutcome::TargetIdentityBlocked => "blocked",
             ReconcileOutcome::LockContention => "contention",
         }
     }
@@ -78,6 +83,7 @@ impl ReconcileOutcome {
             ReconcileOutcome::Planned => "Planned",
             ReconcileOutcome::Suspended => "Suspended",
             ReconcileOutcome::Conflict => "ConflictingPolicy",
+            ReconcileOutcome::TargetIdentityBlocked => "PhysicalIdentityRequired",
             ReconcileOutcome::LockContention => "LockContention",
         }
     }
@@ -928,6 +934,29 @@ async fn reconcile_apply_inner(
     result
 }
 
+/// Resolve both halves of the target's identity.
+///
+/// The physical half is read from the connection the reconcile already holds;
+/// the logical half is resolved from the connection Secret, which is exactly
+/// the fingerprint the ephemeral path computes and covers URL-mode
+/// connections whose Kubernetes reference names only a Secret and key.
+async fn resolve_target_identity(
+    ctx: &OperatorContext,
+    pool: &sqlx::PgPool,
+    namespace: &str,
+    resource: &PostgresPolicy,
+) -> Result<pgroles_core::approval::TargetIdentity, ReconcileError> {
+    let physical = pgroles_inspect::detect_system_identifier(pool).await?;
+    let logical = ctx
+        .resolve_database_target_fingerprint(namespace, &resource.spec.connection)
+        .await
+        .map_err(Box::new)?;
+    Ok(pgroles_core::approval::TargetIdentity {
+        physical,
+        logical: Some(logical),
+    })
+}
+
 /// Execute the inspect/diff/apply cycle while both locks are held.
 ///
 /// Extracted to keep `reconcile_apply_inner` focused on lock acquisition.
@@ -945,6 +974,50 @@ async fn apply_under_lock(
     namespace: &str,
     identity: &DatabaseIdentity,
 ) -> Result<(Action, ReconcileOutcome), ReconcileError> {
+    // 5a. Resolve the identity of the database actually on the other end of
+    // the connection, under the lock and against the same pool everything
+    // else uses. Both halves are bound into the approval digest, so an
+    // approval made against one server cannot execute against another even
+    // though the Kubernetes reference is unchanged.
+    let target_identity = resolve_target_identity(ctx, pool, namespace, resource).await?;
+    if resource.spec.connection.requires_physical_identity() && !target_identity.has_physical() {
+        let reason = pgroles_core::approval::TargetIdentityReason::PhysicalIdentityRequired;
+        let message = format!(
+            "{} Reconciliation is blocked until the identifier is readable, or \
+             connection.requirePhysicalIdentity is cleared.",
+            reason.message()
+        );
+        tracing::warn!(name, namespace, "{message}");
+        crate::events::publish_policy_warning(
+            &ctx.event_recorder,
+            resource,
+            reason.as_str(),
+            "TargetIdentity",
+            message.clone(),
+        )
+        .await
+        .ok();
+        update_status(ctx, resource, |status| {
+            status.set_condition(ready_condition(false, reason.as_str(), &message));
+            status.set_condition(crate::crd::target_identity_blocked_condition(
+                reason.as_str(),
+                &message,
+            ));
+            status.set_condition(degraded_condition(reason.as_str(), &message));
+            status
+                .conditions
+                .retain(|c| c.condition_type != "Reconciling" && c.condition_type != "Drifted");
+            status.last_attempted_generation = generation;
+            status.last_error = Some(message.clone());
+            status.transient_failure_count = 0;
+        })
+        .await?;
+        return Ok((
+            Action::requeue(requeue_interval),
+            ReconcileOutcome::TargetIdentityBlocked,
+        ));
+    }
+
     // 5b. Recover stuck Applying plans (operator may have crashed mid-apply).
     if let Some(stuck_plan) =
         crate::plan::get_plan_by_phase(&ctx.kube_client, resource, crate::crd::PlanPhase::Applying)
@@ -1114,6 +1187,7 @@ async fn apply_under_lock(
                 &inspect_config,
                 resource.spec.reconciliation_mode,
                 identity.as_str(),
+                &target_identity,
                 &summary,
                 &applied_password_source_versions,
             )
@@ -1179,6 +1253,7 @@ async fn apply_under_lock(
                     && c.condition_type != "Degraded"
                     && c.condition_type != "Conflict"
                     && c.condition_type != "Paused"
+                    && c.condition_type != crate::crd::CONDITION_TARGET_IDENTITY_BLOCKED
             });
             status.observed_generation = generation;
             status.last_attempted_generation = generation;
@@ -1230,6 +1305,7 @@ async fn apply_under_lock(
                     &inspect_config,
                     resource.spec.reconciliation_mode,
                     identity.as_str(),
+                    &target_identity,
                     &summary,
                     &applied_password_source_versions,
                 )
@@ -1340,6 +1416,7 @@ async fn apply_under_lock(
                         && c.condition_type != "Degraded"
                         && c.condition_type != "Conflict"
                         && c.condition_type != "Paused"
+                        && c.condition_type != crate::crd::CONDITION_TARGET_IDENTITY_BLOCKED
                 });
                 status.observed_generation = generation;
                 status.last_attempted_generation = generation;
@@ -1377,13 +1454,61 @@ async fn apply_under_lock(
                             &changes,
                             resource.spec.reconciliation_mode,
                             identity.as_str(),
+                            &target_identity,
                             &applied_password_source_versions,
                         )?;
-                        let decision = crate::plan::decide_approved_plan(
+                        // Before anything else, ask whether this is even the
+                        // database the reviewer approved against. The identity
+                        // is bound into the digest, so a moved target already
+                        // fails the comparison below — this seam exists to say
+                        // *why*, with a reason a human can act on, rather than
+                        // reporting a target change as an effects change.
+                        let approved_identity = current_plan
+                            .status
+                            .as_ref()
+                            .map(crate::plan::plan_target_identity)
+                            .unwrap_or_default();
+                        let verdict = pgroles_core::approval::evaluate_target_identity(
+                            &approved_identity,
+                            &target_identity,
+                            resource.spec.connection.requires_physical_identity(),
+                        );
+                        if let pgroles_core::approval::TargetIdentityVerdict::Superseded(reason)
+                        | pgroles_core::approval::TargetIdentityVerdict::Blocked(reason) =
+                            verdict
+                        {
+                            tracing::warn!(
+                                plan = %current_plan.name_any(),
+                                reason = reason.as_str(),
+                                "approved plan will not execute: {}",
+                                reason.message()
+                            );
+                            emit_plan_event(
+                                ctx,
+                                resource,
+                                &current_plan,
+                                PlanEventType::TargetIdentityChanged {
+                                    reason: reason.as_str().to_string(),
+                                    detail: reason.message().to_string(),
+                                },
+                            )
+                            .await;
+                        }
+
+                        let mut decision = crate::plan::decide_approved_plan(
                             current_plan.status.as_ref(),
                             &fresh_digest,
                             !changes.is_empty(),
                         );
+                        // Belt and braces: the digest already binds the
+                        // identity, so this cannot currently disagree — but a
+                        // future encoding that dropped the binding must not
+                        // silently re-enable execution against a moved target.
+                        if verdict != pgroles_core::approval::TargetIdentityVerdict::Proceed
+                            && decision == crate::plan::ApprovedPlanDecision::Execute
+                        {
+                            decision = crate::plan::ApprovedPlanDecision::Replace;
+                        }
 
                         if decision != crate::plan::ApprovedPlanDecision::Execute {
                             // The approved effects are no longer the effects
@@ -1445,6 +1570,7 @@ async fn apply_under_lock(
                                 &inspect_config,
                                 resource.spec.reconciliation_mode,
                                 identity.as_str(),
+                                &target_identity,
                                 &summary,
                                 &applied_password_source_versions,
                             )
@@ -1503,6 +1629,8 @@ async fn apply_under_lock(
                                         && c.condition_type != "Degraded"
                                         && c.condition_type != "Conflict"
                                         && c.condition_type != "Paused"
+                                        && c.condition_type
+                                            != crate::crd::CONDITION_TARGET_IDENTITY_BLOCKED
                                 });
                                 status.last_attempted_generation = generation;
                                 status.change_summary = Some(summary.clone());
@@ -1694,6 +1822,7 @@ async fn apply_under_lock(
                             &changes,
                             resource.spec.reconciliation_mode,
                             identity.as_str(),
+                            &target_identity,
                             &applied_password_source_versions,
                         )?;
                         let plan_status = current_plan.status.as_ref();
@@ -1748,6 +1877,7 @@ async fn apply_under_lock(
                                 &inspect_config,
                                 resource.spec.reconciliation_mode,
                                 identity.as_str(),
+                                &target_identity,
                                 &summary,
                                 &applied_password_source_versions,
                             )
@@ -1770,6 +1900,8 @@ async fn apply_under_lock(
                                         && c.condition_type != "Degraded"
                                         && c.condition_type != "Conflict"
                                         && c.condition_type != "Paused"
+                                        && c.condition_type
+                                            != crate::crd::CONDITION_TARGET_IDENTITY_BLOCKED
                                 });
                                 status.last_attempted_generation = generation;
                                 status.change_summary = Some(summary.clone());
@@ -1882,6 +2014,7 @@ async fn apply_under_lock(
                 &inspect_config,
                 resource.spec.reconciliation_mode,
                 identity.as_str(),
+                &target_identity,
                 &summary,
                 &applied_password_source_versions,
             )
@@ -1920,6 +2053,7 @@ async fn apply_under_lock(
                         && c.condition_type != "Degraded"
                         && c.condition_type != "Conflict"
                         && c.condition_type != "Paused"
+                        && c.condition_type != crate::crd::CONDITION_TARGET_IDENTITY_BLOCKED
                 });
                 status.last_attempted_generation = generation;
                 status.change_summary = Some(summary.clone());
@@ -2915,6 +3049,7 @@ mod tests {
                 }),
                 secret_key: Some("DATABASE_URL".to_string()),
                 params: None,
+                require_physical_identity: None,
             },
             interval: interval.to_string(),
             suspend: false,
@@ -2955,6 +3090,7 @@ mod tests {
                     }),
                     secret_key: Some("DATABASE_URL".to_string()),
                     params: None,
+                    require_physical_identity: None,
                 },
                 interval: "5m".to_string(),
                 suspend: false,
@@ -3111,6 +3247,7 @@ mod tests {
                     }),
                     secret_key: Some("DATABASE_URL".to_string()),
                     params: None,
+                    require_physical_identity: None,
                 },
                 interval: "5m".to_string(),
                 suspend: false,
@@ -3144,6 +3281,7 @@ mod tests {
                     }),
                     secret_key: Some("DATABASE_URL".to_string()),
                     params: None,
+                    require_physical_identity: None,
                 },
                 interval: "5m".to_string(),
                 suspend: false,

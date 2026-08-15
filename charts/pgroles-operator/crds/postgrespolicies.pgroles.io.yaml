@@ -268,6 +268,11 @@
                         },
                         "type": "object"
                       },
+                      "requirePhysicalIdentity": {
+                        "description": "Refuse to plan or execute unless the target's *physical* identity —\n`pg_control_system().system_identifier` — can be read.\n\nOff by default: every mainstream managed PostgreSQL exposes the\nidentifier, but PostgreSQL-protocol engines that are not PostgreSQL\n(CockroachDB, Spanner's PostgreSQL interface, Redshift, Aurora DSQL) do\nnot implement it, and those targets run on the logical identity alone.\nSet it where a real PostgreSQL is expected and losing the strongest\nhalf of the target binding should stop reconciliation rather than\nsilently weaken it.",
+                        "nullable": true,
+                        "type": "boolean"
+                      },
                       "secretKey": {
                         "description": "Key within the Secret to read. Defaults to `DATABASE_URL`.\nOnly used with `secretRef`.",
                         "nullable": true,

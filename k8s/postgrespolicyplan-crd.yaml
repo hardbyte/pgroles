@@ -378,6 +378,11 @@
                     ],
                     "type": "string"
                   },
+                  "physicalIdentityAvailable": {
+                    "description": "Whether the physical identity was readable when this plan was computed.\n\nRecorded explicitly rather than inferred from\n`target_physical_identity` being set, so that \"the identifier could not\nbe read\" is distinguishable from \"this plan predates the field\". The\ndifference matters at execution: a plan that had the identifier and now\ndoes not is a downgrade and fails closed.",
+                    "nullable": true,
+                    "type": "boolean"
+                  },
                   "redactedSqlHash": {
                     "description": "SHA-256 hash of the redacted SQL preview bytes. This is for storage\nintegrity only; approval and deduplication use `change_digest`.",
                     "nullable": true,
@@ -452,6 +457,16 @@
                     "default": false,
                     "description": "True when the SQL preview was truncated because the full redacted SQL\ncould not be persisted within Kubernetes object limits.",
                     "type": "boolean"
+                  },
+                  "targetLogicalFingerprint": {
+                    "description": "Fingerprint of the resolved connection endpoint (host, port, database)\nthis plan was computed against.",
+                    "nullable": true,
+                    "type": "string"
+                  },
+                  "targetPhysicalIdentity": {
+                    "description": "`pg_control_system().system_identifier` as read from the target when\nthis plan was computed — the storage lineage the approval is bound to.\nAbsent on engines that do not expose it.",
+                    "nullable": true,
+                    "type": "string"
                   }
                 },
                 "type": "object",

@@ -141,6 +141,13 @@ Before approving a plan:
 - verify external identities and referenced schemas exist
 - inspect revocations, membership removals, ownership changes, and retirements
 - reject or allow supersession rather than approving a stale plan
+- check `status.targetPhysicalIdentity` and `status.targetLogicalFingerprint`
+  name the database you intend. Both are bound into the approval, so a plan
+  whose target moved — a repointed connection Secret, a restore, a major
+  version upgrade, a blue-green cutover — is superseded instead of executing,
+  and needs a fresh approval. Set
+  `spec.connection.requirePhysicalIdentity: true` to refuse to proceed at all
+  when `pg_control_system().system_identifier` cannot be read.
 
 Approve or reject the current plan explicitly:
 

@@ -702,6 +702,73 @@ jobs:
           pg_query "REASSIGN OWNED BY approval_test_user TO postgres; DROP OWNED BY approval_test_user; DROP ROLE IF EXISTS approval_test_user;"
 
           # ================================================================
+          # Group A continued: target identity (#180)
+          # ================================================================
+
+          echo "--- Test: repointing the connection Secret supersedes the plan ---"
+          # One Postgres runs in this cluster, so the *physical* identity
+          # (system_identifier) is the same either way. Pointing the Secret at
+          # a different database on it changes the logical fingerprint — which
+          # is exactly the repointing case a Kubernetes reference cannot see,
+          # since `secretRef` names the same Secret and key throughout.
+          pg_query "SELECT 1 FROM pg_database WHERE datname='identity_alt'" | grep -qx 1 \
+            || pg_query "CREATE DATABASE identity_alt"
+
+          upsert_secret target-identity-credentials \
+            DATABASE_URL='postgres://postgres:devpassword@postgres.default.svc.cluster.local:5432/postgres'
+
+          kubectl apply -f - <<EOF
+          apiVersion: pgroles.io/v1alpha1
+          kind: PostgresPolicy
+          metadata:
+            name: target-identity-policy
+            namespace: default
+          spec:
+            connection:
+              secretRef:
+                name: target-identity-credentials
+            interval: "30s"
+            mode: apply
+            approval: manual
+            roles:
+              - name: target_identity_user
+                login: true
+          EOF
+
+          wait_for_ready_status_reason target-identity-policy True Planned
+          first_plan=$(wait_for_current_plan_ref target-identity-policy)
+
+          # Both identities are recorded. A real PostgreSQL always exposes
+          # pg_control_system(), so the physical half must be present here.
+          physical=$(kubectl get pgplan "$first_plan" -o jsonpath='{.status.targetPhysicalIdentity}')
+          logical=$(kubectl get pgplan "$first_plan" -o jsonpath='{.status.targetLogicalFingerprint}')
+          available=$(kubectl get pgplan "$first_plan" -o jsonpath='{.status.physicalIdentityAvailable}')
+          test -n "$physical" || { echo "::error::Expected targetPhysicalIdentity to be set"; exit 1; }
+          test -n "$logical" || { echo "::error::Expected targetLogicalFingerprint to be set"; exit 1; }
+          test "$available" = "true" || { echo "::error::Expected physicalIdentityAvailable=true, got $available"; exit 1; }
+
+          # Repoint at a different database. The plan was computed against the
+          # old target, so it can no longer authorise anything.
+          upsert_secret target-identity-credentials \
+            DATABASE_URL='postgres://postgres:devpassword@postgres.default.svc.cluster.local:5432/identity_alt'
+
+          wait_for_plan_phase "$first_plan" Superseded
+          second_plan=$(wait_for_current_plan_ref target-identity-policy)
+          test "$second_plan" != "$first_plan" || { echo "::error::Expected a fresh plan after repointing"; exit 1; }
+
+          moved_logical=$(kubectl get pgplan "$second_plan" -o jsonpath='{.status.targetLogicalFingerprint}')
+          test "$moved_logical" != "$logical" || { echo "::error::Logical fingerprint did not change after repointing"; exit 1; }
+          moved_physical=$(kubectl get pgplan "$second_plan" -o jsonpath='{.status.targetPhysicalIdentity}')
+          test "$moved_physical" = "$physical" || { echo "::error::Physical identity changed on the same cluster"; exit 1; }
+
+          # The approval never carried over: nothing ran against either database.
+          assert_role_absent target_identity_user
+
+          kubectl delete pgr target-identity-policy --wait=true
+          # The operator may still hold a pooled connection to it briefly.
+          pg_query "DROP DATABASE IF EXISTS identity_alt WITH (FORCE)" || true
+
+          # ================================================================
           # Group A continued: Rejection
           # ================================================================
 

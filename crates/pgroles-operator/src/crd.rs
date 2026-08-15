@@ -259,9 +259,26 @@ pub struct ConnectionSpec {
     /// or a reference to a Secret key. Mutually exclusive with `secretRef`.
     #[serde(default)]
     pub params: Option<ConnectionParams>,
+
+    /// Refuse to plan or execute unless the target's *physical* identity —
+    /// `pg_control_system().system_identifier` — can be read.
+    ///
+    /// Off by default: every mainstream managed PostgreSQL exposes the
+    /// identifier, but PostgreSQL-protocol engines that are not PostgreSQL
+    /// (CockroachDB, Spanner's PostgreSQL interface, Redshift, Aurora DSQL) do
+    /// not implement it, and those targets run on the logical identity alone.
+    /// Set it where a real PostgreSQL is expected and losing the strongest
+    /// half of the target binding should stop reconciliation rather than
+    /// silently weaken it.
+    #[serde(default)]
+    pub require_physical_identity: Option<bool>,
 }
 
 impl ConnectionSpec {
+    /// Whether the physical target identity is mandatory for this connection.
+    pub fn requires_physical_identity(&self) -> bool {
+        self.require_physical_identity.unwrap_or(false)
+    }
     /// Effective secret key for URL mode. Defaults to `DATABASE_URL`.
     pub fn effective_secret_key(&self) -> &str {
         self.secret_key.as_deref().unwrap_or("DATABASE_URL")
@@ -289,19 +306,24 @@ impl ConnectionSpec {
         }
     }
 
-    /// Deterministic identity key for this connection spec.
+    /// Deterministic identity key for per-database locking and conflict
+    /// detection.
     ///
     /// - URL mode: `{secret_ref.name}/{secret_key}`
     /// - Params mode: canonical representation of the params
     ///
     /// Uses `\0` as field separator since null bytes cannot appear in K8s names
     /// or secret values, avoiding ambiguity from colons in literal values.
-    /// Deterministic identity key for per-database locking and conflict detection.
     ///
-    /// Identifies the target database (host + port + dbname) but NOT the
-    /// credentials. Two policies targeting the same database with different
-    /// users should still be considered as targeting the same database for
-    /// locking and overlap checks.
+    /// This is a *Kubernetes-level* key, not a database identity. In URL mode
+    /// it names only the Secret and key, so repointing that Secret at a
+    /// different server leaves it unchanged; in params mode it covers host,
+    /// port and dbname only when those are literals, and covers the Secret
+    /// reference (not its value) when they are not. Two policies targeting the
+    /// same database with different credentials do share it, which is what
+    /// locking and overlap checks need. What the database actually *is* comes
+    /// from the resolved target identity bound into the approval digest — see
+    /// `pgroles_core::approval::TargetIdentity`.
     pub fn identity_key(&self) -> String {
         if let Some(ref secret_ref) = self.secret_ref {
             format!("{}/{}", secret_ref.name, self.effective_secret_key())
@@ -1100,6 +1122,24 @@ pub struct PostgresPolicyPlanStatus {
     /// from different encodings are never comparable.
     #[serde(default)]
     pub change_digest_encoding: Option<String>,
+    /// `pg_control_system().system_identifier` as read from the target when
+    /// this plan was computed — the storage lineage the approval is bound to.
+    /// Absent on engines that do not expose it.
+    #[serde(default)]
+    pub target_physical_identity: Option<String>,
+    /// Fingerprint of the resolved connection endpoint (host, port, database)
+    /// this plan was computed against.
+    #[serde(default)]
+    pub target_logical_fingerprint: Option<String>,
+    /// Whether the physical identity was readable when this plan was computed.
+    ///
+    /// Recorded explicitly rather than inferred from
+    /// `target_physical_identity` being set, so that "the identifier could not
+    /// be read" is distinguishable from "this plan predates the field". The
+    /// difference matters at execution: a plan that had the identifier and now
+    /// does not is a downgrade and fails closed.
+    #[serde(default)]
+    pub physical_identity_available: Option<bool>,
     /// The policy generation this plan was most recently confirmed current
     /// against.
     ///
@@ -2085,6 +2125,24 @@ pub fn paused_condition(message: &str) -> PolicyCondition {
     }
 }
 
+/// Condition type set when the target's identity stops the policy dead.
+///
+/// Distinct from `Drifted`/`Degraded`: nothing here is retried into
+/// convergence. Either the deployment requires an identity the target cannot
+/// answer with, or the target is not the one the operator was pointed at.
+pub const CONDITION_TARGET_IDENTITY_BLOCKED: &str = "TargetIdentityBlocked";
+
+/// Helper to create a `TargetIdentityBlocked` condition.
+pub fn target_identity_blocked_condition(reason: &str, message: &str) -> PolicyCondition {
+    PolicyCondition {
+        condition_type: CONDITION_TARGET_IDENTITY_BLOCKED.to_string(),
+        status: "True".to_string(),
+        reason: Some(reason.to_string()),
+        message: Some(message.to_string()),
+        last_transition_time: Some(now_rfc3339()),
+    }
+}
+
 /// Helper to create a "Conflict" condition.
 pub fn conflict_condition(reason: &str, message: &str) -> PolicyCondition {
     PolicyCondition {
@@ -2249,6 +2307,7 @@ mod tests {
                 }),
                 secret_key: Some("DATABASE_URL".to_string()),
                 params: None,
+                require_physical_identity: None,
             },
             interval: "5m".to_string(),
             suspend: false,
@@ -2311,6 +2370,7 @@ mod tests {
                 }),
                 secret_key: Some("DATABASE_URL".to_string()),
                 params: None,
+                require_physical_identity: None,
             },
             interval: "5m".to_string(),
             suspend: false,
@@ -2394,6 +2454,7 @@ mod tests {
                 }),
                 secret_key: Some("DATABASE_URL".to_string()),
                 params: None,
+                require_physical_identity: None,
             },
             interval: "5m".to_string(),
             suspend: false,
@@ -2467,6 +2528,7 @@ mod tests {
             }),
             secret_key: Some("DATABASE_URL".to_string()),
             params: None,
+            require_physical_identity: None,
         };
         let identity = DatabaseIdentity::from_connection("prod", &conn);
         assert_eq!(identity.as_str(), "prod/db-creds/DATABASE_URL");
@@ -2495,6 +2557,7 @@ mod tests {
                 ssl_mode_secret: None,
                 set_role: None,
             }),
+            require_physical_identity: None,
         };
         let user_b = ConnectionSpec {
             secret_ref: None,
@@ -2515,6 +2578,7 @@ mod tests {
                 ssl_mode_secret: None,
                 set_role: None,
             }),
+            require_physical_identity: None,
         };
 
         assert_eq!(
@@ -2553,6 +2617,7 @@ mod tests {
                 ssl_mode_secret: None,
                 set_role: None,
             }),
+            require_physical_identity: None,
         };
         let secret_conn = ConnectionSpec {
             secret_ref: None,
@@ -2576,6 +2641,7 @@ mod tests {
                 ssl_mode_secret: None,
                 set_role: None,
             }),
+            require_physical_identity: None,
         };
 
         assert_ne!(
@@ -2606,6 +2672,7 @@ mod tests {
                 ssl_mode_secret: None,
                 set_role: None,
             }),
+            require_physical_identity: None,
         };
         let conn_with_ssl = ConnectionSpec {
             secret_ref: None,
@@ -2626,6 +2693,7 @@ mod tests {
                 ssl_mode_secret: None,
                 set_role: None,
             }),
+            require_physical_identity: None,
         };
 
         assert_ne!(
@@ -2656,6 +2724,7 @@ mod tests {
                 ssl_mode_secret: None,
                 set_role: None,
             }),
+            require_physical_identity: None,
         });
 
         let err = spec.validate_connection_spec().unwrap_err();
@@ -2686,6 +2755,7 @@ mod tests {
                 ssl_mode_secret: None,
                 set_role: None,
             }),
+            require_physical_identity: None,
         });
 
         let err = spec.validate_connection_spec().unwrap_err();
@@ -2722,6 +2792,7 @@ mod tests {
             }),
             secret_key: Some("DATABASE_URL".into()),
             params: None,
+            require_physical_identity: None,
         }
     }
 
@@ -2751,6 +2822,7 @@ mod tests {
                 ssl_mode_secret: None,
                 set_role: None,
             }),
+            require_physical_identity: None,
         }
     }
 
@@ -2791,6 +2863,7 @@ mod tests {
                 ssl_mode_secret: None,
                 set_role: None,
             }),
+            require_physical_identity: None,
         });
         assert!(matches!(
             spec.validate_connection_spec(),
@@ -2804,6 +2877,7 @@ mod tests {
             secret_ref: None,
             secret_key: None,
             params: None,
+            require_physical_identity: None,
         });
         assert!(spec.validate_connection_spec().is_err());
     }
@@ -2829,6 +2903,7 @@ mod tests {
                 ssl_mode_secret: None,
                 set_role: None,
             }),
+            require_physical_identity: None,
         });
         assert!(spec.validate_connection_spec().is_err());
     }
@@ -2866,6 +2941,7 @@ mod tests {
                 secret_ref: None,
                 secret_key: None,
                 params: Some(params_with_set_role(Some(role.into()))),
+                require_physical_identity: None,
             });
             assert!(
                 spec.validate_connection_spec().is_ok(),
@@ -2888,6 +2964,7 @@ mod tests {
                 secret_ref: None,
                 secret_key: None,
                 params: Some(params_with_set_role(Some(role.into()))),
+                require_physical_identity: None,
             });
             let err = spec
                 .validate_connection_spec()
@@ -2905,6 +2982,7 @@ mod tests {
             secret_ref: None,
             secret_key: None,
             params: Some(params_with_set_role(Some("   ".into()))),
+            require_physical_identity: None,
         });
         assert!(matches!(
             spec.validate_connection_spec(),
@@ -2918,11 +2996,13 @@ mod tests {
             secret_ref: None,
             secret_key: None,
             params: Some(params_with_set_role(None)),
+            require_physical_identity: None,
         };
         let conn_with_role = ConnectionSpec {
             secret_ref: None,
             secret_key: None,
             params: Some(params_with_set_role(Some("cloudsqlsuperuser".into()))),
+            require_physical_identity: None,
         };
         assert_ne!(
             conn_no_role.cache_key("ns"),
@@ -2955,6 +3035,7 @@ mod tests {
                 ssl_mode_secret: None,
                 set_role: None,
             }),
+            require_physical_identity: None,
         });
 
         assert!(spec.validate_connection_spec().is_ok());
@@ -2985,6 +3066,7 @@ mod tests {
                 ssl_mode_secret: None,
                 set_role: None,
             }),
+            require_physical_identity: None,
         });
 
         assert!(matches!(
@@ -3017,6 +3099,7 @@ mod tests {
                 ssl_mode_secret: None,
                 set_role: None,
             }),
+            require_physical_identity: None,
         });
 
         assert!(matches!(
@@ -3055,6 +3138,7 @@ mod tests {
                     ssl_mode_secret: None,
                     set_role: None,
                 }),
+                require_physical_identity: None,
             });
             assert!(
                 spec.validate_connection_spec().is_ok(),
@@ -3087,6 +3171,7 @@ mod tests {
                 ssl_mode_secret: None,
                 set_role: None,
             }),
+            require_physical_identity: None,
         });
         assert!(spec.validate_connection_spec().is_err());
     }
@@ -3115,6 +3200,7 @@ mod tests {
                 ssl_mode_secret: None,
                 set_role: None,
             }),
+            require_physical_identity: None,
         });
         assert!(matches!(
             spec.validate_connection_spec(),
@@ -3143,6 +3229,7 @@ mod tests {
                 ssl_mode_secret: None,
                 set_role: None,
             }),
+            require_physical_identity: None,
         });
         assert!(matches!(
             spec.validate_connection_spec(),
@@ -3465,6 +3552,7 @@ params:
             }),
             secret_key: Some("DATABASE_URL".to_string()),
             params: None,
+            require_physical_identity: None,
         };
         let a = DatabaseIdentity::from_connection("prod", &conn_a);
         let b = DatabaseIdentity::from_connection("prod", &conn_a);
@@ -3481,6 +3569,7 @@ params:
             }),
             secret_key: Some("DATABASE_URL".to_string()),
             params: None,
+            require_physical_identity: None,
         };
         let conn_b = ConnectionSpec {
             secret_ref: Some(SecretReference {
@@ -3488,6 +3577,7 @@ params:
             }),
             secret_key: Some("CUSTOM_URL".to_string()),
             params: None,
+            require_physical_identity: None,
         };
         let a = DatabaseIdentity::from_connection("prod", &conn_a);
         let b = DatabaseIdentity::from_connection("prod", &conn_b);
@@ -3830,6 +3920,7 @@ retirements:
                 }),
                 secret_key: Some("DATABASE_URL".to_string()),
                 params: None,
+                require_physical_identity: None,
             },
             interval: "5m".to_string(),
             suspend: false,
@@ -3860,6 +3951,7 @@ retirements:
                 }),
                 secret_key: Some("DATABASE_URL".to_string()),
                 params: None,
+                require_physical_identity: None,
             },
             interval: "5m".to_string(),
             suspend: false,
@@ -3962,6 +4054,7 @@ retirements:
                 }),
                 secret_key: Some("DATABASE_URL".to_string()),
                 params: None,
+                require_physical_identity: None,
             },
             interval: "5m".to_string(),
             suspend: false,
@@ -4014,6 +4107,7 @@ retirements:
                 }),
                 secret_key: Some("DATABASE_URL".to_string()),
                 params: None,
+                require_physical_identity: None,
             },
             interval: "5m".to_string(),
             suspend: false,
@@ -4066,6 +4160,7 @@ retirements:
                 }),
                 secret_key: Some("DATABASE_URL".to_string()),
                 params: None,
+                require_physical_identity: None,
             },
             interval: "5m".to_string(),
             suspend: false,
@@ -4122,6 +4217,7 @@ retirements:
                 }),
                 secret_key: Some("DATABASE_URL".to_string()),
                 params: None,
+                require_physical_identity: None,
             },
             interval: "5m".to_string(),
             suspend: false,
@@ -4176,6 +4272,7 @@ retirements:
                 }),
                 secret_key: Some("DATABASE_URL".to_string()),
                 params: None,
+                require_physical_identity: None,
             },
             interval: "5m".to_string(),
             suspend: false,
@@ -4231,6 +4328,7 @@ retirements:
                 }),
                 secret_key: Some("DATABASE_URL".to_string()),
                 params: None,
+                require_physical_identity: None,
             },
             interval: "5m".to_string(),
             suspend: false,
@@ -4285,6 +4383,7 @@ retirements:
                 }),
                 secret_key: Some("DATABASE_URL".to_string()),
                 params: None,
+                require_physical_identity: None,
             },
             interval: "5m".to_string(),
             suspend: false,
@@ -4368,6 +4467,7 @@ retirements:
                 }),
                 secret_key: Some("DATABASE_URL".into()),
                 params: None,
+                require_physical_identity: None,
             },
             interval: "5m".into(),
             suspend: false,
@@ -4481,6 +4581,7 @@ retirements:
                 }),
                 secret_key: Some("DATABASE_URL".into()),
                 params: None,
+                require_physical_identity: None,
             },
             interval: "5m".into(),
             suspend: false,

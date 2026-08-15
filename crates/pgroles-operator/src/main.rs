@@ -376,6 +376,7 @@ mod tests {
                 }),
                 secret_key: Some("DATABASE_URL".to_string()),
                 params: None,
+                require_physical_identity: None,
             },
             interval: "5m".to_string(),
             suspend: false,
