@@ -171,6 +171,28 @@ pub enum ReconcileError {
 struct ResolvedPassword {
     cleartext: String,
     source_version: String,
+    /// Set when the password was generated in memory because no Secret exists
+    /// yet. The Secret is deliberately not written during planning — it is
+    /// materialized only once the plan is about to execute, so a plan that is
+    /// never approved leaves no credential behind (#181).
+    pending_materialization: Option<PendingGeneratedSecret>,
+}
+
+impl ResolvedPassword {
+    fn existing(cleartext: String, source_version: String) -> Self {
+        Self {
+            cleartext,
+            source_version,
+            pending_materialization: None,
+        }
+    }
+}
+
+/// Everything needed to create a generated-password Secret at execution time.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PendingGeneratedSecret {
+    role: String,
+    spec: crate::crd::GeneratePasswordSpec,
 }
 
 /// Parse a duration string like "5m", "1h", "30s", "2h30m".
@@ -1019,7 +1041,7 @@ async fn apply_under_lock(
     changes = pgroles_core::diff::filter_external_role_changes(changes, &expanded.roles);
 
     let resolved_passwords = resolve_passwords_from_secrets(ctx, resource, namespace).await?;
-    let (password_changes, applied_password_source_versions) =
+    let (password_changes, mut applied_password_source_versions) =
         select_password_changes(&changes, &resolved_passwords, resource.status.as_ref());
     if !password_changes.is_empty() {
         changes = pgroles_core::diff::inject_password_changes(changes, &password_changes);
@@ -1243,6 +1265,36 @@ async fn apply_under_lock(
                 let plan = plans_api.get(&plan_name).await?;
                 emit_plan_event(ctx, resource, &plan, PlanEventType::Approved).await;
                 emit_plan_event(ctx, resource, &plan, PlanEventType::ApplyStarted).await;
+
+                // Generated Secrets are created here, after approval and before
+                // any SQL runs. A failure aborts the apply with no DDL issued.
+                if let Err(err) = materialize_pending_generated_secrets(
+                    ctx,
+                    resource,
+                    namespace,
+                    &resolved_passwords,
+                    &mut changes,
+                    &mut applied_password_source_versions,
+                )
+                .await
+                {
+                    let message = err.to_string();
+                    if let Err(status_err) =
+                        crate::plan::mark_plan_failed(&ctx.kube_client, &plan, &message).await
+                    {
+                        tracing::warn!(plan = %plan_name, %status_err, "failed to mark plan Failed");
+                    }
+                    emit_plan_event(
+                        ctx,
+                        resource,
+                        &plan,
+                        PlanEventType::ApplyFailed {
+                            error: message.clone(),
+                        },
+                    )
+                    .await;
+                    return Err(err);
+                }
 
                 match crate::plan::execute_plan(&ctx.kube_client, &plan, pool, &sql_ctx, &changes)
                     .await
@@ -1494,6 +1546,42 @@ async fn apply_under_lock(
                         let plan = plans_api.get(&current_plan.name_any()).await?;
 
                         emit_plan_event(ctx, resource, &plan, PlanEventType::ApplyStarted).await;
+
+                        // Generated Secrets are created here, after the human
+                        // decision and before any SQL runs. A failure aborts the
+                        // apply with no DDL issued.
+                        if let Err(err) = materialize_pending_generated_secrets(
+                            ctx,
+                            resource,
+                            namespace,
+                            &resolved_passwords,
+                            &mut changes,
+                            &mut applied_password_source_versions,
+                        )
+                        .await
+                        {
+                            let message = err.to_string();
+                            if let Err(status_err) =
+                                crate::plan::mark_plan_failed(&ctx.kube_client, &plan, &message)
+                                    .await
+                            {
+                                tracing::warn!(
+                                    plan = %plan.name_any(),
+                                    %status_err,
+                                    "failed to mark plan Failed"
+                                );
+                            }
+                            emit_plan_event(
+                                ctx,
+                                resource,
+                                &plan,
+                                PlanEventType::ApplyFailed {
+                                    error: message.clone(),
+                                },
+                            )
+                            .await;
+                            return Err(err);
+                        }
 
                         match crate::plan::execute_plan(
                             &ctx.kube_client,
@@ -1861,9 +1949,11 @@ async fn apply_under_lock(
 ///
 /// For each role that declares a `password`:
 /// - `PasswordSpec::SecretRef`: fetches the password from the referenced Secret.
-/// - `PasswordSpec::Generate`: reads the generated Secret if it exists; in
-///   apply mode it creates the Secret if needed, while in plan mode it keeps
-///   reconciliation non-mutating and synthesizes an in-memory password.
+/// - `PasswordSpec::Generate`: reads the generated Secret if it exists. If it
+///   does not, an in-memory password is synthesized and the entry is marked for
+///   materialization — resolution itself never writes, in any mode. The Secret
+///   is created by [`materialize_pending_generated_secrets`] immediately before
+///   the approved plan executes (#181).
 ///
 /// Returns a map of role name → cleartext password string suitable for
 /// [`pgroles_core::diff::inject_password_changes`] (which computes the
@@ -1913,60 +2003,71 @@ async fn resolve_passwords_from_secrets(
         }
         if let Some(pw) = &role_spec.password {
             if let Some(gen_spec) = &pw.generate {
-                let password = if resource.spec.mode == PolicyMode::Plan {
-                    match crate::password::get_generated_secret(
-                        ctx.kube_client.clone(),
-                        namespace,
-                        &resource.name_any(),
-                        &role_spec.name,
-                        gen_spec,
-                    )
-                    .await
-                    .map_err(Box::new)?
-                    {
-                        Some(existing) => existing,
-                        None => {
-                            let secret_name = crate::password::generated_secret_name(
-                                &resource.name_any(),
-                                &role_spec.name,
-                                gen_spec,
-                            );
-                            let secret_key = crate::password::generated_secret_key(gen_spec);
-                            let cleartext = crate::password::generate_password(
+                // Resolution never writes: planning must not leave a credential
+                // behind for a plan that is rejected or never approved. An
+                // existing Secret is read; a missing one resolves to an
+                // in-memory password plus the `:missing` sentinel version, and
+                // the Secret is created just before the plan executes.
+                let existing = crate::password::get_generated_secret(
+                    ctx.kube_client.clone(),
+                    namespace,
+                    &resource.name_any(),
+                    &role_spec.name,
+                    gen_spec,
+                )
+                .await
+                .map_err(Box::new)?;
+
+                let entry = match existing {
+                    Some(existing) => {
+                        ResolvedPassword::existing(existing.password, existing.source_version)
+                    }
+                    None => {
+                        let secret_name = crate::password::generated_secret_name(
+                            &resource.name_any(),
+                            &role_spec.name,
+                            gen_spec,
+                        );
+                        let secret_key = crate::password::generated_secret_key(gen_spec);
+                        let sentinel = crate::password::missing_generated_secret_source_version(
+                            &secret_name,
+                            &secret_key,
+                        );
+
+                        // A recorded version that is not the sentinel means a
+                        // real Secret existed and has since been deleted. The
+                        // next plan legitimately rotates the password, but that
+                        // is worth saying out loud.
+                        if recorded_source_version_was_real(resource, &role_spec.name, &sentinel) {
+                            emit_policy_warning(
+                                ctx,
+                                resource,
+                                "GeneratedSecretMissing",
+                                "PasswordGeneration",
+                                format!(
+                                    "generated Secret \"{secret_name}\" for role \
+                                     \"{}\" disappeared; regenerating and rotating password",
+                                    role_spec.name
+                                ),
+                            )
+                            .await;
+                        }
+
+                        ResolvedPassword {
+                            cleartext: crate::password::generate_password(
                                 gen_spec
                                     .length
                                     .unwrap_or(crate::password::DEFAULT_PASSWORD_LENGTH),
-                            );
-
-                            crate::password::GeneratedPasswordSecret {
-                                password: cleartext,
-                                source_version:
-                                    crate::password::missing_generated_secret_source_version(
-                                        &secret_name,
-                                        &secret_key,
-                                    ),
-                            }
+                            ),
+                            source_version: sentinel,
+                            pending_materialization: Some(PendingGeneratedSecret {
+                                role: role_spec.name.clone(),
+                                spec: gen_spec.clone(),
+                            }),
                         }
                     }
-                } else {
-                    // Apply mode — ensure a Secret exists with a generated password.
-                    crate::password::ensure_generated_secret(
-                        ctx.kube_client.clone(),
-                        namespace,
-                        resource,
-                        &role_spec.name,
-                        gen_spec,
-                    )
-                    .await
-                    .map_err(Box::new)?
                 };
-                resolved.insert(
-                    role_spec.name.clone(),
-                    ResolvedPassword {
-                        cleartext: password.password,
-                        source_version: password.source_version,
-                    },
-                );
+                resolved.insert(role_spec.name.clone(), entry);
             } else if pw.secret_ref.is_some() {
                 // SecretRef mode — read from an existing Secret.
                 let password = resolve_password_from_cache(&role_spec.name, pw, &secret_cache)?;
@@ -2034,10 +2135,89 @@ fn resolve_password_from_cache(
         .resource_version
         .as_deref()
         .unwrap_or("unknown");
-    Ok(ResolvedPassword {
-        cleartext: password,
-        source_version: format!("{secret_name}:{secret_key}:{resource_version}"),
-    })
+    Ok(ResolvedPassword::existing(
+        password,
+        format!("{secret_name}:{secret_key}:{resource_version}"),
+    ))
+}
+
+/// Returns `true` when the policy previously recorded a real (non-sentinel)
+/// source version for this role's generated password.
+fn recorded_source_version_was_real(resource: &PostgresPolicy, role: &str, sentinel: &str) -> bool {
+    resource
+        .status
+        .as_ref()
+        .and_then(|status| status.applied_password_source_versions.get(role))
+        .is_some_and(|recorded| recorded != sentinel)
+}
+
+/// Create the Kubernetes Secrets for generated passwords that planning left
+/// unmaterialized, immediately before the approved plan executes.
+///
+/// Ordering is deliberate: the Secret is written *before* the SQL transaction.
+/// A crash between the two leaves an unused Secret which the next reconcile
+/// adopts and applies; the reverse order could commit a password to the
+/// database that exists nowhere else.
+///
+/// `ensure_generated_secret` is create-or-read, so a Secret written concurrently
+/// by another replica wins. When it does, the plan's `SetPassword` verifier is
+/// rebuilt from the Secret's cleartext so the database matches what the Secret
+/// hands to applications.
+///
+/// The returned source versions replace the planning-time `:missing` sentinels
+/// in `applied_password_source_versions`, so the status records the version the
+/// database was actually set from. Recording the sentinel instead would make
+/// the very next reconcile see a changed source and emit a spurious plan.
+async fn materialize_pending_generated_secrets(
+    ctx: &OperatorContext,
+    resource: &PostgresPolicy,
+    namespace: &str,
+    resolved_passwords: &std::collections::BTreeMap<String, ResolvedPassword>,
+    changes: &mut [pgroles_core::diff::Change],
+    applied_password_source_versions: &mut std::collections::BTreeMap<String, String>,
+) -> Result<(), ReconcileError> {
+    for resolved in resolved_passwords.values() {
+        let Some(pending) = &resolved.pending_materialization else {
+            continue;
+        };
+
+        let materialized = crate::password::ensure_generated_secret(
+            ctx.kube_client.clone(),
+            namespace,
+            resource,
+            &pending.role,
+            &pending.spec,
+        )
+        .await
+        .map_err(Box::new)?;
+
+        applied_password_source_versions
+            .insert(pending.role.clone(), materialized.source_version.clone());
+
+        if materialized.password != resolved.cleartext {
+            // Another writer created the Secret first. The plan's verifier was
+            // computed from the password we generated, which nothing will ever
+            // read — set the database from the Secret's password instead.
+            tracing::info!(
+                role = %pending.role,
+                "generated Secret already existed at execution time; \
+                 rebuilding password change from its contents"
+            );
+            let verifier = pgroles_core::scram::compute_verifier(
+                &materialized.password,
+                pgroles_core::scram::DEFAULT_ITERATIONS,
+            );
+            for change in changes.iter_mut() {
+                if let pgroles_core::diff::Change::SetPassword { name, password } = change
+                    && name == &pending.role
+                {
+                    *password = verifier.clone();
+                }
+            }
+        }
+    }
+
+    Ok(())
 }
 
 /// Resolve passwords from a pre-populated cache (for unit testing without K8s).
@@ -2086,7 +2266,12 @@ fn select_password_changes(
 
     for (role, resolved) in resolved_passwords {
         current_versions.insert(role.clone(), resolved.source_version.clone());
+        // An unmaterialized generated password always needs applying: the
+        // recorded version could only match the `:missing` sentinel if a
+        // previous run recorded it, and no database ever received that
+        // password.
         if created_roles.contains(role.as_str())
+            || resolved.pending_materialization.is_some()
             || previous_versions.get(role) != Some(&resolved.source_version)
         {
             password_changes.insert(role.clone(), resolved.cleartext.clone());
@@ -2218,6 +2403,28 @@ pub(crate) async fn detect_sql_context(
         pgroles_core::sql::SqlContext::from_version_num(pg_version.version_num)
             .with_relation_inventory(relation_inventory),
     )
+}
+
+/// Emit a Warning event on the policy, logging failures rather than failing the
+/// reconcile — the event is a notification, not a control-flow step.
+async fn emit_policy_warning(
+    ctx: &OperatorContext,
+    policy: &PostgresPolicy,
+    reason: &str,
+    action: &str,
+    note: String,
+) {
+    tracing::warn!(policy = %policy.name_any(), reason, note = %note, "policy warning");
+    if let Err(error) =
+        crate::events::publish_policy_warning(&ctx.event_recorder, policy, reason, action, note)
+            .await
+    {
+        tracing::warn!(
+            policy = %policy.name_any(),
+            %error,
+            "failed to publish policy warning event"
+        );
+    }
 }
 
 /// Emit a plan lifecycle event on the parent policy, logging warnings on failure.
@@ -4397,10 +4604,10 @@ mod tests {
     fn select_password_changes_skips_unchanged_password_sources() {
         let resolved = BTreeMap::from([(
             "app".to_string(),
-            ResolvedPassword {
-                cleartext: "app-secret".to_string(),
-                source_version: "role-passwords:app:7".to_string(),
-            },
+            ResolvedPassword::existing(
+                "app-secret".to_string(),
+                "role-passwords:app:7".to_string(),
+            ),
         )]);
         let status = PostgresPolicyStatus {
             applied_password_source_versions: BTreeMap::from([(
@@ -4424,10 +4631,10 @@ mod tests {
     fn select_password_changes_applies_on_source_version_change() {
         let resolved = BTreeMap::from([(
             "app".to_string(),
-            ResolvedPassword {
-                cleartext: "new-secret".to_string(),
-                source_version: "role-passwords:app:8".to_string(),
-            },
+            ResolvedPassword::existing(
+                "new-secret".to_string(),
+                "role-passwords:app:8".to_string(),
+            ),
         )]);
         let status = PostgresPolicyStatus {
             applied_password_source_versions: BTreeMap::from([(
@@ -4452,10 +4659,10 @@ mod tests {
 
         let resolved = BTreeMap::from([(
             "app".to_string(),
-            ResolvedPassword {
-                cleartext: "new-secret".to_string(),
-                source_version: "role-passwords:app:7".to_string(),
-            },
+            ResolvedPassword::existing(
+                "new-secret".to_string(),
+                "role-passwords:app:7".to_string(),
+            ),
         )]);
         let status = PostgresPolicyStatus {
             applied_password_source_versions: BTreeMap::from([(
@@ -4487,17 +4694,17 @@ mod tests {
         let resolved = BTreeMap::from([
             (
                 "app".to_string(),
-                ResolvedPassword {
-                    cleartext: "secret-a".to_string(),
-                    source_version: "role-passwords:app:1".to_string(),
-                },
+                ResolvedPassword::existing(
+                    "secret-a".to_string(),
+                    "role-passwords:app:1".to_string(),
+                ),
             ),
             (
                 "reporter".to_string(),
-                ResolvedPassword {
-                    cleartext: "secret-b".to_string(),
-                    source_version: "role-passwords:reporter:1".to_string(),
-                },
+                ResolvedPassword::existing(
+                    "secret-b".to_string(),
+                    "role-passwords:reporter:1".to_string(),
+                ),
             ),
         ]);
         let changes: Vec<pgroles_core::diff::Change> = vec![];
@@ -4518,6 +4725,118 @@ mod tests {
             Some("secret-b")
         );
         assert_eq!(versions.len(), 2, "all source versions should be tracked");
+    }
+
+    fn pending_generated(cleartext: &str, secret: &str) -> ResolvedPassword {
+        ResolvedPassword {
+            cleartext: cleartext.to_string(),
+            source_version: crate::password::missing_generated_secret_source_version(
+                secret, "password",
+            ),
+            pending_materialization: Some(PendingGeneratedSecret {
+                role: "app".to_string(),
+                spec: crate::crd::GeneratePasswordSpec {
+                    length: None,
+                    secret_name: Some(secret.to_string()),
+                    secret_key: None,
+                },
+            }),
+        }
+    }
+
+    #[test]
+    fn select_password_changes_always_applies_unmaterialized_generated_passwords() {
+        // Deferred materialization records a `:missing` sentinel while the plan
+        // is pending. If a sentinel ever survives into status, the password it
+        // stood for was never written to any database, so re-seeing the same
+        // sentinel must still apply — not be treated as "unchanged".
+        let resolved = BTreeMap::from([(
+            "app".to_string(),
+            pending_generated("in-memory", "policy-pgr-app"),
+        )]);
+        let status = PostgresPolicyStatus {
+            applied_password_source_versions: BTreeMap::from([(
+                "app".to_string(),
+                crate::password::missing_generated_secret_source_version(
+                    "policy-pgr-app",
+                    "password",
+                ),
+            )]),
+            ..Default::default()
+        };
+
+        let (password_changes, _) = select_password_changes(&[], &resolved, Some(&status));
+
+        assert_eq!(
+            password_changes.get("app").map(String::as_str),
+            Some("in-memory"),
+            "an unmaterialized generated password must always be applied"
+        );
+    }
+
+    #[test]
+    fn materialized_source_version_suppresses_the_next_password_change() {
+        // The regression this guards: planning records the `:missing` sentinel,
+        // execution creates the Secret. If status kept the sentinel, the next
+        // reconcile would see a different (now real) source version, emit a
+        // spurious SetPassword, and demand a second approval. Recording the
+        // post-materialization version instead makes the next reconcile quiet.
+        let mut versions = BTreeMap::from([(
+            "app".to_string(),
+            crate::password::missing_generated_secret_source_version("policy-pgr-app", "password"),
+        )]);
+        // Stand-in for `materialize_pending_generated_secrets` overwriting the
+        // sentinel with what the created Secret reported.
+        versions.insert("app".to_string(), "policy-pgr-app:password:512".to_string());
+
+        let status = PostgresPolicyStatus {
+            applied_password_source_versions: versions,
+            ..Default::default()
+        };
+        // Next reconcile: the Secret now exists, so resolution reads it.
+        let resolved = BTreeMap::from([(
+            "app".to_string(),
+            ResolvedPassword::existing(
+                "from-secret".to_string(),
+                "policy-pgr-app:password:512".to_string(),
+            ),
+        )]);
+
+        let (password_changes, _) = select_password_changes(&[], &resolved, Some(&status));
+
+        assert!(
+            password_changes.is_empty(),
+            "recording the materialized version must not re-emit SetPassword"
+        );
+    }
+
+    #[test]
+    fn recorded_real_source_version_is_detected_for_disappeared_secret() {
+        let mut resource = valid_role_policy("policy", "app", "shared-db-secret");
+        let sentinel =
+            crate::password::missing_generated_secret_source_version("policy-pgr-app", "password");
+        resource.status = Some(PostgresPolicyStatus {
+            applied_password_source_versions: BTreeMap::from([(
+                "app".to_string(),
+                "policy-pgr-app:password:41".to_string(),
+            )]),
+            ..Default::default()
+        });
+        assert!(
+            recorded_source_version_was_real(&resource, "app", &sentinel),
+            "a real recorded version plus a missing Secret means the Secret disappeared"
+        );
+
+        resource
+            .status
+            .as_mut()
+            .unwrap()
+            .applied_password_source_versions
+            .insert("app".to_string(), sentinel.clone());
+        assert!(
+            !recorded_source_version_was_real(&resource, "app", &sentinel),
+            "a recorded sentinel is not a disappeared Secret"
+        );
     }
 
     #[test]

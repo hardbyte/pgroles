@@ -55,6 +55,21 @@ pub async fn publish_status_events(
     Ok(())
 }
 
+/// Publish a Warning Event on a policy for a condition that has no status
+/// representation of its own.
+pub async fn publish_policy_warning(
+    recorder: &Recorder,
+    policy: &PostgresPolicy,
+    reason: &str,
+    action: &str,
+    note: String,
+) -> Result<(), kube::Error> {
+    let reference: ObjectReference = policy.object_ref(&());
+    recorder
+        .publish(&event(EventType::Warning, reason, action, note), &reference)
+        .await
+}
+
 /// Publish a plan lifecycle event on the parent policy.
 pub async fn publish_plan_event(
     recorder: &Recorder,

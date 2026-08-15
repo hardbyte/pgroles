@@ -677,7 +677,7 @@ impl PasswordSpec {
 }
 
 /// Configuration for operator-generated passwords.
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct GeneratePasswordSpec {
     /// Password length. Defaults to 32. Minimum 16, maximum 128.
