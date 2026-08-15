@@ -305,9 +305,13 @@ Approving a plan therefore approves what the plan currently shows. If a
 supersede races your approval, the decision lands on a plan that is no longer
 current and nothing executes — the fresh plan awaits its own decision.
 
-A supersede writes `Approved=False` and names the cause in the condition
-message, so the reason a plan you were reviewing disappeared survives on the
-object:
+A supersede sets the phase to `Superseded` and writes a `Superseded=True`
+condition naming the cause, so the reason a plan you were reviewing disappeared
+survives on the object. The phase is what voids the plan — a superseded plan is
+never selected for execution. A decision already recorded on it is left exactly
+as the reviewer left it, because plan decisions and `decidedBy` are terminal and
+write-once; on a plan nobody decided the cause is also stamped on its
+`Approved=False` condition:
 
 | Cause | Condition reason | What happened |
 | --- | --- | --- |

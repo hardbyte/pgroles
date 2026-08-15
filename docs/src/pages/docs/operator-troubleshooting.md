@@ -246,7 +246,7 @@ same cycle. Reject a plan by writing a terminal `Denied` condition and
 approval](/docs/operator-plan-approval#deciding-a-plan) for the exact command
 and the full lifecycle.
 
-A superseded plan names its cause in the `Approved=False` condition message —
+A superseded plan names its cause in the `Superseded=True` condition message —
 effects changed, effects cleared, replaced by a newer plan, the policy stopped
 referencing it, or the target moved (reason `TargetChanged`,
 `TargetIdentityUnavailable`, or `TargetIdentityAppeared`).

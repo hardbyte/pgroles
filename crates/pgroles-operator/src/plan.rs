@@ -754,20 +754,10 @@ async fn supersede_stale_plans(
             phase = ?status.phase,
             "marking existing plan as Superseded"
         );
-        let mut superseded_status = status.clone();
-        superseded_status.phase = PlanPhase::Superseded;
-        if status.phase == PlanPhase::Approved {
-            // The decision is void along with the plan: a superseded approval
-            // must never read as still granting anything.
-            set_plan_condition(
-                &mut superseded_status.conditions,
-                "Approved",
-                "False",
-                SupersedeCause::ReplacedByNewerPlan.reason(),
-                SupersedeCause::ReplacedByNewerPlan.message(),
-            );
-        }
-        let patch = serde_json::json!({ "status": superseded_status });
+        // The plan is void along with its phase — but the decision on it is
+        // terminal and write-once, so the record of who approved what is left
+        // untouched. See `superseded_status`.
+        let patch = serde_json::json!({ "status": superseded_status(status, SupersedeCause::ReplacedByNewerPlan) });
         plans_api
             .patch_status(
                 &old_plan_name,
@@ -1910,48 +1900,62 @@ pub async fn mark_plan_rejected(
     Ok(())
 }
 
-/// Mark a plan as Superseded, recording `cause` on the `Approved=False`
-/// condition so the reason the plan was retired survives on the object.
-/// Retire a plan whose *approval* is still recorded, without touching the
-/// decision.
+/// Whether a terminal decision — `Approved=True` or `Denied=True` — is
+/// recorded on this status.
 ///
-/// [`mark_plan_superseded`] flips `Approved` to `False`, which the CRD's
-/// terminality and `decidedBy` rules reject on a plan a human actually
-/// approved: a recorded decision is write-once, and clearing it would also
-/// leave a `decidedBy` with no decision beside it. A promotion strands other
-/// candidates' approvals, so it has to retire them while leaving the record of
-/// who decided what exactly as it was — the phase and a `Superseded` condition
-/// carry the cause instead.
-pub async fn mark_plan_stranded(
-    client: &Client,
-    plan: &PostgresPolicyPlan,
-    cause: SupersedeCause,
-) -> Result<(), ReconcileError> {
-    let namespace = plan.namespace().ok_or(ReconcileError::NoNamespace)?;
-    let plan_name = plan.name_any();
-    let plans_api: Api<PostgresPolicyPlan> = Api::namespaced(client.clone(), &namespace);
+/// This is exactly the predicate the CRD's CEL rules key off: once it is true,
+/// the set of decisions that are true is frozen and `decidedBy` is write-once.
+pub(crate) fn has_terminal_decision(status: &PostgresPolicyPlanStatus) -> bool {
+    status.conditions.iter().any(|c| {
+        (c.condition_type == "Approved" || c.condition_type == "Denied") && c.status == "True"
+    })
+}
 
-    let mut status = plan.status.clone().unwrap_or_default();
-    status.phase = PlanPhase::Superseded;
+/// The status a supersede writes: the plan is voided by its *phase*, and the
+/// cause is recorded on a `Superseded` condition.
+///
+/// Voiding must never be expressed by flipping a recorded decision. The plan
+/// CRD holds a decision terminal — the set of decision types that are `True`
+/// may not change once non-empty — and pairs any terminal decision with a
+/// write-once `decidedBy`. Writing `Approved=False` over a real approval
+/// breaks both rules at once, so against a live API server the write is
+/// rejected and the stale approved plan stays actionable. Execution gates on
+/// phase (`get_current_actionable_plan` only considers `Pending`/`Approved`)
+/// plus a digest match, so `Superseded` alone is what makes a plan
+/// unexecutable; the decision record is left exactly as the reviewer left it.
+///
+/// A plan that was never decided has no decision to preserve, so the
+/// retirement cause is also stamped on its already-`False` `Approved`
+/// condition, where reviewers have always read it.
+pub(crate) fn superseded_status(
+    status: &PostgresPolicyPlanStatus,
+    cause: SupersedeCause,
+) -> PostgresPolicyPlanStatus {
+    let mut next = status.clone();
+    next.phase = PlanPhase::Superseded;
     set_plan_condition(
-        &mut status.conditions,
+        &mut next.conditions,
         crate::crd::CONDITION_SUPERSEDED,
         "True",
         cause.reason(),
         cause.message(),
     );
-
-    plans_api
-        .patch_status(
-            &plan_name,
-            &PatchParams::apply("pgroles-operator"),
-            &Patch::Merge(&serde_json::json!({ "status": status })),
-        )
-        .await?;
-
-    Ok(())
+    if !has_terminal_decision(status) {
+        set_plan_condition(
+            &mut next.conditions,
+            "Approved",
+            "False",
+            cause.reason(),
+            cause.message(),
+        );
+    }
+    next
 }
 
+/// Mark a plan as Superseded, recording `cause` on a `Superseded` condition so
+/// the reason the plan was retired survives on the object.
+///
+/// Safe to call on a plan carrying a human decision: see [`superseded_status`].
 pub async fn mark_plan_superseded(
     client: &Client,
     plan: &PostgresPolicyPlan,
@@ -1961,15 +1965,7 @@ pub async fn mark_plan_superseded(
     let plan_name = plan.name_any();
     let plans_api: Api<PostgresPolicyPlan> = Api::namespaced(client.clone(), &namespace);
 
-    let mut status = plan.status.clone().unwrap_or_default();
-    status.phase = PlanPhase::Superseded;
-    set_plan_condition(
-        &mut status.conditions,
-        "Approved",
-        "False",
-        cause.reason(),
-        cause.message(),
-    );
+    let status = superseded_status(&plan.status.clone().unwrap_or_default(), cause);
 
     let patch = serde_json::json!({ "status": status });
     plans_api
@@ -2569,6 +2565,179 @@ mod tests {
             SupersedeCause::TargetChanged(TargetIdentityReason::TargetIdentityUnavailable).reason(),
             "TargetIdentityUnavailable"
         );
+    }
+
+    /// Rust model of the two CRD CEL rules a supersede write has to satisfy,
+    /// for a status update from `old` to `new`:
+    ///
+    /// * "plan decisions are terminal" — the decision types that are `True`
+    ///   may not change once the old set is non-empty.
+    /// * "a terminal plan decision and decidedBy identity must be recorded
+    ///   together" — `decidedBy` is present exactly when a decision is `True`.
+    ///
+    /// Kept beside the code that produces the write, because there is no live
+    /// API server in unit tests to reject it.
+    fn cel_admits(
+        old: &crate::crd::PostgresPolicyPlanStatus,
+        new: &crate::crd::PostgresPolicyPlanStatus,
+    ) -> Result<(), &'static str> {
+        let true_decisions = |status: &crate::crd::PostgresPolicyPlanStatus| -> Vec<String> {
+            status
+                .conditions
+                .iter()
+                .filter(|c| {
+                    (c.condition_type == "Approved" || c.condition_type == "Denied")
+                        && c.status == "True"
+                })
+                .map(|c| c.condition_type.clone())
+                .collect()
+        };
+
+        let old_decisions = true_decisions(old);
+        if !old_decisions.is_empty() && old_decisions != true_decisions(new) {
+            return Err("plan decisions are terminal");
+        }
+        if old.decided_by.is_some()
+            && new.decided_by.as_ref().map(|d| &d.username)
+                != old.decided_by.as_ref().map(|d| &d.username)
+        {
+            return Err("decision identity is write-once");
+        }
+        if true_decisions(new).is_empty() != new.decided_by.is_none() {
+            return Err(
+                "a terminal plan decision and decidedBy identity must be recorded together",
+            );
+        }
+        Ok(())
+    }
+
+    /// Retiring a plan a human approved must not touch the decision. Voiding
+    /// is expressed by the phase alone; `Approved=True` and `decidedBy` are
+    /// terminal and write-once, and rewriting them is a write the API server
+    /// rejects — leaving the stale plan actionable.
+    #[test]
+    fn superseding_an_approved_plan_preserves_the_decision() {
+        let plan = test_plan_with_decisions("plan-1", PlanPhase::Approved, &[("Approved", "True")]);
+        let old = plan.status.clone().expect("status");
+        let new = superseded_status(&old, SupersedeCause::EffectsChanged);
+
+        assert_eq!(new.phase, PlanPhase::Superseded);
+        let approved = new
+            .conditions
+            .iter()
+            .find(|c| c.condition_type == "Approved")
+            .expect("Approved condition preserved");
+        assert_eq!(approved.status, "True");
+        assert_eq!(
+            new.decided_by.as_ref().map(|d| d.username.as_str()),
+            Some("reviewer@example.com")
+        );
+        let superseded = new
+            .conditions
+            .iter()
+            .find(|c| c.condition_type == crate::crd::CONDITION_SUPERSEDED)
+            .expect("Superseded condition recorded");
+        assert_eq!(superseded.status, "True");
+        assert_eq!(
+            superseded.message.as_deref(),
+            Some(SupersedeCause::EffectsChanged.message())
+        );
+
+        // And the write the API server would see is admissible.
+        assert_eq!(cel_admits(&old, &new), Ok(()));
+    }
+
+    /// A denied plan is retired the same way: the `Denied=True` record stands.
+    #[test]
+    fn superseding_a_denied_plan_preserves_the_decision() {
+        let plan = test_plan_with_decisions("plan-1", PlanPhase::Rejected, &[("Denied", "True")]);
+        let old = plan.status.clone().expect("status");
+        let new = superseded_status(&old, SupersedeCause::SupersededByPromotion);
+
+        assert!(
+            new.conditions
+                .iter()
+                .any(|c| c.condition_type == "Denied" && c.status == "True")
+        );
+        assert!(
+            !new.conditions
+                .iter()
+                .any(|c| c.condition_type == "Approved")
+        );
+        assert_eq!(cel_admits(&old, &new), Ok(()));
+    }
+
+    /// A plan nobody decided has no decision to protect, so the cause still
+    /// lands on the `Approved=False` condition reviewers read — and that write
+    /// is admissible because the old decision set was empty.
+    #[test]
+    fn superseding_a_pending_plan_still_records_the_cause_on_approved() {
+        let plan = test_plan_with_decisions("plan-1", PlanPhase::Pending, &[("Approved", "False")]);
+        let old = plan.status.clone().expect("status");
+        let new = superseded_status(&old, SupersedeCause::ReplacedByNewerPlan);
+
+        let approved = new
+            .conditions
+            .iter()
+            .find(|c| c.condition_type == "Approved")
+            .expect("Approved condition");
+        assert_eq!(approved.status, "False");
+        assert_eq!(
+            approved.message.as_deref(),
+            Some(SupersedeCause::ReplacedByNewerPlan.message())
+        );
+        assert!(
+            new.conditions
+                .iter()
+                .any(|c| c.condition_type == crate::crd::CONDITION_SUPERSEDED)
+        );
+        assert_eq!(cel_admits(&old, &new), Ok(()));
+    }
+
+    /// The regression this guards: the old supersede wrote `Approved=False`
+    /// unconditionally, and the model rejects that write on an approved plan
+    /// for exactly the reason a real API server does.
+    #[test]
+    fn voiding_an_approval_by_flipping_the_condition_is_rejected() {
+        let plan = test_plan_with_decisions("plan-1", PlanPhase::Approved, &[("Approved", "True")]);
+        let old = plan.status.clone().expect("status");
+        let mut new = old.clone();
+        new.phase = PlanPhase::Superseded;
+        set_plan_condition(
+            &mut new.conditions,
+            "Approved",
+            "False",
+            SupersedeCause::EffectsChanged.reason(),
+            SupersedeCause::EffectsChanged.message(),
+        );
+
+        assert_eq!(cel_admits(&old, &new), Err("plan decisions are terminal"));
+    }
+
+    /// A superseded plan is not executable even with its approval intact: the
+    /// only way to reach execution is a plan the policy picks as actionable,
+    /// and that selection is by phase.
+    #[test]
+    fn a_superseded_plan_is_not_actionable_even_when_approved() {
+        let plan = test_plan_with_decisions("plan-1", PlanPhase::Approved, &[("Approved", "True")]);
+        let superseded = superseded_status(
+            &plan.status.clone().expect("status"),
+            SupersedeCause::SupersededByPromotion,
+        );
+
+        // `check_plan_approval` still reads the preserved decision — that is
+        // the record, not the gate.
+        let mut retired = plan.clone();
+        retired.status = Some(superseded.clone());
+        assert_eq!(check_plan_approval(&retired), PlanApprovalState::Approved);
+
+        // The gate is the phase, which `get_current_actionable_plan` filters on.
+        assert!(!matches!(
+            superseded.phase,
+            PlanPhase::Pending | PlanPhase::Approved
+        ));
+        // And a replacement never re-retires it, so it cannot be resurrected.
+        assert!(!supersedes_after_create(&superseded, "some-other-digest"));
     }
 
     #[test]

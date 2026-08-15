@@ -517,7 +517,7 @@ pub async fn record_promotion(
         let Some(plan) = context.plan_of(&stranded) else {
             continue;
         };
-        crate::plan::mark_plan_stranded(
+        crate::plan::mark_plan_superseded(
             &ctx.kube_client,
             plan,
             SupersedeCause::SupersededByPromotion,
