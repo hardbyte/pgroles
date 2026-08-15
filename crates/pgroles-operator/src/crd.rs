@@ -31,7 +31,7 @@ pub const VALID_SSL_MODES: &[&str] = &[
 ///
 /// Defines the desired state of PostgreSQL roles, grants, default privileges,
 /// and memberships for a single database connection.
-#[derive(CustomResource, Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[derive(CustomResource, KubeSchema, Debug, Clone, Serialize, Deserialize)]
 #[kube(
     group = "pgroles.io",
     version = "v1alpha1",
@@ -82,11 +82,18 @@ pub struct PostgresPolicySpec {
     pub profiles: std::collections::HashMap<String, ProfileSpec>,
 
     /// Schema bindings that expand profiles into concrete roles/grants.
+    ///
+    /// Keyed by `name` so server-side apply merges entries per schema instead
+    /// of replacing the whole list. The API server also rejects duplicate keys.
     #[serde(default)]
+    #[x_kube(merge_strategy = ListMerge::Map(vec!["name".into()]))]
     pub schemas: Vec<SchemaBinding>,
 
     /// One-off role definitions.
+    ///
+    /// Keyed by `name`; see `schemas`.
     #[serde(default)]
+    #[x_kube(merge_strategy = ListMerge::Map(vec!["name".into()]))]
     pub roles: Vec<RoleSpec>,
 
     /// One-off grants.
@@ -102,7 +109,12 @@ pub struct PostgresPolicySpec {
     pub memberships: Vec<Membership>,
 
     /// Explicit role-retirement workflows for roles that should be removed.
+    ///
+    /// Keyed by `role`, which is this list's unique identifier rather than
+    /// `name`. Retiring one role twice was never meaningful, so the key is
+    /// unambiguous.
     #[serde(default)]
+    #[x_kube(merge_strategy = ListMerge::Map(vec!["role".into()]))]
     pub retirements: Vec<RoleRetirement>,
 
     /// Approval mode for plans: `auto` or `manual`.
@@ -2092,6 +2104,60 @@ pub fn drifted_condition(status: bool, reason: &str, message: &str) -> PolicyCon
 mod tests {
     use super::*;
     use kube::CustomResourceExt;
+
+    /// Named spec arrays must carry key-aware list semantics so server-side
+    /// apply merges per entry instead of replacing the whole list, and so the
+    /// API server rejects duplicate keys.
+    ///
+    /// `memberships`, `grants`, and `default_privileges` are deliberately left
+    /// as plain arrays: the same role may legitimately appear in several
+    /// membership entries, and the natural keys for the other two are
+    /// composite. Keying them needs duplicate-merge semantics designed first.
+    #[test]
+    fn named_spec_arrays_declare_list_map_keys() {
+        let crd = PostgresPolicy::crd();
+        let schema = crd.spec.versions[0]
+            .schema
+            .as_ref()
+            .and_then(|s| s.open_api_v3_schema.as_ref())
+            .expect("CRD should carry an OpenAPI schema");
+        let spec_props = schema
+            .properties
+            .as_ref()
+            .and_then(|p| p.get("spec"))
+            .and_then(|s| s.properties.as_ref())
+            .expect("spec should have properties");
+
+        for (field, key) in [
+            ("schemas", "name"),
+            ("roles", "name"),
+            ("retirements", "role"),
+        ] {
+            let prop = spec_props
+                .get(field)
+                .unwrap_or_else(|| panic!("spec.{field} should exist"));
+            assert_eq!(
+                prop.x_kubernetes_list_type.as_deref(),
+                Some("map"),
+                "spec.{field} should be a map-list"
+            );
+            assert_eq!(
+                prop.x_kubernetes_list_map_keys.as_deref(),
+                Some([key.to_string()].as_slice()),
+                "spec.{field} should be keyed by {key}"
+            );
+        }
+
+        for field in ["memberships", "grants", "default_privileges"] {
+            let prop = spec_props
+                .get(field)
+                .unwrap_or_else(|| panic!("spec.{field} should exist"));
+            assert!(
+                prop.x_kubernetes_list_type.is_none(),
+                "spec.{field} should stay a plain array until its merge semantics are designed"
+            );
+        }
+    }
 
     #[test]
     fn crd_generates_valid_schema() {
