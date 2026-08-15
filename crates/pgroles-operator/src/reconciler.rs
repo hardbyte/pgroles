@@ -134,6 +134,9 @@ pub enum ReconcileError {
     #[error("invalid spec: {0}")]
     InvalidSpec(String),
 
+    #[error("approval digest error: {0}")]
+    ApprovalDigest(#[from] pgroles_core::approval::ApprovalDigestError),
+
     #[error(
         "policy references objects that do not exist in target database: {0}. Either create \
          the missing objects, remove them from the policy, or verify the policy is pointing at \
@@ -384,6 +387,7 @@ fn retry_class_for_reconcile_error(error: &ReconcileError) -> RetryClass {
         | ReconcileError::UnsafeRoleDrops(_)
         | ReconcileError::EmptyPasswordSecret { .. }
         | ReconcileError::NoNamespace
+        | ReconcileError::ApprovalDigest(_)
         | ReconcileError::PlanSqlStorage(_) => RetryClass::Slow,
         ReconcileError::PasswordGeneration(err) => {
             if err.is_transient() {
@@ -1082,6 +1086,7 @@ async fn apply_under_lock(
                 resource.spec.reconciliation_mode,
                 identity.as_str(),
                 &summary,
+                &applied_password_source_versions,
             )
             .await?;
             let plan_name = creation_result.plan_name().to_string();
@@ -1186,6 +1191,7 @@ async fn apply_under_lock(
                     resource.spec.reconciliation_mode,
                     identity.as_str(),
                     &summary,
+                    &applied_password_source_versions,
                 )
                 .await?;
                 let plan_name = creation_result.plan_name().to_string();
@@ -1292,22 +1298,33 @@ async fn apply_under_lock(
 
                 match approval_state {
                     crate::plan::PlanApprovalState::Approved => {
-                        // Validate that the database state has not drifted since
-                        // the plan was approved by comparing SQL hashes.
-                        let fresh_sql = crate::plan::render_full_sql(&changes, &sql_ctx);
-                        let fresh_hash = crate::plan::compute_sql_hash(&fresh_sql);
-                        let stored_hash = current_plan
-                            .status
-                            .as_ref()
-                            .and_then(|s| s.sql_hash.as_deref());
+                        // Validate that nothing the approval bound has changed
+                        // since the decision, by recomputing the canonical
+                        // effect digest. Comparing rendered SQL here would
+                        // supersede every password-bearing plan, because the
+                        // SCRAM verifier is re-salted on each computation.
+                        let fresh_digest = crate::plan::compute_change_digest(
+                            &changes,
+                            resource.spec.reconciliation_mode,
+                            identity.as_str(),
+                            &applied_password_source_versions,
+                        )?;
+                        let digest_matches = current_plan.status.as_ref().is_some_and(|status| {
+                            crate::plan::plan_matches_digest(status, &fresh_digest)
+                        });
 
-                        if stored_hash != Some(&fresh_hash) {
-                            // Database state changed since the plan was approved.
+                        if !digest_matches {
+                            // The approved effects are no longer the effects
+                            // this policy would produce.
+                            let stored_digest = current_plan
+                                .status
+                                .as_ref()
+                                .and_then(|s| s.change_digest.as_deref());
                             tracing::warn!(
                                 plan = %current_plan.name_any(),
-                                stored_hash = ?stored_hash,
-                                fresh_hash = %fresh_hash,
-                                "approved plan superseded: database state changed since approval"
+                                stored_digest = ?stored_digest,
+                                fresh_digest = %fresh_digest,
+                                "approved plan superseded: effects changed since approval"
                             );
 
                             crate::plan::mark_plan_superseded(&ctx.kube_client, &current_plan)
@@ -1323,6 +1340,7 @@ async fn apply_under_lock(
                                 resource.spec.reconciliation_mode,
                                 identity.as_str(),
                                 &summary,
+                                &applied_password_source_versions,
                             )
                             .await?;
                             let new_plan_name = new_creation_result.plan_name().to_string();
@@ -1593,6 +1611,7 @@ async fn apply_under_lock(
                 resource.spec.reconciliation_mode,
                 identity.as_str(),
                 &summary,
+                &applied_password_source_versions,
             )
             .await?;
             let plan_name = creation_result.plan_name().to_string();
@@ -2207,6 +2226,7 @@ impl ReconcileError {
             ReconcileError::ManifestExpansion(_)
             | ReconcileError::InvalidInterval(_, _)
             | ReconcileError::InvalidSpec(_) => "InvalidSpec",
+            ReconcileError::ApprovalDigest(_) => "ApprovalDigestFailed",
             ReconcileError::ConflictingPolicy(_) => "ConflictingPolicy",
             ReconcileError::UnsatisfiableWildcardGrant(_) => "UnsatisfiableWildcardGrant",
             ReconcileError::LockContention(_, _) => "LockContention",

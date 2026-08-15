@@ -27,6 +27,7 @@ use crate::crd::{
 };
 use crate::k8s_names::{LabelValue, truncate_name_prefix};
 use crate::reconciler::ReconcileError;
+use pgroles_core::approval::APPROVAL_EFFECT_ENCODING_V1;
 
 /// Result of plan creation — distinguishes genuinely new plans from
 /// deduplication hits so callers can decide whether to emit events.
@@ -191,15 +192,29 @@ pub async fn create_or_update_plan(
     reconciliation_mode: CrdReconciliationMode,
     database_identity: &str,
     change_summary: &ChangeSummary,
+    password_source_versions: &BTreeMap<String, String>,
 ) -> Result<PlanCreationResult, ReconcileError> {
     let namespace = policy.namespace().ok_or(ReconcileError::NoNamespace)?;
     let policy_name = policy.name_any();
     let generation = policy.metadata.generation.unwrap_or(0);
 
-    // 1. Render the full executable SQL (not redacted).
+    // 1. Render the full executable SQL (not redacted). This is a review
+    //    artifact only — never an execution payload, and never the approval
+    //    identity.
     let full_sql = render_full_sql(changes, sql_context);
 
-    // 2. Compute SHA-256 hash of the full SQL.
+    // 2. Compute the approval identity: a canonical digest of the typed
+    //    effects. Deduplication and approval both key off this rather than the
+    //    SQL hash, which is unstable for password changes (fresh SCRAM salt on
+    //    every render).
+    let change_digest = compute_change_digest(
+        changes,
+        reconciliation_mode,
+        database_identity,
+        password_source_versions,
+    )?;
+
+    // 3. Hash the rendered SQL for preview diagnostics.
     let sql_hash = compute_sql_hash(&full_sql);
 
     // 3. Count SQL statements (after wildcard expansion).
@@ -222,18 +237,18 @@ pub async fn create_or_update_plan(
         .filter(|plan| is_owned_by_policy(plan, policy))
         .collect();
 
-    // 5. Check for duplicate pending plan with same hash.
+    // 5. Check for duplicate pending plan with the same effects.
     for plan in &existing_plans {
         if let Some(ref status) = plan.status
             && status.phase == PlanPhase::Pending
-            && status.sql_hash.as_deref() == Some(&sql_hash)
+            && plan_matches_digest(status, &change_digest)
         {
             // Identical plan already exists — return early (deduplicated).
             let plan_name = plan.name_any();
             info!(
                 plan = %plan_name,
                 policy = %policy_name,
-                "existing pending plan has identical SQL hash, skipping creation"
+                "existing pending plan has identical change digest, skipping creation"
             );
             return Ok(PlanCreationResult::Deduplicated(plan_name));
         }
@@ -250,7 +265,7 @@ pub async fn create_or_update_plan(
     for plan in &existing_plans {
         if let Some(ref status) = plan.status
             && status.phase == PlanPhase::Failed
-            && status.sql_hash.as_deref() == Some(&sql_hash)
+            && plan_matches_digest(status, &change_digest)
         {
             let failed_ts = status
                 .failed_at
@@ -263,7 +278,7 @@ pub async fn create_or_update_plan(
                     plan = %plan_name,
                     policy = %policy_name,
                     age_secs = now_ts - failed_ts,
-                    "recently-failed plan has identical SQL hash, skipping creation"
+                    "recently-failed plan has identical change digest, skipping creation"
                 );
                 return Ok(PlanCreationResult::Deduplicated(plan_name));
             }
@@ -415,6 +430,8 @@ pub async fn create_or_update_plan(
         applied_at: None,
         last_error: None,
         sql_hash: Some(sql_hash),
+        change_digest: Some(change_digest),
+        change_digest_encoding: Some(APPROVAL_EFFECT_ENCODING_V1.to_string()),
         applying_since: None,
         failed_at: None,
         sql_statements: Some(sql_statement_count),
@@ -1126,6 +1143,42 @@ fn render_redacted_sql(
         })
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+/// Compute the canonical approval-effect digest for a set of changes.
+///
+/// This is the approval identity — see `pgroles_core::approval`. Unlike the
+/// SQL hash it is stable across recomputation of unchanged effects, which is
+/// what makes a password-bearing plan approvable at all.
+pub(crate) fn compute_change_digest(
+    changes: &[pgroles_core::diff::Change],
+    reconciliation_mode: CrdReconciliationMode,
+    database_identity: &str,
+    password_source_versions: &BTreeMap<String, String>,
+) -> Result<String, ReconcileError> {
+    Ok(pgroles_core::approval::compute_change_digest(
+        changes,
+        &pgroles_core::approval::EffectDigestInputs {
+            reconciliation_mode: reconciliation_mode.into(),
+            target: database_identity,
+            password_source_versions,
+        },
+    )?)
+}
+
+/// Whether a stored plan status carries the given change digest under the
+/// current encoding.
+///
+/// Digests from a different encoding version are never comparable, so a plan
+/// written by an earlier operator (no digest, or an older encoding) never
+/// matches. Such plans are superseded and re-reviewed rather than silently
+/// accepted — the fail-closed direction.
+pub(crate) fn plan_matches_digest(
+    status: &crate::crd::PostgresPolicyPlanStatus,
+    change_digest: &str,
+) -> bool {
+    status.change_digest_encoding.as_deref() == Some(APPROVAL_EFFECT_ENCODING_V1)
+        && status.change_digest.as_deref() == Some(change_digest)
 }
 
 /// Compute SHA-256 hash of the SQL string as a hex digest.
@@ -2290,5 +2343,129 @@ mod tests {
         let mut decoded = String::new();
         decoder.read_to_string(&mut decoded).unwrap();
         decoded
+    }
+
+    // -----------------------------------------------------------------------
+    // Approval identity (#174)
+    // -----------------------------------------------------------------------
+
+    fn password_versions(role: &str, version: &str) -> BTreeMap<String, String> {
+        BTreeMap::from([(role.to_string(), version.to_string())])
+    }
+
+    fn set_password(name: &str, verifier: &str) -> pgroles_core::diff::Change {
+        pgroles_core::diff::Change::SetPassword {
+            name: name.to_string(),
+            password: verifier.to_string(),
+        }
+    }
+
+    fn digest_for(
+        changes: &[pgroles_core::diff::Change],
+        versions: &BTreeMap<String, String>,
+    ) -> String {
+        compute_change_digest(
+            changes,
+            CrdReconciliationMode::default(),
+            "default/db-credentials:DATABASE_URL",
+            versions,
+        )
+        .expect("digest")
+    }
+
+    /// The #174 failure mode: a manually approved password plan could never
+    /// execute, because each reconcile re-derived the SCRAM verifier with a
+    /// fresh salt and the approval was bound to the rendered SQL.
+    #[test]
+    fn password_plans_keep_one_approval_identity_across_reconciles() {
+        let versions = password_versions("app", "role-passwords:app:7");
+
+        // Two reconciles of an unchanged password source, each with its own
+        // randomly salted verifier.
+        let first = digest_for(
+            &[set_password("app", "SCRAM-SHA-256$4096:aaa$sA:vA")],
+            &versions,
+        );
+        let second = digest_for(
+            &[set_password("app", "SCRAM-SHA-256$4096:bbb$sB:vB")],
+            &versions,
+        );
+
+        assert_eq!(first, second);
+
+        // The SQL hash is what used to gate approval, and is still unstable —
+        // which is exactly why it is no longer the approval identity.
+        let ctx = pgroles_core::sql::SqlContext::default();
+        assert_ne!(
+            compute_sql_hash(&render_full_sql(
+                &[set_password("app", "SCRAM-SHA-256$4096:aaa$sA:vA")],
+                &ctx
+            )),
+            compute_sql_hash(&render_full_sql(
+                &[set_password("app", "SCRAM-SHA-256$4096:bbb$sB:vB")],
+                &ctx
+            )),
+        );
+    }
+
+    #[test]
+    fn rotating_a_password_source_is_a_new_approval() {
+        let change = [set_password("app", "SCRAM-SHA-256$4096:aaa$sA:vA")];
+
+        assert_ne!(
+            digest_for(&change, &password_versions("app", "role-passwords:app:7")),
+            digest_for(&change, &password_versions("app", "role-passwords:app:8")),
+        );
+    }
+
+    #[test]
+    fn a_plan_matches_only_its_own_digest_under_the_current_encoding() {
+        let versions = password_versions("app", "role-passwords:app:7");
+        let digest = digest_for(
+            &[set_password("app", "SCRAM-SHA-256$4096:aaa$sA:vA")],
+            &versions,
+        );
+
+        let current = PostgresPolicyPlanStatus {
+            change_digest: Some(digest.clone()),
+            change_digest_encoding: Some(APPROVAL_EFFECT_ENCODING_V1.to_string()),
+            ..Default::default()
+        };
+        assert!(plan_matches_digest(&current, &digest));
+
+        // A plan written before this encoding existed must never match, so it
+        // is superseded and re-reviewed rather than silently accepted.
+        let legacy = PostgresPolicyPlanStatus {
+            sql_hash: Some("deadbeef".to_string()),
+            ..Default::default()
+        };
+        assert!(!plan_matches_digest(&legacy, &digest));
+
+        let other_encoding = PostgresPolicyPlanStatus {
+            change_digest: Some(digest.clone()),
+            change_digest_encoding: Some("pgroles.io/approval-effect/v0".to_string()),
+            ..Default::default()
+        };
+        assert!(!plan_matches_digest(&other_encoding, &digest));
+
+        let different_effects = PostgresPolicyPlanStatus {
+            change_digest: Some("sha256:0000".to_string()),
+            change_digest_encoding: Some(APPROVAL_EFFECT_ENCODING_V1.to_string()),
+            ..Default::default()
+        };
+        assert!(!plan_matches_digest(&different_effects, &digest));
+    }
+
+    /// Planning must never persist password material, in any field.
+    #[test]
+    fn the_digest_carries_no_password_material() {
+        let verifier = "SCRAM-SHA-256$4096:c2FsdA==$c3RvcmVk:c2VydmVy";
+        let digest = digest_for(
+            &[set_password("app", verifier)],
+            &password_versions("app", "role-passwords:app:7"),
+        );
+
+        assert!(digest.starts_with("sha256:"));
+        assert!(!digest.contains(verifier));
     }
 }
