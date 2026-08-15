@@ -27,10 +27,12 @@ rules:
     verbs: ["get", "patch", "update"]
   # Watch and manage PostgresPolicyCandidate CRDs. The operator reads
   # candidates and owns their status; it never writes their spec, which the
-  # API server holds immutable anyway.
+  # API server holds immutable anyway. `patch` is for adoption — stamping the
+  # parent policy's ownerReference onto the candidate — and `delete` for
+  # pruning terminal candidates beyond the retention bound.
   - apiGroups: ["pgroles.io"]
     resources: ["postgrespolicycandidates"]
-    verbs: ["get", "list", "watch"]
+    verbs: ["get", "list", "watch", "patch", "delete"]
   - apiGroups: ["pgroles.io"]
     resources: ["postgrespolicycandidates/status"]
     verbs: ["get", "patch", "update"]
