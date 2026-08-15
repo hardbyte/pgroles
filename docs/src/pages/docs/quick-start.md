@@ -1,5 +1,5 @@
 ---
-title: Quick start
+title: CLI quick start
 description: Install pgroles and run your first manifest against a PostgreSQL database.
 ---
 
@@ -28,11 +28,13 @@ Use `pgroles generate --database-url ... > pgroles.yaml` first, then refine the 
 
 ## Create a manifest
 
+Before typing any YAML, here is the role graph the manifest below describes — a single login role with read-only access to one schema.
+
+{% role-graph-diagram /%}
+
 Create a file called `pgroles.yaml`:
 
 ```yaml
-default_owner: app_owner
-
 roles:
   - name: analytics
     login: true

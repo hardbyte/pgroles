@@ -16,8 +16,14 @@ export function OperatorArchitectureDiagram() {
           <p className="m-0 text-xs font-semibold uppercase tracking-[0.2em] text-teal-800 dark:text-teal-300">
             Kubernetes API
           </p>
-          <div className="mt-3 grid gap-3 sm:grid-cols-3">
+          <div className="mt-3 grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
             <DiagramChip title="PostgresPolicy" subtitle="generation changes" tone="teal" />
+            <DiagramChip title="PostgresPolicyPlan" subtitle="approval changes" tone="teal" />
+            <DiagramChip
+              title="EphemeralAccessRequest"
+              subtitle="own controller, own locks"
+              tone="teal"
+            />
             <DiagramChip title="Secret" subtitle="resourceVersion changes" tone="amber" />
             <DiagramChip title="Status" subtitle="conditions and summary" tone="stone" />
           </div>
@@ -49,6 +55,7 @@ export function OperatorArchitectureDiagram() {
               tone="teal"
               items={[
                 'PostgresPolicy generation updates',
+                'PostgresPolicyPlan approval changes',
                 'Referenced Secret changes',
                 'Interval-based requeues',
               ]}
@@ -62,6 +69,7 @@ export function OperatorArchitectureDiagram() {
                 'Fetch Secret and refresh sqlx pool',
                 'Convert CRD to PolicyManifest',
                 'Expand profiles and schemas',
+                'Overlay active ephemeral grants',
                 'Inspect PostgreSQL',
                 'Diff current vs desired state',
                 'Apply SQL in one transaction',

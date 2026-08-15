@@ -115,17 +115,24 @@ The intended deployment model is operator -> OpenTelemetry Collector -> your met
 | `pgroles.wildcard.grantability_queries` | - | Wildcard grantability catalog queries issued |
 | `pgroles.wildcard.unsatisfied_grants` | - | Wildcard grants missing privileges before grantability checks |
 | `pgroles.ephemeral_access.transitions` | `phase`, `reason` | Ephemeral request phase transitions |
-| `pgroles.ephemeral_access.failures` | `reason` | Ephemeral activation and revocation failures |
+| `pgroles.ephemeral_access.failures` | `reason` | Requests reaching a failed terminal phase — in practice `Denied` and `ApprovalExpired`, since nothing sets `Failed` |
 | `pgroles.ephemeral_access.retained_memberships` | - | Memberships kept at expiry because they became durable |
 | `pgroles.ephemeral_access.expiry_lag` | - | Milliseconds between expiry and revocation |
 | `pgroles.ephemeral_access.role_retirement_blocked` | - | Role retirements blocked by an in-flight request |
+| `pgroles.ephemeral_access.cached_requests` | - | Request-cache size sampled at reconcile start |
+| `pgroles.ephemeral_access.relevant_requests` | `lookup` | Requests returned by an indexed lookup |
+| `pgroles.ephemeral_access.reconcile.duration` | `kind`, `request_count` | Ephemeral reconcile wall time, bucketed by request count |
+| `pgroles.ephemeral_access.reconcile.inflight` | `kind` | Ephemeral reconciles currently running |
 
-Useful alerting signals: `Degraded=True` for reconcile failure (not bare
-`Ready=False`, which is also how a healthy plan-awaiting-approval policy
-reports), sustained `Drifted=True` on an auto-applying policy,
-`pgroles.lock_contention.total` rising steadily, and
-`pgroles.deprecated.approval_unset` as the count of policies still relying on
-the deprecated inference.
+Useful alerting signals: `Degraded=True` for reconcile failure, sustained
+`Drifted=True` on an auto-applying policy, `pgroles.lock_contention.total`
+rising steadily, and `pgroles.deprecated.approval_unset` as the count of
+policies still relying on the deprecated inference.
+
+A policy waiting on plan approval is healthy and reports `Ready=True` with
+reason `Planned`, alongside `Drifted=True`. `Drifted` is what distinguishes it
+from a policy with nothing to do; `Ready=False` always means something is
+wrong.
 
 The operator also emits transition-based Kubernetes Events on the policy.
 Status transitions:
@@ -146,6 +153,13 @@ Plan lifecycle:
 
 - `PlanCreated`, `PlanApproved`, `PlanRejected`
 - `ApplyStarted`, `ApplySucceeded`, `ApplyFailed`
+
+Ephemeral access requests carry their own Events, recorded on the
+`EphemeralAccessRequest` object rather than on the policy, with the action
+`EphemeralAccessLifecycle`. Terminal failures — `Failed`, `Denied`, and
+`ApprovalExpired` — are `Warning`; every other phase transition is `Normal`. So
+`kubectl describe -n <namespace> ephemeralaccessrequest <name>` is where one
+request's history lives, not `kubectl describe pgr`.
 
 Not every failure becomes an Event. `MissingDatabaseObject`,
 `InvalidConnectionParams`, and `UnsatisfiableWildcardGrant` are condition

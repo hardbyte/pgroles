@@ -47,7 +47,7 @@ The operator's safety model — serialized reconciliation, conflict detection, f
 
 **Password drift visibility:**
 
-- PostgreSQL does not expose password material in a way pgroles can compare safely. The operator can detect password source Secret changes and re-apply them, but it cannot detect out-of-band manual password changes made directly in the database.
+- The operator re-applies passwords when the source Secret changes, but cannot detect a password changed directly in the database. See [password drift](/docs/limitations#password-drift) for why PostgreSQL makes this undetectable.
 
 **Managed provider validation:**
 
@@ -55,13 +55,15 @@ The operator's safety model — serialized reconciliation, conflict detection, f
 
 **Deployment security:**
 
-- The operator requires cluster-scoped controller RBAC with Secret read access;
-  there is no namespace-scoped deployment option. Ephemeral request and
-  approval hardening is covered in [securing ephemeral access](/docs/ephemeral-access-security).
+- The operator requires controller RBAC with Secret read access. It is
+  cluster-scoped by default; `operator.watchNamespace` scopes every watch and
+  the chart's RBAC to a single namespace. Ephemeral request and approval
+  hardening is covered in [securing ephemeral access](/docs/ephemeral-access-security).
 
 **Deletion semantics:**
 
 - Deleting a `PostgresPolicy` stops reconciliation but does not revert the database. This is by design (stop managing, not undo) but differs from GitOps conventions where deleting a resource reverts its effects.
+- Deleting a policy with `--cascade=orphan` leaves its plans and plan-SQL ConfigMaps behind. They are matched to their policy by owner UID rather than by name, so a recreated policy of the same name does not re-adopt them, and orphan deletion strips the owner references that garbage collection relies on. Prefer the default cascading delete; if you have already orphaned some, delete the leftover `pgplan` objects and `*-sql` ConfigMaps by hand.
 
 ## Path to API stability
 

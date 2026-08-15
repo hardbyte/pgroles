@@ -2,6 +2,7 @@ import { Callout } from '@/components/Callout'
 import { OperatorArchitectureDiagram } from '@/components/OperatorArchitectureDiagram'
 import { OperatorReconciliationDiagram } from '@/components/OperatorReconciliationDiagram'
 import { QuickLink, QuickLinks } from '@/components/QuickLinks'
+import { RoleGraphDiagram } from '@/components/RoleGraphDiagram'
 import { WorkspaceDataFlowDiagram } from '@/components/WorkspaceDataFlowDiagram'
 
 const tags = {
@@ -52,6 +53,10 @@ const tags = {
   'operator-reconciliation-diagram': {
     selfClosing: true,
     render: OperatorReconciliationDiagram,
+  },
+  'role-graph-diagram': {
+    selfClosing: true,
+    render: RoleGraphDiagram,
   },
   'workspace-data-flow-diagram': {
     selfClosing: true,

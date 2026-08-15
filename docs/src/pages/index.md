@@ -28,7 +28,7 @@ Built for platform teams, DBAs, and anyone managing more than a handful of Postg
 
 {% quick-links %}
 
-{% quick-link title="Quick start" icon="installation" href="/docs/quick-start" description="Install pgroles and run your first diff against a live database." /%}
+{% quick-link title="CLI quick start" icon="installation" href="/docs/quick-start" description="Install pgroles and run your first diff against a live database." /%}
 
 {% quick-link title="Manifest guide" icon="presets" href="/docs/manifest-format" description="Learn how manifest sections fit together when designing a policy." /%}
 
