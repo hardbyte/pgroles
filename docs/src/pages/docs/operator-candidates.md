@@ -1,6 +1,6 @@
 ---
 title: Candidates and promotion
-description: Propose policy changes, review their exact PostgreSQL effects, and promote them — while the active policy stays enforced.
+description: Propose policy changes, review their exact PostgreSQL effects, and promote them — while the active policy keeps enforcing during review.
 ---
 
 Review what a change would do to production before it becomes the desired state. {% .lead %}
@@ -21,11 +21,14 @@ that an author wants reviewed against a live database without touching the
 `PostgresPolicy` that is enforcing it. The operator plans the candidate in the
 active policy's own execution context — same credentials, same advisory lock,
 same managed scope — and publishes a `PostgresPolicyPlan` describing exactly
-what would change. The active policy keeps enforcing throughout.
+what would change. The active policy keeps enforcing throughout review. (After
+promotion the picture changes if the promotion does not match its approval —
+see [Promotion](#promotion).)
 
-A candidate is not a second policy. It carries no connection, interval, or
-mode; it can never execute SQL in any state; and it is terminal once promoted,
-superseded, or stale. Think of it the way you think of a
+A candidate is not a second policy. It carries no interval or mode, and no
+connection unless it is explicitly previewing a different target; it can never
+execute SQL in any state; and it is terminal once promoted, superseded, stale,
+or its plan is rejected. Think of it the way you think of a
 `CertificateSigningRequest`: a request for the controller to produce a
 reviewable result, not a piece of desired state.
 
@@ -76,9 +79,11 @@ spec:
 ```
 
 `spec.content` is the exact policy-content schema from `PostgresPolicySpec` —
-everything except connection, interval, mode, and approval, which always come
-from the parent policy. The whole spec is immutable (`self == oldSelf`); to
-revise a proposal, create a successor:
+everything except connection, interval, mode, and approval. Interval, mode and
+approval always come from the parent policy; the connection does too, unless
+`spec.target` overrides it (see [Previewing a connection
+migration](#previewing-a-connection-migration)). The whole spec is immutable
+(`self == oldSelf`); to revise a proposal, create a successor:
 
 ```bash
 pgroles candidate create --policy orders -f revised.yaml --replaces orders-change-x7k2p
@@ -101,8 +106,9 @@ operator:
    post-enforcement reality rather than drift
 2. plans the candidate content against that state
 3. publishes an operator-owned `PostgresPolicyPlan` bound to the candidate
-   (name and UID), its content digest, the applied-base digest it observed,
-   the target identity, the managed scope, and the canonical change digest
+   (name and UID), its content digest, the target identity, the managed
+   scope, and the canonical change digest — and records the applied base it
+   observed as provenance (see [Staleness](#staleness-and-revalidation))
 
 Planning writes nothing: no PostgreSQL statements, no generated password
 Secrets, no changes to the active policy. Filing a candidate may advance the
@@ -131,6 +137,11 @@ pgroles candidate show orders-change-x7k2p     # plan summary, effects, digests
 pgroles plan approve orders-change-x7k2p-plan-9f21c4
 ```
 
+Rejection lands on the plan, not the candidate: the plan records
+`Denied=True` (phase `Rejected`) and is terminal. The candidate is terminal
+too — it has no other plan coming — and reports `Superseded=True` with reason
+`PlanDenied`. To propose a revised version, file a successor candidate.
+
 ## Promotion
 
 Approval does not change the `PostgresPolicy`. Promotion is the ordinary
@@ -157,21 +168,28 @@ The edge cases are defined, not implied:
 | Promotion with no approved plan at all | Normal manual-plan flow |
 | Plan X approved, candidate Y merged | Y plans fresh; X goes stale |
 
-One honest cost to know: after a mismatched promotion, the merged spec is the
-desired state but is unenforced until a fresh plan is approved — the same
-suspension `apply + manual` has always had, surfaced by condition and Event
-and bounded by the plan retention TTL. Continued enforcement of the *previous*
-state through a failed promotion is what a future Revision model would add.
+One honest cost to know: after a mismatched promotion, nothing has executed
+and the database is unchanged — but the merged spec is now the desired state
+and is not being converged, so drift against *either* state goes unreconciled
+until a fresh plan is approved. That is the same suspension `apply + manual`
+has always had, surfaced by condition and Event and bounded by the plan
+retention TTL. Continued enforcement of the *previous* state through a failed
+promotion is what a future Revision model would add.
 
 ## Staleness and revalidation
 
-Staleness is semantic. When anything the plan depends on changes — the applied
-base, the live database, active ephemeral overlays — the operator replans the
-candidate and compares canonical change digests:
+Staleness is semantic, and the applied base is *provenance, not identity*. The
+plan records which base it was computed against so you can see what it was
+compared to, but that value is not hashed into the change digest — if it were,
+every unrelated base edit would invalidate every open candidate. When anything
+the plan depends on changes — the applied base, the live database, active
+ephemeral overlays — the operator replans the candidate and compares canonical
+change digests:
 
 - **identical digest**: the plan and any decision on it are retained; the
-  revalidation is recorded. Unrelated base changes and unrelated ephemeral
-  activity do not cost you a review round.
+  recorded base advances to the one just observed and the revalidation is
+  noted. Unrelated base changes and unrelated ephemeral activity do not cost
+  you a review round.
 - **changed digest**: the plan is superseded with an explicit condition and
   Event, and the fresh plan awaits a fresh decision.
 
@@ -200,17 +218,36 @@ spec:
   content: ...
 ```
 
-The resulting plan binds the override's target identity; it can never be
-promoted onto the current target by accident, because the digest match fails.
+A target override changes the execution context, and the contract is
+explicit about it:
+
+- **Credentials and connection settings come from the override**, not the
+  parent. The referenced Secret must carry credentials for the destination.
+- **Locking follows the target.** Advisory and in-process locks are keyed by
+  database identity, so planning against the override acquires that
+  database's locks — it cannot share the parent's lock state, and it does not
+  block the parent's reconcile. The enforce-then-plan ordering still applies
+  to the parent (it is reconciled first on its own target); the override is
+  then inspected separately within the same reconcile.
+- **The plan binds the override's target identity**, so it can never be
+  promoted onto the current target by accident: the identity check fails
+  before execution.
+
+Because of that last point, a target-override plan is a *preview*, not a
+migration step. Promoting a migration is a deliberate two-part sequence:
+merge the connection change into `PostgresPolicy.spec` so the active policy
+points at the destination, then approve a plan computed against the new
+target. The override lets you see the destination's diff before committing to
+step one; it never performs the cutover itself.
 
 ## Retention
 
 Candidates carry an `ownerReference` to their parent policy, and each derived
-plan is owned by its candidate, so pruning cascades. Terminal candidates
-(promoted, superseded, stale, rejected) are pruned by the same bounded
-retention loop as plans; label a candidate `pgroles.io/keep=true` to exempt
-it. Plans also expire after a TTL — an approval is not an indefinite
-authorisation.
+plan is owned by its candidate, so pruning cascades. Terminal candidates —
+`Promoted=True`, or `Superseded=True` for any reason including `PlanDenied` —
+are pruned by the same bounded retention loop as plans; label a candidate
+`pgroles.io/keep=true` to exempt it. Plans also expire after a TTL — an
+approval is not an indefinite authorisation.
 
 ## Conditions
 
@@ -221,8 +258,14 @@ authorisation.
 | `Ready=True, reason=Planned` | A current plan exists for this candidate |
 | `Ready=False, reason=BlockedByActivePolicy` | Parent is failing or awaiting its own approval; will re-plan |
 | `Ready=False, reason=OverlayOverlap` | An ephemeral grant overlaps this candidate's effects; fresh review required |
-| `Superseded=True` | Replaced by a successor candidate or invalidated by a digest change |
+| `Superseded=True, reason=Replaced` | A successor candidate named this one in `spec.replaces` |
+| `Superseded=True, reason=EffectsChanged` | Replanning produced a different change digest; the fresh plan awaits its own decision |
+| `Superseded=True, reason=PlanDenied` | The candidate's plan was rejected (terminal) |
 | `Promoted=True` | This candidate's content was promoted and executed |
+
+Rejection is recorded on the plan (`Denied=True`, phase `Rejected`); the
+candidate reflects it as `Superseded=True, reason=PlanDenied`. Both are
+terminal.
 
 ## Limits
 

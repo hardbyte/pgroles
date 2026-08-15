@@ -53,7 +53,8 @@ one coherent (drift visibility without a stream of permission-denied errors).
 For a reviewed apply, use `mode: apply` with `approval: manual`. Use `suspend`
 to stop reconciling entirely.
 
-The rendered SQL lives on the plan; follow `current_plan_ref` to it:
+The rendered SQL lives on the plan; follow `current_plan_ref` to it. Small
+plans carry it inline:
 
 ```bash
 POLICY=observed-policy
@@ -61,9 +62,22 @@ PLAN="$(kubectl get pgr "$POLICY" -o jsonpath='{.status.current_plan_ref.name}')
 kubectl get pgplan "$PLAN" -o jsonpath='{.status.sqlInline}'
 ```
 
-Plans above the inline size limit set `status.sqlRef`, naming a ConfigMap
-whose `plan.sql.gz` entry holds the gzipped SQL. The preview is a review
-artifact in every case: **pgroles never executes stored SQL**.
+Plans above the inline size limit leave `sqlInline` empty and set
+`status.sqlRef` instead, naming a ConfigMap whose `plan.sql.gz` entry holds
+the gzipped SQL — so the command above prints nothing for a large plan.
+Fetching that takes a decode step:
+
+```bash
+CM="$(kubectl get pgplan "$PLAN" -o jsonpath='{.status.sqlRef.name}')"
+kubectl get configmap "$CM" -o jsonpath="{.binaryData['plan\.sql\.gz']}" |
+  base64 -d | gunzip
+```
+
+`pgroles plan show <plan>` follows whichever branch applies. A plan whose
+compressed preview would still exceed the ConfigMap limit sets no `sqlRef`,
+and `sqlInline` carries a truncated preview ending in a `-- truncated: ... --`
+marker. The preview is a review artifact in every case: **pgroles never
+executes stored SQL**.
 
 ## What executes: mode and approval together
 
@@ -88,7 +102,16 @@ What a decision approves is the plan's **change digest**: a versioned hash
 (`pgroles.io/approval-effect/v1`) of the canonical, deterministically ordered
 typed effects — role lifecycle, grants, memberships, ownership and default
 privileges, retirements — bound together with the reconciliation mode, the
-managed scope, the applied-base digest, and the target identity.
+managed scope, and the target identity.
+
+The applied base is deliberately *not* a digest input. The plan records which
+base it was computed against as provenance, and that record advances whenever
+revalidation confirms the effects are unchanged. Hashing the base in would
+make every unrelated policy edit invalidate every pending approval, which is
+exactly the churn semantic identity exists to prevent. What the base record
+does buy is the promotion check: execution requires the promoted content to
+match the approved candidate *and* the base to be the one the plan last
+revalidated against.
 
 The digest deliberately excludes anything that legitimately differs between
 planning and execution: cleartext passwords, SCRAM salts and verifiers, and
@@ -113,6 +136,13 @@ decisions work:
 ```bash
 pgroles plan approve orders-plan-9f21c4      # or: pgroles plan reject ...
 ```
+
+There is one rejection model across the product. A rejected plan records
+`Denied=True` with reason `DeniedByReviewer` and moves to phase `Rejected`;
+`Approved=True` and `Denied=True` are mutually exclusive and neither can be
+changed once written. ("Rejected" is the phase; `Denied` is the condition —
+they always travel together.) A candidate whose plan is denied is terminal
+too, reporting `Superseded=True, reason=PlanDenied`.
 
 The CLI patches the plan's status subresource; raw `kubectl patch
 --subresource=status` works identically. The approval annotations from
@@ -152,9 +182,11 @@ Approving a plan therefore approves what the plan currently shows. If a
 supersede races your approval, the decision lands on a plan that is no longer
 current and nothing executes — the fresh plan awaits its own decision.
 
-Rejecting a plan marks it `Rejected` and clears `status.current_plan_ref`;
-the replacement is created on the next reconcile, which keeps a rejected plan
-from spinning in a reject-recreate loop.
+Rejecting a plan — `Denied=True`, phase `Rejected`, as above — clears
+`status.current_plan_ref` on the policy. The replacement is created on the
+next reconcile rather than immediately, which keeps a rejected plan from
+spinning in a reject-recreate loop. For a candidate's plan there is no
+replacement: fix the proposal by filing a successor candidate.
 
 ## Target identity
 
