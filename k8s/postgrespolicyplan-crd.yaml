@@ -180,7 +180,7 @@
                 "type": "object"
               },
               "status": {
-                "description": "Status of a `PostgresPolicyPlan` resource.",
+                "description": "Status of a `PostgresPolicyPlan` resource.\n\nThe decision rules below are the same grammar `EphemeralAccessRequest`\nuses: a decision is terminal, `Approved` and `Denied` cannot both be true,\nand the deciding identity is recorded in the same admitted write. What CEL\ncannot do is check *who* is writing — see [`DecisionActor`].",
                 "nullable": true,
                 "properties": {
                   "appliedAt": {
@@ -287,7 +287,7 @@
                   },
                   "conditions": {
                     "default": [],
-                    "description": "Standard conditions: Computed, Approved, Applied.",
+                    "description": "Standard conditions: Computed, Applied, and the terminal decision\nconditions `Approved` / `Denied`.",
                     "items": {
                       "description": "A condition on the `PostgresPolicy` resource.",
                       "properties": {
@@ -321,7 +321,38 @@
                       ],
                       "type": "object"
                     },
+                    "maxItems": 16,
                     "type": "array"
+                  },
+                  "decidedBy": {
+                    "description": "Kubernetes identity which approved or denied this plan.\n\nWritten in the same status update as the terminal decision, and\nwrite-once thereafter. The supplied Kyverno reference policy overwrites\nit from authenticated admission `userInfo`; without that admission layer\nit is an assertion by whoever wrote the status, not a verified identity.",
+                    "nullable": true,
+                    "properties": {
+                      "groups": {
+                        "default": [],
+                        "items": {
+                          "maxLength": 256,
+                          "minLength": 1,
+                          "type": "string"
+                        },
+                        "maxItems": 64,
+                        "type": "array"
+                      },
+                      "uid": {
+                        "maxLength": 128,
+                        "nullable": true,
+                        "type": "string"
+                      },
+                      "username": {
+                        "maxLength": 512,
+                        "minLength": 1,
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "username"
+                    ],
+                    "type": "object"
                   },
                   "failedAt": {
                     "description": "Timestamp when the plan entered Failed phase (for dedup window).",
@@ -423,7 +454,25 @@
                     "type": "boolean"
                   }
                 },
-                "type": "object"
+                "type": "object",
+                "x-kubernetes-validations": [
+                  {
+                    "message": "Approved=True and Denied=True are mutually exclusive",
+                    "rule": "!(self.conditions.exists(c, c.type == 'Approved' && c.status == 'True') && self.conditions.exists(c, c.type == 'Denied' && c.status == 'True'))"
+                  },
+                  {
+                    "message": "plan decisions are terminal",
+                    "rule": "oldSelf.conditions.filter(c, (c.type == 'Approved' || c.type == 'Denied') && c.status == 'True').map(c, c.type) == self.conditions.filter(c, (c.type == 'Approved' || c.type == 'Denied') && c.status == 'True').map(c, c.type) || oldSelf.conditions.filter(c, (c.type == 'Approved' || c.type == 'Denied') && c.status == 'True').size() == 0"
+                  },
+                  {
+                    "message": "decision identity is write-once",
+                    "rule": "!has(oldSelf.decidedBy) || (has(self.decidedBy) && self.decidedBy == oldSelf.decidedBy)"
+                  },
+                  {
+                    "message": "a terminal plan decision and decidedBy identity must be recorded together",
+                    "rule": "self.conditions.exists(c, (c.type == 'Approved' || c.type == 'Denied') && c.status == 'True') == has(self.decidedBy)"
+                  }
+                ]
               }
             },
             "required": [

@@ -1,0 +1,179 @@
+# Admission policy for PostgresPolicyPlan decisions.
+#
+# The CRD's CEL rules make a decision terminal, mutually exclusive, and paired
+# with a `decidedBy` identity — but CEL cannot see `request.userInfo`, so the
+# API server alone cannot tell a real approver from a client that simply typed
+# a username into the field. This policy is what closes that gap:
+#
+#   1. it overwrites `decidedBy` from the authenticated admission request, so
+#      the recorded identity is the one the API server verified, and
+#   2. it requires the logical `approve` verb on the parent PostgresPolicy, so
+#      being able to patch a plan's status is not by itself authority to
+#      approve database changes.
+#
+# Without this policy installed, `decidedBy` is an assertion, and anyone with
+# patch on plans/status can approve. Deployments that need separation of duties
+# must install it. This is stated in the operator docs as a deployment
+# requirement, not an optional hardening step.
+#
+# Mirrors k8s/security/ephemeral-access-kyverno.yaml so both decision
+# lifecycles are enforced the same way.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: pgroles-plan-decision-kyverno-reports
+  labels:
+    rbac.kyverno.io/aggregate-to-reports-controller: "true"
+rules:
+  - apiGroups: [pgroles.io]
+    resources:
+      - postgrespolicies
+      - postgrespolicyplans
+      - postgrespolicyplans/status
+    verbs: [get, list, watch]
+---
+# The `approve`-verb check below posts a SubjectAccessReview using the Kyverno
+# admission controller's own credentials. Without this it cannot, and because
+# the policy is enforcing, a failed context lookup blocks every decision write.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: pgroles-plan-decision-kyverno-sar
+  labels:
+    rbac.kyverno.io/aggregate-to-admission-controller: "true"
+rules:
+  - apiGroups: [authorization.k8s.io]
+    resources: [subjectaccessreviews]
+    verbs: [create]
+  - apiGroups: [pgroles.io]
+    resources: [postgrespolicies, postgrespolicyplans]
+    verbs: [get, list, watch]
+---
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: pgroles-plan-decision-authorization
+  labels:
+    app.kubernetes.io/name: pgroles-operator
+    app.kubernetes.io/component: admission-policy
+spec:
+  validationFailureAction: Enforce
+  background: false
+  rules:
+    # Record the authenticated identity in the same status mutation as the
+    # first terminal decision. The CRD's transition rules make it write-once
+    # once admission has persisted it.
+    - name: record-authenticated-decision-maker
+      match:
+        any:
+          - resources:
+              kinds: [pgroles.io/v1alpha1/PostgresPolicyPlan/status]
+              operations: [UPDATE]
+      preconditions:
+        all:
+          # Only a *newly true* decision counts. The operator's own writes —
+          # creating a plan with Approved=False, recording a rejection it
+          # observed, auto-approving under `approval: auto` — must not be
+          # treated as a reviewer decision, or the operator would need the
+          # approve verb and would have its own decidedBy overwritten.
+          - key: >-
+              {{ length(request.object.status.conditions[?(type == 'Approved' || type == 'Denied') && status == 'True']) }}
+            operator: GreaterThan
+            value: >-
+              {{ length(request.oldObject.status.conditions[?(type == 'Approved' || type == 'Denied') && status == 'True'] || `[]`) }}
+          # EDIT THIS if you install the operator under a different namespace
+          # or ServiceAccount name (Helm: `operator.serviceAccount.name`,
+          # `--namespace`). Kyverno cannot resolve it for you, and getting it
+          # wrong means the operator's own status writes are treated as
+          # reviewer decisions and rejected.
+          - key: "{{ request.userInfo.username }}"
+            operator: NotEquals
+            value: "system:serviceaccount:pgroles-system:pgroles-operator"
+      mutate:
+        patchStrategicMerge:
+          status:
+            decidedBy:
+              username: "{{ request.userInfo.username }}"
+              uid: "{{ request.userInfo.uid || '' }}"
+              groups: "{{ request.userInfo.groups }}"
+
+    # Deciding a plan requires the logical `approve` verb on the parent policy.
+    # Patch access to plans/status is shared with the operator and is not, on
+    # its own, authority to approve a change to the database.
+    - name: require-approve-on-decision-change
+      match:
+        any:
+          - resources:
+              kinds: [pgroles.io/v1alpha1/PostgresPolicyPlan/status]
+              operations: [UPDATE]
+      preconditions:
+        all:
+          # Only a *newly true* decision counts. The operator's own writes —
+          # creating a plan with Approved=False, recording a rejection it
+          # observed, auto-approving under `approval: auto` — must not be
+          # treated as a reviewer decision, or the operator would need the
+          # approve verb and would have its own decidedBy overwritten.
+          - key: >-
+              {{ length(request.object.status.conditions[?(type == 'Approved' || type == 'Denied') && status == 'True']) }}
+            operator: GreaterThan
+            value: >-
+              {{ length(request.oldObject.status.conditions[?(type == 'Approved' || type == 'Denied') && status == 'True'] || `[]`) }}
+          # EDIT THIS if you install the operator under a different namespace
+          # or ServiceAccount name (Helm: `operator.serviceAccount.name`,
+          # `--namespace`). Kyverno cannot resolve it for you, and getting it
+          # wrong means the operator's own status writes are treated as
+          # reviewer decisions and rejected.
+          - key: "{{ request.userInfo.username }}"
+            operator: NotEquals
+            value: "system:serviceaccount:pgroles-system:pgroles-operator"
+      context:
+        - name: subjectaccessreview
+          apiCall:
+            urlPath: /apis/authorization.k8s.io/v1/subjectaccessreviews
+            method: POST
+            data:
+              - key: kind
+                value: SubjectAccessReview
+              - key: apiVersion
+                value: authorization.k8s.io/v1
+              - key: spec
+                value:
+                  resourceAttributes:
+                    group: pgroles.io
+                    resource: postgrespolicies
+                    namespace: "{{ request.namespace }}"
+                    name: "{{ request.object.spec.policyRef.name }}"
+                    verb: approve
+                  user: "{{ request.userInfo.username }}"
+                  groups: "{{ request.userInfo.groups }}"
+      validate:
+        message: >-
+          changing Approved or Denied requires the approve verb on the parent
+          PostgresPolicy
+        deny:
+          conditions:
+            any:
+              - key: "{{ subjectaccessreview.status.allowed }}"
+                operator: NotEquals
+                value: true
+---
+# Grant the logical `approve` verb to plan reviewers. Bind this to the humans
+# or groups permitted to authorise database changes; it is deliberately
+# separate from write access to PostgresPolicy itself, so proposing a change
+# and approving one are distinct capabilities.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: pgroles-plan-approver
+  labels:
+    app.kubernetes.io/name: pgroles-operator
+rules:
+  - apiGroups: [pgroles.io]
+    resources: [postgrespolicies]
+    verbs: [approve]
+  - apiGroups: [pgroles.io]
+    resources: [postgrespolicyplans]
+    verbs: [get, list, watch]
+  - apiGroups: [pgroles.io]
+    resources: [postgrespolicyplans/status]
+    verbs: [patch, update]

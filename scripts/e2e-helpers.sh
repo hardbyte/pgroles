@@ -316,14 +316,58 @@ wait_for_plan_phase() {
   return 1
 }
 
+# Record a terminal decision on a plan's status subresource.
+#
+# The decision and the deciding identity must land in one write: CEL rejects a
+# decision condition without `decidedBy`. In a cluster running the Kyverno
+# reference policy the `decidedBy` sent here is overwritten with the caller's
+# authenticated identity; without that policy it stands as written, which is
+# exactly the trust boundary documented in operator-plan-approval.md.
+decide_plan() {
+  local plan="$1" condition="$2" reason="$3"
+  local now existing merged
+  now="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+
+  # Replace any existing decision condition rather than appending one.
+  #
+  # A plan is created carrying `Approved=False`, so a blind append leaves two
+  # `Approved` entries; the operator's own condition writer then flips the
+  # first, producing two `Approved=True`. The CRD's terminality rule compares
+  # the decision types that are true, so that reads as ['Approved','Approved']
+  # against ['Approved'] and the operator's write is rejected — the plan can
+  # never reach Applied. A plain merge patch avoids the duplicate but deletes
+  # the operator's Computed condition, so read, filter, and write back.
+  if ! existing="$(kubectl get pgplan "$plan" -o json)"; then
+    echo "::error::could not read PostgresPolicyPlan $plan" >&2
+    return 1
+  fi
+
+  merged="$(printf '%s' "$existing" | python3 -c "
+import json, sys
+status = json.load(sys.stdin).get('status', {})
+conditions = [
+    c for c in status.get('conditions', [])
+    if c.get('type') not in ('Approved', 'Denied')
+]
+conditions.append({
+    'type': '$condition', 'status': 'True', 'reason': '$reason',
+    'message': 'recorded by e2e', 'lastTransitionTime': '$now',
+})
+print(json.dumps({'status': {
+    'conditions': conditions,
+    'decidedBy': {'username': 'e2e-reviewer'},
+}}))
+")" || return 1
+
+  kubectl patch pgplan "$plan" --subresource=status --type=merge -p "$merged"
+}
+
 approve_plan() {
-  local plan="$1"
-  kubectl annotate pgplan "$plan" pgroles.io/approved=true --overwrite
+  decide_plan "$1" Approved ApprovedByReviewer
 }
 
 reject_plan() {
-  local plan="$1"
-  kubectl annotate pgplan "$plan" pgroles.io/rejected=true --overwrite
+  decide_plan "$1" Denied DeniedByReviewer
 }
 
 get_plan_sql() {

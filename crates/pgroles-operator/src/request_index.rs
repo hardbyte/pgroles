@@ -261,7 +261,7 @@ impl RequestIndex {
 mod tests {
     use super::*;
     use crate::crd::{
-        EphemeralAccessActor, EphemeralAccessRequestSpec, EphemeralAccessRequestStatus,
+        DecisionActor, EphemeralAccessRequestSpec, EphemeralAccessRequestStatus,
         EphemeralAccessSubject, LocalObjectReference, ResolvedEphemeralAccess,
     };
 
@@ -280,7 +280,7 @@ mod tests {
                 subject: EphemeralAccessSubject {
                     role: "alice".into(),
                 },
-                requested_by: EphemeralAccessActor {
+                requested_by: DecisionActor {
                     username: "user".into(),
                     uid: None,
                     groups: vec![],

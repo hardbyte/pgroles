@@ -21,9 +21,8 @@ use tracing::info;
 
 use crate::crd::{
     ChangeSummary, CrdReconciliationMode, LABEL_DATABASE_IDENTITY, LABEL_PLAN, LABEL_POLICY,
-    PLAN_APPROVED_ANNOTATION, PLAN_REJECTED_ANNOTATION, PlanPhase, PlanReference, PolicyCondition,
-    PolicyPlanRef, PostgresPolicy, PostgresPolicyPlan, PostgresPolicyPlanSpec,
-    PostgresPolicyPlanStatus, SqlCompression, SqlRef,
+    PlanPhase, PlanReference, PolicyCondition, PolicyPlanRef, PostgresPolicy, PostgresPolicyPlan,
+    PostgresPolicyPlanSpec, PostgresPolicyPlanStatus, SqlCompression, SqlRef,
 };
 use crate::k8s_names::{LabelValue, truncate_name_prefix};
 use crate::reconciler::ReconcileError;
@@ -138,28 +137,38 @@ pub enum PlanApprovalState {
     Rejected,
 }
 
-/// Check the approval state of a plan by inspecting its annotations.
+/// Identity recorded as the decider when `approval: auto` lets the operator
+/// approve its own plan. It is not a Kubernetes user; it names the mechanism so
+/// an audit trail never shows an unattributed approval.
+pub const AUTO_APPROVAL_ACTOR: &str = "system:pgroles-operator(auto-approval)";
+
+/// Read the decision recorded on a plan.
 ///
-/// Rejection takes priority over approval: if both annotations are set,
-/// the plan is considered rejected.
+/// The decision lives in the status subresource as a terminal `Approved` or
+/// `Denied` condition, alongside the `decidedBy` identity written in the same
+/// admitted update. It replaced the `pgroles.io/approved` annotation, which any
+/// holder of patch on the object could set, unset, or forge without trace.
+///
+/// `Denied` wins over `Approved` if both are somehow present. CEL rejects that
+/// combination at admission, so reaching it means the rules were bypassed —
+/// refusing to execute is the fail-closed reading.
 pub fn check_plan_approval(plan: &PostgresPolicyPlan) -> PlanApprovalState {
-    let annotations = plan.metadata.annotations.as_ref();
+    let Some(status) = plan.status.as_ref() else {
+        return PlanApprovalState::Pending;
+    };
 
-    let rejected = annotations
-        .and_then(|a| a.get(PLAN_REJECTED_ANNOTATION))
-        .map(|v| v == "true")
-        .unwrap_or(false);
+    let decided = |condition_type: &str| {
+        status
+            .conditions
+            .iter()
+            .any(|c| c.condition_type == condition_type && c.status == "True")
+    };
 
-    if rejected {
+    if decided("Denied") {
         return PlanApprovalState::Rejected;
     }
 
-    let approved = annotations
-        .and_then(|a| a.get(PLAN_APPROVED_ANNOTATION))
-        .map(|v| v == "true")
-        .unwrap_or(false);
-
-    if approved {
+    if decided("Approved") {
         return PlanApprovalState::Approved;
     }
 
@@ -407,6 +416,9 @@ pub async fn create_or_update_plan(
     };
     let plan_status = PostgresPolicyPlanStatus {
         phase: PlanPhase::Pending,
+        // No decision yet, so no deciding identity. The CEL rule pairing the
+        // two means a plan is never born with one without the other.
+        decided_by: None,
         conditions: vec![
             PolicyCondition {
                 condition_type: "Computed".to_string(),
@@ -1381,14 +1393,13 @@ fn set_plan_condition(
         message: Some(message.to_string()),
         last_transition_time: transition_time,
     };
-    if let Some(existing) = conditions
-        .iter_mut()
-        .find(|c| c.condition_type == condition_type)
-    {
-        *existing = condition;
-    } else {
-        conditions.push(condition);
-    }
+    // Collapse to exactly one entry per condition type. Replacing only the
+    // first match would leave a duplicate in place, and a second `Approved`
+    // that this never touches makes the CRD's terminality rule see the
+    // decision set grow — rejecting the operator's own writes and stranding
+    // the plan. A malformed status should not be able to do that.
+    conditions.retain(|c| c.condition_type != condition_type);
+    conditions.push(condition);
 }
 
 /// Update the parent policy's `current_plan_ref` in status.
@@ -1545,6 +1556,16 @@ pub async fn mark_plan_approved(
     let mut status = plan.status.clone().unwrap_or_default();
     status.phase = PlanPhase::Approved;
     set_plan_condition(&mut status.conditions, "Approved", "True", reason, message);
+    // Under `approval: auto` the operator itself is the decider, and the CEL
+    // rule requires the identity in the same write as the decision. Naming the
+    // operator is also the honest record: no human reviewed this.
+    if status.decided_by.is_none() {
+        status.decided_by = Some(crate::crd::DecisionActor {
+            username: AUTO_APPROVAL_ACTOR.to_string(),
+            uid: None,
+            groups: Vec::new(),
+        });
+    }
 
     let patch = serde_json::json!({ "status": status });
     plans_api
@@ -1567,17 +1588,11 @@ pub async fn mark_plan_rejected(
     let plan_name = plan.name_any();
     let plans_api: Api<PostgresPolicyPlan> = Api::namespaced(client.clone(), &namespace);
 
-    let mut status = plan.status.clone().unwrap_or_default();
-    status.phase = PlanPhase::Rejected;
-    set_plan_condition(
-        &mut status.conditions,
-        "Approved",
-        "False",
-        "Rejected",
-        "Plan rejected via annotation",
-    );
-
-    let patch = serde_json::json!({ "status": status });
+    // Patch the phase alone. The reviewer's `Denied=True` is the decision and
+    // is terminal, so there is nothing here for the operator to add to the
+    // conditions — and resending the whole array from a watch-backed read
+    // could drop a decision that landed after that read.
+    let patch = serde_json::json!({ "status": { "phase": PlanPhase::Rejected } });
     plans_api
         .patch_status(
             &plan_name,
@@ -1932,6 +1947,37 @@ mod tests {
         );
     }
 
+    /// Build a plan carrying the given terminal decision conditions.
+    ///
+    /// `decisions` are `(condition_type, status)` pairs written exactly as a
+    /// reviewer's status patch would leave them.
+    fn test_plan_with_decisions(
+        name: &str,
+        phase: PlanPhase,
+        decisions: &[(&str, &str)],
+    ) -> PostgresPolicyPlan {
+        let mut plan = test_plan(name, phase, None);
+        let status = plan.status.as_mut().expect("status");
+        status.conditions = decisions
+            .iter()
+            .map(|(condition_type, condition_status)| PolicyCondition {
+                condition_type: (*condition_type).to_string(),
+                status: (*condition_status).to_string(),
+                reason: Some("DecidedByReviewer".to_string()),
+                message: None,
+                last_transition_time: Some(crate::crd::now_rfc3339()),
+            })
+            .collect();
+        if decisions.iter().any(|(_, s)| *s == "True") {
+            status.decided_by = Some(crate::crd::DecisionActor {
+                username: "reviewer@example.com".to_string(),
+                uid: Some("uid-1".to_string()),
+                groups: vec!["platform".to_string()],
+            });
+        }
+        plan
+    }
+
     fn test_plan(
         name: &str,
         phase: PlanPhase,
@@ -1962,41 +2008,68 @@ mod tests {
     }
 
     #[test]
-    fn check_plan_approval_pending_when_no_annotations() {
+    fn a_plan_with_no_recorded_decision_is_pending() {
         let plan = test_plan("plan-1", PlanPhase::Pending, None);
         assert_eq!(check_plan_approval(&plan), PlanApprovalState::Pending);
+
+        // A plan with no status at all — freshly created, status not yet
+        // written — must also read as undecided rather than panicking.
+        let mut statusless = test_plan("plan-2", PlanPhase::Pending, None);
+        statusless.status = None;
+        assert_eq!(check_plan_approval(&statusless), PlanApprovalState::Pending);
     }
 
     #[test]
-    fn check_plan_approval_approved_with_annotation() {
-        let annotations =
-            BTreeMap::from([(PLAN_APPROVED_ANNOTATION.to_string(), "true".to_string())]);
-        let plan = test_plan("plan-1", PlanPhase::Pending, Some(annotations));
-        assert_eq!(check_plan_approval(&plan), PlanApprovalState::Approved);
+    fn a_decision_is_read_from_the_status_conditions() {
+        let approved =
+            test_plan_with_decisions("plan-1", PlanPhase::Pending, &[("Approved", "True")]);
+        assert_eq!(check_plan_approval(&approved), PlanApprovalState::Approved);
+
+        let denied = test_plan_with_decisions("plan-1", PlanPhase::Pending, &[("Denied", "True")]);
+        assert_eq!(check_plan_approval(&denied), PlanApprovalState::Rejected);
     }
 
+    /// A plan is created carrying `Approved=False`, which is the *absence* of a
+    /// decision, not a denial. Reading it as either decision would auto-execute
+    /// or auto-reject every freshly created plan.
     #[test]
-    fn check_plan_approval_rejected_with_annotation() {
-        let annotations =
-            BTreeMap::from([(PLAN_REJECTED_ANNOTATION.to_string(), "true".to_string())]);
-        let plan = test_plan("plan-1", PlanPhase::Pending, Some(annotations));
+    fn a_false_decision_condition_is_not_a_decision() {
+        for conditions in [
+            &[("Approved", "False")][..],
+            &[("Denied", "False")][..],
+            &[("Approved", "False"), ("Denied", "False")][..],
+        ] {
+            let plan = test_plan_with_decisions("plan-1", PlanPhase::Pending, conditions);
+            assert_eq!(
+                check_plan_approval(&plan),
+                PlanApprovalState::Pending,
+                "conditions {conditions:?} must not read as a decision"
+            );
+        }
+    }
+
+    /// CEL rejects Approved=True alongside Denied=True at admission, so this
+    /// state is only reachable if the rules were bypassed. Refusing to execute
+    /// is the fail-closed reading.
+    #[test]
+    fn a_contradictory_decision_never_executes() {
+        let plan = test_plan_with_decisions(
+            "plan-1",
+            PlanPhase::Pending,
+            &[("Approved", "True"), ("Denied", "True")],
+        );
         assert_eq!(check_plan_approval(&plan), PlanApprovalState::Rejected);
     }
 
+    /// The decision no longer lives in annotations. A plan annotated the old
+    /// way carries no authority at all — otherwise removing the mechanism
+    /// would have left a silent bypass behind.
     #[test]
-    fn check_plan_approval_rejected_wins_over_approved() {
+    fn the_retired_approval_annotation_grants_nothing() {
         let annotations = BTreeMap::from([
-            (PLAN_APPROVED_ANNOTATION.to_string(), "true".to_string()),
-            (PLAN_REJECTED_ANNOTATION.to_string(), "true".to_string()),
+            ("pgroles.io/approved".to_string(), "true".to_string()),
+            ("pgroles.io/rejected".to_string(), "true".to_string()),
         ]);
-        let plan = test_plan("plan-1", PlanPhase::Pending, Some(annotations));
-        assert_eq!(check_plan_approval(&plan), PlanApprovalState::Rejected);
-    }
-
-    #[test]
-    fn check_plan_approval_non_true_value_is_pending() {
-        let annotations =
-            BTreeMap::from([(PLAN_APPROVED_ANNOTATION.to_string(), "false".to_string())]);
         let plan = test_plan("plan-1", PlanPhase::Pending, Some(annotations));
         assert_eq!(check_plan_approval(&plan), PlanApprovalState::Pending);
     }
@@ -2823,6 +2896,49 @@ mod tests {
             decide_approved_plan(Some(&approved_empty), &empty_digest, false),
             ApprovedPlanDecision::Execute,
         );
+    }
+
+    /// A status carrying a duplicate condition type must collapse to one.
+    ///
+    /// Replacing only the first match left the second in place, and a second
+    /// `Approved=True` makes the terminality rule see the true-decision set
+    /// grow — which rejects the operator's own write and strands the plan.
+    #[test]
+    fn setting_a_condition_leaves_exactly_one_of_that_type() {
+        let mut conditions = vec![
+            PolicyCondition {
+                condition_type: "Computed".to_string(),
+                status: "True".to_string(),
+                reason: None,
+                message: None,
+                last_transition_time: None,
+            },
+            PolicyCondition {
+                condition_type: "Approved".to_string(),
+                status: "False".to_string(),
+                reason: Some("PendingApproval".to_string()),
+                message: None,
+                last_transition_time: None,
+            },
+            PolicyCondition {
+                condition_type: "Approved".to_string(),
+                status: "True".to_string(),
+                reason: Some("ApprovedByReviewer".to_string()),
+                message: None,
+                last_transition_time: None,
+            },
+        ];
+
+        set_plan_condition(&mut conditions, "Approved", "True", "Reason", "Message");
+
+        let approved: Vec<_> = conditions
+            .iter()
+            .filter(|c| c.condition_type == "Approved")
+            .collect();
+        assert_eq!(approved.len(), 1, "duplicate Approved conditions survived");
+        assert_eq!(approved[0].status, "True");
+        // Unrelated conditions are untouched.
+        assert!(conditions.iter().any(|c| c.condition_type == "Computed"));
     }
 
     /// Planning must never persist password material, in any field.

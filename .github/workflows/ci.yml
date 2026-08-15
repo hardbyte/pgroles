@@ -377,8 +377,15 @@ jobs:
           wait_for_condition_status plan-policy ApprovalIgnored True
           wait_for_event_reason plan-policy ApprovalIgnored
           assert_role_absent plan-preview-user
-          kubectl annotate pgplan "$plan_preview_plan" pgroles.io/approved- --overwrite
-          wait_for_condition_absent plan-policy ApprovalIgnored
+
+          # A decision is terminal, so there is no un-approving: removing the
+          # retired annotation is a no-op, and the warning must persist rather
+          # than clear. This previously deleted `pgroles.io/approved` and waited
+          # for ApprovalIgnored to disappear — the mutable-annotation model that
+          # write-once decisions replaced.
+          kubectl annotate pgplan "$plan_preview_plan" pgroles.io/approved- --overwrite || true
+          wait_for_condition_status plan-policy ApprovalIgnored True
+          assert_role_absent plan-preview-user
 
           upsert_secret rotating-postgres-credentials \
             DATABASE_URL='postgres://postgres:devpassword@postgres.default.svc.cluster.local:5432/postgres'
