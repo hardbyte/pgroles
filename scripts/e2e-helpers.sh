@@ -325,19 +325,41 @@ wait_for_plan_phase() {
 # exactly the trust boundary documented in operator-plan-approval.md.
 decide_plan() {
   local plan="$1" condition="$2" reason="$3"
-  local now
+  local now existing merged
   now="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-  # Append rather than merge: a merge patch replaces `status.conditions`
-  # wholesale and would delete the operator's Computed condition.
-  kubectl patch pgplan "$plan" --subresource=status --type=json -p "$(cat <<JSON
-[
-  {"op": "add", "path": "/status/conditions/-",
-   "value": {"type": "$condition", "status": "True", "reason": "$reason",
-             "message": "recorded by e2e", "lastTransitionTime": "$now"}},
-  {"op": "add", "path": "/status/decidedBy", "value": {"username": "e2e-reviewer"}}
+
+  # Replace any existing decision condition rather than appending one.
+  #
+  # A plan is created carrying `Approved=False`, so a blind append leaves two
+  # `Approved` entries; the operator's own condition writer then flips the
+  # first, producing two `Approved=True`. The CRD's terminality rule compares
+  # the decision types that are true, so that reads as ['Approved','Approved']
+  # against ['Approved'] and the operator's write is rejected — the plan can
+  # never reach Applied. A plain merge patch avoids the duplicate but deletes
+  # the operator's Computed condition, so read, filter, and write back.
+  if ! existing="$(kubectl get pgplan "$plan" -o json)"; then
+    echo "::error::could not read PostgresPolicyPlan $plan" >&2
+    return 1
+  fi
+
+  merged="$(printf '%s' "$existing" | python3 -c "
+import json, sys
+status = json.load(sys.stdin).get('status', {})
+conditions = [
+    c for c in status.get('conditions', [])
+    if c.get('type') not in ('Approved', 'Denied')
 ]
-JSON
-)"
+conditions.append({
+    'type': '$condition', 'status': 'True', 'reason': '$reason',
+    'message': 'recorded by e2e', 'lastTransitionTime': '$now',
+})
+print(json.dumps({'status': {
+    'conditions': conditions,
+    'decidedBy': {'username': 'e2e-reviewer'},
+}}))
+")" || return 1
+
+  kubectl patch pgplan "$plan" --subresource=status --type=merge -p "$merged"
 }
 
 approve_plan() {
