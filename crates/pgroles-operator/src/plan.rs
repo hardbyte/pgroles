@@ -34,21 +34,36 @@ use pgroles_core::approval::APPROVAL_EFFECT_ENCODING_V1;
 pub enum PlanCreationResult {
     /// A new plan was created with the given name.
     Created(String),
-    /// An existing plan with the same hash was found (deduplication).
+    /// An existing pending plan with the same effects was found
+    /// (deduplication). The returned plan is actionable: it is awaiting a
+    /// decision and holds exactly the effects just computed.
     Deduplicated(String),
+    /// A plan holding exactly these effects failed recently and is still
+    /// inside its retry window, so no new plan was opened. The returned plan
+    /// is *Failed*, not pending — nothing is awaiting approval, and callers
+    /// must not report it as if it were.
+    DeduplicatedFailed(String),
 }
 
 impl PlanCreationResult {
     /// Return the plan name regardless of variant.
     pub fn plan_name(&self) -> &str {
         match self {
-            PlanCreationResult::Created(name) | PlanCreationResult::Deduplicated(name) => name,
+            PlanCreationResult::Created(name)
+            | PlanCreationResult::Deduplicated(name)
+            | PlanCreationResult::DeduplicatedFailed(name) => name,
         }
     }
 
     /// True when a new plan was actually created.
     pub fn is_created(&self) -> bool {
         matches!(self, PlanCreationResult::Created(_))
+    }
+
+    /// True when the identical change set recently failed and the referenced
+    /// plan is in its backoff window rather than awaiting a decision.
+    pub fn is_failed_backoff(&self) -> bool {
+        matches!(self, PlanCreationResult::DeduplicatedFailed(_))
     }
 }
 
@@ -259,6 +274,17 @@ pub async fn create_or_update_plan(
                 policy = %policy_name,
                 "existing pending plan has identical change digest, skipping creation"
             );
+            // This pending plan *is* the replacement: it is already visible and
+            // holds exactly these effects, so any stale approved plan can be
+            // retired now without leaving the policy with nothing actionable.
+            supersede_stale_plans(
+                &plans_api,
+                &existing_plans,
+                &policy_name,
+                &plan_name,
+                &change_digest,
+            )
+            .await?;
             return Ok(PlanCreationResult::Deduplicated(plan_name));
         }
     }
@@ -290,7 +316,10 @@ pub async fn create_or_update_plan(
                     age_secs = now_ts - failed_ts,
                     "recently-failed plan has identical change digest, skipping creation"
                 );
-                return Ok(PlanCreationResult::Deduplicated(plan_name));
+                // Deliberately no supersede sweep here: nothing new became
+                // visible, so retiring a still-actionable plan would leave the
+                // policy holding neither a decision nor a plan to make one on.
+                return Ok(PlanCreationResult::DeduplicatedFailed(plan_name));
             }
         }
     }
@@ -443,7 +472,7 @@ pub async fn create_or_update_plan(
         applied_at: None,
         last_error: None,
         sql_hash: Some(sql_hash),
-        change_digest: Some(change_digest),
+        change_digest: Some(change_digest.clone()),
         change_digest_encoding: Some(APPROVAL_EFFECT_ENCODING_V1.to_string()),
         revalidated_generation: Some(generation),
         revalidated_at: Some(crate::crd::now_rfc3339()),
@@ -471,34 +500,18 @@ pub async fn create_or_update_plan(
         return Err(err.into());
     }
 
-    // 12. Mark any existing Pending plans as Superseded after the new plan is
+    // 12. Retire the plans this one replaces, only now that the new plan is
     // fully visible. This avoids losing the current actionable plan if SQL
-    // persistence fails before the replacement is materialised.
-    for plan in &existing_plans {
-        if let Some(ref status) = plan.status
-            && status.phase == PlanPhase::Pending
-            && plan.name_any() != plan_name
-        {
-            let old_plan_name = plan.name_any();
-            info!(
-                plan = %old_plan_name,
-                policy = %policy_name,
-                "marking existing pending plan as Superseded"
-            );
-            let superseded_status = PostgresPolicyPlanStatus {
-                phase: PlanPhase::Superseded,
-                ..status.clone()
-            };
-            let patch = serde_json::json!({ "status": superseded_status });
-            plans_api
-                .patch_status(
-                    &old_plan_name,
-                    &PatchParams::apply("pgroles-operator"),
-                    &Patch::Merge(&patch),
-                )
-                .await?;
-        }
-    }
+    // persistence fails before the replacement is materialised, which is why
+    // no caller may supersede ahead of calling in here.
+    supersede_stale_plans(
+        &plans_api,
+        &existing_plans,
+        &policy_name,
+        &plan_name,
+        &change_digest,
+    )
+    .await?;
 
     info!(
         plan = %plan_name,
@@ -508,6 +521,76 @@ pub async fn create_or_update_plan(
     );
 
     Ok(PlanCreationResult::Created(plan_name))
+}
+
+/// Whether a pre-existing plan is retired by the plan that now holds
+/// `new_digest`.
+///
+/// Pending plans are always retired: at most one plan may await a decision, and
+/// the replacement is the one that describes what would happen now. Approved
+/// plans are retired only when their effects differ from the replacement's —
+/// an approval that still describes the current effects is a live decision and
+/// is never discarded, while one that does not can no longer authorise
+/// anything and must be voided rather than left looking actionable.
+pub(crate) fn supersedes_after_create(status: &PostgresPolicyPlanStatus, new_digest: &str) -> bool {
+    match status.phase {
+        PlanPhase::Pending => true,
+        PlanPhase::Approved => !plan_matches_digest(status, new_digest),
+        _ => false,
+    }
+}
+
+/// Retire the plans replaced by `new_plan_name`.
+///
+/// Called only once the replacement plan is visible with its status written —
+/// crash safety for the whole plan pointer rests on that ordering, so callers
+/// must never supersede ahead of creating.
+async fn supersede_stale_plans(
+    plans_api: &Api<PostgresPolicyPlan>,
+    existing_plans: &[PostgresPolicyPlan],
+    policy_name: &str,
+    new_plan_name: &str,
+    new_digest: &str,
+) -> Result<(), ReconcileError> {
+    for plan in existing_plans {
+        let Some(ref status) = plan.status else {
+            continue;
+        };
+        let old_plan_name = plan.name_any();
+        if old_plan_name == new_plan_name || !supersedes_after_create(status, new_digest) {
+            continue;
+        }
+
+        info!(
+            plan = %old_plan_name,
+            policy = %policy_name,
+            phase = ?status.phase,
+            "marking existing plan as Superseded"
+        );
+        let mut superseded_status = status.clone();
+        superseded_status.phase = PlanPhase::Superseded;
+        if status.phase == PlanPhase::Approved {
+            // The decision is void along with the plan: a superseded approval
+            // must never read as still granting anything.
+            set_plan_condition(
+                &mut superseded_status.conditions,
+                "Approved",
+                "False",
+                "Superseded",
+                "Database state changed since plan was approved",
+            );
+        }
+        let patch = serde_json::json!({ "status": superseded_status });
+        plans_api
+            .patch_status(
+                &old_plan_name,
+                &PatchParams::apply("pgroles-operator"),
+                &Patch::Merge(&patch),
+            )
+            .await?;
+    }
+
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -2693,6 +2776,84 @@ mod tests {
             &pending,
             &digest_for(&edited, &versions)
         ));
+    }
+
+    #[test]
+    fn creating_a_replacement_retires_the_pending_plan_it_replaces() {
+        // The retirement is what step 12 performs *after* the replacement is
+        // visible; no caller may supersede ahead of it, so this predicate is
+        // the only thing deciding which plans a create retires.
+        let versions = password_versions("app", "role-passwords:app:1");
+        let old_digest = digest_for(&[grant_change("app")], &versions);
+        let new_digest = digest_for(&[grant_change("reporting")], &versions);
+
+        let pending = PostgresPolicyPlanStatus {
+            phase: PlanPhase::Pending,
+            change_digest: Some(old_digest.clone()),
+            change_digest_encoding: Some(APPROVAL_EFFECT_ENCODING_V1.to_string()),
+            ..Default::default()
+        };
+        // At most one plan may await a decision, so a pending plan is retired
+        // whether or not its effects moved.
+        assert!(supersedes_after_create(&pending, &new_digest));
+        assert!(supersedes_after_create(&pending, &old_digest));
+    }
+
+    #[test]
+    fn creating_a_replacement_voids_an_approval_that_no_longer_describes_the_effects() {
+        let versions = password_versions("app", "role-passwords:app:1");
+        let approved_digest = digest_for(&[grant_change("app")], &versions);
+        let fresh_digest = digest_for(&[grant_change("reporting")], &versions);
+
+        let approved = PostgresPolicyPlanStatus {
+            phase: PlanPhase::Approved,
+            change_digest: Some(approved_digest.clone()),
+            change_digest_encoding: Some(APPROVAL_EFFECT_ENCODING_V1.to_string()),
+            ..Default::default()
+        };
+
+        // The decision described effects the policy no longer produces: void.
+        assert!(supersedes_after_create(&approved, &fresh_digest));
+        // Still the current effects — a live decision, never discarded by a
+        // create that happens to run beside it.
+        assert!(!supersedes_after_create(&approved, &approved_digest));
+    }
+
+    #[test]
+    fn creating_a_plan_never_disturbs_a_settled_one() {
+        for phase in [
+            PlanPhase::Applied,
+            PlanPhase::Failed,
+            PlanPhase::Rejected,
+            PlanPhase::Superseded,
+            PlanPhase::Applying,
+        ] {
+            let status = PostgresPolicyPlanStatus {
+                phase,
+                ..Default::default()
+            };
+            assert!(!supersedes_after_create(&status, "any-digest"));
+        }
+    }
+
+    #[test]
+    fn a_recently_failed_identical_plan_is_reported_apart_from_a_pending_one() {
+        // Callers word the policy status off these variants: one plan is
+        // awaiting a decision, the other has already failed and is waiting out
+        // its retry window.
+        let pending = PlanCreationResult::Deduplicated("plan-a".to_string());
+        assert_eq!(pending.plan_name(), "plan-a");
+        assert!(!pending.is_created());
+        assert!(!pending.is_failed_backoff());
+
+        let failed = PlanCreationResult::DeduplicatedFailed("plan-b".to_string());
+        assert_eq!(failed.plan_name(), "plan-b");
+        assert!(!failed.is_created());
+        assert!(failed.is_failed_backoff());
+
+        let created = PlanCreationResult::Created("plan-c".to_string());
+        assert!(created.is_created());
+        assert!(!created.is_failed_backoff());
     }
 
     #[test]

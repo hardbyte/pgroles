@@ -1073,6 +1073,13 @@ async fn apply_under_lock(
 
         // Create a PostgresPolicyPlan resource for changes (if any).
         let mut plan_ref_name = None;
+        // Plan mode used to only ever *set* this reference. When drift went
+        // away out of band the pending plan stayed Pending and the reference
+        // stayed pointing at it, while the policy reported InSync beside it.
+        let previous_plan_ref = resource
+            .status
+            .as_ref()
+            .and_then(|status| status.current_plan_ref.clone());
         // Tracks a plan that someone approved even though this policy never
         // executes, so the pointless approval is reported rather than ignored.
         let mut ignored_approval_plan = None;
@@ -1158,13 +1165,24 @@ async fn apply_under_lock(
             status.last_reconcile_mode = Some(PolicyMode::Plan);
             status.last_error = None;
             status.transient_failure_count = 0;
-            if let Some(ref plan_name) = plan_ref_name {
-                status.current_plan_ref = Some(crate::crd::PlanReference {
-                    name: plan_name.clone(),
-                });
-            }
+            // Cleared, not left alone, when there is no drift: a reference is
+            // a claim that a plan describes outstanding work, and with nothing
+            // outstanding there is no such plan.
+            status.current_plan_ref =
+                plan_ref_name
+                    .as_ref()
+                    .map(|plan_name| crate::crd::PlanReference {
+                        name: plan_name.clone(),
+                    });
         })
         .await?;
+
+        // Retire the plan the cleared reference pointed at. Ordered after the
+        // status write so a crash in between leaves a Pending plan the next
+        // reconcile finds and clears again, never a reference to nothing.
+        if !drift_detected {
+            supersede_referenced_plan_if_pending(ctx, resource, previous_plan_ref.as_ref()).await;
+        }
 
         info!(
             name,
@@ -1329,9 +1347,6 @@ async fn apply_under_lock(
                                 "approved plan superseded: effects changed since approval"
                             );
 
-                            crate::plan::mark_plan_superseded(&ctx.kube_client, &current_plan)
-                                .await?;
-
                             // The effects did not just move, they vanished —
                             // someone applied them by hand, or an edit removed
                             // them. A replacement would hold nothing and still
@@ -1343,6 +1358,16 @@ async fn apply_under_lock(
                                     plan = %current_plan.name_any(),
                                     "approved plan superseded with no remaining changes"
                                 );
+
+                                // No replacement is created on this path, so
+                                // this is the one place the supersede has to
+                                // happen here rather than after a create. A
+                                // crash between the two leaves the plan
+                                // Superseded and the reference behind, which
+                                // the next reconcile clears through the same
+                                // helper.
+                                crate::plan::mark_plan_superseded(&ctx.kube_client, &current_plan)
+                                    .await?;
 
                                 mark_reconciled_no_changes(
                                     ctx,
@@ -1396,14 +1421,26 @@ async fn apply_under_lock(
                             )
                             .await?;
 
-                            let msg = format!(
-                                "Plan {} superseded (DB state changed); new plan {} created with {} change(s) awaiting approval",
-                                current_plan.name_any(),
-                                new_plan_name,
-                                summary.total,
-                            );
+                            let report = planned_report(&new_creation_result, summary.total.into());
+                            // The old plan is retired by `create_or_update_plan`
+                            // once the replacement exists — except in the
+                            // failed-backoff case, where nothing replaced it
+                            // and claiming otherwise would misreport it.
+                            let msg = if new_creation_result.is_failed_backoff() {
+                                format!(
+                                    "Plan {} can no longer be executed (effects changed since approval); {}",
+                                    current_plan.name_any(),
+                                    report.message,
+                                )
+                            } else {
+                                format!(
+                                    "Plan {} superseded (DB state changed); {}",
+                                    current_plan.name_any(),
+                                    report.message,
+                                )
+                            };
                             update_status(ctx, resource, |status| {
-                                status.set_condition(ready_condition(true, "Planned", &msg));
+                                status.set_condition(ready_condition(true, report.reason, &msg));
                                 status.set_condition(drifted_condition(
                                     true,
                                     "DriftDetected",
@@ -1590,14 +1627,16 @@ async fn apply_under_lock(
                                 "pending plan superseded while awaiting approval"
                             );
 
-                            crate::plan::mark_plan_superseded(&ctx.kube_client, &current_plan)
-                                .await?;
-
                             // The effects did not just move, they vanished. A
                             // replacement plan here would hold nothing and still
                             // demand a decision, so leave the policy with no
                             // pending plan at all.
                             if decision == crate::plan::PendingPlanDecision::Clear {
+                                // Nothing replaces this plan, so it is retired
+                                // here rather than after a create.
+                                crate::plan::mark_plan_superseded(&ctx.kube_client, &current_plan)
+                                    .await?;
+
                                 mark_reconciled_no_changes(
                                     ctx,
                                     resource,
@@ -1626,13 +1665,11 @@ async fn apply_under_lock(
                             )
                             .await?;
                             let replacement = creation_result.plan_name().to_string();
+                            let report = planned_report(&creation_result, summary.total.into());
 
                             update_status(ctx, resource, |status| {
-                                let msg = format!(
-                                    "Plan {replacement} awaiting approval; {} change(s) pending",
-                                    summary.total,
-                                );
-                                status.set_condition(ready_condition(true, "Planned", &msg));
+                                let msg = report.message.clone();
+                                status.set_condition(ready_condition(true, report.reason, &msg));
                                 // Replace implies a non-empty change set; the
                                 // empty case returned above as Clear.
                                 status.set_condition(drifted_condition(
@@ -1781,12 +1818,10 @@ async fn apply_under_lock(
 
             crate::plan::update_policy_plan_ref(&ctx.kube_client, resource, &plan_name).await?;
 
-            let msg = format!(
-                "Plan {plan_name} created; {} change(s) awaiting approval",
-                summary.total,
-            );
+            let report = planned_report(&creation_result, summary.total.into());
+            let msg = report.message.clone();
             update_status(ctx, resource, |status| {
-                status.set_condition(ready_condition(true, "Planned", &msg));
+                status.set_condition(ready_condition(true, report.reason, &msg));
                 status.set_condition(drifted_condition(
                     true,
                     "DriftDetected",
@@ -2217,6 +2252,11 @@ async fn mark_reconciled_no_changes(
     summary: crate::crd::ChangeSummary,
     applied_password_source_versions: std::collections::BTreeMap<String, String>,
 ) -> Result<(), ReconcileError> {
+    let previous_plan_ref = resource
+        .status
+        .as_ref()
+        .and_then(|status| status.current_plan_ref.clone());
+
     update_status(ctx, resource, |status| {
         status.set_condition(ready_condition(true, "Reconciled", "No changes needed"));
         status.set_condition(drifted_condition(false, "InSync", "No pending changes"));
@@ -2238,7 +2278,86 @@ async fn mark_reconciled_no_changes(
         status.applied_password_source_versions = applied_password_source_versions;
         status.transient_failure_count = 0;
     })
-    .await
+    .await?;
+
+    // Only after the reference is gone: a crash here leaves a Pending plan
+    // that the next reconcile still finds, whereas superseding first and
+    // crashing would strand the reference on a plan nobody can act on.
+    supersede_referenced_plan_if_pending(ctx, resource, previous_plan_ref.as_ref()).await;
+
+    Ok(())
+}
+
+/// Retire a plan a just-cleared `current_plan_ref` pointed at, if it is still
+/// Pending.
+///
+/// Best-effort by design: the reference is already gone, so a failure here
+/// costs a stale Pending plan that the next reconcile or plan retention
+/// collects — not a wedged reconcile.
+async fn supersede_referenced_plan_if_pending(
+    ctx: &OperatorContext,
+    resource: &PostgresPolicy,
+    plan_ref: Option<&crate::crd::PlanReference>,
+) {
+    let (Some(plan_ref), Some(namespace)) = (plan_ref, resource.namespace()) else {
+        return;
+    };
+
+    let plans_api: Api<PostgresPolicyPlan> = Api::namespaced(ctx.kube_client.clone(), &namespace);
+    let plan = match plans_api.get_opt(&plan_ref.name).await {
+        Ok(Some(plan)) => plan,
+        Ok(None) => return,
+        Err(err) => {
+            tracing::warn!(
+                plan = %plan_ref.name,
+                error = %err,
+                "could not read the plan a cleared reference pointed at"
+            );
+            return;
+        }
+    };
+
+    if plan.status.as_ref().map(|s| &s.phase) != Some(&crate::crd::PlanPhase::Pending) {
+        return;
+    }
+
+    if let Err(err) = crate::plan::mark_plan_superseded(&ctx.kube_client, &plan).await {
+        tracing::warn!(
+            plan = %plan_ref.name,
+            error = %err,
+            "could not supersede the plan a cleared reference pointed at"
+        );
+    }
+}
+
+/// Ready-condition wording for a reconcile that just planned changes.
+///
+/// `create_or_update_plan` can answer with a plan that is *not* awaiting a
+/// decision: when an identical change set failed recently, the failed plan is
+/// held in its retry window instead of a new one being opened. Reporting that
+/// as "awaiting approval" sends a reviewer to a Failed plan looking for a
+/// decision to make.
+struct PlannedReport {
+    reason: &'static str,
+    message: String,
+}
+
+fn planned_report(result: &crate::plan::PlanCreationResult, total: i64) -> PlannedReport {
+    let plan_name = result.plan_name();
+    if result.is_failed_backoff() {
+        PlannedReport {
+            reason: "PlanFailedRetryBackoff",
+            message: format!(
+                "Plan {plan_name} holds these exact {total} change(s) and failed recently; \
+                 it is in its retry backoff window and no plan is awaiting approval"
+            ),
+        }
+    } else {
+        PlannedReport {
+            reason: "Planned",
+            message: format!("Plan {plan_name} created; {total} change(s) awaiting approval"),
+        }
+    }
 }
 
 async fn update_status<F>(
@@ -2473,6 +2592,31 @@ mod tests {
     use std::collections::BTreeMap;
     use std::error::Error as StdError;
     use std::fmt;
+
+    #[test]
+    fn a_failed_plan_held_in_backoff_is_not_reported_as_awaiting_approval() {
+        // Pointing a reviewer at a Failed plan with "awaiting approval" is the
+        // bug: there is no decision to make, only a retry window to wait out.
+        let backoff = planned_report(
+            &crate::plan::PlanCreationResult::DeduplicatedFailed("plan-old".to_string()),
+            3,
+        );
+        assert_eq!(backoff.reason, "PlanFailedRetryBackoff");
+        assert!(backoff.message.contains("plan-old"));
+        assert!(backoff.message.contains("failed recently"));
+        assert!(backoff.message.contains("retry backoff window"));
+        assert!(!backoff.message.contains("created;"));
+
+        for result in [
+            crate::plan::PlanCreationResult::Created("plan-new".to_string()),
+            crate::plan::PlanCreationResult::Deduplicated("plan-new".to_string()),
+        ] {
+            let report = planned_report(&result, 3);
+            assert_eq!(report.reason, "Planned");
+            assert!(report.message.contains("plan-new"));
+            assert!(report.message.contains("3 change(s) awaiting approval"));
+        }
+    }
 
     #[derive(Debug)]
     struct TestDatabaseError {
