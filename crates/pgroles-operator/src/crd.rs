@@ -934,7 +934,9 @@ pub struct PostgresPolicyStatus {
     pub current_plan_ref: Option<PlanReference>,
 
     /// Canonical digest of this policy's own content, computed by exactly the
-    /// same function as a candidate's `status.contentDigest`.
+    /// same function as a candidate's `status.contentDigest` (note the wire
+    /// names differ: this status object serialises snake_case, so the field is
+    /// `status.content_digest` here).
     ///
     /// Promotion is recognised by comparing the two. The value is also the
     /// operator's memory of what the content was on the previous reconcile,
