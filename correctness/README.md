@@ -48,8 +48,9 @@ reconciles that keep happening underneath it:
 | `PlanRevalidation_frozen.cfg` | `frozen` | `SummaryMatchesPlan` violated |
 | `PlanRevalidation_generational.cfg` | `generational` | `ApprovalSurvivesEffectNeutralEdits` violated |
 | `PlanRevalidation_replace.cfg` | `replace` | `NoEmptyPendingPlan` violated |
+| `PlanRevalidation_drift.cfg` | `generational`, drift allowed | `SummaryMatchesPlan` violated |
 
-The three failing configurations bracket the design. `frozen` is the behaviour
+The four failing configurations bracket the design. `frozen` is the behaviour
 before this work: the Pending arm returned early without revalidating, so the
 status summary advanced while the plan stood still. `generational` is the
 plausible wrong fix — superseding whenever the policy generation moves — which
@@ -63,6 +64,20 @@ them, the replacement holds nothing and still blocks on an approval, while the
 policy reports `Drifted=False` beside it. Superseding a pending plan and
 opening a new one are separate decisions, and only the first applies when there
 is nothing left to execute.
+
+`drift` is the same `generational` strategy with the database allowed to move
+underneath the plan with no policy edit behind it — someone runs the DDL by
+hand, or another actor converges part of it. Under policy edits alone
+`generational` keeps the summary and the plan paired, which is what makes it
+look adequate; drift carries no generation bump, so it has nothing to trigger
+on. It refreshes the reported summary from the new database state and retains a
+plan holding the old effects — a reviewer reads one and approves the other. The
+shipped `semantic` strategy compares the effects themselves and passes the same
+configuration, which is the whole argument for keying revalidation on the change
+digest rather than the generation. The configuration checks `SummaryMatchesPlan`
+alone: `generational` also leaves an empty plan behind when the effects vanish,
+and checking both would leave which violation TLC reports first an accident of
+exploration order.
 
 ### `races/PlanApproval.tla`
 
@@ -81,15 +96,28 @@ The constant `SqlHashApproval` selects the approval gate:
 ./run-tlc.sh races/PlanApproval.tla races/PlanApproval.cfg           # passes
 ./run-tlc.sh races/PlanApproval.tla races/PlanApproval_buggy.cfg     # liveness violated (#174)
 ./run-tlc.sh races/PlanApproval.tla races/PlanApproval_unlocked.cfg  # NoStaleExecution violated
+./run-tlc.sh races/PlanApproval.tla races/PlanApproval_no_password.cfg # passes
 ```
 
 Each configuration demonstrates a distinct requirement:
 
-| Config | `SqlHashApproval` | `LockDuringApply` | Result |
-| --- | --- | --- | --- |
-| `PlanApproval.cfg` | FALSE | TRUE | passes |
-| `PlanApproval_buggy.cfg` | TRUE | TRUE | `EventuallyApplies` violated |
-| `PlanApproval_unlocked.cfg` | FALSE | FALSE | `NoStaleExecution` violated |
+| Config | `SqlHashApproval` | `LockDuringApply` | `HasPasswordChange` | Result |
+| --- | --- | --- | --- | --- |
+| `PlanApproval.cfg` | FALSE | TRUE | TRUE | passes |
+| `PlanApproval_buggy.cfg` | TRUE | TRUE | TRUE | `EventuallyApplies` violated |
+| `PlanApproval_unlocked.cfg` | FALSE | FALSE | TRUE | `NoStaleExecution` violated |
+| `PlanApproval_no_password.cfg` | FALSE | TRUE | FALSE | passes |
+
+`PlanApproval_no_password.cfg` passes, like the shipped configuration — it earns
+its place by what it catches when the model is *wrong*. Under
+`HasPasswordChange = TRUE`, `OperatorExecutes` also requires `planRenderStale`,
+which only `OperatorRevalidates` sets and which itself requires `approved`. The
+approval gate therefore stands transitively, and deleting the `approved`
+conjunct from `OperatorExecutes` leaves all three password-bearing
+configurations passing their safety invariants: the mutation is invisible. A
+change set with no password has no second path, so the same deletion is reported
+immediately as `NoUnreviewedExecution` violated. Every model needs at least one
+configuration in which its central invariant is load-bearing.
 
 `PlanApproval_unlocked.cfg` shows why verification and execution must share one
 lock hold: with drift permitted while a plan is `Applying`, what executes no
