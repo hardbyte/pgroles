@@ -1670,6 +1670,52 @@ pub(crate) fn decide_pending_plan(
     }
 }
 
+/// What to do with a plan that a reviewer has approved but that has not yet
+/// executed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ApprovedPlanDecision {
+    /// The approved effects are still the effects this policy would produce.
+    /// Execute what was reviewed.
+    Execute,
+    /// The effects moved between the decision and this reconcile. The approval
+    /// described something else, so it cannot authorise this — supersede and
+    /// open a new plan for review.
+    Replace,
+    /// The effects moved to nothing. Supersede and leave no plan behind, for
+    /// the same reason as `PendingPlanDecision::Clear`: a zero-change
+    /// replacement would demand a second approval that buys nothing while the
+    /// policy reports no drift beside it.
+    Clear,
+}
+
+/// Decide the fate of an approved plan against the effects the policy would
+/// produce right now.
+///
+/// This is the single gate between a recorded decision and executing DDL, so it
+/// fails closed: a plan whose status is missing, or written under an older
+/// digest encoding, cannot be shown to still hold the approved effects and is
+/// never executed.
+///
+/// Unlike [`decide_pending_plan`], a matching digest executes even when the
+/// change set is empty. An approved no-op plan is resolved by running it — that
+/// marks it Applied and releases the policy — whereas an unapproved no-op plan
+/// would sit waiting for a decision no one should have to make.
+pub(crate) fn decide_approved_plan(
+    plan_status: Option<&crate::crd::PostgresPolicyPlanStatus>,
+    fresh_digest: &str,
+    has_changes: bool,
+) -> ApprovedPlanDecision {
+    if plan_status.is_some_and(|status| plan_matches_digest(status, fresh_digest)) {
+        return ApprovedPlanDecision::Execute;
+    }
+
+    if has_changes {
+        ApprovedPlanDecision::Replace
+    } else {
+        ApprovedPlanDecision::Clear
+    }
+}
+
 /// Record that a pending plan was re-confirmed against the current policy.
 ///
 /// Called when the freshly computed effects still match what the plan holds, so
@@ -2528,6 +2574,12 @@ mod tests {
         };
         assert!(!needs_revalidation_record(&confirmed_at_3, Some(3)));
         assert!(needs_revalidation_record(&confirmed_at_3, Some(4)));
+        // A plan recorded against a *newer* generation than the one being
+        // reconciled — a stale watch-cache read — must also re-record, so the
+        // provenance always names the generation actually confirmed. Without
+        // this case the comparison could be `<` rather than `!=` and no test
+        // would notice.
+        assert!(needs_revalidation_record(&confirmed_at_3, Some(2)));
 
         // A plan from before this field existed gets its provenance filled in.
         let legacy = PostgresPolicyPlanStatus::default();
@@ -2690,16 +2742,125 @@ mod tests {
         );
     }
 
+    /// The gate between a recorded decision and executing DDL. Every case that
+    /// is not a proven match must refuse to execute — this is the one check
+    /// standing between an approval and running different SQL than was read.
+    #[test]
+    fn an_approval_executes_only_the_effects_it_was_given_for() {
+        let versions = password_versions("app", "role-passwords:app:7");
+        let approved_changes = [grant_change("reporting")];
+        let approved_digest = digest_for(&approved_changes, &versions);
+        let approved = PostgresPolicyPlanStatus {
+            phase: PlanPhase::Approved,
+            change_digest: Some(approved_digest.clone()),
+            change_digest_encoding: Some(APPROVAL_EFFECT_ENCODING_V1.to_string()),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            decide_approved_plan(Some(&approved), &approved_digest, true),
+            ApprovedPlanDecision::Execute,
+        );
+
+        // Effects moved after the decision: the approval described something
+        // else, so it must not authorise this.
+        assert_eq!(
+            decide_approved_plan(
+                Some(&approved),
+                &digest_for(&[grant_change("analytics")], &versions),
+                true
+            ),
+            ApprovedPlanDecision::Replace,
+        );
+
+        // Fail closed on anything that cannot be proven to match: no status
+        // yet, no digest at all, or a digest under an older encoding.
+        for unprovable in [
+            None,
+            Some(&PostgresPolicyPlanStatus::default()),
+            Some(&PostgresPolicyPlanStatus {
+                change_digest: Some(approved_digest.clone()),
+                change_digest_encoding: Some("pgroles.io/approval-effect/v0".to_string()),
+                ..Default::default()
+            }),
+        ] {
+            assert_ne!(
+                decide_approved_plan(unprovable, &approved_digest, true),
+                ApprovedPlanDecision::Execute,
+            );
+        }
+    }
+
+    /// The same no-op trap as the pending arm: if the approved effects are
+    /// applied by hand before the plan executes, superseding it must not leave
+    /// a zero-change replacement demanding a second approval.
+    #[test]
+    fn an_approved_plan_whose_effects_vanish_is_cleared_not_replaced() {
+        let versions = password_versions("app", "role-passwords:app:7");
+        let approved = PostgresPolicyPlanStatus {
+            phase: PlanPhase::Approved,
+            change_digest: Some(digest_for(&[grant_change("reporting")], &versions)),
+            change_digest_encoding: Some(APPROVAL_EFFECT_ENCODING_V1.to_string()),
+            ..Default::default()
+        };
+        let empty_digest = digest_for(&[], &versions);
+
+        assert_eq!(
+            decide_approved_plan(Some(&approved), &empty_digest, false),
+            ApprovedPlanDecision::Clear,
+        );
+
+        // An approved plan that genuinely holds nothing is resolved by running
+        // it — that marks it Applied and releases the policy, rather than
+        // superseding it into another decision no one should have to make.
+        let approved_empty = PostgresPolicyPlanStatus {
+            phase: PlanPhase::Approved,
+            change_digest: Some(empty_digest.clone()),
+            change_digest_encoding: Some(APPROVAL_EFFECT_ENCODING_V1.to_string()),
+            ..Default::default()
+        };
+        assert_eq!(
+            decide_approved_plan(Some(&approved_empty), &empty_digest, false),
+            ApprovedPlanDecision::Execute,
+        );
+    }
+
     /// Planning must never persist password material, in any field.
+    ///
+    /// Asserted against the *pre-hash* canonical bytes, not the digest string.
+    /// Checking that a SHA-256 hex string does not contain the verifier is true
+    /// of any hash of any input, so it would pass even while the verifier was
+    /// being hashed in — the same trap the core suite documents at
+    /// `approval::the_digest_never_contains_password_material`.
     #[test]
     fn the_digest_carries_no_password_material() {
         let verifier = "SCRAM-SHA-256$4096:c2FsdA==$c3RvcmVk:c2VydmVy";
-        let digest = digest_for(
-            &[set_password("app", verifier)],
-            &password_versions("app", "role-passwords:app:7"),
-        );
+        let changes = [set_password("app", verifier)];
+        let versions = password_versions("app", "role-passwords:app:7");
 
-        assert!(digest.starts_with("sha256:"));
-        assert!(!digest.contains(verifier));
+        let bytes = pgroles_core::approval::canonical_change_set_bytes(
+            &changes,
+            &pgroles_core::approval::EffectDigestInputs {
+                reconciliation_mode: CrdReconciliationMode::default().into(),
+                target: "default/db-credentials:DATABASE_URL",
+                password_source_versions: &versions,
+            },
+        )
+        .expect("canonical bytes");
+        let encoded = String::from_utf8(bytes).expect("canonical bytes are UTF-8");
+
+        assert!(
+            !encoded.contains(verifier),
+            "verifier reached the digest input: {encoded}"
+        );
+        assert!(
+            !encoded.contains("c3RvcmVk"),
+            "stored key reached the digest input: {encoded}"
+        );
+        // The password *source version* is what the digest binds instead, so a
+        // rotation is a new approval while a re-salted verifier is not.
+        assert!(encoded.contains("role-passwords:app:7"));
+
+        assert!(digest_for(&changes, &versions).starts_with("sha256:"));
     }
 }

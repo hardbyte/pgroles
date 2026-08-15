@@ -1309,11 +1309,13 @@ async fn apply_under_lock(
                             identity.as_str(),
                             &applied_password_source_versions,
                         )?;
-                        let digest_matches = current_plan.status.as_ref().is_some_and(|status| {
-                            crate::plan::plan_matches_digest(status, &fresh_digest)
-                        });
+                        let decision = crate::plan::decide_approved_plan(
+                            current_plan.status.as_ref(),
+                            &fresh_digest,
+                            !changes.is_empty(),
+                        );
 
-                        if !digest_matches {
+                        if decision != crate::plan::ApprovedPlanDecision::Execute {
                             // The approved effects are no longer the effects
                             // this policy would produce.
                             let stored_digest = current_plan
@@ -1329,6 +1331,55 @@ async fn apply_under_lock(
 
                             crate::plan::mark_plan_superseded(&ctx.kube_client, &current_plan)
                                 .await?;
+
+                            // The effects did not just move, they vanished —
+                            // someone applied them by hand, or an edit removed
+                            // them. A replacement would hold nothing and still
+                            // demand a second approval.
+                            if decision == crate::plan::ApprovedPlanDecision::Clear {
+                                info!(
+                                    name,
+                                    namespace,
+                                    plan = %current_plan.name_any(),
+                                    "approved plan superseded with no remaining changes"
+                                );
+
+                                update_status(ctx, resource, |status| {
+                                    status.set_condition(ready_condition(
+                                        true,
+                                        "Reconciled",
+                                        "No changes needed",
+                                    ));
+                                    status.set_condition(drifted_condition(
+                                        false,
+                                        "InSync",
+                                        "No pending changes",
+                                    ));
+                                    status.conditions.retain(|c| {
+                                        c.condition_type != "Reconciling"
+                                            && c.condition_type != "Degraded"
+                                            && c.condition_type != "Conflict"
+                                            && c.condition_type != "Paused"
+                                    });
+                                    status.observed_generation = generation;
+                                    status.last_attempted_generation = generation;
+                                    status.last_successful_reconcile_time =
+                                        Some(crate::crd::now_rfc3339());
+                                    status.change_summary = Some(summary.clone());
+                                    status.last_reconcile_mode = Some(PolicyMode::Apply);
+                                    status.current_plan_ref = None;
+                                    status.last_error = None;
+                                    status.applied_password_source_versions =
+                                        applied_password_source_versions.clone();
+                                    status.transient_failure_count = 0;
+                                })
+                                .await?;
+
+                                return Ok((
+                                    Action::requeue(requeue_interval),
+                                    ReconcileOutcome::Reconciled,
+                                ));
+                            }
 
                             // Create a new plan with the fresh changes.
                             let new_creation_result = crate::plan::create_or_update_plan(
@@ -1403,7 +1454,8 @@ async fn apply_under_lock(
                             ));
                         }
 
-                        // Hash matches — safe to execute the approved plan.
+                        // The approved effects are still the effects this
+                        // policy would produce — execute what was reviewed.
                         info!(
                             name,
                             namespace,

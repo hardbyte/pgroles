@@ -82,9 +82,14 @@ TypeOK ==
 
 \* Property 1. A reviewer reading the policy's summary and opening the plan it
 \* points at must see the same change. The frozen strategy breaks this.
+\*
+\* Stated with no guard on summaryEffects. An earlier form exempted
+\* summaryEffects = NoEffects, which excused exactly the worst reading: the
+\* policy reporting no drift while a plan holding real changes waits beside it.
+\* A strategy that clears the summary but keeps the plan pending passed the
+\* whole suite under the guarded form.
 SummaryMatchesPlan ==
-    (planPhase = Pending /\ summaryEffects /= NoEffects) =>
-        summaryEffects = planEffects
+    (planPhase = Pending) => summaryEffects = planEffects
 
 \* Property 2. An effect-neutral policy edit must not discard a decision.
 \* The generational strategy breaks this.
