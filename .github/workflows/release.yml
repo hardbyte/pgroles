@@ -423,9 +423,15 @@ jobs:
   # ---------------------------------------------------------------------------
   # Publish to crates.io
   # ---------------------------------------------------------------------------
+  # Runs after the images rather than beside them, because this is the one step
+  # that cannot be undone. A GHCR package version can be deleted and a draft
+  # release discarded, but a crates.io version can only be yanked — the number is
+  # spent either way. Publishing here last means a docker failure no longer burns
+  # four crate versions on a release that never completes, and leaves only the
+  # attach-and-publish step after it.
   publish-crates:
     name: Publish to crates.io
-    needs: [prepare-github-release]
+    needs: [prepare-github-release, docker-operator, docker-cli]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6

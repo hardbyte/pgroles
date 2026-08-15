@@ -9,11 +9,37 @@ on:
 permissions:
   contents: read
   packages: write
+  # The CI gate below queries this repository's workflow runs.
+  actions: read
 
 jobs:
   release:
     runs-on: ubuntu-latest
     steps:
+      # This workflow publishes on its own, in its own run, so release.yml's
+      # candidate-ci gate does not cover it. Without repeating the check here a
+      # tag on a commit whose CI failed still ships a chart: release.yml aborts,
+      # and this workflow goes right on to package and push.
+      - name: Require a successful CI run for this SHA
+        if: github.event_name == 'push'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EXPECTED_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          count=$(gh api -X GET \
+            "repos/${GITHUB_REPOSITORY}/actions/workflows/ci.yml/runs" \
+            -f head_sha="${EXPECTED_SHA}" \
+            -f event=push \
+            -f status=success \
+            -f per_page=100 \
+            --jq '.total_count')
+          if [ "$count" -lt 1 ]; then
+            echo "::error::No successful CI run exists for ${EXPECTED_SHA}, so refusing to publish the chart. CI runs automatically on pushes to main and release/**; wait for that run to go green and tag that exact commit."
+            exit 1
+          fi
+          echo "Found ${count} successful CI run(s) for ${EXPECTED_SHA}."
+
       # This workflow runs on the same tag as release.yml but in its own run, so
       # it cannot depend on that workflow's immutable-release gate. Repeat the
       # check here rather than pushing a chart into a release whose binaries can
