@@ -1,104 +1,71 @@
 ---
 title: Plan and approval
-description: Preview changes with plan mode and gate execution behind a reviewed, approved plan.
+description: Preview changes with observe mode and gate execution behind a reviewed, approved plan.
 ---
 
 Seeing what the operator would do before it does it. {% .lead %}
 
 ---
 
-## Plan mode
+{% callout type="warning" title="Design preview" %}
+This page documents the target design from
+[#173](https://github.com/hardbyte/pgroles/issues/173) ahead of implementation:
+`mode: observe` (renamed from `plan`), the semantic change digest, write-once
+plan decisions, and tiered target identity. Released behaviour still uses
+`mode: plan`, approval annotations, and SQL-hash matching.
+{% /callout %}
 
-Set `mode: plan` to let the operator inspect the database, compute the diff, and publish the planned SQL without executing it.
+## Observe mode
+
+Set `mode: observe` to let the operator inspect the database, compute the
+diff, and publish the planned SQL without executing it. (`observe` is the mode
+previously named `plan` — renamed so that "plan" means exactly one thing: the
+`PostgresPolicyPlan` resource.)
 
 ```yaml
 spec:
   connection:
     secretRef:
       name: postgres-credentials
-  mode: plan
+  mode: observe
   approval: manual
   roles:
     - name: preview-user
       login: true
 ```
 
-Plan mode is useful when you want the operator to stay in-cluster but you are not ready to trust it with PostgreSQL mutations yet.
-
-In `plan` mode:
+In `observe` mode:
 
 - the operator connects to the database and computes the full diff normally
-- no mutating PostgreSQL SQL is executed
+- no mutating PostgreSQL SQL is executed and no Kubernetes Secrets are created
 - `status.change_summary` records the pending changes
-- `status.current_plan_ref.name` points at the generated `PostgresPolicyPlan`, which holds the rendered SQL in `status.sqlInline` or, for larger plans, a gzipped ConfigMap referenced by `status.sqlRef`
-- `Ready=True` with reason `Planned`
-- `Drifted=True` when changes are pending, `Drifted=False` when the database is already in sync
-- for `password.generate`, the controller does not create or recreate the generated Kubernetes Secret while running in `plan` mode
-- for password-managed roles, `Drifted=False` is only possible after a prior successful `apply` recorded the password source version; a plan-only policy cannot prove an existing database password already matches the configured source
+- `status.current_plan_ref.name` points at the generated `PostgresPolicyPlan`,
+  which holds the rendered SQL in `status.sqlInline` or, for larger plans, a
+  gzipped ConfigMap referenced by `status.sqlRef`
+- `Ready=True` with reason `Planned`; `Drifted=True` while changes are pending
 
-Example `kubectl get` output:
+Be clear about what `observe` is not: it is a mutable spec field, not a
+security boundary. Anyone who can edit the policy can switch it to `apply`,
+and the operator still holds whatever database credential it was given. For
+deployments where the operator must never write, the guarantee is a
+**read-only PostgreSQL credential** — `observe` is what makes running under
+one coherent (drift visibility without a stream of permission-denied errors).
+For a reviewed apply, use `mode: apply` with `approval: manual`. Use `suspend`
+to stop reconciling entirely.
 
-```text
-NAME          READY   MODE   DRIFT   CHANGES   LAST RECONCILE   AGE
-plan-policy   True    plan   True    2         2s               2s
-```
-
-Example status fields:
-
-```yaml
-status:
-  change_summary:
-    grants_added: 1
-    roles_created: 1
-    total: 2
-  conditions:
-    - type: Ready
-      status: "True"
-      reason: Planned
-      message: Plan computed; 2 change(s) pending
-    - type: Drifted
-      status: "True"
-      reason: DriftDetected
-      message: 2 planned change(s) pending review
-  current_plan_ref:
-    name: plan-policy-plan-20260512-090308-118e50e437c9
-  last_reconcile_mode: plan
-```
-
-The rendered SQL lives on the plan, so start from the policy name you already
-have and follow `current_plan_ref` to it:
+The rendered SQL lives on the plan; follow `current_plan_ref` to it. Small
+plans carry it inline:
 
 ```bash
-POLICY=plan-policy
+POLICY=observed-policy
 PLAN="$(kubectl get pgr "$POLICY" -o jsonpath='{.status.current_plan_ref.name}')"
 kubectl get pgplan "$PLAN" -o jsonpath='{.status.sqlInline}'
 ```
 
-```text
-CREATE ROLE "plan-preview-user" LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE INHERIT NOREPLICATION NOBYPASSRLS;
-COMMENT ON ROLE "plan-preview-user" IS 'Preview-only role';
-GRANT CONNECT ON DATABASE "postgres" TO "plan-preview-user";
-```
-
-To see every plan a policy has produced rather than just the current one, list
-plans and read the `POLICY` column, which carries the full policy name:
-
-```bash
-kubectl get pgplan
-```
-
-```text
-NAME                                                     POLICY        MODE            APPROVED   CHANGES   PHASE     AGE
-plan-policy-plan-20260512-090308-118e50e437c9            plan-policy   authoritative   False      2         Pending   3s
-```
-
-Avoid selecting plans with `-l pgroles.io/policy=<name>`. That label is a
-server-side prefilter truncated to 63 bytes, so it is not an identity and two
-policies sharing a long prefix select each other's plans.
-
-Plans above the inline size limit set `status.sqlRef` instead of `sqlInline`,
-naming a ConfigMap whose `plan.sql.gz` entry holds the gzipped SQL under
-`binaryData`. Fetching that takes a decode step:
+Plans above the inline size limit leave `sqlInline` empty and set
+`status.sqlRef` instead, naming a ConfigMap whose `plan.sql.gz` entry holds
+the gzipped SQL — so the command above prints nothing for a large plan.
+Fetching that takes a decode step:
 
 ```bash
 CM="$(kubectl get pgplan "$PLAN" -o jsonpath='{.status.sqlRef.name}')"
@@ -106,15 +73,11 @@ kubectl get configmap "$CM" -o jsonpath="{.binaryData['plan\.sql\.gz']}" |
   base64 -d | gunzip
 ```
 
-A plan whose compressed preview would still exceed the ConfigMap limit sets no
-`sqlRef` at all, and `status.sqlInline` carries a truncated preview ending in a
-`-- truncated: ... --` marker.
-
-The preview is a review artifact in every case. pgroles never executes stored
-SQL: an approved plan is re-rendered from the current diff at execution time and
-superseded if the hash no longer matches.
-
-Use `suspend` when you want the controller to stop reconciling entirely. Use `plan` when you want it to keep inspecting and showing you what it would do.
+`pgroles plan show <plan>` follows whichever branch applies. A plan whose
+compressed preview would still exceed the ConfigMap limit sets no `sqlRef`,
+and `sqlInline` carries a truncated preview ending in a `-- truncated: ... --`
+marker. The preview is a review artifact in every case: **pgroles never
+executes stored SQL**.
 
 ## What executes: mode and approval together
 
@@ -124,142 +87,154 @@ order. Only the last one is about human review:
 | `suspend` | `mode` | `approval` | Plan created? | Mutating SQL executed? |
 |---|---|---|---|---|
 | `true` | — | — | no | no — nothing reconciles at all |
-| `false` | `plan` | *ignored* | yes | **never** |
+| `false` | `observe` | *ignored* | yes | **never** |
 | `false` | `apply` | `auto` | yes | immediately, plan auto-approved |
 | `false` | `apply` | `manual` | yes | only once approved *and* still current |
 
-**`approval` has no effect in `plan` mode.** A plan-mode policy computes the
-diff, publishes a `PostgresPolicyPlan`, and returns before it ever consults
-`approval`. Annotating that plan with `pgroles.io/approved=true` is accepted by
-the API server and then does nothing: the plan stays `Pending` and no database
-changes are applied.
-Because that is indistinguishable from a stalled operator, the policy reports an
-`ApprovalIgnored` condition naming the plan and emits a warning Event. If you
-want a reviewed apply, the combination you want is `mode: apply` with
-`approval: manual` — plan mode is for looking, not for gated applying.
+`approval` has no effect in `observe` mode; a decision recorded on an
+observe-mode plan is accepted and does nothing, and the policy reports an
+`ApprovalIgnored` condition so this is distinguishable from a stalled
+operator.
 
-Execution never trusts stored SQL. An approved plan is re-rendered from the
-current diff and its hash compared against the approved one, so the plan object
-is a review artifact rather than an execution payload.
+## Approval identity: the change digest
 
-### When the policy changes mid-review
+What a decision approves is the plan's **change digest**: a versioned hash
+(`pgroles.io/approval-effect/v1`) of the canonical, deterministically ordered
+typed effects — role lifecycle, grants, memberships, ownership and default
+privileges, retirements — bound together with the reconciliation mode, the
+managed scope, and the target identity.
 
-With `mode: apply` and `approval: manual`, a pending plan is **frozen** — the
-operator returns early while a plan awaits a decision, so it neither refreshes
-nor supersedes it. Two consequences worth knowing before you rely on the review
-step:
+The applied base is deliberately *not* a digest input. The plan records which
+base it was computed against as provenance, and that record advances whenever
+revalidation confirms the effects are unchanged. Hashing the base in would
+make every unrelated policy edit invalidate every pending approval, which is
+exactly the churn semantic identity exists to prevent. What the base record
+does buy is the promotion check: execution requires the promoted content to
+match the approved candidate *and* the base to be the one the plan last
+revalidated against.
 
-- The policy's status reports the *freshly computed* change count each reconcile,
-  while the pending plan still holds the SQL from when it was created. Status and
-  plan can therefore disagree after a manifest change, and the plan is the stale
-  one.
-- Approving a stale plan does not apply it. On the next reconcile the hash
-  comparison fails, the plan is marked `Superseded`, and a **new** plan is
-  created awaiting approval. Nothing unsafe executes, but the approval is
-  consumed without effect and a second review round is required.
+The digest deliberately excludes anything that legitimately differs between
+planning and execution: cleartext passwords, SCRAM salts and verifiers, and
+renderer-specific SQL text. A password change is identified semantically as
+*(role, password source, source version)* — rotating the source Secret
+produces exactly one new plan, and re-planning an unchanged source produces
+the same digest every time. `status.sqlHash` still exists, but only as a
+diagnostic for the preview text; it is never the approval gate.
 
-Check that the plan you are approving matches the current generation:
+Because identity is semantic, plans survive irrelevant change. A policy
+generation bump, an unrelated base edit, or unrelated ephemeral-access
+activity re-plans to an identical digest and the pending plan — including a
+decision already recorded on it — is retained, with the revalidated
+generation noted on its status.
+
+## Deciding a plan
+
+A decision is a status write on the plan — one terminal condition and
+`status.decidedBy`, recorded together, exactly as `EphemeralAccessRequest`
+decisions work:
 
 ```bash
-kubectl get pgr <policy> -o jsonpath='{.metadata.generation}{"\n"}'
-kubectl get pgplan <plan> -o jsonpath='{.spec.policyGeneration}{"\n"}'
+pgroles plan approve orders-plan-9f21c4      # or: pgroles plan reject ...
 ```
 
-Everywhere else, a superseding write happens automatically: creating a plan marks
-any other `Pending` plan for the same policy `Superseded`, so plan mode and the
-first plan after an approval both converge on a single current plan.
+There is one rejection model across the product. A rejected plan records
+`Denied=True` with reason `DeniedByReviewer` and moves to phase `Rejected`;
+`Approved=True` and `Denied=True` are mutually exclusive and neither can be
+changed once written. ("Rejected" is the phase; `Denied` is the condition —
+they always travel together.) A candidate whose plan is denied is terminal
+too, reporting `Superseded=True, reason=PlanDenied`.
 
-Rejecting with `pgroles.io/rejected=true` marks the plan `Rejected` and clears
-`status.current_plan_ref`. The replacement is created on the *next* reconcile
-rather than immediately, which keeps a rejected plan from spinning in a
-reject-recreate loop.
+The CLI patches the plan's status subresource; raw `kubectl patch
+--subresource=status` works identically. The approval annotations from
+earlier releases are removed.
 
-## Plan approval resources
+The trust model has two layers, and both matter:
+
+- **CEL validation rules** (shipped in the CRD) make decisions terminal and
+  write-once: `Approved=True` and `Denied=True` are mutually exclusive, a
+  recorded decision can never change, and `decidedBy` must be written in the
+  same operation as the decision.
+- **Actor identity requires the admission layer.** CEL cannot see the
+  requesting user, so `decidedBy` is truthful only when the shipped Kyverno
+  reference policy (or an equivalent mutating webhook) overwrites it from
+  admission `userInfo`. Without that layer, `decidedBy` is whatever the
+  client asserted. Deploy the reference policy anywhere approvals are a
+  control you rely on.
+
+Approval RBAC is per-kind: granting a team create on policies or candidates
+grants nothing on plan status. Execution settings (`approval`, managed scope)
+are platform-controlled — protect them with an admission policy so a policy
+author cannot weaken them in the same edit that introduces a change.
+
+## Plans stay current while awaiting review
+
+A pending plan is revalidated on every reconcile — there is no frozen-plan
+window. When the policy, database, target, or overlays change while a plan
+awaits a decision:
+
+- **effects unchanged** (identical change digest): the plan is retained, the
+  revalidated generation recorded; the policy's change summary and
+  `current_plan_ref` always describe the same plan.
+- **effects changed**: the plan is superseded with an explicit condition and
+  Event, and a fresh plan is created for review.
+
+Approving a plan therefore approves what the plan currently shows. If a
+supersede races your approval, the decision lands on a plan that is no longer
+current and nothing executes — the fresh plan awaits its own decision.
+
+Rejecting a plan — `Denied=True`, phase `Rejected`, as above — clears
+`status.current_plan_ref` on the policy. The replacement is created on the
+next reconcile rather than immediately, which keeps a rejected plan from
+spinning in a reject-recreate loop. For a candidate's plan there is no
+replacement: fix the proposal by filing a successor candidate.
+
+## Target identity
+
+Every plan binds the identity of the database it was computed against, at the
+strongest tier available:
+
+1. **Physical**: `pg_control_system().system_identifier`, when the server
+   exposes it.
+2. **Logical**: the resolved connection fingerprint — host, port, database
+   name — plus the connection Secret's version.
+
+Execution fails closed on a *mismatch* at either tier, and on a *tier
+downgrade* (the identifier was readable at approval but not at execution).
+Repointing the connection Secret at a different server therefore invalidates
+every approval made against the old one, even though the Kubernetes reference
+is unchanged. Environments where the physical identifier is consistently
+unavailable run on the logical tier; set `requirePhysicalIdentity: true` to
+refuse execution without tier 1.
+
+A target change is not an error to work around — it flows through the
+ordinary supersede-and-review path. The fresh approval is the sanctioned
+acknowledgement that the target moved.
+
+## Passwords and planning
+
+Planning is side-effect free in every mode. For `password.generate` roles the
+operator synthesizes in-memory material while planning and creates the real
+Kubernetes Secret only during post-approval execution — under `apply +
+manual` there is no generated Secret in the cluster until a reviewer has
+approved the plan that introduces it.
+
+## Execution
+
+Approval never executes a stored artifact. Under the same database and
+advisory lock, with no unlock window, the operator re-inspects, recomputes
+the effects, and verifies the recomputed change digest against the approved
+one. The statements executed are exactly the approved canonical effects
+recomputed against the state observed under that lock; any divergence aborts
+before the first statement and supersedes the plan.
+
+To review proposed changes *without* editing the active policy at all, see
+[Candidates and promotion](/docs/operator-candidates).
 
 {% callout type="warning" title="Set `spec.approval` explicitly" %}
-`spec.approval` decides whether a human gates SQL execution. When it is omitted
-the operator still infers it from `spec.mode` — `apply` implies `auto`, `plan`
-implies `manual` — which leaves that gate invisible on the object: nothing in
-`kubectl get pgr -o yaml` tells you whether the policy applies DDL on its own.
-
-That inference is deprecated. A policy relying on it reports an `ApprovalUnset`
-status condition naming the inferred value, emits a warning Event, and counts
-toward the `pgroles.deprecated.approval_unset` metric. A future release will
-reject a policy that omits the field.
-
-Write down the value you are already getting — `approval: auto` for a policy in
-`mode: apply`, `approval: manual` for `mode: plan` — and the condition clears on
-the next reconcile with no change in behaviour.
+`spec.approval` decides whether a human gates SQL execution. When omitted the
+operator still infers it from `spec.mode` — `apply` implies `auto`, `observe`
+implies `manual` — which leaves the gate invisible on the object. That
+inference is deprecated: a policy relying on it reports an `ApprovalUnset`
+condition, emits a warning Event, and counts toward
+`pgroles.deprecated.approval_unset`. Write the value down explicitly.
 {% /callout %}
-
-When `spec.approval: manual` is used with `mode: apply`, the operator creates a `PostgresPolicyPlan` and waits for approval instead of immediately executing the SQL.
-
-```yaml
-spec:
-  connection:
-    secretRef:
-      name: postgres-credentials
-  mode: apply
-  approval: manual
-```
-
-A generated plan looks like this:
-
-```text
-NAME                                                     POLICY                 MODE            APPROVED   CHANGES   PHASE     AGE
-plan-approval-policy-plan-20260512-090318-454373251739   plan-approval-policy   authoritative   False      2         Pending   3s
-```
-
-Approve it by annotating the plan:
-
-```shell
-kubectl annotate pgplan plan-approval-policy-plan-20260512-090318-454373251739 \
-  pgroles.io/approved=true --overwrite
-```
-
-After approval, the plan moves to `Applied`:
-
-```text
-NAME                                                     POLICY                 MODE            APPROVED   CHANGES   PHASE     AGE
-plan-approval-policy-plan-20260512-090318-454373251739   plan-approval-policy   authoritative   True       2         Applied   5s
-```
-
-The plan status included:
-
-```yaml
-status:
-  appliedAt: "2026-05-12T09:03:21Z"
-  changeSummary:
-    grants_added: 1
-    roles_created: 1
-    total: 2
-  conditions:
-    - type: Computed
-      status: "True"
-      reason: PlanComputed
-      message: Plan computed with 2 change(s)
-    - type: Approved
-      status: "True"
-      reason: Approved
-      message: Plan approved and executed
-  phase: Applied
-  sqlHash: 454373251739fdfbe188ae07358b01d9e0465eb47011fe2d4f386fa34ef7de1b
-  sqlInline: |-
-    CREATE ROLE "approval_test_user" LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE INHERIT NOREPLICATION NOBYPASSRLS;
-    GRANT CONNECT ON DATABASE "postgres" TO "approval_test_user";
-  sqlStatements: 2
-  sqlTruncated: false
-```
-
-With `spec.approval: auto`, the operator creates a `PostgresPolicyPlan` and applies it immediately:
-
-```text
-NAME                                                     POLICY                 MODE            APPROVED   CHANGES   PHASE     AGE
-auto-approval-policy-plan-20260512-090329-11a6ca1d7c09   auto-approval-policy   authoritative   True       2         Applied   2s
-```
-
-The corresponding database role is present after reconcile:
-
-```text
-auto_approved_user
-```
