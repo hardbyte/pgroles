@@ -121,6 +121,9 @@ jobs:
       - name: Chart README drift check
         run: scripts/check-helm-docs.sh
 
+      - name: Kyverno policy mirror drift check
+        run: scripts/check-kyverno-drift.sh
+
       - uses: astral-sh/setup-uv@v9.0.0
 
       - name: Validate Agent Skills
