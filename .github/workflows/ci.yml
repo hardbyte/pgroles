@@ -1222,6 +1222,184 @@ jobs:
           kubectl delete pgr restart-test --wait=true
           pg_query "REASSIGN OWNED BY restart_test_user TO postgres; DROP OWNED BY restart_test_user; DROP ROLE IF EXISTS restart_test_user;"
 
+      # ==================================================================
+      # Group F: candidates and promotion (#182)
+      #
+      # Extends this job rather than adding one: these scenarios need the same
+      # cluster, operator and PostgreSQL, and a second kind cluster would cost
+      # several minutes of CI for nothing.
+      # ==================================================================
+      - name: Run candidate and promotion scenarios
+        run: |
+          source scripts/e2e-helpers.sh
+
+          # Write the policy with the base role plus every role named in "$@",
+          # and apply it. This is the GitOps promotion: the same content the
+          # candidate carried, written into PostgresPolicy.spec.
+          write_promo_policy() {
+            cat >/tmp/promo-policy.yaml <<'POLICY'
+          apiVersion: pgroles.io/v1alpha1
+          kind: PostgresPolicy
+          metadata:
+            name: promo-policy
+            namespace: default
+          spec:
+            connection:
+              secretRef:
+                name: postgres-credentials
+            interval: "15s"
+            mode: apply
+            approval: manual
+            roles:
+              - name: promo_base_user
+                login: true
+          POLICY
+            local role
+            for role in "$@"; do
+              printf '    - name: %s\n      login: true\n' "$role" >>/tmp/promo-policy.yaml
+            done
+            kubectl apply -f /tmp/promo-policy.yaml
+          }
+
+          # A candidate proposing the base role plus every role named in "$2..".
+          file_candidate() {
+            local name="$1"; shift
+            {
+              printf 'apiVersion: pgroles.io/v1alpha1\n'
+              printf 'kind: PostgresPolicyCandidate\n'
+              printf 'metadata:\n  name: %s\n  namespace: default\n' "$name"
+              printf 'spec:\n  policyRef:\n    name: promo-policy\n'
+              printf '  content:\n    roles:\n      - name: promo_base_user\n        login: true\n'
+              local role
+              for role in "$@"; do
+                printf '      - name: %s\n        login: true\n' "$role"
+              done
+            } >"/tmp/$name.yaml"
+            kubectl apply -f "/tmp/$name.yaml"
+          }
+
+          echo "--- Test: base policy converges before any candidate exists ---"
+          write_promo_policy
+          base_plan=$(wait_for_pending_plan_ref promo-policy)
+          approve_plan "$base_plan"
+          wait_for_plan_phase "$base_plan" Applied
+          assert_role_exists promo_base_user
+
+          echo "--- Test: a candidate is planned and writes nothing ---"
+          file_candidate promo-cand-1 promo_new_user
+          wait_for_candidate_phase promo-cand-1 Planned
+          wait_for_candidate_condition promo-cand-1 Ready True Planned
+          cand_plan=$(wait_for_candidate_plan_ref promo-cand-1)
+
+          # The plan binds the content digest promotion is matched against, and
+          # the candidate that produced it.
+          cand_digest=$(get_candidate_digest promo-cand-1)
+          test -n "$cand_digest" || { echo "::error::candidate has no contentDigest"; exit 1; }
+          plan_digest=$(kubectl get pgplan "$cand_plan" -o jsonpath='{.spec.origin.contentDigest}')
+          test "$plan_digest" = "$cand_digest" \
+            || { echo "::error::plan contentDigest '$plan_digest' != candidate '$cand_digest'"; exit 1; }
+          origin_kind=$(kubectl get pgplan "$cand_plan" -o jsonpath='{.spec.origin.kind}')
+          test "$origin_kind" = "PostgresPolicyCandidate" \
+            || { echo "::error::expected a candidate-origin plan, got '$origin_kind'"; exit 1; }
+
+          # The active policy keeps enforcing, and the proposal executes nothing.
+          assert_role_exists promo_base_user
+          assert_role_absent promo_new_user
+
+          echo "--- Test: the candidate spec is immutable (CEL) ---"
+          if kubectl patch pgcand promo-cand-1 --type=merge \
+              -p '{"spec":{"content":{"roles":[{"name":"promo_sneaky_user","login":true}]}}}' \
+              2>/tmp/immutable.txt; then
+            echo "::error::editing a candidate spec was accepted; immutability is not in force"
+            exit 1
+          fi
+          cat /tmp/immutable.txt
+          grep -qi 'immutable' /tmp/immutable.txt \
+            || { echo "::error::the rejection did not name immutability"; exit 1; }
+          assert_role_absent promo_sneaky_user
+
+          echo "--- Test: approving a candidate plan executes nothing by itself ---"
+          approve_plan "$cand_plan"
+          sleep 20
+          assert_role_absent promo_new_user
+
+          echo "--- Test: promoting the approved content executes it ---"
+          write_promo_policy promo_new_user
+          wait_for_plan_phase "$cand_plan" Applied
+          assert_role_exists promo_new_user
+          wait_for_candidate_phase promo-cand-1 Promoted
+          wait_for_candidate_condition promo-cand-1 Promoted True Promoted
+
+          # The policy records the content it converged on — the same digest,
+          # computed over the same canonical form, on both kinds.
+          policy_digest=$(get_policy_content_digest promo-policy)
+          test "$policy_digest" = "$cand_digest" \
+            || { echo "::error::policy digest '$policy_digest' != promoted candidate '$cand_digest'"; exit 1; }
+
+          echo "--- Test: promoting EDITED content falls back to the manual flow ---"
+          file_candidate promo-cand-2 promo_new_user promo_edited_user
+          wait_for_candidate_phase promo-cand-2 Planned
+          cand2_plan=$(wait_for_candidate_plan_ref promo-cand-2)
+          approve_plan "$cand2_plan"
+
+          # Merge something that is not what was approved.
+          write_promo_policy promo_new_user promo_other_user
+
+          wait_for_candidate_condition promo-cand-2 Promoted False PromotionDigestMismatch
+          # Nothing executed on an approval that does not cover this content —
+          # neither the approved candidate's role nor the merged one.
+          assert_role_absent promo_edited_user
+          assert_role_absent promo_other_user
+
+          # The merged content goes through the ordinary manual-plan flow.
+          fresh_plan=$(wait_for_pending_plan_ref promo-policy)
+          test "$fresh_plan" != "$cand2_plan" \
+            || { echo "::error::the policy adopted a candidate plan for content it does not describe"; exit 1; }
+          approve_plan "$fresh_plan"
+          wait_for_plan_phase "$fresh_plan" Applied
+          assert_role_exists promo_other_user
+
+          # The edited promotion never promoted the approved candidate.
+          phase=$(kubectl get pgcand promo-cand-2 -o jsonpath='{.status.phase}')
+          test "$phase" != "Promoted" \
+            || { echo "::error::a candidate whose content never applied reached Promoted"; exit 1; }
+
+          echo "--- Test: approving X and merging Y promotes Y and strands X ---"
+          file_candidate promo-cand-x promo_new_user promo_other_user promo_x_user
+          file_candidate promo-cand-y promo_new_user promo_other_user promo_y_user
+          wait_for_candidate_phase promo-cand-x Planned
+          wait_for_candidate_phase promo-cand-y Planned
+          plan_x=$(wait_for_candidate_plan_ref promo-cand-x)
+          plan_y=$(wait_for_candidate_plan_ref promo-cand-y)
+          approve_plan "$plan_x"
+          approve_plan "$plan_y"
+
+          write_promo_policy promo_new_user promo_other_user promo_y_user
+
+          wait_for_plan_phase "$plan_y" Applied
+          wait_for_candidate_phase promo-cand-y Promoted
+          assert_role_exists promo_y_user
+          # X was approved against a base this promotion replaced: its approval
+          # is retired rather than left executable, and nothing of X ran.
+          wait_for_plan_phase "$plan_x" Superseded
+          reason=$(kubectl get pgplan "$plan_x" \
+            -o jsonpath='{.status.conditions[?(@.type=="Superseded")].reason}')
+          test "$reason" = "SupersededByPromotion" \
+            || { echo "::error::expected SupersededByPromotion on the stranded plan, got '$reason'"; exit 1; }
+          # The decision record itself is untouched: who approved what is
+          # write-once, and retiring a plan must not rewrite it.
+          decided=$(kubectl get pgplan "$plan_x" -o jsonpath='{.status.decidedBy.username}')
+          test "$decided" = "e2e-reviewer" \
+            || { echo "::error::stranding a plan rewrote its decision identity: '$decided'"; exit 1; }
+          assert_role_absent promo_x_user
+
+          # Cleanup
+          kubectl delete pgcand --all --wait=true
+          kubectl delete pgr promo-policy --wait=true
+          for role in promo_base_user promo_new_user promo_other_user promo_y_user; do
+            pg_query "REASSIGN OWNED BY $role TO postgres; DROP OWNED BY $role; DROP ROLE IF EXISTS $role;"
+          done
+
       - name: Cleanup
         if: always()
         run: kind delete cluster --name pgroles-e2e-plans

@@ -932,6 +932,16 @@ pub struct PostgresPolicyStatus {
     /// Reference to the current/latest plan for this policy.
     #[serde(default)]
     pub current_plan_ref: Option<PlanReference>,
+
+    /// Canonical digest of this policy's own content, computed by exactly the
+    /// same function as a candidate's `status.contentDigest`.
+    ///
+    /// Promotion is recognised by comparing the two. The value is also the
+    /// operator's memory of what the content was on the previous reconcile,
+    /// which is how an edited-after-approval promotion is distinguished from a
+    /// policy that simply has not changed while a candidate is under review.
+    #[serde(default)]
+    pub content_digest: Option<String>,
 }
 
 /// A condition on the `PostgresPolicy` resource.
@@ -2046,9 +2056,51 @@ impl PolicyContent {
             &self.retirements,
         )
     }
+
+    /// The canonical content digest of this content.
+    ///
+    /// The single entry point, so a policy and a candidate can never be
+    /// digested through different code.
+    pub fn content_digest(&self) -> String {
+        pgroles_core::candidate::compute_content_digest(self)
+    }
 }
 
 impl PostgresPolicySpec {
+    /// Project the policy's content fields into [`PolicyContent`].
+    ///
+    /// The inverse of promotion: promotion copies `candidate.spec.content`
+    /// into `policy.spec`, and this reads that content back out. Both
+    /// directions are pure field moves — [`PolicyContent`] exists precisely so
+    /// that the projection is total and lossless — which is what lets the same
+    /// content produce the same digest on either kind.
+    pub fn policy_content(&self) -> PolicyContent {
+        PolicyContent {
+            reconciliation_mode: self.reconciliation_mode,
+            default_owner: self.default_owner.clone(),
+            profiles: self
+                .profiles
+                .iter()
+                .map(|(name, spec)| (name.clone(), spec.clone()))
+                .collect(),
+            schemas: self.schemas.clone(),
+            roles: self.roles.clone(),
+            grants: self.grants.clone(),
+            default_privileges: self.default_privileges.clone(),
+            memberships: self.memberships.clone(),
+            retirements: self.retirements.clone(),
+        }
+    }
+
+    /// The canonical content digest of this policy's content.
+    ///
+    /// Computed over [`PolicyContent`], not over the spec, so promoting a
+    /// candidate byte-for-byte yields the identical digest — the property
+    /// `promoting_candidate_content_yields_the_candidates_digest` pins.
+    pub fn content_digest(&self) -> String {
+        self.policy_content().content_digest()
+    }
+
     /// Convert the CRD spec into a `PolicyManifest` for use with the core library.
     pub fn to_policy_manifest(&self) -> pgroles_core::manifest::PolicyManifest {
         build_policy_manifest(
@@ -2542,10 +2594,47 @@ pub mod candidate_reason {
     pub const EFFECTS_CHANGED: &str = "EffectsChanged";
     /// `Superseded=True` — the candidate's plan was denied (terminal).
     pub const PLAN_DENIED: &str = "PlanDenied";
+    /// `Promoted=True` — this candidate's content became the policy's and
+    /// executed (terminal).
+    pub const PROMOTED: &str = "Promoted";
+    /// `Ready=False` — this candidate's content was promoted into the policy
+    /// while its plan held no approval, so the promotion executes nothing on
+    /// the approval it never had: the policy falls back to its ordinary
+    /// manual-plan flow.
+    pub const PROMOTED_WITHOUT_APPROVAL: &str = "PromotedWithoutApproval";
+    /// `Ready=False` — the policy's content changed to something that is *not*
+    /// this approved candidate: edited after approval, or rebased.
+    pub const PROMOTION_DIGEST_MISMATCH: &str = "PromotionDigestMismatch";
+    /// `Ready=False` — the content was promoted but the policy never executes
+    /// (`mode: plan`), so the candidate cannot reach `Promoted`.
+    pub const PROMOTION_NOT_EXECUTED: &str = "PromotionNotExecuted";
+    /// `Superseded=True` on a *plan* — another candidate's content was
+    /// promoted and executed, so this plan's approval can never be used.
+    pub const SUPERSEDED_BY_PROMOTION: &str = "SupersededByPromotion";
 }
 
 /// Condition type recording that a candidate is terminal.
 pub const CONDITION_SUPERSEDED: &str = "Superseded";
+
+/// Condition type carrying everything promotion has to say about a candidate.
+///
+/// `Promoted=True` is terminal: the content was promoted and executed.
+/// `Promoted=False` reports a promotion that did *not* complete — merged
+/// without approval, merged edited, or merged into a policy that never
+/// executes — and is deliberately a separate condition from `Ready`, which
+/// belongs to the planning lifecycle and is rewritten on every cycle.
+pub const CONDITION_PROMOTED: &str = "Promoted";
+
+/// Helper to create a candidate `Promoted` condition.
+pub fn promoted_condition(promoted: bool, reason: &str, message: &str) -> PolicyCondition {
+    PolicyCondition {
+        condition_type: CONDITION_PROMOTED.to_string(),
+        status: if promoted { "True" } else { "False" }.to_string(),
+        reason: Some(reason.to_string()),
+        message: Some(message.to_string()),
+        last_transition_time: Some(now_rfc3339()),
+    }
+}
 
 /// Set a condition on a bare condition list, preserving the transition time
 /// when the status value is unchanged.
@@ -5383,6 +5472,62 @@ retirements:
         assert!(content.roles.is_empty());
         assert!(content.grants.is_empty());
         assert!(content.profiles.is_empty());
+    }
+
+    /// The property the whole promotion gate rests on: promoting a candidate's
+    /// content into a policy produces the *identical* digest, so recognition
+    /// is exact rather than approximate. If this ever fails, promotion of a
+    /// reviewed candidate silently degrades to the manual-plan flow and no
+    /// approval is ever honoured.
+    #[test]
+    fn promoting_candidate_content_yields_the_candidates_digest() {
+        let content: PolicyContent = serde_json::from_value(serde_json::json!({
+            "reconciliation_mode": "additive",
+            "default_owner": "app_owner",
+            "profiles": { "reader": { "grants": [] } },
+            "schemas": [{ "name": "app", "profiles": ["reader"] }],
+            "roles": [{ "name": "reporting-reader", "login": true }],
+            "grants": [{
+                "role": "reporting-reader",
+                "privileges": ["CONNECT"],
+                "object": { "type": "database", "name": "orders" }
+            }],
+            "memberships": [{ "role": "reporting-reader", "members": [{ "name": "app_owner" }] }],
+        }))
+        .expect("content fixture");
+
+        // The GitOps promotion: the same content, pasted into a policy spec
+        // beside the execution fields, which the digest must ignore.
+        let mut spec_json = serde_json::to_value(&content).expect("content serializes");
+        let object = spec_json.as_object_mut().expect("content is an object");
+        object.insert(
+            "connection".to_string(),
+            serde_json::json!({ "secretRef": { "name": "db" } }),
+        );
+        object.insert("interval".to_string(), serde_json::json!("30s"));
+        object.insert("mode".to_string(), serde_json::json!("apply"));
+        object.insert("approval".to_string(), serde_json::json!("manual"));
+        object.insert("suspend".to_string(), serde_json::json!(false));
+        let spec: PostgresPolicySpec =
+            serde_json::from_value(spec_json).expect("promoted policy spec");
+
+        assert_eq!(spec.content_digest(), content.content_digest());
+        assert_eq!(
+            spec.content_digest(),
+            pgroles_core::candidate::compute_content_digest(&content),
+        );
+
+        // And the execution fields are genuinely outside the digest: changing
+        // one must not move it, or every interval bump would break promotion.
+        let mut other = spec.clone();
+        other.interval = "1h".to_string();
+        other.suspend = true;
+        assert_eq!(other.content_digest(), spec.content_digest());
+
+        // While a content edit must move it — that is the whole mechanism.
+        let mut edited = spec.clone();
+        edited.roles[0].login = Some(false);
+        assert_ne!(edited.content_digest(), spec.content_digest());
     }
 
     /// Promotion copies `candidate.spec.content` into `policy.spec` verbatim,

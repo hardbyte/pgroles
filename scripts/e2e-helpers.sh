@@ -491,3 +491,94 @@ get_plan_count() {
   local policy="$1"
   kubectl get pgplan -l "pgroles.io/policy=$policy" --no-headers 2>/dev/null | wc -l | tr -d ' '
 }
+
+# -- Candidate helpers --------------------------------------------------------
+
+wait_for_candidate_phase() {
+  local candidate="$1" expected_phase="$2"
+  for i in $(seq 1 30); do
+    phase="$(kubectl get pgcand "$candidate" -o jsonpath='{.status.phase}' 2>/dev/null || true)"
+    if [ "$phase" = "$expected_phase" ]; then
+      echo "$candidate reached phase=$expected_phase"
+      return 0
+    fi
+    echo "Waiting for $candidate phase=$expected_phase (current=$phase)... ($i/30)"
+    sleep 3
+  done
+  echo "::error::$candidate did not reach phase=$expected_phase within timeout"
+  kubectl get pgcand "$candidate" -o yaml || true
+  return 1
+}
+
+# Wait for a condition on a candidate to hold a given status and reason.
+# Conditions are the source of truth; phase is only a printable summary.
+wait_for_candidate_condition() {
+  local candidate="$1" ctype="$2" expected_status="$3" expected_reason="$4"
+  for i in $(seq 1 30); do
+    local status reason
+    status="$(kubectl get pgcand "$candidate" \
+      -o jsonpath="{.status.conditions[?(@.type==\"$ctype\")].status}" 2>/dev/null || true)"
+    reason="$(kubectl get pgcand "$candidate" \
+      -o jsonpath="{.status.conditions[?(@.type==\"$ctype\")].reason}" 2>/dev/null || true)"
+    if [ "$status" = "$expected_status" ] && [ "$reason" = "$expected_reason" ]; then
+      echo "$candidate has $ctype=$expected_status reason=$expected_reason"
+      return 0
+    fi
+    echo "Waiting for $candidate $ctype=$expected_status/$expected_reason (current=$status/$reason)... ($i/30)"
+    sleep 3
+  done
+  echo "::error::$candidate did not reach $ctype=$expected_status/$expected_reason within timeout"
+  kubectl get pgcand "$candidate" -o yaml || true
+  return 1
+}
+
+# The plan the operator published for a candidate. Progress goes to stderr:
+# callers capture stdout as the plan name.
+wait_for_candidate_plan_ref() {
+  local candidate="$1"
+  for i in $(seq 1 30); do
+    local plan_name
+    plan_name="$(kubectl get pgcand "$candidate" -o jsonpath='{.status.planRef.name}' 2>/dev/null || true)"
+    if [ -n "$plan_name" ]; then
+      echo "$plan_name"
+      return 0
+    fi
+    echo "Waiting for $candidate planRef... ($i/30)" >&2
+    sleep 3
+  done
+  echo "::error::$candidate did not get a planRef within timeout" >&2
+  kubectl get pgcand "$candidate" -o yaml >&2 || true
+  return 1
+}
+
+get_candidate_digest() {
+  kubectl get pgcand "$1" -o jsonpath='{.status.contentDigest}'
+}
+
+get_policy_content_digest() {
+  kubectl get pgr "$1" -o jsonpath='{.status.content_digest}'
+}
+
+# The policy's current plan, once it names a plan that is actually awaiting a
+# decision. `wait_for_current_plan_ref` can return a reference to the plan that
+# just applied, which a caller about to approve something must not mistake for
+# the fresh one.
+wait_for_pending_plan_ref() {
+  local policy="$1"
+  for i in $(seq 1 30); do
+    local plan_name phase
+    plan_name="$(kubectl get pgr "$policy" -o jsonpath='{.status.current_plan_ref.name}' 2>/dev/null || true)"
+    if [ -n "$plan_name" ]; then
+      phase="$(kubectl get pgplan "$plan_name" -o jsonpath='{.status.phase}' 2>/dev/null || true)"
+      if [ "$phase" = "Pending" ]; then
+        echo "$plan_name"
+        return 0
+      fi
+    fi
+    echo "Waiting for $policy to hold a Pending plan... ($i/30)" >&2
+    sleep 3
+  done
+  echo "::error::$policy did not hold a Pending plan within timeout" >&2
+  kubectl get pgplan -l "pgroles.io/policy=$policy" -o wide >&2 || true
+  return 1
+}

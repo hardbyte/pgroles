@@ -1093,6 +1093,11 @@
                     },
                     "type": "array"
                   },
+                  "content_digest": {
+                    "description": "Canonical digest of this policy's own content, computed by exactly the\nsame function as a candidate's `status.contentDigest`.\n\nPromotion is recognised by comparing the two. The value is also the\noperator's memory of what the content was on the previous reconcile,\nwhich is how an edited-after-approval promotion is distinguished from a\npolicy that simply has not changed while a candidate is under review.",
+                    "nullable": true,
+                    "type": "string"
+                  },
                   "current_plan_ref": {
                     "description": "Reference to the current/latest plan for this policy.",
                     "nullable": true,

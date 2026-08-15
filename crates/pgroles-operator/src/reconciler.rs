@@ -1211,6 +1211,30 @@ async fn apply_under_lock(
 
     let effective_approval = resource.spec.effective_approval();
 
+    // Is this reconcile the promotion of a reviewed candidate? Recognition is
+    // by content digest, computed over exactly the canonical form a candidate's
+    // is, and it runs here — under both locks, on the state just inspected —
+    // so that the plan it may hand back is checked against fresh effects.
+    //
+    // A failure to look candidates up degrades to the ordinary flow rather
+    // than failing the reconcile: the ordinary flow can only ever execute a
+    // plan this policy owns and a human approved, so degrading cannot execute
+    // anything unreviewed — while failing closed here would take enforcement
+    // down whenever the candidate CRD is unavailable.
+    let content_digest = resource.spec.content_digest();
+    let promoted_plan = match crate::promotion::recognize(ctx, resource, &content_digest).await {
+        Ok(plan) => plan,
+        Err(err) => {
+            tracing::warn!(
+                name,
+                namespace,
+                %err,
+                "could not evaluate candidate promotion; continuing with the ordinary flow"
+            );
+            None
+        }
+    };
+
     if resource.spec.mode == PolicyMode::Plan {
         let drift_detected = !changes.is_empty();
         let ready_message = if drift_detected {
@@ -1477,6 +1501,13 @@ async fn apply_under_lock(
                 info!(name, namespace, "no changes needed");
             }
 
+            // The database now holds this content, however it got there — an
+            // auto-approved apply, or nothing to do because it was already
+            // converged. Either way a candidate proposing exactly this content
+            // has been promoted. Under `approval: auto` the gate is trivially
+            // satisfied, and this is the whole of promotion's effect.
+            record_promotion(ctx, resource, &content_digest).await;
+
             // Update status to Ready.
             update_status(ctx, resource, |status| {
                 status.set_condition(ready_condition(true, "Reconciled", "All changes applied"));
@@ -1507,10 +1538,21 @@ async fn apply_under_lock(
         crate::crd::ApprovalMode::Manual => {
             // Manual approval: check for an existing approved plan, or create one.
 
-            // First, check if there is a current pending plan that has been approved.
-            if let Some(current_plan) =
-                crate::plan::get_current_actionable_plan(&ctx.kube_client, resource).await?
-            {
+            // First, check if there is a current pending plan that has been
+            // approved — or, when this reconcile is the promotion of an
+            // approved candidate, that candidate's plan, which *is* this
+            // policy's plan for this transition. Adopting it rather than
+            // minting an approval on a fresh plan is what keeps promotion from
+            // adding a trusted step: the plan below carries the human decision,
+            // the `decidedBy`, the approved change digest and the bound target
+            // identity, and it goes through the identical verification.
+            let current_plan = match promoted_plan.clone() {
+                Some(plan) => Some(plan),
+                None => {
+                    crate::plan::get_current_actionable_plan(&ctx.kube_client, resource).await?
+                }
+            };
+            if let Some(current_plan) = current_plan {
                 let approval_state = crate::plan::check_plan_approval(&current_plan);
 
                 match approval_state {
@@ -1639,6 +1681,11 @@ async fn apply_under_lock(
                                     supersede_cause,
                                 )
                                 .await?;
+
+                                // The database already holds this content:
+                                // a candidate proposing it has been promoted,
+                                // even though this reconcile executed nothing.
+                                record_promotion(ctx, resource, &content_digest).await;
 
                                 mark_reconciled_no_changes(
                                     ctx,
@@ -1840,6 +1887,13 @@ async fn apply_under_lock(
 
                         ctx.observability.record_apply_result("success");
 
+                        // The approved effects executed. If they were a
+                        // candidate's content, that candidate is now promoted —
+                        // whether the approval came from the candidate's own
+                        // plan (the gate) or from a fresh policy plan approved
+                        // after a `PromotedWithoutApproval` fallback.
+                        record_promotion(ctx, resource, &content_digest).await;
+
                         // Update status to Ready.
                         update_status(ctx, resource, |status| {
                             status.set_condition(ready_condition(
@@ -1952,6 +2006,11 @@ async fn apply_under_lock(
                                     crate::plan::SupersedeCause::EffectsCleared,
                                 )
                                 .await?;
+
+                                // The database already holds this content:
+                                // a candidate proposing it has been promoted,
+                                // even though this reconcile executed nothing.
+                                record_promotion(ctx, resource, &content_digest).await;
 
                                 mark_reconciled_no_changes(
                                     ctx,
@@ -2090,6 +2149,11 @@ async fn apply_under_lock(
                 // previously it left a reference to whatever plan had been
                 // superseded, which outlived the plan itself once retention
                 // pruned it.
+                // Nothing to do because the content is already the
+                // database's state — which promotes a candidate that proposed
+                // exactly this content.
+                record_promotion(ctx, resource, &content_digest).await;
+
                 mark_reconciled_no_changes(
                     ctx,
                     resource,
@@ -2704,6 +2768,22 @@ async fn emit_plan_event(
 }
 
 /// Patch the status sub-resource of a PostgresPolicy.
+/// Promotion bookkeeping after the database converged on the policy's content.
+///
+/// Never fatal. The SQL has already run (or was never needed), so failing the
+/// reconcile here would retry an apply to fix a status write — and the next
+/// reconcile re-recognises the same promotion and writes it anyway, because
+/// recognition is by digest and not by a one-shot transition.
+async fn record_promotion(ctx: &OperatorContext, resource: &PostgresPolicy, content_digest: &str) {
+    if let Err(err) = crate::promotion::record_promotion(ctx, resource, content_digest).await {
+        tracing::warn!(
+            policy = %resource.name_any(),
+            %err,
+            "failed to record candidate promotion; will retry on the next reconcile"
+        );
+    }
+}
+
 /// Record that the policy is in sync with nothing left to do.
 ///
 /// Three paths reach this state under manual approval — no plan and no changes,

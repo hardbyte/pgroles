@@ -8,19 +8,18 @@ Seeing what the operator would do before it does it. {% .lead %}
 ---
 
 Everything on this page describes shipped behaviour and works today, with one
-exception: the four items in the callout below, which are marked inline where
+exception: the items in the callout below, which are marked inline where
 they appear.
 
 {% callout type="note" title="Not built yet" %}
 These are the only forward-looking items on this page:
 
-- **The `PostgresPolicyCandidate` CRD** — proposing a change without editing
-  the enforcing policy. See [candidates and
-  promotion](/docs/operator-candidates), which is a design preview in full.
 - **`pgroles plan ...` and `pgroles candidate ...` CLI subcommands** — the CLI
   has no such commands. `pgroles plan` is an alias of `pgroles diff` and works
   against a database directly, not against a cluster. Use `kubectl` for
-  everything on this page.
+  everything on this page, and for candidates too.
+- **Content by reference** — `spec.contentRef` on a candidate, for policies too
+  large to embed. Inline content is the only supported form today.
 - **Renaming `mode: plan` to `mode: observe`** — so that "plan" names exactly
   one thing, the `PostgresPolicyPlan` resource. The field value today is
   `plan`, and that is what this page uses throughout.
@@ -401,8 +400,9 @@ recomputed against the state observed under that lock; any divergence aborts
 before the first statement and supersedes the plan.
 
 To review proposed changes *without* editing the active policy at all, see
-[Candidates and promotion](/docs/operator-candidates) — a design preview, not
-yet released.
+[Candidates and promotion](/docs/operator-candidates). A promoted candidate
+executes through this exact path: the candidate's own reviewed plan becomes the
+policy's plan for that transition, and the verification above is what runs.
 
 {% callout type="warning" title="Set `spec.approval` explicitly" %}
 `spec.approval` decides whether a human gates SQL execution. When omitted the

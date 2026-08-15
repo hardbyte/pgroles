@@ -168,6 +168,10 @@ pub enum SupersedeCause {
     /// The policy stopped pointing at this plan — it moved out of a planning
     /// state, or its pending changes were resolved another way.
     PolicyStoppedPlanning,
+    /// A different candidate's content was promoted and executed. This plan
+    /// was computed against a base that no longer exists, and its approval can
+    /// never authorise anything.
+    SupersededByPromotion,
 }
 
 impl SupersedeCause {
@@ -177,6 +181,12 @@ impl SupersedeCause {
     pub fn reason(self) -> &'static str {
         match self {
             SupersedeCause::TargetChanged(reason) => reason.as_str(),
+            // Promotion is the one supersede a reviewer can act on by filing a
+            // successor candidate, so it names itself rather than hiding
+            // behind the generic reason.
+            SupersedeCause::SupersededByPromotion => {
+                crate::crd::candidate_reason::SUPERSEDED_BY_PROMOTION
+            }
             _ => "Superseded",
         }
     }
@@ -198,6 +208,10 @@ impl SupersedeCause {
             SupersedeCause::TargetChanged(reason) => reason.message(),
             SupersedeCause::PolicyStoppedPlanning => {
                 "the policy no longer references this plan, so it will never be executed"
+            }
+            SupersedeCause::SupersededByPromotion => {
+                "another candidate's content was promoted and executed, so this plan describes a \
+                 change against a base that no longer exists"
             }
         }
     }
@@ -1898,6 +1912,46 @@ pub async fn mark_plan_rejected(
 
 /// Mark a plan as Superseded, recording `cause` on the `Approved=False`
 /// condition so the reason the plan was retired survives on the object.
+/// Retire a plan whose *approval* is still recorded, without touching the
+/// decision.
+///
+/// [`mark_plan_superseded`] flips `Approved` to `False`, which the CRD's
+/// terminality and `decidedBy` rules reject on a plan a human actually
+/// approved: a recorded decision is write-once, and clearing it would also
+/// leave a `decidedBy` with no decision beside it. A promotion strands other
+/// candidates' approvals, so it has to retire them while leaving the record of
+/// who decided what exactly as it was — the phase and a `Superseded` condition
+/// carry the cause instead.
+pub async fn mark_plan_stranded(
+    client: &Client,
+    plan: &PostgresPolicyPlan,
+    cause: SupersedeCause,
+) -> Result<(), ReconcileError> {
+    let namespace = plan.namespace().ok_or(ReconcileError::NoNamespace)?;
+    let plan_name = plan.name_any();
+    let plans_api: Api<PostgresPolicyPlan> = Api::namespaced(client.clone(), &namespace);
+
+    let mut status = plan.status.clone().unwrap_or_default();
+    status.phase = PlanPhase::Superseded;
+    set_plan_condition(
+        &mut status.conditions,
+        crate::crd::CONDITION_SUPERSEDED,
+        "True",
+        cause.reason(),
+        cause.message(),
+    );
+
+    plans_api
+        .patch_status(
+            &plan_name,
+            &PatchParams::apply("pgroles-operator"),
+            &Patch::Merge(&serde_json::json!({ "status": status })),
+        )
+        .await?;
+
+    Ok(())
+}
+
 pub async fn mark_plan_superseded(
     client: &Client,
     plan: &PostgresPolicyPlan,
