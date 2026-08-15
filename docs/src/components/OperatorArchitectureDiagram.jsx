@@ -18,7 +18,12 @@ export function OperatorArchitectureDiagram() {
           </p>
           <div className="mt-3 grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
             <DiagramChip title="PostgresPolicy" subtitle="generation changes" tone="teal" />
-            <DiagramChip title="EphemeralAccessRequest" subtitle="request lifecycle" tone="teal" />
+            <DiagramChip title="PostgresPolicyPlan" subtitle="approval changes" tone="teal" />
+            <DiagramChip
+              title="EphemeralAccessRequest"
+              subtitle="own controller, own locks"
+              tone="teal"
+            />
             <DiagramChip title="Secret" subtitle="resourceVersion changes" tone="amber" />
             <DiagramChip title="Status" subtitle="conditions and summary" tone="stone" />
           </div>

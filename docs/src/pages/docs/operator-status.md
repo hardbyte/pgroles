@@ -115,7 +115,7 @@ The intended deployment model is operator -> OpenTelemetry Collector -> your met
 | `pgroles.wildcard.grantability_queries` | - | Wildcard grantability catalog queries issued |
 | `pgroles.wildcard.unsatisfied_grants` | - | Wildcard grants missing privileges before grantability checks |
 | `pgroles.ephemeral_access.transitions` | `phase`, `reason` | Ephemeral request phase transitions |
-| `pgroles.ephemeral_access.failures` | `reason` | Ephemeral activation and revocation failures |
+| `pgroles.ephemeral_access.failures` | `reason` | Requests reaching a failed terminal phase — in practice `Denied` and `ApprovalExpired`, since nothing sets `Failed` |
 | `pgroles.ephemeral_access.retained_memberships` | - | Memberships kept at expiry because they became durable |
 | `pgroles.ephemeral_access.expiry_lag` | - | Milliseconds between expiry and revocation |
 | `pgroles.ephemeral_access.role_retirement_blocked` | - | Role retirements blocked by an in-flight request |
@@ -158,8 +158,8 @@ Ephemeral access requests carry their own Events, recorded on the
 `EphemeralAccessRequest` object rather than on the policy, with the action
 `EphemeralAccessLifecycle`. Terminal failures — `Failed`, `Denied`, and
 `ApprovalExpired` — are `Warning`; every other phase transition is `Normal`. So
-`kubectl describe ephemeralaccessrequest <name>` is where one request's history
-lives, not `kubectl describe pgr`.
+`kubectl describe -n <namespace> ephemeralaccessrequest <name>` is where one
+request's history lives, not `kubectl describe pgr`.
 
 Not every failure becomes an Event. `MissingDatabaseObject`,
 `InvalidConnectionParams`, and `UnsatisfiableWildcardGrant` are condition
