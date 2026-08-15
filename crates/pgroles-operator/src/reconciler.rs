@@ -1529,7 +1529,103 @@ async fn apply_under_lock(
                         return Ok((Action::requeue(requeue_interval), ReconcileOutcome::Planned));
                     }
                     crate::plan::PlanApprovalState::Pending => {
-                        // Plan exists and is pending — nothing to do, requeue.
+                        // Revalidate the pending plan against the effects the
+                        // policy would produce right now. Without this the plan
+                        // is frozen while awaiting a decision, so the policy can
+                        // report a fresh change summary beside a plan holding
+                        // different content — and a reviewer approves the stale
+                        // one.
+                        let fresh_digest = crate::plan::compute_change_digest(
+                            &changes,
+                            resource.spec.reconciliation_mode,
+                            identity.as_str(),
+                            &applied_password_source_versions,
+                        )?;
+                        let plan_status = current_plan.status.as_ref();
+                        let still_current = plan_status.is_some_and(|status| {
+                            crate::plan::plan_matches_digest(status, &fresh_digest)
+                        });
+
+                        if !still_current {
+                            // The effects moved. Supersede rather than leave a
+                            // reviewable plan that no longer describes what
+                            // would happen.
+                            info!(
+                                name,
+                                namespace,
+                                plan = %current_plan.name_any(),
+                                "pending plan superseded: effects changed while awaiting approval"
+                            );
+
+                            crate::plan::mark_plan_superseded(&ctx.kube_client, &current_plan)
+                                .await?;
+
+                            let creation_result = crate::plan::create_or_update_plan(
+                                &ctx.kube_client,
+                                resource,
+                                &changes,
+                                &sql_ctx,
+                                &inspect_config,
+                                resource.spec.reconciliation_mode,
+                                identity.as_str(),
+                                &summary,
+                                &applied_password_source_versions,
+                            )
+                            .await?;
+                            let replacement = creation_result.plan_name().to_string();
+
+                            update_status(ctx, resource, |status| {
+                                let msg = format!(
+                                    "Plan {replacement} awaiting approval; {} change(s) pending",
+                                    summary.total,
+                                );
+                                status.set_condition(ready_condition(true, "Planned", &msg));
+                                status.set_condition(drifted_condition(
+                                    !changes.is_empty(),
+                                    if changes.is_empty() {
+                                        "InSync"
+                                    } else {
+                                        "DriftDetected"
+                                    },
+                                    &msg,
+                                ));
+                                status.conditions.retain(|c| {
+                                    c.condition_type != "Reconciling"
+                                        && c.condition_type != "Degraded"
+                                        && c.condition_type != "Conflict"
+                                        && c.condition_type != "Paused"
+                                });
+                                status.last_attempted_generation = generation;
+                                status.change_summary = Some(summary.clone());
+                                status.current_plan_ref = Some(crate::crd::PlanReference {
+                                    name: replacement.clone(),
+                                });
+                                status.last_error = None;
+                                status.transient_failure_count = 0;
+                            })
+                            .await?;
+
+                            return Ok((
+                                Action::requeue(requeue_interval),
+                                ReconcileOutcome::Planned,
+                            ));
+                        }
+
+                        // Effects unchanged — the plan, and any decision on it,
+                        // stand. Record the generation it was confirmed against
+                        // so an effect-neutral policy edit is visible as
+                        // provenance rather than looking like a stale plan.
+                        if plan_status
+                            .is_some_and(|s| crate::plan::needs_revalidation_record(s, generation))
+                        {
+                            crate::plan::record_plan_revalidation(
+                                &ctx.kube_client,
+                                &current_plan,
+                                generation,
+                            )
+                            .await?;
+                        }
+
                         info!(
                             name,
                             namespace,
@@ -1561,6 +1657,12 @@ async fn apply_under_lock(
                             });
                             status.last_attempted_generation = generation;
                             status.change_summary = Some(summary.clone());
+                            // The summary and the plan reference must always
+                            // describe the same effects; the plan was just
+                            // confirmed to still hold them.
+                            status.current_plan_ref = Some(crate::crd::PlanReference {
+                                name: current_plan.name_any(),
+                            });
                             status.last_error = None;
                             status.transient_failure_count = 0;
                         })

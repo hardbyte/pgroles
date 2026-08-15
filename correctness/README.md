@@ -25,6 +25,35 @@ Races modeled:
 4. Database drift changes between plan creation and approval
 5. Hash dedup skips identical plans
 
+### `races/PlanRevalidation.tla`
+
+Verifies what must hold while a plan awaits a manual decision, across the
+reconciles that keep happening underneath it:
+
+- what the policy *reports* and what the pending plan *holds* describe the same
+  effects — a reviewer never reads a fresh summary beside a stale plan
+- an approval survives a policy edit that turns out to be effect-neutral
+
+```sh
+./run-tlc.sh races/PlanRevalidation.tla races/PlanRevalidation.cfg                # passes
+./run-tlc.sh races/PlanRevalidation.tla races/PlanRevalidation_frozen.cfg         # SummaryMatchesPlan violated
+./run-tlc.sh races/PlanRevalidation.tla races/PlanRevalidation_generational.cfg   # ApprovalSurvivesEffectNeutralEdits violated
+```
+
+| Config | `RevalidationMode` | Result |
+| --- | --- | --- |
+| `PlanRevalidation.cfg` | `semantic` | passes |
+| `PlanRevalidation_frozen.cfg` | `frozen` | `SummaryMatchesPlan` violated |
+| `PlanRevalidation_generational.cfg` | `generational` | `ApprovalSurvivesEffectNeutralEdits` violated |
+
+The two failing configurations bracket the design. `frozen` is the behaviour
+before this work: the Pending arm returned early without revalidating, so the
+status summary advanced while the plan stood still. `generational` is the
+plausible wrong fix — superseding whenever the policy generation moves — which
+restores the pairing but discards a decision on every effect-neutral edit. That
+is why `policyGeneration` is a revalidation *trigger* and the change digest is
+the *identity*.
+
 ### `races/PlanApproval.tla`
 
 Verifies what an approval actually binds, by separating two things
