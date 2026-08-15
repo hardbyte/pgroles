@@ -275,6 +275,30 @@ assert_secret_has_keys() {
   echo "Secret $name contains expected keys: $*"
 }
 
+assert_secret_absent() {
+  local name="$1"
+  if kubectl get secret "$name" -o name >/dev/null 2>&1; then
+    echo "::error::Secret $name exists but should not"
+    return 1
+  fi
+  echo "Secret $name is absent as expected"
+}
+
+# A generated Secret must stay absent for as long as its plan is unapproved,
+# not merely be absent at one instant — the operator reconciles on an interval,
+# so a single check could simply have run before the first reconcile.
+assert_secret_absent_stable() {
+  local name="$1"
+  for i in $(seq 1 6); do
+    sleep 5
+    if kubectl get secret "$name" -o name >/dev/null 2>&1; then
+      echo "::error::Secret $name appeared while its plan was still unapproved"
+      return 1
+    fi
+    echo "Secret $name still absent (attempt $i/6)"
+  done
+}
+
 upsert_secret() {
   local name="$1"; shift
   local args=()
@@ -443,6 +467,24 @@ wait_for_current_plan_ref() {
   done
   echo "::error::$policy did not get currentPlanRef within timeout" >&2
   return 1
+}
+
+# Assert the policy is not sitting on a plan awaiting a decision, and stays
+# that way. A password change planned from a stale source version shows up
+# exactly here: a second Pending plan for work that already applied.
+assert_no_pending_plan_stable() {
+  local policy="$1"
+  for i in $(seq 1 6); do
+    sleep 5
+    local pending
+    pending="$(kubectl get pgplan -l "pgroles.io/policy=$policy" \
+      -o jsonpath='{.items[?(@.status.phase=="Pending")].metadata.name}' 2>/dev/null || true)"
+    if [ -n "$pending" ]; then
+      echo "::error::$policy has a pending plan it should not: $pending"
+      return 1
+    fi
+    echo "No pending plan for $policy (attempt $i/6)"
+  done
 }
 
 get_plan_count() {

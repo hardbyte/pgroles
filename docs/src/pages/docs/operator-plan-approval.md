@@ -9,14 +9,14 @@ Seeing what the operator would do before it does it. {% .lead %}
 
 {% callout type="warning" title="Partly a design preview" %}
 Shipped and described accurately below: the semantic change digest as approval
-identity, revalidation of pending plans, and write-once plan decisions with
-`decidedBy` — including the annotation removal.
+identity, revalidation of pending plans, write-once plan decisions with
+`decidedBy` — including the annotation removal — and deferring generated
+password Secrets until after approval
+([#181](https://github.com/hardbyte/pgroles/issues/181)).
 
 **Not yet built**, though this page describes them: `mode: observe` (today it is
 still `mode: plan`), tiered target identity and `requirePhysicalIdentity`
-([#180](https://github.com/hardbyte/pgroles/issues/180)), deferring generated
-password Secrets until after approval
-([#181](https://github.com/hardbyte/pgroles/issues/181)), the
+([#180](https://github.com/hardbyte/pgroles/issues/180)), the
 `PostgresPolicyCandidate` CRD, and every `pgroles plan ...` /
 `pgroles candidate ...` command shown here — the CLI has no such subcommands
 yet. Use `kubectl` for anything you need to do today; see the
@@ -228,7 +228,15 @@ Planning is side-effect free in every mode. For `password.generate` roles the
 operator synthesizes in-memory material while planning and creates the real
 Kubernetes Secret only during post-approval execution — under `apply +
 manual` there is no generated Secret in the cluster until a reviewer has
-approved the plan that introduces it.
+approved the plan that introduces it, and a plan that is rejected or
+abandoned leaves none behind.
+
+The Secret is written immediately *before* the SQL transaction, not after: a
+crash between the two then leaves an unused Secret that the next reconcile
+adopts, rather than a password committed to the database that exists nowhere
+else. If an equivalent Secret already exists — another replica won the race,
+or a previous attempt got that far — that Secret's password is the one the
+database is set from.
 
 ## Execution
 

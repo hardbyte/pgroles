@@ -768,6 +768,97 @@ jobs:
           pg_query "REASSIGN OWNED BY auto_approved_user TO postgres; DROP OWNED BY auto_approved_user; DROP ROLE IF EXISTS auto_approved_user;"
 
           # ================================================================
+          # Group B2: passwords under manual approval (#181, #174)
+          # ================================================================
+
+          echo "--- Test: generated Secret is not created before approval ---"
+          upsert_secret manual-approval-passwords manual_ref_user='e2e_manual_pw!'
+          cat >/tmp/deferred-password-policy.yaml <<'EOF'
+          apiVersion: pgroles.io/v1alpha1
+          kind: PostgresPolicy
+          metadata:
+            name: deferred-password-policy
+            namespace: default
+          spec:
+            connection:
+              secretRef:
+                name: postgres-credentials
+            interval: "15s"
+            mode: apply
+            approval: manual
+            roles:
+              - name: deferred_gen_user
+                login: true
+                password:
+                  generate:
+                    length: 32
+                    secretName: deferred-gen-secret
+              - name: manual_ref_user
+                login: true
+                password:
+                  secretRef:
+                    name: manual-approval-passwords
+                  secretKey: manual_ref_user
+          EOF
+          kubectl apply -f /tmp/deferred-password-policy.yaml
+
+          wait_for_ready_status_reason deferred-password-policy True Planned
+          first_plan=$(wait_for_current_plan_ref deferred-password-policy)
+
+          # The credential must not exist while the plan is only proposed.
+          assert_secret_absent deferred-gen-secret
+          assert_secret_absent_stable deferred-gen-secret
+
+          echo "--- Test: rejection leaves no generated Secret behind ---"
+          reject_plan "$first_plan"
+          wait_for_plan_phase "$first_plan" Rejected
+          assert_secret_absent deferred-gen-secret
+          assert_role_absent deferred_gen_user
+
+          echo "--- Test: approval materializes the Secret exactly once ---"
+          # Rejection deliberately does not create a replacement in the same
+          # cycle, so wait for the next reconcile's plan rather than reusing the
+          # rejected one.
+          for i in $(seq 1 30); do
+            second_plan=$(kubectl get pgr deferred-password-policy \
+              -o jsonpath='{.status.current_plan_ref.name}' 2>/dev/null || true)
+            if [ -n "$second_plan" ] && [ "$second_plan" != "$first_plan" ]; then
+              break
+            fi
+            echo "Waiting for a replacement plan... ($i/30)"
+            sleep 3
+          done
+          test -n "$second_plan" && test "$second_plan" != "$first_plan" \
+            || { echo "::error::no replacement plan after rejection"; exit 1; }
+
+          assert_secret_absent deferred-gen-secret
+          approve_plan "$second_plan"
+          wait_for_plan_phase "$second_plan" Applied
+
+          assert_role_exists deferred_gen_user
+          assert_password_set deferred_gen_user
+          assert_role_exists manual_ref_user
+          assert_password_set manual_ref_user
+          assert_secret_has_keys deferred-gen-secret password verifier
+
+          gen_secret_count=$(kubectl get secret \
+            -l pgroles.io/policy=deferred-password-policy --no-headers 2>/dev/null | wc -l | tr -d ' ')
+          test "$gen_secret_count" -eq 1 \
+            || { echo "::error::expected exactly 1 generated Secret, got $gen_secret_count"; exit 1; }
+
+          # The regression #181's fix exists for: if the policy recorded the
+          # planning-time `:missing` sentinel instead of the version the created
+          # Secret reported, this next reconcile would plan another password
+          # change and demand a second approval.
+          wait_for_drift_status deferred-password-policy False
+          assert_no_pending_plan_stable deferred-password-policy
+          gen_password_hash="$(get_password_hash deferred_gen_user)"
+          wait_for_password_hash_stable deferred_gen_user "$gen_password_hash"
+
+          kubectl delete pgr deferred-password-policy --wait=true
+          pg_query "DROP ROLE IF EXISTS deferred_gen_user; DROP ROLE IF EXISTS manual_ref_user;"
+
+          # ================================================================
           # Group C: Plan supersede on policy change
           # ================================================================
 
