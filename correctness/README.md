@@ -33,11 +33,13 @@ reconciles that keep happening underneath it:
 - what the policy *reports* and what the pending plan *holds* describe the same
   effects — a reviewer never reads a fresh summary beside a stale plan
 - an approval survives a policy edit that turns out to be effect-neutral
+- a plan holding no effects never sits waiting for a decision
 
 ```sh
 ./run-tlc.sh races/PlanRevalidation.tla races/PlanRevalidation.cfg                # passes
 ./run-tlc.sh races/PlanRevalidation.tla races/PlanRevalidation_frozen.cfg         # SummaryMatchesPlan violated
 ./run-tlc.sh races/PlanRevalidation.tla races/PlanRevalidation_generational.cfg   # ApprovalSurvivesEffectNeutralEdits violated
+./run-tlc.sh races/PlanRevalidation.tla races/PlanRevalidation_replace.cfg        # NoEmptyPendingPlan violated
 ```
 
 | Config | `RevalidationMode` | Result |
@@ -45,14 +47,22 @@ reconciles that keep happening underneath it:
 | `PlanRevalidation.cfg` | `semantic` | passes |
 | `PlanRevalidation_frozen.cfg` | `frozen` | `SummaryMatchesPlan` violated |
 | `PlanRevalidation_generational.cfg` | `generational` | `ApprovalSurvivesEffectNeutralEdits` violated |
+| `PlanRevalidation_replace.cfg` | `replace` | `NoEmptyPendingPlan` violated |
 
-The two failing configurations bracket the design. `frozen` is the behaviour
+The three failing configurations bracket the design. `frozen` is the behaviour
 before this work: the Pending arm returned early without revalidating, so the
 status summary advanced while the plan stood still. `generational` is the
 plausible wrong fix — superseding whenever the policy generation moves — which
 restores the pairing but discards a decision on every effect-neutral edit. That
 is why `policyGeneration` is a revalidation *trigger* and the change digest is
 the *identity*.
+
+`replace` is the narrower mistake: revalidate semantically, but always leave a
+replacement plan behind. When an edit does not move the effects but removes
+them, the replacement holds nothing and still blocks on an approval, while the
+policy reports `Drifted=False` beside it. Superseding a pending plan and
+opening a new one are separate decisions, and only the first applies when there
+is nothing left to execute.
 
 ### `races/PlanApproval.tla`
 

@@ -1542,11 +1542,13 @@ async fn apply_under_lock(
                             &applied_password_source_versions,
                         )?;
                         let plan_status = current_plan.status.as_ref();
-                        let still_current = plan_status.is_some_and(|status| {
-                            crate::plan::plan_matches_digest(status, &fresh_digest)
-                        });
+                        let decision = crate::plan::decide_pending_plan(
+                            plan_status,
+                            &fresh_digest,
+                            !changes.is_empty(),
+                        );
 
-                        if !still_current {
+                        if decision != crate::plan::PendingPlanDecision::Retain {
                             // The effects moved. Supersede rather than leave a
                             // reviewable plan that no longer describes what
                             // would happen.
@@ -1559,6 +1561,53 @@ async fn apply_under_lock(
 
                             crate::plan::mark_plan_superseded(&ctx.kube_client, &current_plan)
                                 .await?;
+
+                            // The effects did not just move, they vanished. A
+                            // replacement plan here would hold nothing and still
+                            // demand a decision, so leave the policy with no
+                            // pending plan at all.
+                            if decision == crate::plan::PendingPlanDecision::Clear {
+                                info!(
+                                    name,
+                                    namespace, "pending plan superseded with no remaining changes"
+                                );
+
+                                update_status(ctx, resource, |status| {
+                                    status.set_condition(ready_condition(
+                                        true,
+                                        "Reconciled",
+                                        "No changes needed",
+                                    ));
+                                    status.set_condition(drifted_condition(
+                                        false,
+                                        "InSync",
+                                        "No pending changes",
+                                    ));
+                                    status.conditions.retain(|c| {
+                                        c.condition_type != "Reconciling"
+                                            && c.condition_type != "Degraded"
+                                            && c.condition_type != "Conflict"
+                                            && c.condition_type != "Paused"
+                                    });
+                                    status.observed_generation = generation;
+                                    status.last_attempted_generation = generation;
+                                    status.last_successful_reconcile_time =
+                                        Some(crate::crd::now_rfc3339());
+                                    status.change_summary = Some(summary.clone());
+                                    status.last_reconcile_mode = Some(PolicyMode::Apply);
+                                    status.current_plan_ref = None;
+                                    status.last_error = None;
+                                    status.applied_password_source_versions =
+                                        applied_password_source_versions.clone();
+                                    status.transient_failure_count = 0;
+                                })
+                                .await?;
+
+                                return Ok((
+                                    Action::requeue(requeue_interval),
+                                    ReconcileOutcome::Reconciled,
+                                ));
+                            }
 
                             let creation_result = crate::plan::create_or_update_plan(
                                 &ctx.kube_client,

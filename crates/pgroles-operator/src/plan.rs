@@ -1632,6 +1632,44 @@ pub(crate) fn needs_revalidation_record(
     status.revalidated_generation != generation
 }
 
+/// What to do with a plan that is still awaiting a manual decision.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PendingPlanDecision {
+    /// The effects are unchanged. The plan, and any decision on it, stand.
+    Retain,
+    /// The effects moved. Supersede the plan and open a new one for review.
+    Replace,
+    /// The effects are gone. Supersede the plan and leave none in its place —
+    /// a replacement would hold no changes yet still demand an approval, and
+    /// the policy would report `Drifted=False` while blocked on it.
+    Clear,
+}
+
+/// Decide the fate of a pending plan against the effects the policy would
+/// produce right now.
+///
+/// `plan_status` is `None` for a plan whose status has not been written yet;
+/// like a plan under an older digest encoding it cannot be shown to still hold
+/// the current effects, so it is superseded rather than trusted.
+pub(crate) fn decide_pending_plan(
+    plan_status: Option<&crate::crd::PostgresPolicyPlanStatus>,
+    fresh_digest: &str,
+    has_changes: bool,
+) -> PendingPlanDecision {
+    // Nothing to execute means nothing to approve, whatever the plan holds.
+    // A plan that still matches an empty change set is itself a no-op, so it
+    // is cleared too rather than left blocking on a decision.
+    if !has_changes {
+        return PendingPlanDecision::Clear;
+    }
+
+    if plan_status.is_some_and(|status| plan_matches_digest(status, fresh_digest)) {
+        PendingPlanDecision::Retain
+    } else {
+        PendingPlanDecision::Replace
+    }
+}
+
 /// Record that a pending plan was re-confirmed against the current policy.
 ///
 /// Called when the freshly computed effects still match what the plan holds, so
@@ -2579,6 +2617,77 @@ mod tests {
             ..Default::default()
         };
         assert!(!plan_matches_digest(&different_effects, &digest));
+    }
+
+    /// A pending plan whose effects disappear before anyone decides on it must
+    /// leave no plan behind. Replacing it with an empty one would park the
+    /// policy on an approval for nothing while it reports `Drifted=False`.
+    #[test]
+    fn a_pending_plan_whose_effects_vanish_is_cleared_not_replaced() {
+        let versions = password_versions("app", "role-passwords:app:7");
+        let planned = digest_for(&[grant_change("reporting")], &versions);
+        let pending = PostgresPolicyPlanStatus {
+            phase: PlanPhase::Pending,
+            change_digest: Some(planned),
+            change_digest_encoding: Some(APPROVAL_EFFECT_ENCODING_V1.to_string()),
+            ..Default::default()
+        };
+        let empty_digest = digest_for(&[], &versions);
+
+        assert_eq!(
+            decide_pending_plan(Some(&pending), &empty_digest, false),
+            PendingPlanDecision::Clear,
+        );
+
+        // Even a plan that legitimately matches an empty change set holds
+        // nothing to approve, so it is cleared rather than retained.
+        let empty_plan = PostgresPolicyPlanStatus {
+            phase: PlanPhase::Pending,
+            change_digest: Some(empty_digest.clone()),
+            change_digest_encoding: Some(APPROVAL_EFFECT_ENCODING_V1.to_string()),
+            ..Default::default()
+        };
+        assert_eq!(
+            decide_pending_plan(Some(&empty_plan), &empty_digest, false),
+            PendingPlanDecision::Clear,
+        );
+    }
+
+    #[test]
+    fn a_pending_plan_is_replaced_only_when_real_effects_moved() {
+        let versions = password_versions("app", "role-passwords:app:7");
+        let original = [grant_change("reporting")];
+        let edited = [grant_change("analytics")];
+        let pending = PostgresPolicyPlanStatus {
+            phase: PlanPhase::Pending,
+            change_digest: Some(digest_for(&original, &versions)),
+            change_digest_encoding: Some(APPROVAL_EFFECT_ENCODING_V1.to_string()),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            decide_pending_plan(Some(&pending), &digest_for(&original, &versions), true),
+            PendingPlanDecision::Retain,
+        );
+        assert_eq!(
+            decide_pending_plan(Some(&pending), &digest_for(&edited, &versions), true),
+            PendingPlanDecision::Replace,
+        );
+
+        // A plan with no status yet, or one written under an older encoding,
+        // cannot be shown to hold the current effects — fail closed.
+        assert_eq!(
+            decide_pending_plan(None, &digest_for(&original, &versions), true),
+            PendingPlanDecision::Replace,
+        );
+        assert_eq!(
+            decide_pending_plan(
+                Some(&PostgresPolicyPlanStatus::default()),
+                &digest_for(&original, &versions),
+                true
+            ),
+            PendingPlanDecision::Replace,
+        );
     }
 
     /// Planning must never persist password material, in any field.

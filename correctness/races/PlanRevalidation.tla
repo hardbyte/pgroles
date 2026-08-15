@@ -29,6 +29,10 @@ EXTENDS FiniteSets, Naturals
                      effect-neutral edit throws away a decision. This is why
                      `policyGeneration` is a revalidation *trigger* and the
                      change digest is the *identity*.
+    - "replace"      (PlanRevalidation_replace.cfg) — compares effects, but
+                     always leaves a replacement plan behind. When the effects
+                     did not move but *vanished*, the replacement holds nothing
+                     and still blocks on a decision. Violates property 3.
 
   What is NOT modeled: approval mechanics and execution (PlanApproval.tla),
   crashes and locking (PlanLifecycle.tla).
@@ -41,9 +45,12 @@ CONSTANTS
 NoPlan == "none"
 Pending == "Pending"
 
-\* Distinct semantic effect sets, standing in for change digests.
+\* Distinct semantic effect sets, standing in for change digests. `NoEffects`
+\* is a first-class value here: a policy edit can remove the drift entirely,
+\* and what happens to a pending plan at that moment is property 3 below.
 Effects == {"e1", "e2"}
 NoEffects == "none"
+MaybeEffects == Effects \cup {NoEffects}
 
 VARIABLES
     planPhase,       \* Whether a plan is currently pending review
@@ -62,11 +69,11 @@ vars == <<planPhase, planEffects, planGen, summaryEffects, approved,
 
 TypeOK ==
     /\ planPhase \in {NoPlan, Pending}
-    /\ planEffects \in Effects \cup {NoEffects}
+    /\ planEffects \in MaybeEffects
     /\ planGen \in 0..MaxEdits
-    /\ summaryEffects \in Effects \cup {NoEffects}
+    /\ summaryEffects \in MaybeEffects
     /\ approved \in BOOLEAN
-    /\ dbEffects \in Effects
+    /\ dbEffects \in MaybeEffects
     /\ policyGen \in 0..MaxEdits
     /\ editsLeft \in 0..MaxEdits
     /\ lostApproval \in BOOLEAN
@@ -83,6 +90,12 @@ SummaryMatchesPlan ==
 \* The generational strategy breaks this.
 ApprovalSurvivesEffectNeutralEdits == ~lostApproval
 
+\* Property 3. Nothing to execute means nothing to approve. A pending plan
+\* holding no effects parks the policy on a decision that buys nothing, while
+\* the policy reports no drift beside it. The "replace" strategy breaks this.
+NoEmptyPendingPlan ==
+    (planPhase = Pending) => planEffects /= NoEffects
+
 Init ==
     /\ planPhase = NoPlan
     /\ planEffects = NoEffects
@@ -96,8 +109,11 @@ Init ==
 
 \* --- Actions ---
 
+\* The operator opens a plan only when there is something to execute; with no
+\* changes it reports InSync and creates nothing.
 OperatorCreatesPlan ==
     /\ planPhase = NoPlan
+    /\ dbEffects /= NoEffects
     /\ planPhase' = Pending
     /\ planEffects' = dbEffects
     /\ summaryEffects' = dbEffects
@@ -114,10 +130,11 @@ PolicyEditEffectNeutral ==
     /\ UNCHANGED <<planPhase, planEffects, planGen, summaryEffects, approved,
                     dbEffects, lostApproval>>
 
-\* A policy edit that genuinely changes what would be executed.
+\* A policy edit that genuinely changes what would be executed — including one
+\* that removes the drift altogether, leaving nothing to do.
 PolicyEditEffective ==
     /\ editsLeft > 0
-    /\ \E e \in Effects:
+    /\ \E e \in MaybeEffects:
         /\ e /= dbEffects
         /\ dbEffects' = e
     /\ policyGen' = policyGen + 1
@@ -143,6 +160,16 @@ SupersedeAndReplace ==
     /\ lostApproval' = (lostApproval \/ (approved /\ planEffects = dbEffects))
     /\ UNCHANGED <<planPhase, dbEffects, policyGen, editsLeft>>
 
+\* Drop the pending plan without opening another: there is nothing left to
+\* execute, so there is nothing to review.
+ClearPlan ==
+    /\ planPhase' = NoPlan
+    /\ planEffects' = NoEffects
+    /\ summaryEffects' = NoEffects
+    /\ planGen' = policyGen
+    /\ approved' = FALSE
+    /\ UNCHANGED <<dbEffects, policyGen, editsLeft, lostApproval>>
+
 \* Keep the plan and its decision; only the provenance advances.
 RetainPlan ==
     /\ summaryEffects' = dbEffects
@@ -155,7 +182,17 @@ ReconcilePending ==
     /\ planPhase = Pending
     /\ \/ /\ RevalidationMode = "semantic"
           \* Compare effects. Identical effects retain the plan and its
-          \* decision; changed effects supersede it.
+          \* decision; changed effects supersede it; vanished effects clear it.
+          /\ \/ /\ dbEffects = NoEffects
+                /\ ClearPlan
+             \/ /\ dbEffects /= NoEffects
+                /\ \/ /\ planEffects = dbEffects
+                      /\ RetainPlan
+                   \/ /\ planEffects /= dbEffects
+                      /\ SupersedeAndReplace
+       \/ /\ RevalidationMode = "replace"
+          \* Compare effects, but always leave a replacement behind, however
+          \* little it holds. The defect property 3 exists to catch.
           /\ \/ /\ planEffects = dbEffects
                 /\ RetainPlan
              \/ /\ planEffects /= dbEffects
