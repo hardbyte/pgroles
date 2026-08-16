@@ -35,7 +35,7 @@
 //! The rendered-SQL hash remains useful as a diagnostic for the preview
 //! artifact; it is simply not the approval identity.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use serde::Serialize;
 use serde_json::Value;
@@ -107,8 +107,8 @@ struct CanonicalChangeSet<'a> {
     target: &'a str,
     target_physical_identity: Option<&'a str>,
     target_logical_fingerprint: Option<&'a str>,
-    owned_roles: Vec<&'a str>,
-    owned_schemas: Vec<&'a str>,
+    owned_roles: BTreeSet<&'a str>,
+    owned_schemas: BTreeSet<&'a str>,
     effects: Vec<Value>,
 }
 
@@ -296,13 +296,11 @@ pub fn canonical_change_set_bytes(
     effects.sort_by_cached_key(ToString::to_string);
 
     // Management scope is a set: order is a listing artifact, duplicates say
-    // nothing, and both would make equal scopes hash differently.
-    let mut owned_roles: Vec<&str> = inputs.owned_roles.iter().map(String::as_str).collect();
-    owned_roles.sort_unstable();
-    owned_roles.dedup();
-    let mut owned_schemas: Vec<&str> = inputs.owned_schemas.iter().map(String::as_str).collect();
-    owned_schemas.sort_unstable();
-    owned_schemas.dedup();
+    // nothing, and both would make equal scopes hash differently. `BTreeSet`
+    // makes that canonicalisation the type's job rather than a call site's,
+    // and serialises as a sorted JSON array.
+    let owned_roles: BTreeSet<&str> = inputs.owned_roles.iter().map(String::as_str).collect();
+    let owned_schemas: BTreeSet<&str> = inputs.owned_schemas.iter().map(String::as_str).collect();
 
     Ok(serde_json::to_vec(&CanonicalChangeSet {
         effect_encoding: APPROVAL_EFFECT_ENCODING_V2,
