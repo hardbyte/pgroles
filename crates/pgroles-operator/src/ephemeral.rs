@@ -2088,6 +2088,7 @@ async fn create_scoped_plan(
                 content_digest: None,
                 content_digest_encoding: None,
                 policy_uid: None,
+                base_content_digest: None,
             }),
             scope: Some(PlanScope {
                 kind: "MembershipBundle".to_string(),
@@ -2426,6 +2427,7 @@ mod tests {
                     content_digest: None,
                     content_digest_encoding: None,
                     policy_uid: None,
+                    base_content_digest: None,
                 }),
                 scope: Some(PlanScope {
                     kind: "MembershipBundle".into(),

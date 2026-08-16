@@ -172,6 +172,12 @@ pub enum SupersedeCause {
     /// was computed against a base that no longer exists, and its approval can
     /// never authorise anything.
     SupersededByPromotion,
+    /// The policy's content moved after this candidate plan was computed
+    /// against it. A candidate is a complete desired-state snapshot, so even
+    /// effect-identical SQL does not prove the snapshot preserves what the
+    /// base has come to manage since; the plan is replaced by one computed
+    /// against — and pinned to — the current base.
+    BaseContentChanged,
 }
 
 impl SupersedeCause {
@@ -187,6 +193,9 @@ impl SupersedeCause {
             SupersedeCause::SupersededByPromotion => {
                 crate::crd::candidate_reason::SUPERSEDED_BY_PROMOTION
             }
+            // A base change is likewise actionable — re-review the fresh
+            // plan pinned to the current base — so it names itself too.
+            SupersedeCause::BaseContentChanged => "SupersededByBaseChange",
             _ => "Superseded",
         }
     }
@@ -212,6 +221,10 @@ impl SupersedeCause {
             SupersedeCause::SupersededByPromotion => {
                 "another candidate's content was promoted and executed, so this plan describes a \
                  change against a base that no longer exists"
+            }
+            SupersedeCause::BaseContentChanged => {
+                "the policy's content changed after this candidate plan was computed against it; \
+                 a fresh plan pinned to the current base replaces it and needs its own review"
             }
         }
     }
@@ -280,6 +293,8 @@ pub struct CandidatePlanBinding<'a> {
     pub candidate: &'a PostgresPolicyCandidate,
     pub content_digest: &'a str,
     pub content_digest_encoding: &'a str,
+    /// Canonical digest of the policy content this plan was computed against.
+    pub base_content_digest: &'a str,
 }
 
 /// The plan-identity binding a candidate-origin plan records.
@@ -300,6 +315,7 @@ pub(crate) fn candidate_plan_origin(
         content_digest: Some(binding.content_digest.to_string()),
         content_digest_encoding: Some(binding.content_digest_encoding.to_string()),
         policy_uid: policy.metadata.uid.clone(),
+        base_content_digest: Some(binding.base_content_digest.to_string()),
     }
 }
 
@@ -378,6 +394,14 @@ impl PlanOwner<'_> {
 /// 6. Updates the plan status
 /// 7. Marks any older Pending plans with a different hash as Superseded
 #[allow(clippy::too_many_arguments)]
+/// The base pin a candidate-origin plan records, if any.
+fn plan_base_pin(plan: &PostgresPolicyPlan) -> Option<&str> {
+    plan.spec
+        .origin
+        .as_ref()
+        .and_then(|origin| origin.base_content_digest.as_deref())
+}
+
 pub async fn create_or_update_plan(
     client: &Client,
     policy: &PostgresPolicy,
@@ -402,6 +426,17 @@ pub async fn create_or_update_plan(
         None => PlanOwner::Policy(policy),
     };
     let owner_name = owner.name();
+    // The base precondition for candidate plans. A plan pinned to a different
+    // base than the content the policy carries now is superseded even when its
+    // change digest is identical: same SQL does not prove the snapshot
+    // preserves what the base has come to manage since. The one exception is
+    // the base moving to the candidate's *own* content — the merge being
+    // promoted is not a staleness event against itself, and treating it as
+    // one would void every approval at the moment it is being used.
+    let expected_base: Option<&str> = candidate.and_then(|binding| {
+        (binding.base_content_digest != binding.content_digest)
+            .then_some(binding.base_content_digest)
+    });
 
     // 1. Render the full executable SQL (not redacted). This is a review
     //    artifact only — never an execution payload, and never the approval
@@ -455,6 +490,7 @@ pub async fn create_or_update_plan(
         if let Some(ref status) = plan.status
             && status.phase == PlanPhase::Pending
             && plan_matches_digest(status, &change_digest)
+            && expected_base.is_none_or(|base| plan_base_pin(plan) == Some(base))
         {
             // Identical plan already exists — return early (deduplicated).
             let plan_name = plan.name_any();
@@ -472,6 +508,7 @@ pub async fn create_or_update_plan(
                 &policy_name,
                 &plan_name,
                 &change_digest,
+                expected_base,
             )
             .await?;
             return Ok(PlanCreationResult::Deduplicated(plan_name));
@@ -709,6 +746,7 @@ pub async fn create_or_update_plan(
         &owner_name,
         &plan_name,
         &change_digest,
+        expected_base,
     )
     .await?;
 
@@ -750,15 +788,30 @@ async fn supersede_stale_plans(
     policy_name: &str,
     new_plan_name: &str,
     new_digest: &str,
+    expected_base: Option<&str>,
 ) -> Result<(), ReconcileError> {
     for plan in existing_plans {
         let Some(ref status) = plan.status else {
             continue;
         };
         let old_plan_name = plan.name_any();
-        if old_plan_name == new_plan_name || !supersedes_after_create(status, new_digest) {
+        // A live plan pinned to a different base is stale even when its
+        // change digest still matches — see the base precondition in
+        // `create_or_update_plan`.
+        let base_stale = expected_base.is_some_and(|base| {
+            matches!(status.phase, PlanPhase::Pending | PlanPhase::Approved)
+                && plan_base_pin(plan) != Some(base)
+        });
+        if old_plan_name == new_plan_name
+            || (!supersedes_after_create(status, new_digest) && !base_stale)
+        {
             continue;
         }
+        let cause = if base_stale {
+            SupersedeCause::BaseContentChanged
+        } else {
+            SupersedeCause::ReplacedByNewerPlan
+        };
 
         info!(
             plan = %old_plan_name,
@@ -769,7 +822,7 @@ async fn supersede_stale_plans(
         // The plan is void along with its phase — but the decision on it is
         // terminal and write-once, so the record of who approved what is left
         // untouched. See `superseded_status`.
-        let patch = serde_json::json!({ "status": superseded_status(status, SupersedeCause::ReplacedByNewerPlan) });
+        let patch = serde_json::json!({ "status": superseded_status(status, cause) });
         plans_api
             .patch_status(
                 &old_plan_name,
@@ -2195,6 +2248,7 @@ mod tests {
                 candidate: &candidate,
                 content_digest: "sha256:abc",
                 content_digest_encoding: pgroles_core::candidate::CANDIDATE_CONTENT_ENCODING_V1,
+                base_content_digest: "sha256:base",
             },
             &policy,
         );
@@ -2560,6 +2614,7 @@ mod tests {
             SupersedeCause::ReplacedByNewerPlan,
             SupersedeCause::PolicyStoppedPlanning,
             SupersedeCause::SupersededByPromotion,
+            SupersedeCause::BaseContentChanged,
             SupersedeCause::TargetChanged(TargetIdentityReason::TargetChanged),
         ];
         // A new variant must be added to `causes` above or this stops
@@ -2571,6 +2626,7 @@ mod tests {
                 | SupersedeCause::ReplacedByNewerPlan
                 | SupersedeCause::PolicyStoppedPlanning
                 | SupersedeCause::SupersededByPromotion
+                | SupersedeCause::BaseContentChanged
                 | SupersedeCause::TargetChanged(_) => {}
             }
         }

@@ -419,6 +419,11 @@ async fn plan_against_target(
 
     let sql_ctx = crate::reconciler::detect_sql_context(target.pool(), &inspect_config).await?;
     let content_digest = content_digest(candidate);
+    // The base pin: the policy content this plan is being computed against.
+    // Promotion refuses to adopt a plan pinned to any other base, so an
+    // approval can never authorise replacing desired state its reviewer did
+    // not see.
+    let base_content_digest = policy.spec.content_digest();
 
     // `create_or_update_plan` is the whole revalidation rule: an identical
     // change digest deduplicates onto the existing plan, keeping it and any
@@ -440,6 +445,7 @@ async fn plan_against_target(
             candidate,
             content_digest: &content_digest,
             content_digest_encoding: pgroles_core::candidate::CANDIDATE_CONTENT_ENCODING_V1,
+            base_content_digest: &base_content_digest,
         }),
     )
     .await?;
@@ -562,6 +568,56 @@ async fn resolve_target<'a>(
         .await
         .map_err(Box::new)?;
 
+    // Identity lookup runs BEFORE any lock is taken: reading
+    // pg_control_system and resolving the fingerprint are read-only, so they
+    // are safe without the lock, and no lock is held yet so lookup errors
+    // need no release path. Doing it here lets us recognise an override that
+    // merely aliases the parent's own database (a different Secret pointing
+    // at the same server) before we contend on the advisory lock — with the
+    // canonical server-side key, such an alias would otherwise collide with
+    // the parent's own held lock on every reconcile, forever.
+    let physical = pgroles_inspect::detect_system_identifier(&pool).await?;
+    let logical = ctx
+        .resolve_database_target_fingerprint(namespace, &connection)
+        .await
+        .map_err(Box::new)?;
+    let override_database: String = sqlx::query_scalar("SELECT current_database()")
+        .fetch_one(&pool)
+        .await
+        .map_err(ReconcileError::SqlExec)?;
+    let parent_database: String = sqlx::query_scalar("SELECT current_database()")
+        .fetch_one(planning.pool)
+        .await
+        .map_err(ReconcileError::SqlExec)?;
+
+    // The override aliases the parent's own database when either proof holds:
+    // the same physical cluster identity AND the same current_database(), or
+    // the same logical fingerprint. In that case the parent already holds
+    // both locks for this database, so reuse its context — exactly like the
+    // string-identity fast path above.
+    let same_physical_database = physical.is_some()
+        && physical == planning.target_identity.physical
+        && override_database == parent_database;
+    let same_logical_fingerprint =
+        planning.target_identity.logical.as_deref() == Some(logical.as_str());
+    if same_physical_database || same_logical_fingerprint {
+        tracing::info!(
+            candidate = %candidate.name_any(),
+            policy = %policy.name_any(),
+            target = %identity.as_str(),
+            "candidate target override aliases the parent's own database; \
+             reusing the parent's context and locks"
+        );
+        return Ok(CandidateTargetContext::Parent(planning));
+    }
+
+    // Residual: an alias this detection cannot prove — physical identity
+    // unreadable AND the resolved host strings differ (so the logical
+    // fingerprints differ too) — now fails closed as LockContention against
+    // the parent's held advisory lock instead of silently running an
+    // inspect/diff cycle concurrently with it. The contention message below
+    // names this case so the failure mode is diagnosable.
+    //
     // Locking follows the target: the override is a different database, so it
     // has its own advisory and in-process locks and cannot share the parent's.
     let db_lock = ctx
@@ -578,34 +634,15 @@ async fn resolve_target<'a>(
         Ok(None) => {
             return Err(ReconcileError::LockContention(
                 identity.as_str().to_string(),
-                "candidate target override advisory lock held by another session".to_string(),
+                "candidate target override advisory lock held by another session — this is also \
+                 what an unrecognized alias of a locked database (including the parent's own) \
+                 looks like"
+                    .to_string(),
             ));
         }
         Err(err) => return Err(ReconcileError::SqlExec(err)),
     };
 
-    // Everything below can fail, and `AdvisoryLock` has no `Drop` release —
-    // dropping it would return a connection to the pool with the session-level
-    // lock still held, blocking every later reconcile of this database. Any
-    // error past this point must release the lock before propagating.
-    let identity_lookup: Result<_, ReconcileError> = async {
-        let physical = pgroles_inspect::detect_system_identifier(&pool).await?;
-        let logical = ctx
-            .resolve_database_target_fingerprint(namespace, &connection)
-            .await
-            .map_err(Box::new)?;
-        Ok((physical, logical))
-    }
-    .await;
-    let (physical, logical) = match identity_lookup {
-        Ok(identities) => identities,
-        Err(err) => {
-            if let Some(lock) = advisory_lock {
-                lock.release().await;
-            }
-            return Err(err);
-        }
-    };
     tracing::info!(
         candidate = %candidate.name_any(),
         policy = %policy.name_any(),

@@ -4,10 +4,27 @@
 //! inspect/diff/apply cycles against the same database, even when multiple
 //! operator replicas are running.
 //!
-//! Session-level advisory locks are bound to the connection that acquired them,
-//! so this module checks out a dedicated [`PoolConnection`] and holds it for
-//! the lifetime of the lock. Both acquire and release execute on the same
-//! underlying database session.
+//! The lock key is computed **server-side**, on the very connection that will
+//! take the lock:
+//!
+//! ```sql
+//! SELECT hashtextextended('pgroles-reconcile:' || current_database(), 0)
+//! ```
+//!
+//! Server-side keying is what makes the key canonical. A client-side key
+//! derived from how the operator *names* a database (Secret coordinates,
+//! hostnames, connection strings) would give the same physical database a
+//! different key for every alias — two Secrets pointing at one database, a
+//! CNAME versus the raw host, a pooler in front of the server — and each
+//! alias would sail past the others' locks. `current_database()` is evaluated
+//! by the server itself, so any two sessions connected to the same database
+//! compute the same key regardless of the client-side path that got them
+//! there, and they contend on the same lock.
+//!
+//! Session-level advisory locks are bound to the connection that acquired
+//! them, so this module checks out a dedicated [`PoolConnection`] and holds it
+//! for the lifetime of the lock. Key computation, acquire, and release all
+//! execute on that same underlying database session.
 
 use sqlx::pool::PoolConnection;
 use sqlx::{PgPool, Postgres};
@@ -50,12 +67,20 @@ impl AdvisoryLock {
     }
 }
 
-/// Attempt to acquire a session-level advisory lock for the given database identity.
+/// Attempt to acquire a session-level advisory lock on the connected database.
 ///
-/// Checks out a dedicated connection from the pool and executes
-/// `pg_try_advisory_lock` on it. If the lock is acquired, the connection is
-/// kept inside the returned [`AdvisoryLock`] so that both acquire and release
-/// run on the same session.
+/// Checks out a dedicated connection from the pool, computes the canonical
+/// lock key **on that connection** via
+/// `hashtextextended('pgroles-reconcile:' || current_database(), 0)`
+/// (`hashtextextended` exists since PostgreSQL 11; the project requires 16+;
+/// negative keys are fine for `pg_try_advisory_lock`), and then executes
+/// `pg_try_advisory_lock` on the same connection. If the lock is acquired, the
+/// connection is kept inside the returned [`AdvisoryLock`] so that both
+/// acquire and release run on the same session.
+///
+/// `database_identity` is logging context only — the key derives entirely from
+/// the server's own `current_database()`, so differently-named identities that
+/// reach the same database contend on the same key.
 ///
 /// Returns `Ok(Some(AdvisoryLock))` if the lock was acquired, `Ok(None)` if it
 /// is already held by another session, or `Err` on query failure.
@@ -63,9 +88,14 @@ pub async fn try_acquire(
     pool: &PgPool,
     database_identity: &str,
 ) -> Result<Option<AdvisoryLock>, sqlx::Error> {
-    let key = advisory_lock_key(database_identity);
-
     let mut conn = pool.acquire().await?;
+
+    let key: i64 = sqlx::query_scalar(
+        "SELECT hashtextextended('pgroles-reconcile:' || current_database(), 0)",
+    )
+    .fetch_one(&mut *conn)
+    .await?;
+
     let acquired: bool = sqlx::query_scalar("SELECT pg_try_advisory_lock($1)")
         .bind(key)
         .fetch_one(&mut *conn)
@@ -82,78 +112,5 @@ pub async fn try_acquire(
         );
         // `conn` is returned to the pool on drop — no lock was acquired.
         Ok(None)
-    }
-}
-
-/// Derive a stable `i64` advisory lock key from a database identity string.
-///
-/// Uses a simple hash (FNV-1a inspired) folded to i64 range. The exact
-/// algorithm is not important as long as it is deterministic and distributes
-/// well across different identity strings.
-fn advisory_lock_key(identity: &str) -> i64 {
-    // We use a namespace prefix so pgroles advisory locks are unlikely to
-    // collide with application-level advisory locks.
-    const OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
-    const PRIME: u64 = 0x0100_0000_01b3;
-
-    let mut hash = OFFSET_BASIS;
-    for byte in b"pgroles:".iter().chain(identity.as_bytes()) {
-        hash ^= u64::from(*byte);
-        hash = hash.wrapping_mul(PRIME);
-    }
-
-    // Shift right by 1 to clear the sign bit, guaranteeing a non-negative i64.
-    (hash >> 1) as i64
-}
-
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn advisory_lock_key_deterministic() {
-        let a = advisory_lock_key("prod/db-creds/DATABASE_URL");
-        let b = advisory_lock_key("prod/db-creds/DATABASE_URL");
-        assert_eq!(a, b, "same identity must produce same key");
-    }
-
-    #[test]
-    fn advisory_lock_key_different_for_different_identities() {
-        let a = advisory_lock_key("prod/db-creds/DATABASE_URL");
-        let b = advisory_lock_key("staging/db-creds/DATABASE_URL");
-        assert_ne!(a, b, "different identities must produce different keys");
-    }
-
-    #[test]
-    fn advisory_lock_key_different_secret_keys() {
-        let a = advisory_lock_key("prod/db-creds/DATABASE_URL");
-        let b = advisory_lock_key("prod/db-creds/CUSTOM_URL");
-        assert_ne!(a, b, "different secret keys must produce different keys");
-    }
-
-    #[test]
-    fn advisory_lock_key_is_positive() {
-        // The `hash >> 1` conversion guarantees a non-negative i64.
-        let key = advisory_lock_key("prod/db-creds/DATABASE_URL");
-        assert!(key >= 0, "advisory lock key should be non-negative");
-    }
-
-    #[test]
-    fn advisory_lock_key_namespace_prefix_avoids_collision() {
-        // Even with same suffix, the "pgroles:" prefix should differentiate.
-        let a = advisory_lock_key("x");
-        let b = advisory_lock_key("y");
-        assert_ne!(a, b);
-    }
-
-    #[test]
-    fn advisory_lock_key_empty_identity() {
-        // Should not panic on empty identity.
-        let key = advisory_lock_key("");
-        assert!(key >= 0);
     }
 }

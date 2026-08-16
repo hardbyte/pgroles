@@ -92,6 +92,11 @@
                     "description": "Origin of this plan. Omitted for ordinary durable reconciliation plans.",
                     "nullable": true,
                     "properties": {
+                      "baseContentDigest": {
+                        "description": "Canonical content digest of the *policy* content this candidate plan\nwas computed against — the applied base. A candidate is a complete\ndesired-state snapshot, so an approval is only meaningful against the\nbase it was reviewed on: identical SQL effects do not prove the\nsnapshot still preserves everything the base has come to manage since.\nPromotion refuses to adopt a plan whose base pin no longer matches the\ncontent the policy carried before the merge, and planning supersedes\nthe plan as soon as the base moves. Absent for non-candidate origins.",
+                        "nullable": true,
+                        "type": "string"
+                      },
                       "contentDigest": {
                         "description": "Canonical content digest of the originating candidate, and the encoding\nit was computed under.\n\nThis is what binds the reviewed plan to the content that will later be\npromoted. It lives on the origin rather than in an annotation because a\npromotion check that can be edited by anyone holding `patch` is not a\nbinding at all. Both fields are absent for non-candidate origins.",
                         "nullable": true,

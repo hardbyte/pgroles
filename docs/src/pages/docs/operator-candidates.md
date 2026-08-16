@@ -311,9 +311,13 @@ explicit about it:
 
 - **Credentials and connection settings come from the override**, not the
   parent. The referenced Secret must carry credentials for the destination.
-- **Locking follows the target.** Advisory and in-process locks are keyed by
-  database identity, so planning against the override acquires that
-  database's locks — it cannot share the parent's lock state, and it does not
+- **Locking follows the target.** The advisory lock key is derived
+  server-side from the connected database itself (`current_database()`), so
+  differently-named Secrets or aliases of the same database contend on the
+  same lock. An override that merely aliases the parent's own database is
+  detected and shares the parent's lock hold; a genuinely different database
+  gets its own advisory and in-process locks — it cannot share the parent's
+  lock state, and it does not
   block the parent's reconcile. The enforce-then-plan ordering still applies
   to the parent (it is reconciled first on its own target); the override is
   then inspected separately within the same reconcile.

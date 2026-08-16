@@ -74,6 +74,11 @@ pub struct CandidateFacts {
     pub terminal: bool,
     /// The candidate's live plan, if it has one.
     pub plan: Option<PlanFacts>,
+    /// The candidate owns a plan that has already executed. After a promotion
+    /// executes, the adopted plan is `Applied` — no longer live — so this is
+    /// the only fact that identifies which of several identical-content
+    /// candidates actually authorised the execution.
+    pub owns_applied_plan: bool,
 }
 
 /// The live plan of a candidate, and whether it carries an approval.
@@ -83,6 +88,10 @@ pub struct PlanFacts {
     /// A terminal `Approved=True` decision, on a plan that has not already
     /// executed, failed or been retired.
     pub approved: bool,
+    /// `spec.origin.baseContentDigest` — the policy content this plan was
+    /// computed against. `None` on plans that predate base pinning; those are
+    /// never adopted (fail closed) and are healed by the next replan.
+    pub base_content_digest: Option<String>,
 }
 
 impl CandidateFacts {
@@ -110,6 +119,12 @@ pub enum Promotion {
     /// The content changed into something no candidate holds, while these
     /// candidates were sitting on an approved plan.
     Mismatch { candidates: Vec<String> },
+    /// This content is a candidate whose plan is approved — but the plan was
+    /// computed against a base the policy no longer carries. A candidate is a
+    /// complete desired-state snapshot, so identical SQL effects do not prove
+    /// the snapshot preserves what the base has come to manage since the
+    /// review; the approval does not transfer.
+    BaseChanged { candidates: Vec<String> },
 }
 
 /// Decide what the policy's content means, given the open candidates.
@@ -146,23 +161,46 @@ pub fn decide_promotion(
                 .is_some_and(|digest| digest == policy_digest)
         })
     };
-    if let Some(matched) = matches()
-        .find(|candidate| candidate.approved_plan().is_some())
-        .or_else(|| matches().next())
-    {
-        return match matched.approved_plan() {
-            Some(plan) => Promotion::Approved {
-                candidate: matched.name.clone(),
-                plan: plan.name.clone(),
-                superseded: open()
-                    .filter(|other| other.name != matched.name)
-                    .filter(|other| other.approved_plan().is_some())
-                    .map(|other| other.name.clone())
-                    .collect(),
-            },
-            None => Promotion::WithoutApproval {
-                candidate: matched.name.clone(),
-            },
+    // An approved plan only authorises the promotion if it was computed
+    // against the base this merge replaced. `previous_digest` equal to the
+    // pin is the ordinary case; `previous_digest` equal to the *policy's own
+    // digest* is the mid-promotion retry — the stamp landed but execution or
+    // bookkeeping did not — where the base moved to exactly this candidate's
+    // content and there is nothing the snapshot could have lost. A missing
+    // pin fails closed and is healed by the next replan.
+    let base_is_fresh = |plan: &PlanFacts| {
+        plan.base_content_digest.as_deref().is_some_and(|pin| {
+            previous_digest == Some(pin) || previous_digest == Some(policy_digest)
+        })
+    };
+    if let Some(matched) = matches().find(|candidate| {
+        candidate.approved_plan().is_some_and(&base_is_fresh)
+    }) {
+        let plan = matched
+            .approved_plan()
+            .expect("matched on an approved plan");
+        return Promotion::Approved {
+            candidate: matched.name.clone(),
+            plan: plan.name.clone(),
+            superseded: open()
+                .filter(|other| other.name != matched.name)
+                .filter(|other| other.approved_plan().is_some())
+                .map(|other| other.name.clone())
+                .collect(),
+        };
+    }
+    let stale_approved: Vec<String> = matches()
+        .filter(|candidate| candidate.approved_plan().is_some())
+        .map(|candidate| candidate.name.clone())
+        .collect();
+    if !stale_approved.is_empty() {
+        return Promotion::BaseChanged {
+            candidates: stale_approved,
+        };
+    }
+    if let Some(matched) = matches().next() {
+        return Promotion::WithoutApproval {
+            candidate: matched.name.clone(),
         };
     }
 
@@ -204,6 +242,12 @@ pub enum PromotionAction {
     /// The content was promoted but this policy never executes, so the
     /// candidate cannot reach `Promoted`.
     NotExecuted { candidate: String },
+    /// Ordinary manual-plan flow; record `PromotionBaseChanged`.
+    BaseChanged {
+        candidates: Vec<String>,
+        /// Same enforcement-gap semantics as `Mismatch`.
+        enforcement_suspended: bool,
+    },
 }
 
 /// Map a promotion onto an action, given how the policy executes.
@@ -250,6 +294,10 @@ pub fn promotion_action(
             }
         }
         Promotion::Mismatch { candidates } => PromotionAction::Mismatch {
+            candidates,
+            enforcement_suspended,
+        },
+        Promotion::BaseChanged { candidates } => PromotionAction::BaseChanged {
             candidates,
             enforcement_suspended,
         },
@@ -339,23 +387,34 @@ pub async fn load_context(
             .list(&ListParams::default())
             .await?
             .into_iter()
-            .filter(plan_is_live)
             .collect();
 
     let mut plans: Vec<(String, PostgresPolicyPlan)> = Vec::new();
     let mut facts: Vec<CandidateFacts> = Vec::new();
     for candidate in &candidates {
         let uid = candidate.metadata.uid.clone().unwrap_or_default();
-        let owned = all_plans
+        let owned: Vec<&PostgresPolicyPlan> = all_plans
             .iter()
-            .find(|plan| !uid.is_empty() && crate::plan::is_owned_by_uid(*plan, &uid));
-        let plan_facts = owned.map(|plan| PlanFacts {
+            .filter(|plan| !uid.is_empty() && crate::plan::is_owned_by_uid(*plan, &uid))
+            .collect();
+        let live = owned.iter().copied().find(|plan| plan_is_live(plan));
+        let plan_facts = live.map(|plan| PlanFacts {
             name: plan.name_any(),
             approved: check_plan_approval(plan) == PlanApprovalState::Approved,
+            base_content_digest: plan
+                .spec
+                .origin
+                .as_ref()
+                .and_then(|origin| origin.base_content_digest.clone()),
         });
-        if let Some(plan) = owned {
+        if let Some(plan) = live {
             plans.push((candidate.name_any(), plan.clone()));
         }
+        let owns_applied_plan = owned.iter().any(|plan| {
+            plan.status
+                .as_ref()
+                .is_some_and(|status| status.phase == PlanPhase::Applied)
+        });
         facts.push(CandidateFacts {
             name: candidate.name_any(),
             content_digest: candidate
@@ -369,6 +428,7 @@ pub async fn load_context(
                 .unwrap_or_default()
                 .is_terminal(),
             plan: plan_facts,
+            owns_applied_plan,
         });
     }
 
@@ -486,6 +546,36 @@ pub async fn recognize(
             }
             None
         }
+        PromotionAction::BaseChanged {
+            candidates,
+            enforcement_suspended,
+        } => {
+            for candidate in candidates {
+                let mut message = format!(
+                    "policy {} carries exactly this candidate's content, but the plan's approval \
+                     was reviewed against a base the policy no longer has — other content was \
+                     promoted or applied in between — so the approval does not authorise this \
+                     merge and nothing has executed on it. The candidate's plan is being replaced \
+                     by one computed against the current base; approve that fresh plan.",
+                    policy.name_any()
+                );
+                if *enforcement_suspended {
+                    message.push_str(
+                        " Until then the merged spec is the desired state and is NOT being \
+                         enforced.",
+                    );
+                }
+                report(
+                    ctx,
+                    &context,
+                    candidate,
+                    candidate_reason::PROMOTION_BASE_CHANGED,
+                    &message,
+                )
+                .await?;
+            }
+            None
+        }
     };
 
     // Remember the content only now that the action was recorded. The mismatch
@@ -499,6 +589,31 @@ pub async fn recognize(
     }
 
     Ok(plan)
+}
+
+/// Pick which candidate the just-executed content promotes.
+///
+/// Digest equality alone cannot break a tie between identical-content
+/// candidates, and creation order must not: the candidate that authorised
+/// the execution is the one whose adopted plan just went `Applied`. The
+/// fallbacks cover the paths where no candidate plan executed — the policy's
+/// own plan did (`approval: auto`, or a fresh approval after a
+/// `PromotedWithoutApproval` fallback) — where an approved candidate plan
+/// outranks a pending one for the same reason `decide_promotion` prefers it.
+fn select_promoted<'a>(facts: &'a [CandidateFacts], content_digest: &str) -> Option<&'a CandidateFacts> {
+    let matches = || {
+        facts.iter().filter(|candidate| {
+            !candidate.terminal
+                && candidate
+                    .content_digest
+                    .as_deref()
+                    .is_some_and(|digest| digest == content_digest)
+        })
+    };
+    matches()
+        .find(|candidate| candidate.owns_applied_plan)
+        .or_else(|| matches().find(|candidate| candidate.approved_plan().is_some()))
+        .or_else(|| matches().next())
 }
 
 /// Bookkeeping after the policy successfully executed its content.
@@ -515,13 +630,7 @@ pub async fn record_promotion(
     content_digest: &str,
 ) -> Result<(), ReconcileError> {
     let context = load_context(ctx, policy).await?;
-    let Some(promoted) = context.facts.iter().find(|candidate| {
-        !candidate.terminal
-            && candidate
-                .content_digest
-                .as_deref()
-                .is_some_and(|digest| digest == content_digest)
-    }) else {
+    let Some(promoted) = select_promoted(&context.facts, content_digest) else {
         return Ok(());
     };
     let promoted_name = promoted.name.clone();
@@ -700,15 +809,133 @@ mod tests {
             content_digest: Some(digest.to_string()),
             terminal: false,
             plan: None,
+            owns_applied_plan: false,
         }
     }
 
+    /// The table tests all use `previous = Some("sha256:old")`, so the
+    /// default pin models a plan computed against that base.
     fn with_plan(mut facts: CandidateFacts, plan: &str, approved: bool) -> CandidateFacts {
         facts.plan = Some(PlanFacts {
             name: plan.to_string(),
             approved,
+            base_content_digest: Some("sha256:old".to_string()),
         });
         facts
+    }
+
+    fn with_stale_base(mut facts: CandidateFacts) -> CandidateFacts {
+        if let Some(plan) = facts.plan.as_mut() {
+            plan.base_content_digest = Some("sha256:some-other-base".to_string());
+        }
+        facts
+    }
+
+    /// The lost-update review scenario: X's plan was approved against base A,
+    /// but Y promoted in between, so the base X's reviewer saw no longer
+    /// exists. Identical SQL effects notwithstanding, the approval does not
+    /// transfer — X's snapshot would silently drop Y's management.
+    #[test]
+    fn an_approval_reviewed_against_a_replaced_base_does_not_authorise_promotion() {
+        let facts = vec![with_stale_base(with_plan(
+            candidate("x", "sha256:aa"),
+            "x-plan",
+            true,
+        ))];
+        assert_eq!(
+            decide_promotion("sha256:aa", Some("sha256:old"), &facts),
+            Promotion::BaseChanged {
+                candidates: vec!["x".to_string()],
+            }
+        );
+    }
+
+    /// The mid-promotion retry: the stamp landed but execution or bookkeeping
+    /// did not, so `previous` is already the candidate's own content. The base
+    /// moved to exactly what the reviewer approved — nothing the snapshot
+    /// could have lost — so the promotion is still recognised.
+    #[test]
+    fn a_promotion_retry_after_the_stamp_is_still_recognised() {
+        let facts = vec![with_stale_base(with_plan(
+            candidate("x", "sha256:aa"),
+            "x-plan",
+            true,
+        ))];
+        assert!(matches!(
+            decide_promotion("sha256:aa", Some("sha256:aa"), &facts),
+            Promotion::Approved { .. }
+        ));
+    }
+
+    /// A plan with no base pin at all fails closed.
+    #[test]
+    fn an_unpinned_approved_plan_is_never_adopted() {
+        let mut facts = with_plan(candidate("x", "sha256:aa"), "x-plan", true);
+        facts.plan.as_mut().expect("plan set").base_content_digest = None;
+        assert_eq!(
+            decide_promotion("sha256:aa", Some("sha256:old"), &[facts]),
+            Promotion::BaseChanged {
+                candidates: vec!["x".to_string()],
+            }
+        );
+    }
+
+    /// Among identical-content candidates, a fresh-base approval wins over a
+    /// stale-base one regardless of list order.
+    #[test]
+    fn a_fresh_base_approval_outranks_a_stale_one() {
+        let facts = vec![
+            with_stale_base(with_plan(candidate("stale", "sha256:aa"), "p1", true)),
+            with_plan(candidate("fresh", "sha256:aa"), "p2", true),
+        ];
+        assert!(matches!(
+            decide_promotion("sha256:aa", Some("sha256:old"), &facts),
+            Promotion::Approved { ref candidate, .. } if candidate == "fresh"
+        ));
+    }
+
+    fn with_applied_plan(mut facts: CandidateFacts) -> CandidateFacts {
+        facts.owns_applied_plan = true;
+        facts
+    }
+
+    /// The review scenario: two candidates hold identical content, only the
+    /// second's plan was approved and adopted for execution. After execution
+    /// that plan is `Applied` — no longer live — so digest-and-creation-order
+    /// selection would promote the wrong candidate. The applied plan is the
+    /// authority.
+    #[test]
+    fn identical_content_promotes_the_candidate_whose_plan_executed() {
+        let facts = vec![
+            candidate("first-by-creation", "sha256:aa"),
+            with_applied_plan(candidate("actually-executed", "sha256:aa")),
+        ];
+        let promoted = select_promoted(&facts, "sha256:aa").expect("a candidate is promoted");
+        assert_eq!(promoted.name, "actually-executed");
+    }
+
+    /// When no candidate plan executed (the policy's own plan did), an
+    /// approved candidate outranks a pending duplicate, mirroring
+    /// `decide_promotion`.
+    #[test]
+    fn identical_content_without_an_applied_plan_prefers_the_approved_candidate() {
+        let facts = vec![
+            with_plan(candidate("pending", "sha256:aa"), "p1", false),
+            with_plan(candidate("approved", "sha256:aa"), "p2", true),
+        ];
+        let promoted = select_promoted(&facts, "sha256:aa").expect("a candidate is promoted");
+        assert_eq!(promoted.name, "approved");
+    }
+
+    /// A terminal candidate is never re-promoted, even if it owns the
+    /// applied plan from its own earlier promotion.
+    #[test]
+    fn a_terminal_candidate_is_never_selected_for_promotion() {
+        let mut done = with_applied_plan(candidate("already-promoted", "sha256:aa"));
+        done.terminal = true;
+        let facts = vec![done, candidate("open-duplicate", "sha256:aa")];
+        let promoted = select_promoted(&facts, "sha256:aa").expect("a candidate is promoted");
+        assert_eq!(promoted.name, "open-duplicate");
     }
 
     /// Row 1: promoted content matches the approved candidate.
@@ -873,6 +1100,7 @@ mod tests {
             content_digest: None,
             terminal: false,
             plan: None,
+            owns_applied_plan: false,
         }];
         assert_eq!(
             decide_promotion("sha256:aa", Some("sha256:old"), &facts),

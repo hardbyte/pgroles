@@ -1098,6 +1098,16 @@ pub struct PlanOrigin {
     /// delete-and-recreate of the same name.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub policy_uid: Option<String>,
+    /// Canonical content digest of the *policy* content this candidate plan
+    /// was computed against — the applied base. A candidate is a complete
+    /// desired-state snapshot, so an approval is only meaningful against the
+    /// base it was reviewed on: identical SQL effects do not prove the
+    /// snapshot still preserves everything the base has come to manage since.
+    /// Promotion refuses to adopt a plan whose base pin no longer matches the
+    /// content the policy carried before the merge, and planning supersedes
+    /// the plan as soon as the base moves. Absent for non-candidate origins.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_content_digest: Option<String>,
 }
 
 /// Scope enforced when executing a non-durable plan.
@@ -2647,6 +2657,11 @@ pub mod candidate_reason {
     /// `Ready=False` — the policy's content changed to something that is *not*
     /// this approved candidate: edited after approval, or rebased.
     pub const PROMOTION_DIGEST_MISMATCH: &str = "PromotionDigestMismatch";
+    /// `Ready=False` — the policy's content *is* this approved candidate, but
+    /// the base moved between planning and merge, so the approval reviewed a
+    /// snapshot of a desired state that no longer exists. Nothing executes on
+    /// it; the ordinary manual flow takes over.
+    pub const PROMOTION_BASE_CHANGED: &str = "PromotionBaseChanged";
     /// `Ready=False` — the content was promoted but the policy never executes
     /// (`mode: observe`), so the candidate cannot reach `Promoted`.
     pub const PROMOTION_NOT_EXECUTED: &str = "PromotionNotExecuted";

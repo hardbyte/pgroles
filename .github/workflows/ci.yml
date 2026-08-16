@@ -1496,10 +1496,55 @@ jobs:
             || { echo "::error::stranding a plan rewrote its decision identity: '$decided'"; exit 1; }
           assert_role_absent promo_x_user
 
+          echo "--- Test: identical candidates — the approved plan picks the promoted one ---"
+          # dup-cand-a is created FIRST, so lexicographic and creation order
+          # both point at it; only dup-cand-b's plan carries the approval, so
+          # b — not a — must be the candidate recorded Promoted.
+          file_candidate dup-cand-a promo_new_user promo_other_user promo_y_user dup_promo_user
+          wait_for_candidate_phase dup-cand-a Planned
+          file_candidate dup-cand-b promo_new_user promo_other_user promo_y_user dup_promo_user
+          wait_for_candidate_phase dup-cand-b Planned
+          dup_plan_a=$(wait_for_candidate_plan_ref dup-cand-a)
+          dup_plan_b=$(wait_for_candidate_plan_ref dup-cand-b)
+          test "$dup_plan_a" != "$dup_plan_b" \
+            || { echo "::error::identical candidates shared a plan: $dup_plan_a"; exit 1; }
+          dup_digest_a=$(get_candidate_digest dup-cand-a)
+          dup_digest_b=$(get_candidate_digest dup-cand-b)
+          test "$dup_digest_a" = "$dup_digest_b" \
+            || { echo "::error::byte-identical candidates disagree on digest: '$dup_digest_a' vs '$dup_digest_b'"; exit 1; }
+
+          # Approve ONLY b's plan; a's plan stays pending.
+          approve_plan "$dup_plan_b"
+
+          # Merge the identical content into the parent policy; the approved
+          # plan executes it.
+          write_promo_policy promo_new_user promo_other_user promo_y_user dup_promo_user
+          wait_for_plan_phase "$dup_plan_b" Applied
+          assert_role_exists dup_promo_user
+
+          # The candidate whose plan authorized execution is the one promoted.
+          wait_for_candidate_phase dup-cand-b Promoted
+          wait_for_candidate_condition dup-cand-b Promoted True Promoted
+
+          # dup-cand-a listed first, but its plan never carried the approval:
+          # it is superseded, not recorded Promoted.
+          wait_for_candidate_phase dup-cand-a Superseded
+          a_promoted=$(kubectl get pgcand dup-cand-a \
+            -o jsonpath='{.status.conditions[?(@.type=="Promoted")].status}')
+          test "$a_promoted" != "True" \
+            || { echo "::error::dup-cand-a was recorded Promoted on dup-cand-b's approval"; exit 1; }
+          wait_for_plan_phase "$dup_plan_a" Superseded
+          dup_reason=$(kubectl get pgplan "$dup_plan_a" \
+            -o jsonpath='{.status.conditions[?(@.type=="Superseded")].reason}')
+          test "$dup_reason" = "SupersededByPromotion" \
+            || { echo "::error::expected SupersededByPromotion on dup-cand-a's plan, got '$dup_reason'"; exit 1; }
+
+          kubectl delete pgcand dup-cand-a dup-cand-b --wait=true
+
           # Cleanup
           kubectl delete pgcand --all --wait=true
           kubectl delete pgr promo-policy --wait=true
-          for role in promo_base_user promo_new_user promo_other_user promo_y_user; do
+          for role in promo_base_user promo_new_user promo_other_user promo_y_user dup_promo_user; do
             pg_query "REASSIGN OWNED BY $role TO postgres; DROP OWNED BY $role; DROP ROLE IF EXISTS $role;"
           done
 
