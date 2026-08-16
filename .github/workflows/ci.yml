@@ -160,31 +160,51 @@ jobs:
   # Job 3: Integration tests — with a live PostgreSQL
   # ---------------------------------------------------------------------------
   integration-test:
-    name: Integration Tests (PG${{ matrix.pg_version }})
+    name: Integration Tests (${{ matrix.database.name }})
     needs: stack-gate
     if: needs.stack-gate.outputs.run_heavy == 'true'
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
-        pg_version: ["16", "17", "18"]
+        # AlloyDB Omni is the containerised AlloyDB engine — the closest CI can
+        # get to the managed service, and close enough to catch engine-level
+        # divergence (catalog shape, pg_control_system, default GUCs).
+        database:
+          - { name: "PG16", image: "postgres:16" }
+          - { name: "PG17", image: "postgres:17" }
+          - { name: "PG18", image: "postgres:18" }
+          - { name: "AlloyDB Omni 16", image: "google/alloydbomni:16" }
     services:
       postgres:
-        image: postgres:${{ matrix.pg_version }}
+        image: ${{ matrix.database.image }}
         env:
           POSTGRES_PASSWORD: testpassword
           POSTGRES_DB: pgroles_test
         ports:
           - 5432:5432
+        # --shm-size for AlloyDB Omni's shared-memory appetite; harmless for
+        # the vanilla postgres images.
         options: >-
           --health-cmd="pg_isready -U postgres"
           --health-interval=5s
           --health-timeout=5s
           --health-retries=10
+          --shm-size=1g
     env:
       DATABASE_URL: "postgres://postgres:testpassword@localhost:5432/pgroles_test"
     steps:
       - uses: actions/checkout@v6
+
+      # POSTGRES_DB is a docker-entrypoint convention the postgres images
+      # honour; do not assume every engine image does. Create the test
+      # database explicitly if the entrypoint did not.
+      - name: Ensure test database exists
+        run: |
+          docker exec ${{ job.services.postgres.id }} \
+            psql -U postgres -tAc "SELECT 1 FROM pg_database WHERE datname='pgroles_test'" | grep -q 1 || \
+          docker exec ${{ job.services.postgres.id }} \
+            createdb -U postgres pgroles_test
 
       - uses: dtolnay/rust-toolchain@stable
 
@@ -561,6 +581,15 @@ jobs:
           kubectl -n pgroles-system logs deployment/otel-collector --tail=200
           exit 1
 
+      - name: Diagnostics
+        if: failure()
+        run: |
+          kubectl get pgr,pgplan,pgcand,pgeap,pgear -A -o wide || true
+          kubectl get pgr,pgplan,pgcand -A -o yaml || true
+          kubectl -n pgroles-system logs deployment/pgroles-operator --tail=-1 || true
+          kubectl -n pgroles-system logs deployment/pgroles-operator --previous --tail=-1 || true
+          kubectl get events -A --sort-by=.lastTimestamp | tail -100 || true
+
       - name: Cleanup
         if: always()
         run: kind delete cluster --name pgroles-e2e-operator
@@ -627,6 +656,15 @@ jobs:
 
       - name: Run ephemeral request cache regression
         run: scripts/e2e-ephemeral-request-load.sh
+
+      - name: Diagnostics
+        if: failure()
+        run: |
+          kubectl get pgr,pgplan,pgcand,pgeap,pgear -A -o wide || true
+          kubectl get pgr,pgplan,pgcand -A -o yaml || true
+          kubectl -n pgroles-system logs deployment/pgroles-operator --tail=-1 || true
+          kubectl -n pgroles-system logs deployment/pgroles-operator --previous --tail=-1 || true
+          kubectl get events -A --sort-by=.lastTimestamp | tail -100 || true
 
       - name: Cleanup
         if: always()
@@ -1419,6 +1457,15 @@ jobs:
           for role in promo_base_user promo_new_user promo_other_user promo_y_user; do
             pg_query "REASSIGN OWNED BY $role TO postgres; DROP OWNED BY $role; DROP ROLE IF EXISTS $role;"
           done
+
+      - name: Diagnostics
+        if: failure()
+        run: |
+          kubectl get pgr,pgplan,pgcand,pgeap,pgear -A -o wide || true
+          kubectl get pgr,pgplan,pgcand -A -o yaml || true
+          kubectl -n pgroles-system logs deployment/pgroles-operator --tail=-1 || true
+          kubectl -n pgroles-system logs deployment/pgroles-operator --previous --tail=-1 || true
+          kubectl get events -A --sort-by=.lastTimestamp | tail -100 || true
 
       - name: Cleanup
         if: always()

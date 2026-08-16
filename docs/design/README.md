@@ -8,9 +8,11 @@ steady state from the migration path.
 
 Specification prose belongs in `docs/src/pages/docs/`; ADRs must stay legible
 without access to the issue tracker. Number files sequentially
-(`adr-NNN-<topic>.md`), never edit an accepted decision in place — a change of
-mind is a new ADR that names what it supersedes — and keep the status line
-(`Proposed`, `Accepted`, `Superseded by ADR-NNN`) current.
+(`adr-NNN-<topic>.md`) and keep the status line (`Proposed`, `Accepted`,
+`Superseded by ADR-NNN`) current. An accepted ADR may be updated in place as
+more information becomes available — corrected facts, measured numbers,
+executed follow-ups; a *reversal* of the decision is a new ADR that names what
+it supersedes.
 
 ## Index
 
