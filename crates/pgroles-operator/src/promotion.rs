@@ -316,12 +316,32 @@ pub fn promotion_action(
 /// plans are merely pending are left alone — they are replanned against the
 /// new base by the ordinary revalidation rule, which keeps their plan when the
 /// effects are unchanged.
-pub fn stranded_by_promotion(promoted: &str, candidates: &[CandidateFacts]) -> Vec<String> {
+///
+/// Which approvals this promotion replaced is read off the plans' base pins,
+/// not off the wall clock. `applied_digest` is the content that executed and
+/// is therefore the base every live plan is now measured against: a plan
+/// pinned to exactly that base was computed *after* this promotion and is
+/// still perfectly executable, so stranding it would retire an approval this
+/// promotion never invalidated. That distinction matters because recognition
+/// and recording rerun on every reconcile — deliberately, for interrupted
+/// bookkeeping — so a promotion recorded minutes ago is replayed against
+/// candidates filed since, and a timing-free rule is the only one that keeps
+/// giving the same answer on the replay. An unpinned plan fails closed and is
+/// retired, exactly as it fails closed for adoption.
+pub fn stranded_by_promotion(
+    promoted: &str,
+    applied_digest: &str,
+    candidates: &[CandidateFacts],
+) -> Vec<String> {
     candidates
         .iter()
         .filter(|candidate| !candidate.terminal)
         .filter(|candidate| candidate.name != promoted)
-        .filter(|candidate| candidate.approved_plan().is_some())
+        .filter(|candidate| {
+            candidate
+                .approved_plan()
+                .is_some_and(|plan| plan.base_content_digest.as_deref() != Some(applied_digest))
+        })
         .map(|candidate| candidate.name.clone())
         .collect()
 }
@@ -704,7 +724,7 @@ pub async fn record_promotion(
         }
     }
 
-    for stranded in stranded_by_promotion(&promoted_name, &context.facts)
+    for stranded in stranded_by_promotion(&promoted_name, content_digest, &context.facts)
         .into_iter()
         .filter(|name| !duplicates.contains(name))
     {
@@ -1116,14 +1136,52 @@ mod tests {
                 superseded: vec!["x".to_string()],
             }
         );
-        assert_eq!(stranded_by_promotion("y", &facts), vec!["x".to_string()]);
+        assert_eq!(
+            stranded_by_promotion("y", "sha256:yy", &facts),
+            vec!["x".to_string()]
+        );
         // A merely-pending plan is left to ordinary revalidation, which keeps
         // it when the effects are unchanged.
         let pending = vec![
             with_plan(candidate("x", "sha256:xx"), "x-plan", false),
             with_plan(candidate("y", "sha256:yy"), "y-plan", true),
         ];
-        assert!(stranded_by_promotion("y", &pending).is_empty());
+        assert!(stranded_by_promotion("y", "sha256:yy", &pending).is_empty());
+    }
+
+    /// Recording a promotion reruns on every later reconcile, so it meets
+    /// candidates filed *after* the promotion it is replaying. A successor
+    /// candidate's plan is pinned to the promoted content itself — the base it
+    /// was planned and approved against — and that approval is live and
+    /// usable, so the replay must not retire it. Stranding it here would both
+    /// destroy a valid approval and hide the real hazard: with no live
+    /// approved plan left, `decide_promotion` can no longer see the candidate,
+    /// so a later edit of the merged content reports nothing at all instead of
+    /// `PromotionDigestMismatch`.
+    #[test]
+    fn a_replayed_promotion_does_not_strand_an_approval_planned_against_it() {
+        let mut successor = with_plan(candidate("cand-2", "sha256:bb"), "cand-2-plan", true);
+        successor
+            .plan
+            .as_mut()
+            .expect("plan set")
+            .base_content_digest = Some("sha256:aa".to_string());
+        let mut promoted = candidate("cand-1", "sha256:aa");
+        promoted.terminal = true;
+        promoted.promoted = true;
+        let facts = vec![promoted, successor.clone()];
+
+        assert!(stranded_by_promotion("cand-1", "sha256:aa", &facts).is_empty());
+
+        // And with its approval intact, editing the merged content into
+        // something no candidate holds is still reported as the enforcement
+        // gap it is.
+        assert_eq!(
+            decide_promotion("sha256:cc", Some("sha256:aa"), &facts),
+            Promotion::Mismatch {
+                candidates: vec!["cand-2".to_string()],
+            }
+        );
     }
 
     /// Two open candidates with identical content, one approval between them:
