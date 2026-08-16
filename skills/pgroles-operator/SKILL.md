@@ -197,8 +197,15 @@ metadata:
 spec:
   policyRef:
     name: <policy>
+  # The full proposed policy content — what spec would become, not a delta.
   content:
-    # the full proposed policy content — what spec would become, not a delta
+    roles:
+      - name: reporting_reader
+        login: false
+    grants:
+      - role: reporting_reader
+        object: { type: database }
+        privileges: [CONNECT]
 ```
 
 The operator plans the candidate inside the parent's reconcile, with the same
