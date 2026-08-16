@@ -304,14 +304,16 @@ pub async fn load_context(
     policy: &PostgresPolicy,
 ) -> Result<PromotionContext, ReconcileError> {
     let namespace = policy.namespace().ok_or(ReconcileError::NoNamespace)?;
-    let policy_name = policy.name_any();
 
+    // UID discipline, not name matching: a recreated same-name policy must not
+    // recognise — let alone execute — approvals on the deleted policy's
+    // candidates while they await garbage collection.
     let candidates: Vec<PostgresPolicyCandidate> =
         Api::<PostgresPolicyCandidate>::namespaced(ctx.kube_client.clone(), &namespace)
             .list(&ListParams::default())
             .await?
             .into_iter()
-            .filter(|candidate| candidate.spec.policy_ref.name == policy_name)
+            .filter(|candidate| crate::candidate::candidate_belongs_to(candidate, policy))
             .collect();
     if candidates.is_empty() {
         return Ok(PromotionContext {

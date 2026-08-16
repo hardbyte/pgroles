@@ -167,7 +167,7 @@ pub async fn reconcile_candidates(
         .list(&ListParams::default())
         .await?
         .into_iter()
-        .filter(|candidate| candidate.spec.policy_ref.name == policy_name)
+        .filter(|candidate| candidate_belongs_to(candidate, policy))
         .collect();
     if candidates.is_empty() {
         return Ok(());
@@ -659,6 +659,40 @@ pub(crate) fn has_policy_owner_reference(
     policy_uid: &str,
 ) -> bool {
     crate::plan::is_owned_by_uid(candidate, policy_uid)
+}
+
+/// Does this candidate belong to `policy`?
+///
+/// The name in `spec.policyRef` is the author's declaration; the controller
+/// ownerReference is the discipline. A candidate that has already been adopted
+/// belongs only to the policy with that UID, so a same-named policy that was
+/// deleted and recreated never inherits the old policy's candidates while they
+/// await garbage collection — matching them by name alone would let planning
+/// and, worse, promotion recognition read proposals reviewed against an object
+/// that no longer exists. An unadopted candidate (no controller reference yet)
+/// matches by name and is bound to a UID on first touch by [`adopt_candidate`].
+pub(crate) fn candidate_belongs_to(
+    candidate: &PostgresPolicyCandidate,
+    policy: &PostgresPolicy,
+) -> bool {
+    if candidate.spec.policy_ref.name != policy.name_any() {
+        return false;
+    }
+    let controller_uid = candidate
+        .metadata
+        .owner_references
+        .as_deref()
+        .unwrap_or_default()
+        .iter()
+        .find(|owner| owner.controller.unwrap_or(false))
+        .map(|owner| owner.uid.as_str());
+    match (controller_uid, policy.metadata.uid.as_deref()) {
+        // Adopted: only the recorded controller may claim it. A policy with no
+        // UID (only constructible in tests) can prove ownership of nothing.
+        (Some(owned_by), live_uid) => live_uid == Some(owned_by),
+        // Not yet adopted: the name is all there is, and first touch binds it.
+        (None, _) => true,
+    }
 }
 
 /// First-touch bookkeeping: ownerReference, content digest, observedGeneration.
@@ -1207,6 +1241,41 @@ mod tests {
         // A same-named policy that was deleted and recreated must not inherit
         // the old one's candidates.
         assert!(!has_policy_owner_reference(&candidate, "orders-uid-2"));
+    }
+
+    /// Ownership by UID, declaration by name. A recreated same-name policy
+    /// must not inherit — and above all must not promote through — candidates
+    /// adopted by its deleted predecessor.
+    #[test]
+    fn a_candidate_belongs_only_to_the_policy_that_adopted_it() {
+        let orders = policy("orders");
+        let mut unadopted = candidate("orders-change-x7k2p", PolicyContent::default());
+
+        // Wrong name never matches, adopted or not.
+        assert!(!candidate_belongs_to(&unadopted, &policy("billing")));
+
+        // Right name, no controller reference yet: belongs, pending adoption.
+        assert!(candidate_belongs_to(&unadopted, &orders));
+
+        // Adopted by this policy: still belongs.
+        unadopted.metadata.owner_references = Some(vec![policy_owner_reference(&orders)]);
+        let adopted = unadopted;
+        assert!(candidate_belongs_to(&adopted, &orders));
+
+        // Same name, different UID — the deleted-and-recreated policy. The
+        // candidate is the predecessor's, awaiting garbage collection.
+        let mut recreated = policy("orders");
+        recreated.metadata.uid = Some("orders-uid-2".to_string());
+        assert!(!candidate_belongs_to(&adopted, &recreated));
+
+        // A policy that cannot prove its identity claims nothing it has not
+        // merely been named by.
+        let mut anonymous = policy("orders");
+        anonymous.metadata.uid = None;
+        assert!(!candidate_belongs_to(&adopted, &anonymous));
+        // ...though an unadopted candidate still matches by name alone.
+        let fresh = candidate("orders-change-a1b2c", PolicyContent::default());
+        assert!(candidate_belongs_to(&fresh, &anonymous));
     }
 
     #[test]
