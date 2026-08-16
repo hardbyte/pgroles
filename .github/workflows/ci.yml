@@ -413,6 +413,41 @@ jobs:
           wait_for_condition_status observe-policy ApprovalIgnored True
           assert_role_absent observe-preview-user
 
+          # The write-once rules are the API server's own CEL, not the operator
+          # and not an admission add-on — so they must hold even for
+          # cluster-admin. Each of these writes is the attack the rule exists
+          # to stop: flipping a recorded decision, erasing the decider, and
+          # repointing an approval at different effects or a different server.
+          now="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          if kubectl patch pgplan "$plan_preview_plan" --subresource=status --type=merge -p '{
+              "status": {
+                "conditions": [{"type": "Denied", "status": "True",
+                  "reason": "Flipped", "message": "decision flip must be rejected",
+                  "lastTransitionTime": "'"$now"'"}],
+                "decidedBy": {"username": "e2e-reviewer"}
+              }
+            }'; then
+            echo "::error::flipping a terminal Approved decision to Denied was accepted"
+            exit 1
+          fi
+          if kubectl patch pgplan "$plan_preview_plan" --subresource=status --type=merge \
+            -p '{"status":{"decidedBy":{"username":"replacement-reviewer"}}}'; then
+            echo "::error::rewriting the write-once decision identity was accepted"
+            exit 1
+          fi
+          if kubectl patch pgplan "$plan_preview_plan" --subresource=status --type=merge \
+            -p '{"status":{"changeDigest":"sha256:forged"}}'; then
+            echo "::error::rewriting the approval-binding changeDigest was accepted"
+            exit 1
+          fi
+          if kubectl patch pgplan "$plan_preview_plan" --subresource=status --type=merge \
+            -p '{"status":{"targetPhysicalIdentity":"7000000000000000000"}}'; then
+            echo "::error::rewriting the bound target identity was accepted"
+            exit 1
+          fi
+          # And the decision the failed writes attacked is still intact.
+          test "$(kubectl get pgplan "$plan_preview_plan" -o jsonpath='{.status.decidedBy.username}')" = "e2e-reviewer"
+
           upsert_secret rotating-postgres-credentials \
             DATABASE_URL='postgres://postgres:devpassword@postgres.default.svc.cluster.local:5432/postgres'
           kubectl apply -f k8s/samples/rotated-secret-policy.yaml
