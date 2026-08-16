@@ -389,7 +389,7 @@
                             ],
                             "type": "object"
                           },
-                          "maxItems": 16,
+                          "maxItems": 64,
                           "type": "array"
                         },
                         "owner": {
@@ -532,7 +532,7 @@
                             ],
                             "type": "object"
                           },
-                          "maxItems": 256,
+                          "maxItems": 512,
                           "type": "array"
                         },
                         "role": {
@@ -547,7 +547,7 @@
                       ],
                       "type": "object"
                     },
-                    "maxItems": 512,
+                    "maxItems": 2048,
                     "type": "array"
                   },
                   "mode": {
@@ -711,7 +711,7 @@
                     },
                     "default": {},
                     "description": "Reusable privilege profiles.",
-                    "maxProperties": 64,
+                    "maxProperties": 128,
                     "type": "object"
                   },
                   "reconciliation_mode": {
@@ -948,7 +948,7 @@
                       ],
                       "type": "object"
                     },
-                    "maxItems": 256,
+                    "maxItems": 1024,
                     "type": "array",
                     "x-kubernetes-list-map-keys": [
                       "name"

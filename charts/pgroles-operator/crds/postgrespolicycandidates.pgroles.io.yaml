@@ -126,7 +126,7 @@
                                 ],
                                 "type": "object"
                               },
-                              "maxItems": 16,
+                              "maxItems": 64,
                               "type": "array"
                             },
                             "owner": {
@@ -262,7 +262,7 @@
                                 ],
                                 "type": "object"
                               },
-                              "maxItems": 256,
+                              "maxItems": 512,
                               "type": "array"
                             },
                             "role": {
@@ -277,7 +277,7 @@
                           ],
                           "type": "object"
                         },
-                        "maxItems": 512,
+                        "maxItems": 2048,
                         "type": "array"
                       },
                       "profiles": {
@@ -429,7 +429,7 @@
                           "type": "object"
                         },
                         "description": "Reusable privilege profiles.\n\nA `BTreeMap` rather than the policy's `HashMap`: the content digest is\ncomputed over a canonical serialization, and deterministic iteration\norder is one less thing that has to be normalised later.",
-                        "maxProperties": 64,
+                        "maxProperties": 128,
                         "type": "object"
                       },
                       "reconciliation_mode": {
@@ -649,7 +649,7 @@
                           ],
                           "type": "object"
                         },
-                        "maxItems": 256,
+                        "maxItems": 1024,
                         "type": "array"
                       }
                     },

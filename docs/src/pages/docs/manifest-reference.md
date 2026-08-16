@@ -393,12 +393,12 @@ API server.
 | Identifiers — role, schema, owner, member and profile names | 63 (PostgreSQL's `NAMEDATALEN - 1`, which is 63 *bytes* of UTF-8 and silently truncated by the server; the OpenAPI `maxLength` bound counts characters) |
 | Object names, comments, config values | 256 characters |
 | `role_pattern` | 128 characters |
-| `profiles` | 64 entries, each with ≤ 64 `grants` and ≤ 32 `default_privileges` |
-| `schemas` | 256 entries, each referencing ≤ 64 profiles |
+| `profiles` | 128 entries, each with ≤ 64 `grants` and ≤ 32 `default_privileges` |
+| `schemas` | 1024 entries, each referencing ≤ 64 profiles |
 | `roles` | 1024 entries, each with ≤ 32 `config` entries |
 | `grants` | 4096 entries, each with ≤ 16 `privileges` |
-| `default_privileges` | 512 entries, each with ≤ 16 `grant` entries |
-| `memberships` | 512 entries, each with ≤ 256 `members` |
+| `default_privileges` | 512 entries, each with ≤ 64 `grant` entries |
+| `memberships` | 2048 entries, each with ≤ 512 `members` |
 | `retirements` | 512 entries |
 
 Every object was always bounded, by the ~1.5MiB limit Kubernetes inherits from
