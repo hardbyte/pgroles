@@ -184,12 +184,15 @@ jobs:
         ports:
           - 5432:5432
         # --shm-size for AlloyDB Omni's shared-memory appetite; harmless for
-        # the vanilla postgres images.
+        # the vanilla postgres images. The generous retry budget is also for
+        # Omni: its first boot reinstalls extensions and runs a post-startup
+        # script before the real server start, which overruns the ~50s window
+        # that suits the vanilla images.
         options: >-
           --health-cmd="pg_isready -U postgres"
           --health-interval=5s
           --health-timeout=5s
-          --health-retries=10
+          --health-retries=48
           --shm-size=1g
     env:
       DATABASE_URL: "postgres://postgres:testpassword@localhost:5432/pgroles_test"
