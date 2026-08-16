@@ -483,6 +483,30 @@ wait_for_current_plan_ref() {
   return 1
 }
 
+# Print the names of plans controller-owned by this policy, one per line.
+#
+# The label narrows server-side, but it is truncated at 63 characters and
+# candidate-owned plans carry it too, so the controller-owner UID is the
+# exact filter — the same discipline the operator itself uses.
+plans_owned_by_policy() {
+  local policy="$1"
+  local policy_uid
+  policy_uid="$(kubectl get pgr "$policy" -o jsonpath='{.metadata.uid}' 2>/dev/null || true)"
+  if [ -z "$policy_uid" ]; then
+    return 0
+  fi
+  kubectl get pgplan -l "pgroles.io/policy=$policy" -o json 2>/dev/null |
+    POLICY_UID="$policy_uid" python3 -c '
+import json, os, sys
+uid = os.environ["POLICY_UID"]
+for item in json.load(sys.stdin).get("items", []):
+    owners = item.get("metadata", {}).get("ownerReferences") or []
+    if any(o.get("controller") and o.get("uid") == uid for o in owners):
+        phase = (item.get("status") or {}).get("phase", "")
+        print(item["metadata"]["name"], phase)
+'
+}
+
 # Assert the policy is not sitting on a plan awaiting a decision, and stays
 # that way. A password change planned from a stale source version shows up
 # exactly here: a second Pending plan for work that already applied.
@@ -491,11 +515,7 @@ assert_no_pending_plan_stable() {
   for i in $(seq 1 6); do
     sleep 5
     local pending
-    # Candidate-owned plans also carry the policy label (plus
-    # pgroles.io/candidate); exclude them so a candidate's Pending plan does
-    # not fail an assertion about the policy's own plan queue.
-    pending="$(kubectl get pgplan -l "pgroles.io/policy=$policy,!pgroles.io/candidate" \
-      -o jsonpath='{.items[?(@.status.phase=="Pending")].metadata.name}' 2>/dev/null || true)"
+    pending="$(plans_owned_by_policy "$policy" | awk '$2 == "Pending" { print $1 }')"
     if [ -n "$pending" ]; then
       echo "::error::$policy has a pending plan it should not: $pending"
       return 1
@@ -506,8 +526,7 @@ assert_no_pending_plan_stable() {
 
 get_plan_count() {
   local policy="$1"
-  # Exclude candidate-owned plans, which also carry the policy label.
-  kubectl get pgplan -l "pgroles.io/policy=$policy,!pgroles.io/candidate" --no-headers 2>/dev/null | wc -l | tr -d ' '
+  plans_owned_by_policy "$policy" | wc -l | tr -d ' '
 }
 
 # -- Candidate helpers --------------------------------------------------------
