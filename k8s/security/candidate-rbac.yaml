@@ -8,7 +8,7 @@
 # Approving a plan remains the `pgroles-plan-approver` role in
 # k8s/security/plan-decision-kyverno.yaml.
 #
-# See docs/design/adr-001-candidate-api-shakedown.md, Decision 4.
+# See docs/design/adr-001-candidate-api.md, Decision 4.
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:

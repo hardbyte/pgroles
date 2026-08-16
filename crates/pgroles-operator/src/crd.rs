@@ -2484,7 +2484,7 @@ pub struct PolicyContent {
 /// names the earlier one in `spec.replaces`.
 ///
 /// See `docs/src/pages/docs/operator-candidates.md` for the behaviour and
-/// `docs/design/adr-001-candidate-api-shakedown.md` for the API mechanics.
+/// `docs/design/adr-001-candidate-api.md` for the API mechanics.
 #[derive(CustomResource, KubeSchema, Debug, Clone, Serialize, Deserialize)]
 #[kube(
     group = "pgroles.io",

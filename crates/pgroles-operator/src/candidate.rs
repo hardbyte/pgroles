@@ -26,7 +26,7 @@
 //! current target.
 //!
 //! See `docs/src/pages/docs/operator-candidates.md` for the behaviour and
-//! `docs/design/adr-001-candidate-api-shakedown.md` (Decisions 3 and 6) for the
+//! `docs/design/adr-001-candidate-api.md` (Decisions 3 and 6) for the
 //! ownership and overlay-overlap rules.
 
 use std::collections::{BTreeMap, BTreeSet};

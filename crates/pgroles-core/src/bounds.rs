@@ -11,7 +11,7 @@
 //!    `self == oldSelf` immutability rule — that rule is only admissible
 //!    because every collection and string in the transitive schema is bounded.
 //!
-//! See `docs/design/adr-001-candidate-api-shakedown.md`, Decision 1.
+//! See `docs/design/adr-001-candidate-api.md`, Decision 1.
 //!
 //! The bounds are derived from PostgreSQL and from observed usage, not from
 //! CEL: `MAX_IDENTIFIER` is PostgreSQL's `NAMEDATALEN - 1`, and the collection

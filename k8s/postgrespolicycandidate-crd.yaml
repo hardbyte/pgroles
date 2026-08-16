@@ -54,7 +54,7 @@
             "description": "Auto-generated derived type for PostgresPolicyCandidateSpec via `CustomResource`",
             "properties": {
               "spec": {
-                "description": "A one-shot, immutable proposal of policy content.\n\nThe operator plans a candidate in its parent policy's execution context and\npublishes a `PostgresPolicyPlan` for review; the active policy keeps\nenforcing throughout. A candidate never executes SQL in any state, and its\nspec cannot be edited — revising a proposal means creating a successor that\nnames the earlier one in `spec.replaces`.\n\nSee `docs/src/pages/docs/operator-candidates.md` for the behaviour and\n`docs/design/adr-001-candidate-api-shakedown.md` for the API mechanics.",
+                "description": "A one-shot, immutable proposal of policy content.\n\nThe operator plans a candidate in its parent policy's execution context and\npublishes a `PostgresPolicyPlan` for review; the active policy keeps\nenforcing throughout. A candidate never executes SQL in any state, and its\nspec cannot be edited — revising a proposal means creating a successor that\nnames the earlier one in `spec.replaces`.\n\nSee `docs/src/pages/docs/operator-candidates.md` for the behaviour and\n`docs/design/adr-001-candidate-api.md` for the API mechanics.",
                 "properties": {
                   "content": {
                     "description": "The proposed policy content.",

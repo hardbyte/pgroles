@@ -1,16 +1,9 @@
-# ADR-001: PostgresPolicyCandidate API shakedown
+# ADR-001: PostgresPolicyCandidate API
 
 - **Status:** Accepted
 - **Date:** 2026-08-15
 - **Deciders:** pgroles maintainers
 - **Supersedes / superseded by:** —
-
-This is the first ADR in the repo. An ADR records a decision, not a design or a
-task list: the problem and constraints, the chosen approach, why it won, the
-rejected alternatives, and the consequences — including operational risks and
-follow-up work — and it distinguishes the intended steady state from the
-migration path. Specification prose belongs in `docs/src/pages/docs/`; ADRs
-must stay legible without access to the issue tracker.
 
 ## Context and constraints
 
@@ -23,7 +16,7 @@ mechanics that are expensive to change after the kind ships.
 
 Constraints in force at decision time:
 
-- pgroles is pre-1.0 with a single production user (Partly). Breaking changes
+- pgroles is pre-1.0 with a small install base. Breaking changes
   are acceptable and preferred over compatibility scar tissue; optimise for the
   long-term API and DX.
 - Immutability must hold against the object's own author — reviewers must never
@@ -125,7 +118,7 @@ the bounds only behind that test.
    instead of a field-level error.
 2. Bounds are derived from PostgreSQL, not from CEL: 63-byte identifiers are a
    server limit, not a policy choice. A 1024-role / 4096-grant policy is already
-   an order of magnitude above any real Partly policy.
+   an order of magnitude above any policy observed in practice.
 3. Bounding the shared type unblocks future CEL on `PostgresPolicy` itself
    (cross-field validation, protected-field rules) which is impossible today.
 4. Promotion stays a **pure content copy**: `candidate.spec.content` →

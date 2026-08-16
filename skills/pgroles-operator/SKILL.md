@@ -181,6 +181,53 @@ conditions. A plan object supports review and recent history, but is not
 independent proof of current database state and may be removed by terminal-plan
 retention.
 
+## Preview A Change Beside An Enforcing Policy
+
+To see what a proposed change would do while the live policy keeps enforcing,
+file a `PostgresPolicyCandidate` — do not flip the policy to `mode: observe`,
+which stops enforcement for everything, and do not edit the live spec to read
+the diff.
+
+```yaml
+apiVersion: pgroles.io/v1alpha1
+kind: PostgresPolicyCandidate
+metadata:
+  name: <policy>-add-reporting-x7k2p
+  namespace: <namespace>
+spec:
+  policyRef:
+    name: <policy>
+  content:
+    # the full proposed policy content — what spec would become, not a delta
+```
+
+The operator plans the candidate inside the parent's reconcile, with the same
+credentials and locks, against post-enforcement state. Read the result from the
+candidate's own plan:
+
+```bash
+kubectl -n <namespace> get pgcand <candidate>
+PLAN="$(kubectl -n <namespace> get pgcand <candidate> -o jsonpath='{.status.planRef.name}')"
+kubectl -n <namespace> get pgplan "$PLAN" -o jsonpath='{.status.sqlInline}'
+```
+
+Interpretation:
+
+- `content` is the whole desired state; the plan is the diff from current
+  reality, so an unchanged section produces no SQL.
+- `Ready=False, reason=BlockedByActivePolicy` means the parent is failing or
+  has its own plan awaiting a decision; the candidate is planned once the
+  parent settles.
+- The spec is immutable. Revise by filing a successor that names this
+  candidate in `spec.replaces`.
+- Approving the candidate's plan executes nothing by itself. Execution happens
+  only when the same content is merged into the policy spec, at which point the
+  operator recognises the promotion and runs the plan that was reviewed —
+  still digest-checked against fresh effects.
+- `spec.target.connectionRef` previews the content against a different
+  database; such a plan is a preview only and can never be promoted onto the
+  parent's target.
+
 ## Ephemeral Access
 
 Use `EphemeralAccessPolicy` for a GitOps-managed, bounded bundle of concrete
