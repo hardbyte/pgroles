@@ -33,13 +33,13 @@ pgroles generate --database-url $DATABASE_URL --suggest-profiles > pgroles.yaml
 
 The suggester extracts reusable [profiles](/docs/profiles) deterministically and only commits to them when round-trip equivalence with the flat manifest is verified. Roles that don't fit a uniform pattern stay flat. See the [CLI reference](/docs/cli#refining-with-suggest-profiles) for details.
 
-### 2. Plan mode first
+### 2. Observe mode first
 
-Deploy with `mode: plan` to see what pgroles *would* do without executing any SQL:
+Deploy with `mode: observe` to see what pgroles *would* do without executing any SQL:
 
 ```yaml
 spec:
-  mode: plan
+  mode: observe
   approval: manual
   reconciliation_mode: additive
 ```

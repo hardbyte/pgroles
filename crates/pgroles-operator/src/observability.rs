@@ -485,11 +485,11 @@ impl Metrics {
                 .build(),
             plan_total: meter
                 .u64_counter("pgroles.plan.total")
-                .with_description("Successful plan-mode reconciliations by result")
+                .with_description("Successful observe-mode reconciliations by result")
                 .build(),
             plan_changes_total: meter
                 .u64_counter("pgroles.plan.changes")
-                .with_description("Planned changes discovered during plan-mode reconciliations")
+                .with_description("Planned changes discovered during observe-mode reconciliations")
                 .build(),
             lock_contention_total: meter
                 .u64_counter("pgroles.lock_contention.total")

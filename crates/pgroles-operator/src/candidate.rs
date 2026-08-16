@@ -64,7 +64,7 @@ const DEFAULT_MAX_TERMINAL_CANDIDATES: usize = 10;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BlockCause {
     /// The policy has changes of its own that have not executed — it is
-    /// awaiting a decision, or in `mode: plan` where it never executes.
+    /// awaiting a decision, or in `mode: observe` where it never executes.
     AwaitingDecision,
     /// The policy's reconcile did not converge: failing, suspended, in
     /// conflict, or blocked on target identity.
@@ -98,10 +98,10 @@ pub enum ParentGate {
 /// The spec says a candidate is blocked when the parent "is failing or awaiting
 /// its own approval". That maps onto two observable facts and nothing else:
 /// the reconcile reached a converged outcome, and no plan of the policy's own
-/// is still actionable. `mode: plan` therefore blocks candidates exactly while
-/// it holds pending changes, and lets them through when it is in sync — which
-/// is the honest reading, since a plan-mode policy never executes and its
-/// "post-enforcement state" is simply the database as it stands.
+/// is still actionable. `mode: observe` therefore blocks candidates exactly
+/// while it holds pending changes, and lets them through when it is in sync —
+/// which is the honest reading, since an observe-mode policy never executes
+/// and its "post-enforcement state" is simply the database as it stands.
 pub fn parent_gate(converged: bool, has_actionable_plan: bool) -> ParentGate {
     if !converged {
         ParentGate::Blocked(BlockCause::Unstable)

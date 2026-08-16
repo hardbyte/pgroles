@@ -250,7 +250,7 @@ fn derive_status_events(
         crate::crd::CONDITION_APPROVAL_IGNORED,
     ) {
         let note = condition_message(new_status, crate::crd::CONDITION_APPROVAL_IGNORED)
-            .unwrap_or_else(|| "Plan approval has no effect in plan mode".to_string());
+            .unwrap_or_else(|| "Plan approval has no effect in observe mode".to_string());
         events.push(event(
             EventType::Warning,
             "ApprovalIgnored",

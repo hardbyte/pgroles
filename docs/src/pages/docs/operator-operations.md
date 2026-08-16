@@ -17,7 +17,7 @@ The operator reconciles on five paths:
 - `PostgresPolicyPlan` changes, matched back to the owning policy by controller-owner UID — this is what makes approving or rejecting a plan take effect immediately rather than at the next `interval`
 - the normal periodic `interval`
 
-Each reconcile inspects the current database state, computes a diff from the policy, and then either applies it or publishes a plan depending on `spec.mode`. Plan mode is non-mutating: it does not execute PostgreSQL DDL and it does not create generated password Secrets. Same-database policies are serialized, and status-only updates do not retrigger the controller.
+Each reconcile inspects the current database state, computes a diff from the policy, and then either applies it or publishes a plan depending on `spec.mode`. Observe mode is non-mutating: it does not execute PostgreSQL DDL and it does not create generated password Secrets. Same-database policies are serialized, and status-only updates do not retrigger the controller.
 
 Use this page for the external behavior and operating model. For the internal controller pipeline and locking model, see the [operator architecture](/docs/operator-architecture) page.
 

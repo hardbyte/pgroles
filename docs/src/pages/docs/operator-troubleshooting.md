@@ -207,7 +207,7 @@ use a retirement with `reassign_owned_to` and/or `drop_owned` as appropriate.
 If active sessions are the issue, a retirement can terminate them when the
 executor has the required privilege.
 
-Review the generated SQL in plan mode before approving destructive retirement
+Review the generated SQL in observe mode before approving destructive retirement
 steps. Do not remove the safety blocker merely to make the policy green.
 
 ## A plan does not execute
@@ -220,7 +220,7 @@ kubectl get pgr "$POLICY" --namespace "$NAMESPACE" \
 ```
 
 - `suspend: true` stops reconciliation entirely
-- `mode: plan` computes plans but never executes mutating SQL
+- `mode: observe` computes plans but never executes mutating SQL
 - `mode: apply` with `approval: manual` waits for a terminal `Approved`
   decision on the current plan's status
 - `mode: apply` with `approval: auto` applies without a human gate
@@ -233,7 +233,7 @@ PLAN="$(kubectl get pgr "$POLICY" --namespace "$NAMESPACE" \
 kubectl get pgplan "$PLAN" --namespace "$NAMESPACE" -o yaml
 ```
 
-A decision recorded on a plan-mode policy's plan produces `ApprovalIgnored`; switch
+A decision recorded on an observe-mode policy's plan produces `ApprovalIgnored`; switch
 the policy to `mode: apply` if you intend SQL to execute. `ApprovalUnset` means
 the operator inferred an approval mode from `spec.mode`; set `approval`
 explicitly because that inference is deprecated.

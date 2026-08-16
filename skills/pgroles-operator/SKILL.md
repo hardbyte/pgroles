@@ -48,13 +48,13 @@ and rollback implications.
 
 Two independent controls determine behavior:
 
-- `spec.mode: plan` computes and publishes a filtered plan without executing
+- `spec.mode: observe` computes and publishes a filtered plan without executing
   PostgreSQL SQL.
 - `spec.mode: apply` may execute the filtered plan, subject to `spec.approval`.
 - `spec.reconciliation_mode` selects `additive`, `adopt`, or `authoritative`
   filtering. See the policy skill before changing it.
 
-Treat `plan` to `apply`, approval changes, and stronger reconciliation modes as
+Treat `observe` to `apply`, approval changes, and stronger reconciliation modes as
 operational database migrations. Review generated SQL and replacement access
 before enabling execution.
 
@@ -75,7 +75,7 @@ Use the same canonical connection reference for policies intended to share a
 database. Different Secrets can point to the same database without being
 recognized as the same identity.
 
-Plan-only policies retain claims. A suspended policy returns before checking
+Observe-only policies retain claims. A suspended policy returns before checking
 peers, but an active peer can still detect overlap with its claims.
 
 ## Rollout Workflow
@@ -83,7 +83,7 @@ peers, but an active peer can still detect overlap with its claims.
 1. Verify the target chart version, CRDs, connection Secret, executor privileges,
    and provider/IaC prerequisites.
 2. Render the actual Kubernetes overlay or Helm release.
-3. Start in `mode: plan` for brownfield or high-impact changes.
+3. Start in `mode: observe` for brownfield or high-impact changes.
 4. Inspect the `PostgresPolicyPlan`, SQL, change summary, revocations, role
    retirements, and transitive memberships.
 5. Move to `mode: apply` with the smallest safe reconciliation mode and approval

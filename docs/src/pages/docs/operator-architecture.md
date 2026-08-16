@@ -31,7 +31,7 @@ The important difference is that the operator has to do this continuously, safel
 
 - Secret-based connection lookup
 - reconciliation interval
-- execution mode (`apply` or `plan`) and approval mode (`auto` or `manual`)
+- execution mode (`apply` or `observe`) and approval mode (`auto` or `manual`)
 - reconciliation mode (`authoritative`, `additive`, or `adopt`)
 - suspend/pause behavior
 
@@ -174,7 +174,7 @@ request, approval, expiry, and session contracts, and
 [securing ephemeral access](/docs/ephemeral-access-security) for the deployment
 trust and audit boundaries.
 
-For object-local debugging, the controller also emits transition-based Kubernetes Events for notable status changes such as conflicts, suspend/resume, plan-mode drift detection, recovery, secret failures, database connectivity failures, and insufficient privileges. The intended split is:
+For object-local debugging, the controller also emits transition-based Kubernetes Events for notable status changes such as conflicts, suspend/resume, observe-mode drift detection, recovery, secret failures, database connectivity failures, and insufficient privileges. The intended split is:
 
 - status: current state of the policy
 - Events: notable transitions visible in `kubectl describe`

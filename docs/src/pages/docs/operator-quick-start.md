@@ -231,7 +231,7 @@ When you are comfortable with the review loop, choose deliberately between:
 
 - `approval: manual` for a human gate on every change
 - `approval: auto` for continuous convergence without a human gate
-- `mode: plan` for a permanently non-mutating drift preview
+- `mode: observe` for a permanently non-mutating drift preview
 
 Read [plan and approval](/docs/operator-plan-approval) before changing those
 controls. For an existing database, keep additive or follow

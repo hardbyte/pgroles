@@ -11,7 +11,7 @@ Declare your PostgreSQL roles, memberships, and privileges as a Kubernetes resou
 By default a `PostgresPolicy` runs in `mode: apply` with
 `reconciliation_mode: authoritative`, which means anything in the database but
 not in the policy is revoked or dropped. On an existing database that can be
-thousands of grants. Start with `mode: plan`, which executes no mutating SQL, and
+thousands of grants. Start with `mode: observe`, which executes no mutating SQL, and
 read [staged adoption](/docs/adoption) before pointing pgroles at something you
 care about.
 {% /callout %}
@@ -35,7 +35,7 @@ spec:
       name: myapp-db-credentials
     secretKey: DATABASE_URL
 
-  mode: plan          # inspect and publish a plan; change nothing
+  mode: observe       # inspect and publish a plan; change nothing
   approval: manual
   interval: 5m
 
@@ -82,10 +82,10 @@ kubectl get pgr myapp-roles -n default
 
 ```text
 NAME           READY   MODE   DRIFT   CHANGES   LAST RECONCILE   AGE
-myapp-roles    True    plan   True    3         2s               2s
+myapp-roles    True    observe   True    3         2s               2s
 ```
 
-`DRIFT` is `True` because there are pending changes and `mode: plan` never
+`DRIFT` is `True` because there are pending changes and `mode: observe` never
 applies them. To see the SQL it would run, follow the policy to its plan — see
 [plan and approval](/docs/operator-plan-approval).
 

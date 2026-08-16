@@ -245,7 +245,7 @@ Two execution modes make the gate moot rather than absent:
   reconcile, so there is no approval to gate and the candidate's plan is not
   adopted. Promotion executes immediately, and the bookkeeping still happens:
   the candidate reaches `Promoted=True` once the content is applied.
-- **`mode: plan`** — the policy never executes anything, so a promoted
+- **`mode: observe`** — the policy never executes anything, so a promoted
   candidate cannot reach `Promoted`. It reports `Promoted=False,
   reason=PromotionNotExecuted` and stays open; it becomes `Promoted=True` if
   and when the policy is switched to `mode: apply` and the content applies.
@@ -354,7 +354,7 @@ approval is not an indefinite authorisation.
 | `Promoted=True, reason=Promoted` | This candidate's content was promoted and executed (terminal) |
 | `Promoted=False, reason=PromotedWithoutApproval` | The content was promoted while this candidate's plan held no approval |
 | `Promoted=False, reason=PromotionDigestMismatch` | The policy's content changed into something that is not this approved candidate |
-| `Promoted=False, reason=PromotionNotExecuted` | The content was promoted into a policy in `mode: plan`, which never executes |
+| `Promoted=False, reason=PromotionNotExecuted` | The content was promoted into a policy in `mode: observe`, which never executes |
 | `Promoted=False, reason=SupersededByPromotion` | Another candidate was promoted; this one's approved plan was retired |
 
 Rejection is recorded on the plan (`Denied=True`, phase `Rejected`); the

@@ -2101,7 +2101,7 @@ spec:
     secretRef:
       name: pgroles-db-credentials
   interval: "5m"
-  mode: plan
+  mode: observe
   roles:
     - name: app_analytics
       login: true

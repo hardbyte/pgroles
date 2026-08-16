@@ -294,7 +294,9 @@ appears. Correct — that is a genuine change in reviewed effects.
   breaking release as candidates.* One release absorbs one rename; "plan" then
   names exactly one artifact (`PostgresPolicyPlan`). No shim, no alias, pre-1.0.
   It is a change to `PostgresPolicySpec.mode` (`crd.rs:65`), touching docs,
-  samples and E2E — cheap now, expensive after GA.
+  samples and E2E — cheap now, expensive after GA. *Status: executed in this
+  change set — `mode: observe` is the shipped value across code, CRDs, docs and
+  E2E.*
 - **Bundle/fragment composition in-cluster?** *Recommendation: composition stays
   a CLI/CI concern that emits a single candidate or policy.* This removes two
   kinds from the target set, keeps the operator free of Git fetching, and keeps

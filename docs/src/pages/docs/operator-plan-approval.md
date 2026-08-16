@@ -1,6 +1,6 @@
 ---
 title: Plan and approval
-description: Preview changes with plan mode and gate execution behind a reviewed, approved plan.
+description: Preview changes with observe mode and gate execution behind a reviewed, approved plan.
 ---
 
 Seeing what the operator would do before it does it. {% .lead %}
@@ -20,18 +20,15 @@ These are the only forward-looking items on this page:
   everything on this page, and for candidates too.
 - **Content by reference** — `spec.contentRef` on a candidate, for policies too
   large to embed. Inline content is the only supported form today.
-- **Renaming `mode: plan` to `mode: observe`** — so that "plan" names exactly
-  one thing, the `PostgresPolicyPlan` resource. The field value today is
-  `plan`, and that is what this page uses throughout.
 - **An `approvedChangeDigest` token on the decision** — pinning the digest a
   reviewer saw into the decision write itself. Today the binding is the plan
   object: a decision applies to whatever digest that plan holds, and a
   supersede retires the plan rather than mutating it.
 {% /callout %}
 
-## Plan mode
+## Observe mode
 
-Set `mode: plan` to let the operator inspect the database, compute the diff,
+Set `mode: observe` to let the operator inspect the database, compute the diff,
 and publish the planned SQL without executing it.
 
 ```yaml
@@ -39,14 +36,14 @@ spec:
   connection:
     secretRef:
       name: postgres-credentials
-  mode: plan
+  mode: observe
   approval: manual
   roles:
     - name: preview-user
       login: true
 ```
 
-In `plan` mode:
+In `observe` mode:
 
 - the operator connects to the database and computes the full diff normally
 - no mutating PostgreSQL SQL is executed and no Kubernetes Secrets are created
@@ -56,11 +53,11 @@ In `plan` mode:
   gzipped ConfigMap referenced by `status.sqlRef`
 - `Ready=True` with reason `Planned`; `Drifted=True` while changes are pending
 
-Be clear about what `plan` mode is not: it is a mutable spec field, not a
+Be clear about what `observe` mode is not: it is a mutable spec field, not a
 security boundary. Anyone who can edit the policy can switch it to `apply`,
 and the operator still holds whatever database credential it was given. For
 deployments where the operator must never write, the guarantee is a
-**read-only PostgreSQL credential** — `mode: plan` is what makes running under
+**read-only PostgreSQL credential** — `mode: observe` is what makes running under
 one coherent (drift visibility without a stream of permission-denied errors).
 For a reviewed apply, use `mode: apply` with `approval: manual`. Use `suspend`
 to stop reconciling entirely.
@@ -99,12 +96,12 @@ order. Only the last one is about human review:
 | `suspend` | `mode` | `approval` | Plan created? | Mutating SQL executed? |
 |---|---|---|---|---|
 | `true` | — | — | no | no — nothing reconciles at all |
-| `false` | `plan` | *ignored* | yes | **never** |
+| `false` | `observe` | *ignored* | yes | **never** |
 | `false` | `apply` | `auto` | yes | immediately, plan auto-approved |
 | `false` | `apply` | `manual` | yes | only once approved *and* still current |
 
-`approval` has no effect in `plan` mode; a decision recorded on a plan-mode
-plan is accepted and does nothing, and the policy reports an `ApprovalIgnored`
+`approval` has no effect in `observe` mode; a decision recorded on an
+observe-mode plan is accepted and does nothing, and the policy reports an `ApprovalIgnored`
 condition so this is distinguishable from a stalled operator.
 
 Under `approval: auto` the operator approves its own plan and records
@@ -410,7 +407,7 @@ policy's plan for that transition, and the verification above is what runs.
 
 {% callout type="warning" title="Set `spec.approval` explicitly" %}
 `spec.approval` decides whether a human gates SQL execution. When omitted the
-operator still infers it from `spec.mode` — `apply` implies `auto`, `plan`
+operator still infers it from `spec.mode` — `apply` implies `auto`, `observe`
 implies `manual` — which leaves the gate invisible on the object. That
 inference is deprecated: a policy relying on it reports an `ApprovalUnset`
 condition, emits a warning Event, and counts toward

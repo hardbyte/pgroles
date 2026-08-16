@@ -364,22 +364,22 @@ jobs:
           wait_for_last_error_contains insufficient-privileges-policy "permission denied to create role"
           assert_role_absent insufficient-privileges-user
 
-          kubectl apply -f k8s/samples/plan-policy.yaml
-          wait_for_ready_status_reason plan-policy True Planned
-          wait_for_drift_status plan-policy True
-          kubectl get pgr plan-policy -o jsonpath='{.status.last_reconcile_mode}' | grep -qx "plan"
-          plan_preview_plan="$(wait_for_current_plan_ref plan-policy)"
-          get_plan_sql "$plan_preview_plan" | grep -q 'CREATE ROLE \"plan-preview-user\"'
-          assert_role_absent plan-preview-user
-          wait_for_event_reason plan-policy DriftDetected
+          kubectl apply -f k8s/samples/observe-policy.yaml
+          wait_for_ready_status_reason observe-policy True Planned
+          wait_for_drift_status observe-policy True
+          kubectl get pgr observe-policy -o jsonpath='{.status.last_reconcile_mode}' | grep -qx "observe"
+          plan_preview_plan="$(wait_for_current_plan_ref observe-policy)"
+          get_plan_sql "$plan_preview_plan" | grep -q 'CREATE ROLE \"observe-preview-user\"'
+          assert_role_absent observe-preview-user
+          wait_for_event_reason observe-policy DriftDetected
 
-          # Approving a plan-mode plan can never execute. The policy must say so
-          # rather than look stalled, and must still not touch the database.
-          assert_condition_absent plan-policy ApprovalIgnored
+          # Approving an observe-mode plan can never execute. The policy must say
+          # so rather than look stalled, and must still not touch the database.
+          assert_condition_absent observe-policy ApprovalIgnored
           approve_plan "$plan_preview_plan"
-          wait_for_condition_status plan-policy ApprovalIgnored True
-          wait_for_event_reason plan-policy ApprovalIgnored
-          assert_role_absent plan-preview-user
+          wait_for_condition_status observe-policy ApprovalIgnored True
+          wait_for_event_reason observe-policy ApprovalIgnored
+          assert_role_absent observe-preview-user
 
           # A decision is terminal, so there is no un-approving: removing the
           # retired annotation is a no-op, and the warning must persist rather
@@ -387,8 +387,8 @@ jobs:
           # for ApprovalIgnored to disappear — the mutable-annotation model that
           # write-once decisions replaced.
           kubectl annotate pgplan "$plan_preview_plan" pgroles.io/approved- --overwrite || true
-          wait_for_condition_status plan-policy ApprovalIgnored True
-          assert_role_absent plan-preview-user
+          wait_for_condition_status observe-policy ApprovalIgnored True
+          assert_role_absent observe-preview-user
 
           upsert_secret rotating-postgres-credentials \
             DATABASE_URL='postgres://postgres:devpassword@postgres.default.svc.cluster.local:5432/postgres'
@@ -944,7 +944,7 @@ jobs:
               secretRef:
                 name: postgres-credentials
             interval: "30s"
-            mode: plan
+            mode: observe
             approval: manual
             roles:
               - name: supersede_user_v1
@@ -967,7 +967,7 @@ jobs:
               secretRef:
                 name: postgres-credentials
             interval: "30s"
-            mode: plan
+            mode: observe
             approval: manual
             roles:
               - name: supersede_user_v1
@@ -1020,7 +1020,7 @@ jobs:
               secretRef:
                 name: postgres-credentials
             interval: "30s"
-            mode: plan
+            mode: observe
             approval: manual
             roles:
               - name: cleanup_test_user

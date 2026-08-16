@@ -203,8 +203,8 @@ pub enum PromotionAction {
 ///   every reconcile, so there is no approval to gate on and the candidate's
 ///   plan is not needed. The gate is trivially satisfied; the candidate still
 ///   reaches `Promoted` through the ordinary post-execution bookkeeping.
-/// - **`mode: plan`** — the policy never executes anything, ever. A candidate
-///   promoted into a plan-mode policy therefore cannot reach `Promoted`: it
+/// - **`mode: observe`** — the policy never executes anything, ever. A candidate
+///   promoted into an observe-mode policy therefore cannot reach `Promoted`: it
 ///   reports `PromotionNotExecuted` and stays non-terminal, and becomes
 ///   `Promoted` if and when the policy is switched to `mode: apply` and the
 ///   content executes.
@@ -213,7 +213,7 @@ pub fn promotion_action(
     mode: PolicyMode,
     approval: ApprovalMode,
 ) -> PromotionAction {
-    let never_executes = mode == PolicyMode::Plan;
+    let never_executes = mode == PolicyMode::Observe;
     let enforcement_suspended = !never_executes && approval == ApprovalMode::Manual;
 
     match promotion {
@@ -438,7 +438,8 @@ pub async fn recognize(
         PromotionAction::NotExecuted { candidate } => {
             let message = format!(
                 "this candidate's content was promoted into policy {}, but that policy is in \
-                 mode: plan and never executes; the candidate can only become Promoted once the \
+                 mode: observe and never executes; the candidate can only become Promoted once \
+                 the \
                  policy is in mode: apply and the content is applied",
                 policy.name_any()
             );
@@ -854,16 +855,16 @@ mod tests {
         }
     }
 
-    /// Under `mode: plan` nothing ever executes, so a promoted candidate stays
-    /// non-terminal and says why.
+    /// Under `mode: observe` nothing ever executes, so a promoted candidate
+    /// stays non-terminal and says why.
     #[test]
-    fn plan_mode_promotion_never_executes_and_the_candidate_stays_open() {
+    fn observe_mode_promotion_never_executes_and_the_candidate_stays_open() {
         for approved in [true, false] {
             let facts = vec![with_plan(candidate("c1", "sha256:aa"), "c1-plan", approved)];
             assert_eq!(
                 promotion_action(
                     decide_promotion("sha256:aa", Some("sha256:old"), &facts),
-                    PolicyMode::Plan,
+                    PolicyMode::Observe,
                     ApprovalMode::Manual
                 ),
                 PromotionAction::NotExecuted {
@@ -881,7 +882,7 @@ mod tests {
         let mismatch = || decide_promotion("sha256:edited", Some("sha256:old"), &facts);
         for (mode, approval) in [
             (PolicyMode::Apply, ApprovalMode::Auto),
-            (PolicyMode::Plan, ApprovalMode::Manual),
+            (PolicyMode::Observe, ApprovalMode::Manual),
         ] {
             assert_eq!(
                 promotion_action(mismatch(), mode, approval),

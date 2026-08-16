@@ -1235,7 +1235,7 @@ async fn apply_under_lock(
         }
     };
 
-    if resource.spec.mode == PolicyMode::Plan {
+    if resource.spec.mode == PolicyMode::Observe {
         let drift_detected = !changes.is_empty();
         let ready_message = if drift_detected {
             format!("Plan computed; {} change(s) pending", summary.total)
@@ -1260,7 +1260,7 @@ async fn apply_under_lock(
 
         // Create a PostgresPolicyPlan resource for changes (if any).
         let mut plan_ref_name = None;
-        // Plan mode used to only ever *set* this reference. When drift went
+        // Observe mode used to only ever *set* this reference. When drift went
         // away out of band the pending plan stayed Pending and the reference
         // stayed pointing at it, while the policy reported InSync beside it.
         let previous_plan_ref = resource
@@ -1304,7 +1304,7 @@ async fn apply_under_lock(
                 .await;
             }
 
-            // Plan mode returns without ever consulting spec.approval, so an
+            // Observe mode returns without ever consulting spec.approval, so an
             // approval annotation here is inert. Left unreported it looks like
             // the operator is stuck rather than working as designed.
             if matches!(
@@ -1315,7 +1315,7 @@ async fn apply_under_lock(
                     name,
                     namespace,
                     plan = %plan_name,
-                    "plan is approved but spec.mode is `plan`; approval has no effect and no SQL \
+                    "plan is approved but spec.mode is `observe`; approval has no effect and no SQL \
                      will run"
                 );
                 ignored_approval_plan = Some(plan_name.clone());
@@ -1352,7 +1352,7 @@ async fn apply_under_lock(
             status.last_attempted_generation = generation;
             status.last_successful_reconcile_time = Some(crate::crd::now_rfc3339());
             status.change_summary = Some(summary.clone());
-            status.last_reconcile_mode = Some(PolicyMode::Plan);
+            status.last_reconcile_mode = Some(PolicyMode::Observe);
             status.last_error = None;
             status.transient_failure_count = 0;
             // Cleared, not left alone, when there is no drift: a reference is
@@ -2979,14 +2979,14 @@ fn apply_approval_deprecation_condition(
     ));
 }
 
-/// Clear `ApprovalIgnored` for any policy that is not in plan mode. The plan
+/// Clear `ApprovalIgnored` for any policy that is not in observe mode. The observe
 /// path maintains the condition itself; this only stops a stale one surviving a
 /// switch to `mode: apply`, where an approval is no longer ignored.
 fn clear_stale_approval_ignored_condition(
     resource: &PostgresPolicy,
     status: &mut PostgresPolicyStatus,
 ) {
-    if resource.spec.mode != PolicyMode::Plan {
+    if resource.spec.mode != PolicyMode::Observe {
         status
             .conditions
             .retain(|condition| condition.condition_type != crate::crd::CONDITION_APPROVAL_IGNORED);
@@ -3373,7 +3373,7 @@ mod tests {
 
     #[test]
     fn approval_deprecation_condition_reports_inference_per_mode() {
-        for (mode, expected) in [(PolicyMode::Apply, "auto"), (PolicyMode::Plan, "manual")] {
+        for (mode, expected) in [(PolicyMode::Apply, "auto"), (PolicyMode::Observe, "manual")] {
             let mut policy = valid_role_policy("p", "app", "s");
             policy.spec.mode = mode;
             policy.spec.approval = None;
@@ -3431,20 +3431,20 @@ mod tests {
     }
 
     #[test]
-    fn stale_approval_ignored_condition_cleared_when_leaving_plan_mode() {
+    fn stale_approval_ignored_condition_cleared_when_leaving_observe_mode() {
         let mut policy = valid_role_policy("p", "app", "s");
-        policy.spec.mode = PolicyMode::Plan;
+        policy.spec.mode = PolicyMode::Observe;
         let mut status = PostgresPolicyStatus::default();
         status.set_condition(crate::crd::approval_ignored_condition("p-plan-1"));
 
-        // Still in plan mode: the plan path owns the condition, leave it alone.
+        // Still in observe mode: the observe path owns the condition, leave it alone.
         clear_stale_approval_ignored_condition(&policy, &mut status);
         assert!(
             status
                 .conditions
                 .iter()
                 .any(|c| c.condition_type == crate::crd::CONDITION_APPROVAL_IGNORED),
-            "plan mode must keep the condition the plan path maintains"
+            "observe mode must keep the condition the observe path maintains"
         );
 
         // Switched to apply: an approval is honoured now, so the warning is wrong.
@@ -3455,7 +3455,7 @@ mod tests {
                 .conditions
                 .iter()
                 .any(|c| c.condition_type == crate::crd::CONDITION_APPROVAL_IGNORED),
-            "leaving plan mode must clear the stale warning"
+            "leaving observe mode must clear the stale warning"
         );
     }
 

@@ -163,7 +163,7 @@ docker run --rm ghcr.io/hardbyte/pgroles --help
   ```bash
   helm install pgroles-operator oci://ghcr.io/hardbyte/charts/pgroles-operator
   ```
-  Use `spec.mode: plan` to inspect drift without executing SQL.
+  Use `spec.mode: observe` to inspect drift without executing SQL.
 - **Ephemeral access** — define GitOps-managed membership bundles and request,
   approve, audit, and revoke bounded PostgreSQL access through Kubernetes-native
   resources. The supplied, CI-tested Kyverno reference policy demonstrates the
