@@ -414,7 +414,7 @@
                     "type": "string"
                   },
                   "revalidatedGeneration": {
-                    "description": "The policy generation this plan was most recently confirmed current\nagainst.\n\nA pending plan is revalidated on every reconcile. When the policy\nchanges but the resulting effects do not, the plan — and any decision\nrecorded on it — is retained and this advances to the new generation.\nIt is provenance, never approval identity: `change_digest` is what a\ndecision binds.",
+                    "description": "The owning object's `.metadata.generation` this plan was most recently\nconfirmed current against — the policy's for an ordinary plan, the\ncandidate's for a candidate-origin plan.\n\nA pending policy plan is revalidated on every reconcile. When the policy\nchanges but the resulting effects do not, the plan — and any decision\nrecorded on it — is retained and this advances to the new generation.\nA candidate's spec is immutable, so a candidate plan's provenance is\nstamped once at creation; its ongoing revalidation is the digest\ndeduplication itself. It is provenance, never approval identity:\n`change_digest` is what a decision binds.",
                     "format": "int64",
                     "nullable": true,
                     "type": "integer"

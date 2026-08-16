@@ -1211,14 +1211,17 @@ pub struct PostgresPolicyPlanStatus {
     /// does not is a downgrade and fails closed.
     #[serde(default)]
     pub physical_identity_available: Option<bool>,
-    /// The policy generation this plan was most recently confirmed current
-    /// against.
+    /// The owning object's `.metadata.generation` this plan was most recently
+    /// confirmed current against — the policy's for an ordinary plan, the
+    /// candidate's for a candidate-origin plan.
     ///
-    /// A pending plan is revalidated on every reconcile. When the policy
+    /// A pending policy plan is revalidated on every reconcile. When the policy
     /// changes but the resulting effects do not, the plan — and any decision
     /// recorded on it — is retained and this advances to the new generation.
-    /// It is provenance, never approval identity: `change_digest` is what a
-    /// decision binds.
+    /// A candidate's spec is immutable, so a candidate plan's provenance is
+    /// stamped once at creation; its ongoing revalidation is the digest
+    /// deduplication itself. It is provenance, never approval identity:
+    /// `change_digest` is what a decision binds.
     #[serde(default)]
     pub revalidated_generation: Option<i64>,
     /// When the plan was most recently confirmed current.

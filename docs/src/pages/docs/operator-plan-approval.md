@@ -161,7 +161,7 @@ The fields on `PostgresPolicyPlan.status` that a reviewer or a runbook reads:
 | `targetPhysicalIdentity` | `pg_control_system().system_identifier` read at plan time — the storage lineage the approval is bound to. Absent on engines that do not expose it |
 | `targetLogicalFingerprint` | Fingerprint of the resolved connection endpoint (host, port, database) the plan was computed against |
 | `physicalIdentityAvailable` | Whether the physical identity was *readable* at plan time. Recorded explicitly so "could not be read" is distinguishable from "this plan predates the field" — the difference is what makes a later downgrade fail closed |
-| `revalidatedGeneration` | Policy generation the plan was most recently confirmed current against. Provenance, never approval identity |
+| `revalidatedGeneration` | The owning object's generation the plan was most recently confirmed current against — the policy's for an ordinary plan, the candidate's for a candidate-origin plan. Provenance, never approval identity |
 | `revalidatedAt` | When that confirmation last happened |
 | `sqlHash` | SHA-256 of the rendered SQL. A diagnostic for the preview only — never the approval gate |
 | `sqlInline` / `sqlRef` / `sqlTruncated` | Where the redacted SQL preview lives, and whether it was truncated |

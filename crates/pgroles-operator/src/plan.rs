@@ -329,6 +329,18 @@ impl PlanOwner<'_> {
         }
     }
 
+    /// The `.metadata.generation` of the object whose spec defines this plan's
+    /// effects. Revalidation provenance is keyed on the owner: a candidate's
+    /// plan derives from the candidate's immutable content, so stamping the
+    /// *policy's* generation on it would claim a confirmation against a spec
+    /// the plan is not computed from.
+    fn generation(&self) -> i64 {
+        match self {
+            PlanOwner::Policy(policy) => policy.metadata.generation.unwrap_or(0),
+            PlanOwner::Candidate(candidate) => candidate.metadata.generation.unwrap_or(0),
+        }
+    }
+
     fn owner_reference(&self) -> OwnerReference {
         match self {
             PlanOwner::Policy(policy) => build_owner_reference(policy),
@@ -661,7 +673,7 @@ pub async fn create_or_update_plan(
         target_physical_identity: target_identity.physical.clone(),
         target_logical_fingerprint: target_identity.logical.clone(),
         physical_identity_available: Some(target_identity.has_physical()),
-        revalidated_generation: Some(generation),
+        revalidated_generation: Some(owner.generation()),
         revalidated_at: Some(crate::crd::now_rfc3339()),
         applying_since: None,
         failed_at: None,
@@ -3466,6 +3478,36 @@ mod tests {
         let created = PlanCreationResult::Created("plan-c".to_string());
         assert!(created.is_created());
         assert!(!created.is_failed_backoff());
+    }
+
+    /// A candidate-origin plan's provenance names the candidate's generation,
+    /// not the parent policy's: the candidate is the spec the plan derives
+    /// from, and its immutability means the value is stamped once, honestly.
+    #[test]
+    fn a_candidate_plans_provenance_is_the_candidates_own_generation() {
+        let mut policy = PostgresPolicy::new(
+            "orders",
+            serde_json::from_value(serde_json::json!({
+                "connection": { "secretRef": { "name": "db" } },
+            }))
+            .expect("minimal policy spec"),
+        );
+        policy.metadata.generation = Some(5);
+        let mut candidate = PostgresPolicyCandidate::new(
+            "orders-change-x7k2p",
+            crate::crd::PostgresPolicyCandidateSpec {
+                policy_ref: crate::crd::LocalObjectReference {
+                    name: "orders".to_string(),
+                },
+                replaces: None,
+                target: None,
+                content: Default::default(),
+            },
+        );
+        candidate.metadata.generation = Some(1);
+
+        assert_eq!(PlanOwner::Policy(&policy).generation(), 5);
+        assert_eq!(PlanOwner::Candidate(&candidate).generation(), 1);
     }
 
     #[test]
