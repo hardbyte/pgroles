@@ -171,6 +171,49 @@ pub enum ReconcileError {
 
     #[error("plan SQL storage error: {0}")]
     PlanSqlStorage(String),
+
+    #[error("Kubernetes API call \"{0}\" did not complete within {1:?}")]
+    ApiStalled(&'static str, Duration),
+}
+
+/// Ceiling on a single Kubernetes API request made from the reconcile path.
+///
+/// kube-rs defaults its client to a 295-second read/write timeout, which is
+/// sized for long-poll watches, not for the handful of point reads and status
+/// patches a reconcile makes. That default is dangerous here for a reason
+/// specific to the controller runtime: kube-rs never schedules two concurrent
+/// reconciles for the same object, so *one* request that stalls holds that
+/// object's only reconcile slot — every requeue, and every trigger a watch
+/// fires at it, queues behind the stalled call and is silently deferred. A
+/// stalled request must therefore become an ordinary transient error that the
+/// error policy requeues, not a wedge.
+///
+/// Only calls made *before* either reconciliation lock is taken are bounded
+/// this way: cancelling one of those is side-effect-free, whereas cancelling
+/// work under the locks would abandon an in-flight DDL phase.
+const K8S_CALL_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Run one pre-lock Kubernetes API call under [`K8S_CALL_TIMEOUT`].
+///
+/// `call` names the request in the log and in the resulting status condition,
+/// so the next occurrence identifies which request stalled instead of leaving
+/// a silent gap in the log.
+async fn bounded_k8s_call<T, F>(call: &'static str, future: F) -> Result<T, ReconcileError>
+where
+    F: std::future::Future<Output = Result<T, kube::Error>>,
+{
+    match tokio::time::timeout(K8S_CALL_TIMEOUT, future).await {
+        Ok(result) => result.map_err(ReconcileError::Kube),
+        Err(_) => {
+            tracing::error!(
+                call,
+                timeout_secs = K8S_CALL_TIMEOUT.as_secs(),
+                "Kubernetes API call did not complete; failing this reconcile so the controller \
+                 requeues instead of holding the object's only reconcile slot open"
+            );
+            Err(ReconcileError::ApiStalled(call, K8S_CALL_TIMEOUT))
+        }
+    }
 }
 
 /// What the policy's locked phase hands to candidate planning.
@@ -489,6 +532,9 @@ fn retry_class_for_reconcile_error(error: &ReconcileError) -> RetryClass {
             }
         }
         ReconcileError::Kube(_) => RetryClass::Transient,
+        // The API server or the path to it is not answering right now; the
+        // next reconcile is the retry.
+        ReconcileError::ApiStalled(_, _) => RetryClass::Transient,
     }
 }
 
@@ -843,6 +889,12 @@ async fn reconcile_apply_inner(
     })
     .await?;
 
+    // Breadcrumbs across the pre-lock phase. Every step between here and the
+    // in-process lock is a network call, and without them a stall in any of
+    // them looks identical in the log: "starting reconciliation" and then
+    // nothing.
+    tracing::debug!(name, namespace, "status marked Reconciling");
+
     spec.validate_connection_spec()
         .map_err(|err| ReconcileError::InvalidSpec(err.to_string()))?;
     spec.validate_password_specs(&name)
@@ -855,6 +907,8 @@ async fn reconcile_apply_inner(
         status.owned_schemas = ownership.schemas.iter().cloned().collect();
     })
     .await?;
+
+    tracing::debug!(name, namespace, "ownership claims recorded");
 
     if let Some(conflict_message) =
         detect_policy_conflict(ctx, resource, identity, &ownership).await?
@@ -883,6 +937,8 @@ async fn reconcile_apply_inner(
         ));
     }
 
+    tracing::debug!(name, namespace, "no conflicting policy");
+
     // 1. Convert CRD spec to core manifest.
     let manifest = spec.to_policy_manifest();
 
@@ -907,6 +963,8 @@ async fn reconcile_apply_inner(
         .get_or_create_pool(&namespace, &spec.connection)
         .await
         .map_err(Box::new)?;
+
+    tracing::debug!(name, namespace, "database pool ready");
 
     // 5. Acquire the in-process per-database lock for the DDL phase.
     //
@@ -2966,7 +3024,7 @@ where
     let name = resource.name_any();
 
     let api: Api<PostgresPolicy> = Api::namespaced(ctx.kube_client.clone(), &namespace);
-    let latest = api.get(&name).await?;
+    let latest = bounded_k8s_call("get PostgresPolicy", api.get(&name)).await?;
     let old_status = latest.status.clone();
     let mut status = old_status.clone().unwrap_or_default();
 
@@ -2985,10 +3043,13 @@ where
         "status": status
     });
 
-    api.patch_status(
-        &name,
-        &PatchParams::apply("pgroles-operator"),
-        &Patch::Merge(&patch),
+    bounded_k8s_call(
+        "patch PostgresPolicy status",
+        api.patch_status(
+            &name,
+            &PatchParams::apply("pgroles-operator"),
+            &Patch::Merge(&patch),
+        ),
     )
     .await?;
 
@@ -3056,7 +3117,7 @@ async fn detect_policy_conflict(
         Some(namespace) => Api::namespaced(ctx.kube_client.clone(), namespace),
         None => Api::all(ctx.kube_client.clone()),
     };
-    let policies = api.list(&Default::default()).await?;
+    let policies = bounded_k8s_call("list PostgresPolicy", api.list(&Default::default())).await?;
 
     Ok(detect_policy_conflict_in_list(
         resource,
@@ -3174,6 +3235,7 @@ impl ReconcileError {
             ReconcileError::PasswordGeneration(_) => "SecretFetchFailed",
             ReconcileError::PlanSqlStorage(_) => "PlanSqlStorageFailed",
             ReconcileError::Kube(_) => "KubernetesApiError",
+            ReconcileError::ApiStalled(_, _) => "KubernetesApiStalled",
             ReconcileError::NoNamespace => "InvalidResource",
             ReconcileError::PendingEphemeralAccessCleanup(_) => "EphemeralAccessCleanupPending",
         }
@@ -4488,6 +4550,32 @@ mod tests {
             "lock held".into(),
         ));
         assert_eq!(retry_class(&error), RetryClass::LockContention);
+    }
+
+    /// A stalled API call must requeue rather than wedge: kube-rs runs at most
+    /// one reconcile per object, so an unbounded call holds that object's only
+    /// slot and every later trigger — including a plan approval — queues behind
+    /// it forever.
+    #[test]
+    fn a_stalled_api_call_is_a_transient_retry_with_its_own_reason() {
+        let error = ReconcileError::ApiStalled("get PostgresPolicy", K8S_CALL_TIMEOUT);
+        assert_eq!(error.reason(), "KubernetesApiStalled");
+        assert_eq!(
+            retry_class(&finalizer::Error::ApplyFailed(error)),
+            RetryClass::Transient
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn bounded_k8s_call_gives_up_instead_of_waiting_out_the_client_timeout() {
+        let stalled = bounded_k8s_call::<(), _>("get PostgresPolicy", async {
+            std::future::pending::<Result<(), kube::Error>>().await
+        })
+        .await;
+        assert!(matches!(
+            stalled,
+            Err(ReconcileError::ApiStalled("get PostgresPolicy", _))
+        ));
     }
 
     #[test]

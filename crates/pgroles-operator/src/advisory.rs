@@ -27,7 +27,7 @@
 //! execute on that same underlying database session.
 
 use sqlx::pool::PoolConnection;
-use sqlx::{PgPool, Postgres};
+use sqlx::{Connection, PgPool, Postgres};
 
 /// A held advisory lock that must be explicitly released.
 ///
@@ -36,7 +36,9 @@ use sqlx::{PgPool, Postgres};
 /// session-scoped).
 pub struct AdvisoryLock {
     key: i64,
-    conn: PoolConnection<Postgres>,
+    /// `None` once [`AdvisoryLock::release`] has taken the connection, which
+    /// is what tells [`Drop`] there is nothing left to make safe.
+    conn: Option<PoolConnection<Postgres>>,
 }
 
 impl AdvisoryLock {
@@ -45,9 +47,12 @@ impl AdvisoryLock {
     /// The unlock runs on the same connection that acquired the lock, ensuring
     /// `pg_advisory_unlock` targets the correct session.
     pub async fn release(mut self) {
+        let Some(mut conn) = self.conn.take() else {
+            return;
+        };
         match sqlx::query_scalar::<_, bool>("SELECT pg_advisory_unlock($1)")
             .bind(self.key)
-            .fetch_one(&mut *self.conn)
+            .fetch_one(&mut *conn)
             .await
         {
             Ok(true) => {
@@ -63,7 +68,46 @@ impl AdvisoryLock {
                 tracing::warn!(key = self.key, %err, "failed to release advisory lock");
             }
         }
-        // `self.conn` is returned to the pool on drop.
+        // `conn` is returned to the pool here, with the lock released.
+    }
+}
+
+/// Last-resort safety net for a lock that was never released.
+///
+/// `release()` is async, so it cannot be called from `Drop`; the only ways to
+/// get here are a cancelled reconcile future (controller shutdown, a timeout
+/// wrapped around the locked phase) or a future refactor that adds an early
+/// return between acquire and release. Simply dropping the [`PoolConnection`]
+/// would be the dangerous outcome: sqlx hands that connection *back to the
+/// pool* with the session-level lock still held, so the next reconcile to
+/// check it out would re-enter the lock as its own while every other session
+/// stays blocked out until `max_lifetime` recycles it. Detaching the
+/// connection instead takes it out of the pool for good, and closing the
+/// socket is what makes PostgreSQL drop the session's advisory locks.
+impl Drop for AdvisoryLock {
+    fn drop(&mut self) {
+        let Some(conn) = self.conn.take() else {
+            return;
+        };
+        tracing::warn!(
+            key = self.key,
+            "advisory lock dropped without release — closing its connection so PostgreSQL frees \
+             the session lock instead of returning a locked session to the pool"
+        );
+        let detached = conn.detach();
+        match tokio::runtime::Handle::try_current() {
+            Ok(handle) => {
+                handle.spawn(async move {
+                    if let Err(err) = detached.close().await {
+                        tracing::warn!(%err, "failed to close a leaked advisory-lock connection");
+                    }
+                });
+            }
+            // No runtime to close politely on (process shutdown): dropping the
+            // detached connection closes the socket, which is enough for the
+            // server to release the lock.
+            Err(_) => drop(detached),
+        }
     }
 }
 
@@ -103,7 +147,10 @@ pub async fn try_acquire(
 
     if acquired {
         tracing::info!(key, database_identity, "acquired advisory lock");
-        Ok(Some(AdvisoryLock { key, conn }))
+        Ok(Some(AdvisoryLock {
+            key,
+            conn: Some(conn),
+        }))
     } else {
         tracing::info!(
             key,
