@@ -58,3 +58,37 @@ async fn differently_named_identities_contend_on_the_same_canonical_key() {
         .expect("acquire must succeed once the first lock is released");
     lock_b.release().await;
 }
+
+/// The negative direction: a key that ignored `current_database()` — a
+/// constant, say — would pass the contention test above while serializing
+/// every database in the cluster behind one lock. Two different databases on
+/// the same server must hold their locks concurrently.
+#[tokio::test]
+#[ignore]
+async fn different_databases_do_not_contend() {
+    let base = database_url();
+    let pool_a = PgPool::connect(&base)
+        .await
+        .expect("failed to connect pool_a to live test database");
+
+    // The maintenance database always exists beside the test database.
+    let other = base
+        .rsplit_once('/')
+        .map(|(prefix, _)| format!("{prefix}/postgres"))
+        .expect("DATABASE_URL must name a database");
+    let pool_b = PgPool::connect(&other)
+        .await
+        .expect("failed to connect pool_b to the postgres database");
+
+    let lock_a = advisory::try_acquire(&pool_a, "ns/secret-a/KEY")
+        .await
+        .expect("advisory acquire on pool_a must not error")
+        .expect("first acquire must succeed");
+    let lock_b = advisory::try_acquire(&pool_b, "ns/secret-b/KEY")
+        .await
+        .expect("advisory acquire on pool_b must not error")
+        .expect("a different database must not contend on the same key");
+
+    lock_a.release().await;
+    lock_b.release().await;
+}

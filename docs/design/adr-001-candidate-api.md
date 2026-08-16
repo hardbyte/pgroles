@@ -86,14 +86,20 @@ cost units. Chosen bounds and their estimated contribution to the single
 | object names / comments | 256 | qualified names and free text | — |
 | `roles` | 1024 | with `config` ≤ 32 entries (key 63 / value 256) | ~1.4M |
 | `grants` | 4096 | ≤ 16 privileges each | ~0.3M |
-| `memberships` | 512, `members` ≤ 256 | | ~1.3M |
-| `default_privileges` | 512, `grant` ≤ 16 | | ~0.25M |
-| `profiles` | `maxProperties: 64` | grants ≤ 64, defaults ≤ 32, config ≤ 32 | ~0.2M |
-| `schemas` | 256 | | ~0.02M |
+| `memberships` | 2048, `members` ≤ 512 | sized ≥ 20× the largest production policy (99 edges, 21 members) | ~10.5M |
+| `default_privileges` | 512, `grant` ≤ 64 | editor+viewer over three object types is ~15 alone | ~1.0M |
+| `profiles` | `maxProperties: 128` | grants ≤ 64, defaults ≤ 32, config ≤ 32 | ~0.4M |
+| `schemas` | 1024 | 20× 37 observed | ~0.08M |
 | `retirements` | 512 | | ~0.05M |
 
-Estimated total ≈ **3.5M against the 10M per-expression limit** — roughly 35%
-of one expression's budget and 3.5% of the per-CRD budget. Headroom ≈ 3×.
+This envelope arithmetic now totals ≈ **14M**, nominally above the 10M static
+figure — and the generated CRD is nevertheless accepted by a real API server,
+because the upstream estimator does not price nested list equality the way
+this per-row arithmetic does (see the pessimism caveats below; the reverse
+error also exists). The table's job is to show which bound dominates — the
+memberships product — not to predict the estimator; the live-apply gate below
+is the authoritative check, and any future raise of the membership bounds is
+the first place to expect it to fire.
 Runtime cost is computed on the *actual* object, which is bounded by the 1.5MiB
 etcd object cap regardless; a realistic 100KB candidate evaluates at ~10⁴ units
 against `PerCallLimit` 10⁶. Transition rules skip CREATE, so the rule only runs

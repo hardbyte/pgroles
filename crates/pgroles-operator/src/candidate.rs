@@ -581,26 +581,18 @@ async fn resolve_target<'a>(
         .resolve_database_target_fingerprint(namespace, &connection)
         .await
         .map_err(Box::new)?;
-    let override_database: String = sqlx::query_scalar("SELECT current_database()")
-        .fetch_one(&pool)
-        .await
-        .map_err(ReconcileError::SqlExec)?;
-    let parent_database: String = sqlx::query_scalar("SELECT current_database()")
-        .fetch_one(planning.pool)
-        .await
-        .map_err(ReconcileError::SqlExec)?;
 
-    // The override aliases the parent's own database when either proof holds:
-    // the same physical cluster identity AND the same current_database(), or
-    // the same logical fingerprint. In that case the parent already holds
-    // both locks for this database, so reuse its context — exactly like the
-    // string-identity fast path above.
-    let same_physical_database = physical.is_some()
-        && physical == planning.target_identity.physical
-        && override_database == parent_database;
+    // The override aliases the parent's own database only on proof of
+    // *endpoint* identity: the resolved host, port and database fingerprint.
+    // The physical identity deliberately plays no part here — it names a
+    // storage lineage, not an endpoint, so a streaming replica or a restored
+    // clone shares it (and the database name) with the parent while being
+    // exactly the different endpoint the override exists to preview. When the
+    // fingerprints match, the parent already holds both locks for this
+    // database, so reuse its context — like the string-identity fast path.
     let same_logical_fingerprint =
         planning.target_identity.logical.as_deref() == Some(logical.as_str());
-    if same_physical_database || same_logical_fingerprint {
+    if same_logical_fingerprint {
         tracing::info!(
             candidate = %candidate.name_any(),
             policy = %policy.name_any(),
@@ -611,12 +603,13 @@ async fn resolve_target<'a>(
         return Ok(CandidateTargetContext::Parent(planning));
     }
 
-    // Residual: an alias this detection cannot prove — physical identity
-    // unreadable AND the resolved host strings differ (so the logical
-    // fingerprints differ too) — now fails closed as LockContention against
-    // the parent's held advisory lock instead of silently running an
-    // inspect/diff cycle concurrently with it. The contention message below
-    // names this case so the failure mode is diagnosable.
+    // Residual: an alias this detection cannot prove — a different hostname
+    // (a CNAME, a pooler) resolving to the parent's own primary — fails
+    // closed as LockContention against the parent's held advisory lock
+    // instead of silently running an inspect/diff cycle concurrently with
+    // it. The contention message below names this case so the failure mode
+    // is diagnosable. A streaming replica does not hit this: its advisory
+    // lock table is local to the standby.
     //
     // Locking follows the target: the override is a different database, so it
     // has its own advisory and in-process locks and cannot share the parent's.
@@ -947,7 +940,7 @@ async fn block_candidate(
     Ok(())
 }
 
-async fn mark_superseded(
+pub(crate) async fn mark_superseded(
     ctx: &OperatorContext,
     candidate: &mut PostgresPolicyCandidate,
     reason: &str,

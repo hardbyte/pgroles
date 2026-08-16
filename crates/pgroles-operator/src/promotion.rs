@@ -79,6 +79,10 @@ pub struct CandidateFacts {
     /// the only fact that identifies which of several identical-content
     /// candidates actually authorised the execution.
     pub owns_applied_plan: bool,
+    /// `status.phase == Promoted`. A digest whose promotion is already
+    /// recorded must never promote a second, duplicate candidate on a later
+    /// recognition of the same content.
+    pub promoted: bool,
 }
 
 /// The live plan of a candidate, and whether it carries an approval.
@@ -429,6 +433,10 @@ pub async fn load_context(
                 .is_terminal(),
             plan: plan_facts,
             owns_applied_plan,
+            promoted: candidate
+                .status
+                .as_ref()
+                .is_some_and(|status| status.phase == CandidatePhase::Promoted),
         });
     }
 
@@ -633,15 +641,73 @@ pub async fn record_promotion(
     content_digest: &str,
 ) -> Result<(), ReconcileError> {
     let context = load_context(ctx, policy).await?;
-    let Some(promoted) = select_promoted(&context.facts, content_digest) else {
-        return Ok(());
+    let digest_matches = |candidate: &&CandidateFacts| {
+        candidate
+            .content_digest
+            .as_deref()
+            .is_some_and(|digest| digest == content_digest)
     };
-    let promoted_name = promoted.name.clone();
 
-    // Retire the approvals this promotion stranded first: if the operator dies
-    // between the two writes, an unusable approval left live is the worse of
-    // the two states to be caught in.
-    for stranded in stranded_by_promotion(&promoted_name, &context.facts) {
+    // A promotion is recorded exactly once per content. Recognition runs on
+    // every reconcile — deliberately, for interrupted bookkeeping — so once a
+    // candidate is Promoted for this digest, a later pass must spend any open
+    // duplicate rather than promote it too: nothing about the duplicate ever
+    // authorised an execution.
+    let already = context
+        .facts
+        .iter()
+        .find(|candidate| candidate.promoted && digest_matches(candidate))
+        .map(|candidate| candidate.name.clone());
+    let newly_promoted = already.is_none();
+    let promoted_name = match already {
+        Some(name) => name,
+        None => match select_promoted(&context.facts, content_digest) {
+            Some(selected) => selected.name.clone(),
+            None => return Ok(()),
+        },
+    };
+
+    // Everything this promotion spends is retired first: if the operator dies
+    // between the writes, an unusable approval or a promotable-looking
+    // duplicate left live is the worse of the two states to be caught in.
+    // Spent means any other open candidate that either holds an approved plan
+    // (an authorisation that can never be used) or carries this exact content
+    // (a proposal that is now the policy, through another object).
+    let duplicates: Vec<String> = context
+        .facts
+        .iter()
+        .filter(|candidate| !candidate.terminal && candidate.name != promoted_name)
+        .filter(digest_matches)
+        .map(|candidate| candidate.name.clone())
+        .collect();
+    for duplicate in &duplicates {
+        if let Some(plan) = context.plan_of(duplicate) {
+            crate::plan::mark_plan_superseded(
+                &ctx.kube_client,
+                plan,
+                SupersedeCause::SupersededByPromotion,
+            )
+            .await?;
+        }
+        if let Some(candidate) = context.candidate(duplicate) {
+            let message = format!(
+                "identical content was promoted and applied through candidate {promoted_name};                  this duplicate proposal is spent"
+            );
+            let mut candidate = candidate.clone();
+            crate::candidate::mark_superseded(
+                ctx,
+                &mut candidate,
+                candidate_reason::SUPERSEDED_BY_PROMOTION,
+                &message,
+            )
+            .await?;
+        }
+    }
+
+    for stranded in stranded_by_promotion(&promoted_name, &context.facts)
+        .into_iter()
+        .filter(|name| !duplicates.contains(name))
+    {
         let Some(plan) = context.plan_of(&stranded) else {
             continue;
         };
@@ -670,6 +736,9 @@ pub async fn record_promotion(
         }
     }
 
+    if !newly_promoted {
+        return Ok(());
+    }
     let Some(candidate) = context.candidate(&promoted_name) else {
         return Ok(());
     };
@@ -813,6 +882,7 @@ mod tests {
             terminal: false,
             plan: None,
             owns_applied_plan: false,
+            promoted: false,
         }
     }
 
@@ -1104,6 +1174,7 @@ mod tests {
             terminal: false,
             plan: None,
             owns_applied_plan: false,
+            promoted: false,
         }];
         assert_eq!(
             decide_promotion("sha256:aa", Some("sha256:old"), &facts),

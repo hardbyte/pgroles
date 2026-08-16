@@ -96,6 +96,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -148,6 +150,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
 
       - uses: dtolnay/rust-toolchain@stable
 
@@ -205,6 +209,8 @@ jobs:
       DATABASE_URL: "postgres://postgres:testpassword@localhost:5432/pgroles_test"
     steps:
       - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
 
       # POSTGRES_DB is a docker-entrypoint convention the postgres images
       # honour; do not assume every engine image does. Create the test
@@ -248,6 +254,8 @@ jobs:
       DATABASE_URL: "postgres://postgres:testpassword@localhost:5432/pgroles_test"
     steps:
       - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
 
       - uses: docker/setup-buildx-action@v4
 
@@ -314,6 +322,8 @@ jobs:
       DATABASE_URL: "postgres://postgres:testpassword@localhost:5432/pgroles_test"
     steps:
       - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
 
       - uses: dtolnay/rust-toolchain@stable
 
@@ -337,6 +347,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
 
       - uses: ./.github/actions/setup-e2e
         with:
@@ -649,6 +661,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
 
       - uses: ./.github/actions/setup-e2e
         with:
@@ -725,6 +739,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
 
       - uses: ./.github/actions/setup-e2e
         with:
@@ -1541,9 +1557,89 @@ jobs:
 
           kubectl delete pgcand dup-cand-a dup-cand-b --wait=true
 
+          echo "--- Test: a base change supersedes a pending candidate plan and its stale approval never promotes ---"
+          # The parent policy currently holds: promo_new_user promo_other_user
+          # promo_y_user dup_promo_user (the duplicate-content promotion).
+          # stale-x is filed against that base and NEVER approved; fresh-y is
+          # approved and merged, moving the base out from under stale-x.
+          file_candidate stale-x promo_new_user promo_other_user promo_y_user dup_promo_user stale_x_user
+          wait_for_candidate_phase stale-x Planned
+          plan_x1=$(wait_for_candidate_plan_ref stale-x)
+
+          file_candidate fresh-y promo_new_user promo_other_user promo_y_user dup_promo_user fresh_y_user
+          wait_for_candidate_phase fresh-y Planned
+          plan_y1=$(wait_for_candidate_plan_ref fresh-y)
+          approve_plan "$plan_y1"
+
+          # Merge fresh-y's content: the base content digest moves to something
+          # that is not stale-x's own content.
+          write_promo_policy promo_new_user promo_other_user promo_y_user dup_promo_user fresh_y_user
+          wait_for_plan_phase "$plan_y1" Applied
+          assert_role_exists fresh_y_user
+          wait_for_candidate_phase fresh-y Promoted
+
+          # stale-x's original plan was pinned to the pre-merge base; the base
+          # change — not a promotion of its content — must retire it. plan_x1
+          # is deliberately unapproved, so promotion-stranding never touches it
+          # and the only valid supersede reason is the base change.
+          wait_for_plan_phase "$plan_x1" Superseded
+          for i in $(seq 1 20); do
+            x1_reason=$(kubectl get pgplan "$plan_x1" \
+              -o jsonpath='{.status.conditions[?(@.type=="Superseded")].reason}' 2>/dev/null || true)
+            if [ "$x1_reason" = "SupersededByBaseChange" ]; then
+              echo "$plan_x1 superseded with reason=SupersededByBaseChange"
+              break
+            fi
+            if [ "$i" -eq 20 ]; then
+              echo "::error::expected SupersededByBaseChange on $plan_x1, got '$x1_reason'"
+              kubectl get pgplan "$plan_x1" -o yaml || true
+              exit 1
+            fi
+            echo "Waiting for $plan_x1 Superseded reason=SupersededByBaseChange (current='$x1_reason')... ($i/20)"
+            sleep 3
+          done
+
+          # stale-x gets a FRESH plan pinned to the new base, needing its own
+          # approval.
+          plan_x2=""
+          for i in $(seq 1 20); do
+            plan_x2=$(kubectl get pgcand stale-x -o jsonpath='{.status.planRef.name}' 2>/dev/null || true)
+            if [ -n "$plan_x2" ] && [ "$plan_x2" != "$plan_x1" ]; then
+              echo "stale-x replanned onto $plan_x2"
+              break
+            fi
+            if [ "$i" -eq 20 ]; then
+              echo "::error::stale-x did not receive a fresh plan pinned to the new base (still '$plan_x2')"
+              kubectl get pgcand stale-x -o yaml || true
+              exit 1
+            fi
+            echo "Waiting for stale-x to replan away from $plan_x1... ($i/20)"
+            sleep 3
+          done
+
+          # The replacement is pinned to the base as it now stands: its
+          # baseContentDigest must be present and differ from the stale pin.
+          base_digest_x1=$(kubectl get pgplan "$plan_x1" -o jsonpath='{.spec.origin.baseContentDigest}')
+          base_digest_x2=$(kubectl get pgplan "$plan_x2" -o jsonpath='{.spec.origin.baseContentDigest}')
+          test -n "$base_digest_x1" \
+            || { echo "::error::superseded plan $plan_x1 has no baseContentDigest"; exit 1; }
+          test -n "$base_digest_x2" \
+            || { echo "::error::fresh plan $plan_x2 has no baseContentDigest"; exit 1; }
+          test "$base_digest_x1" != "$base_digest_x2" \
+            || { echo "::error::fresh plan $plan_x2 is pinned to the stale base '$base_digest_x1'"; exit 1; }
+
+          # Nothing of stale-x ever executed.
+          assert_role_absent stale_x_user
+
+          kubectl delete pgcand stale-x fresh-y --wait=true
+          # Restore the policy content to the set it held before this test.
+          write_promo_policy promo_new_user promo_other_user promo_y_user dup_promo_user
+
           # Cleanup
           kubectl delete pgcand --all --wait=true
           kubectl delete pgr promo-policy --wait=true
+          pg_query "DROP ROLE IF EXISTS stale_x_user;"
+          pg_query "DROP ROLE IF EXISTS fresh_y_user;"
           for role in promo_base_user promo_new_user promo_other_user promo_y_user dup_promo_user; do
             pg_query "REASSIGN OWNED BY $role TO postgres; DROP OWNED BY $role; DROP ROLE IF EXISTS $role;"
           done

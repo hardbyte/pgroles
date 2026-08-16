@@ -91,6 +91,13 @@ pub struct EffectDigestInputs<'a> {
     /// operator this is `secret:key:resourceVersion`. Every role named by a
     /// `SetPassword` change must have an entry.
     pub password_source_versions: &'a BTreeMap<String, String>,
+    /// The roles this plan's owner claims management of. Bound because scope
+    /// is a material control-plane effect the SQL cannot show: dropping a
+    /// role from management produces no SQL at all, yet stops enforcing it.
+    pub owned_roles: &'a [String],
+    /// The schemas this plan's owner claims management of — bound for the
+    /// same reason as `owned_roles`.
+    pub owned_schemas: &'a [String],
 }
 
 #[derive(Serialize)]
@@ -100,6 +107,8 @@ struct CanonicalChangeSet<'a> {
     target: &'a str,
     target_physical_identity: Option<&'a str>,
     target_logical_fingerprint: Option<&'a str>,
+    owned_roles: Vec<&'a str>,
+    owned_schemas: Vec<&'a str>,
     effects: Vec<Value>,
 }
 
@@ -286,12 +295,23 @@ pub fn canonical_change_set_bytes(
     // of effects are the same approval regardless of emission order.
     effects.sort_by_cached_key(ToString::to_string);
 
+    // Management scope is a set: order is a listing artifact, duplicates say
+    // nothing, and both would make equal scopes hash differently.
+    let mut owned_roles: Vec<&str> = inputs.owned_roles.iter().map(String::as_str).collect();
+    owned_roles.sort_unstable();
+    owned_roles.dedup();
+    let mut owned_schemas: Vec<&str> = inputs.owned_schemas.iter().map(String::as_str).collect();
+    owned_schemas.sort_unstable();
+    owned_schemas.dedup();
+
     Ok(serde_json::to_vec(&CanonicalChangeSet {
         effect_encoding: APPROVAL_EFFECT_ENCODING_V2,
         reconciliation_mode: inputs.reconciliation_mode,
         target: inputs.target,
         target_physical_identity: inputs.target_identity.physical.as_deref(),
         target_logical_fingerprint: inputs.target_identity.logical.as_deref(),
+        owned_roles,
+        owned_schemas,
         effects,
     })
     .expect("canonical change set is serializable"))
@@ -362,7 +382,45 @@ mod tests {
             target: "default/postgres-credentials:url",
             target_identity: &TARGET_IDENTITY,
             password_source_versions,
+            owned_roles: &[],
+            owned_schemas: &[],
         }
+    }
+
+    /// The lost-management review scenario: dropping a role from management
+    /// produces no SQL at all, so scope must be bound for the digest — and
+    /// therefore the approval — to notice.
+    #[test]
+    fn a_management_scope_change_changes_the_digest_with_identical_effects() {
+        let changes = [create_role("reader")];
+        let versions = BTreeMap::new();
+        let narrow = ["app_reader".to_string()];
+        let wide = ["app_reader".to_string(), "team_y_user".to_string()];
+        let mut inputs_narrow = inputs(&versions);
+        inputs_narrow.owned_roles = &narrow;
+        let mut inputs_wide = inputs(&versions);
+        inputs_wide.owned_roles = &wide;
+        assert_ne!(
+            compute_change_digest(&changes, &inputs_narrow).expect("digest"),
+            compute_change_digest(&changes, &inputs_wide).expect("digest"),
+        );
+    }
+
+    /// Scope is a set: listing order and duplicates are canonicalised away.
+    #[test]
+    fn management_scope_order_and_duplicates_do_not_change_the_digest() {
+        let changes = [create_role("reader")];
+        let versions = BTreeMap::new();
+        let forward = ["a".to_string(), "b".to_string()];
+        let shuffled = ["b".to_string(), "a".to_string(), "b".to_string()];
+        let mut inputs_forward = inputs(&versions);
+        inputs_forward.owned_roles = &forward;
+        let mut inputs_shuffled = inputs(&versions);
+        inputs_shuffled.owned_roles = &shuffled;
+        assert_eq!(
+            compute_change_digest(&changes, &inputs_forward).expect("digest"),
+            compute_change_digest(&changes, &inputs_shuffled).expect("digest"),
+        );
     }
 
     fn set_password(name: &str, verifier: &str) -> Change {
@@ -746,9 +804,12 @@ mod tests {
         let bytes = canonical_change_set_bytes(&changes, &inputs(&versions)).expect("bytes");
         let encoded = String::from_utf8(bytes).expect("canonical bytes are UTF-8 JSON");
 
+        // The management-scope fields joined this encoding before v2 ever
+        // shipped in a release, so the constant keeps its name; from the
+        // first released v2 onward, any change here means a new constant.
         assert_eq!(
             encoded,
-            r#"{"effect_encoding":"pgroles.io/approval-effect/v2","reconciliation_mode":"Authoritative","target":"default/postgres-credentials:url","target_physical_identity":"7412330000000000001","target_logical_fingerprint":"sha256:fingerprint","effects":[{"Grant":{"name":"orders","object_type":"table","privileges":["SELECT"],"role":"reporting","schema":"inventory"}},{"SetPassword":{"name":"app","password_source":"role-passwords:app:7"}}]}"#,
+            r#"{"effect_encoding":"pgroles.io/approval-effect/v2","reconciliation_mode":"Authoritative","target":"default/postgres-credentials:url","target_physical_identity":"7412330000000000001","target_logical_fingerprint":"sha256:fingerprint","owned_roles":[],"owned_schemas":[],"effects":[{"Grant":{"name":"orders","object_type":"table","privileges":["SELECT"],"role":"reporting","schema":"inventory"}},{"SetPassword":{"name":"app","password_source":"role-passwords:app:7"}}]}"#,
             "canonical encoding changed; bump the encoding constant rather than \
              editing this fixture"
         );

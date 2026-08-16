@@ -94,31 +94,38 @@
                     "properties": {
                       "baseContentDigest": {
                         "description": "Canonical content digest of the *policy* content this candidate plan\nwas computed against — the applied base. A candidate is a complete\ndesired-state snapshot, so an approval is only meaningful against the\nbase it was reviewed on: identical SQL effects do not prove the\nsnapshot still preserves everything the base has come to manage since.\nPromotion refuses to adopt a plan whose base pin no longer matches the\ncontent the policy carried before the merge, and planning supersedes\nthe plan as soon as the base moves. Absent for non-candidate origins.",
+                        "maxLength": 128,
                         "nullable": true,
                         "type": "string"
                       },
                       "contentDigest": {
                         "description": "Canonical content digest of the originating candidate, and the encoding\nit was computed under.\n\nThis is what binds the reviewed plan to the content that will later be\npromoted. It lives on the origin rather than in an annotation because a\npromotion check that can be edited by anyone holding `patch` is not a\nbinding at all. Both fields are absent for non-candidate origins.",
+                        "maxLength": 128,
                         "nullable": true,
                         "type": "string"
                       },
                       "contentDigestEncoding": {
                         "description": "Version tag of the encoding `contentDigest` was computed under.\nDigests from different encodings are never comparable, so promotion\nrecognition only matches digests carrying the same tag. Absent for\nnon-candidate origins.",
+                        "maxLength": 64,
                         "nullable": true,
                         "type": "string"
                       },
                       "kind": {
+                        "maxLength": 63,
                         "type": "string"
                       },
                       "name": {
+                        "maxLength": 253,
                         "type": "string"
                       },
                       "policyUid": {
                         "description": "UID of the `PostgresPolicy` the candidate proposes content for. The\nplan's `spec.policyRef` names it; the UID is what survives a\ndelete-and-recreate of the same name.",
+                        "maxLength": 63,
                         "nullable": true,
                         "type": "string"
                       },
                       "uid": {
+                        "maxLength": 63,
                         "type": "string"
                       }
                     },
@@ -203,7 +210,13 @@
                   "policyRef",
                   "reconciliationMode"
                 ],
-                "type": "object"
+                "type": "object",
+                "x-kubernetes-validations": [
+                  {
+                    "message": "plan origin is immutable once set",
+                    "rule": "!has(oldSelf.origin) || (has(self.origin) && self.origin == oldSelf.origin)"
+                  }
+                ]
               },
               "status": {
                 "description": "Status of a `PostgresPolicyPlan` resource.\n\nThe decision rules below are the same grammar `EphemeralAccessRequest`\nuses: a decision is terminal, `Approved` and `Denied` cannot both be true,\nand the deciding identity is recorded in the same admitted write. What CEL\ncannot do is check *who* is writing — see [`DecisionActor`].",

@@ -453,6 +453,8 @@ pub async fn create_or_update_plan(
         database_identity,
         target_identity,
         password_source_versions,
+        &inspect_config.managed_roles,
+        &inspect_config.managed_schemas,
     )?;
 
     // 3. Hash the rendered SQL for preview diagnostics.
@@ -1493,12 +1495,15 @@ fn render_redacted_sql(
 /// This is the approval identity — see `pgroles_core::approval`. Unlike the
 /// SQL hash it is stable across recomputation of unchanged effects, which is
 /// what makes a password-bearing plan approvable at all.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn compute_change_digest(
     changes: &[pgroles_core::diff::Change],
     reconciliation_mode: CrdReconciliationMode,
     database_identity: &str,
     target_identity: &TargetIdentity,
     password_source_versions: &BTreeMap<String, String>,
+    owned_roles: &[String],
+    owned_schemas: &[String],
 ) -> Result<String, ReconcileError> {
     Ok(pgroles_core::approval::compute_change_digest(
         changes,
@@ -1507,6 +1512,8 @@ pub(crate) fn compute_change_digest(
             target: database_identity,
             target_identity,
             password_source_versions,
+            owned_roles,
+            owned_schemas,
         },
     )?)
 }
@@ -3367,6 +3374,8 @@ mod tests {
             "default/db-credentials:DATABASE_URL",
             &test_target_identity(),
             versions,
+            &[],
+            &[],
         )
         .expect("digest")
     }
@@ -3784,6 +3793,8 @@ mod tests {
             "default/db-credentials:DATABASE_URL",
             &moved,
             &versions,
+            &[],
+            &[],
         )
         .expect("digest");
 
@@ -3918,6 +3929,8 @@ mod tests {
                 target: "default/db-credentials:DATABASE_URL",
                 target_identity: &test_target_identity(),
                 password_source_versions: &versions,
+                owned_roles: &[],
+                owned_schemas: &[],
             },
         )
         .expect("canonical bytes");

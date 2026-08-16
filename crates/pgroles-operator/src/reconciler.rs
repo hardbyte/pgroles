@@ -1591,6 +1591,8 @@ async fn apply_under_lock(
                             identity.as_str(),
                             &target_identity,
                             &applied_password_source_versions,
+                            &inspect_config.managed_roles,
+                            &inspect_config.managed_schemas,
                         )?;
                         // Before anything else, ask whether this is even the
                         // database the reviewer approved against. The identity
@@ -2003,6 +2005,8 @@ async fn apply_under_lock(
                             identity.as_str(),
                             &target_identity,
                             &applied_password_source_versions,
+                            &inspect_config.managed_roles,
+                            &inspect_config.managed_schemas,
                         )?;
                         let plan_status = current_plan.status.as_ref();
                         let decision = crate::plan::decide_pending_plan(

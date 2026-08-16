@@ -1027,7 +1027,7 @@ pub struct ChangeSummary {
 ///
 /// Represents a computed reconciliation plan for a `PostgresPolicy`. Plans are
 /// created by the operator and may require explicit approval before execution.
-#[derive(CustomResource, Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[derive(CustomResource, KubeSchema, Debug, Clone, Serialize, Deserialize)]
 #[kube(
     group = "pgroles.io",
     version = "v1alpha1",
@@ -1047,6 +1047,16 @@ pub struct ChangeSummary {
     printcolumn = r#"{"name":"Hash","type":"string","jsonPath":".status.sqlHash","priority":1}"#,
     printcolumn = r#"{"name":"Age","type":"date","jsonPath":".metadata.creationTimestamp"}"#
 )]
+// Promotion trusts `spec.origin` — the candidate identity, its content
+// digest, and the base pin — so it must not be editable by anyone holding
+// plan `patch`. Origin equality is cheap to estimate because every origin
+// field is a bounded string; the rest of the spec stays mutable (it is
+// operator-written bookkeeping, and `owned_roles` is unbounded, which would
+// sink a whole-spec rule at the CEL cost gate).
+#[x_kube(validation = Rule::new(
+    "!has(oldSelf.origin) || (has(self.origin) && self.origin == oldSelf.origin)"
+)
+.message("plan origin is immutable once set"))]
 #[serde(rename_all = "camelCase")]
 pub struct PostgresPolicyPlanSpec {
     /// Reference to the policy that generated this plan.
@@ -1075,8 +1085,11 @@ pub struct PostgresPolicyPlanSpec {
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct PlanOrigin {
+    #[schemars(length(max = 63))]
     pub kind: String,
+    #[schemars(length(max = 253))]
     pub name: String,
+    #[schemars(length(max = 63))]
     pub uid: String,
     /// Canonical content digest of the originating candidate, and the encoding
     /// it was computed under.
@@ -1086,17 +1099,20 @@ pub struct PlanOrigin {
     /// promotion check that can be edited by anyone holding `patch` is not a
     /// binding at all. Both fields are absent for non-candidate origins.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(length(max = 128))]
     pub content_digest: Option<String>,
     /// Version tag of the encoding `contentDigest` was computed under.
     /// Digests from different encodings are never comparable, so promotion
     /// recognition only matches digests carrying the same tag. Absent for
     /// non-candidate origins.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(length(max = 64))]
     pub content_digest_encoding: Option<String>,
     /// UID of the `PostgresPolicy` the candidate proposes content for. The
     /// plan's `spec.policyRef` names it; the UID is what survives a
     /// delete-and-recreate of the same name.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(length(max = 63))]
     pub policy_uid: Option<String>,
     /// Canonical content digest of the *policy* content this candidate plan
     /// was computed against — the applied base. A candidate is a complete
@@ -1107,6 +1123,7 @@ pub struct PlanOrigin {
     /// content the policy carried before the merge, and planning supersedes
     /// the plan as soon as the base moves. Absent for non-candidate origins.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(length(max = 128))]
     pub base_content_digest: Option<String>,
 }
 

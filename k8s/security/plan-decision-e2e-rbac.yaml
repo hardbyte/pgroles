@@ -23,7 +23,10 @@ metadata:
   name: pgroles-plan-status-writer-e2e
 rules:
   - apiGroups: [pgroles.io]
-    resources: [postgrespolicyplans, postgrespolicyplans/status]
+    resources: [postgrespolicyplans]
+    verbs: [get, list, watch]
+  - apiGroups: [pgroles.io]
+    resources: [postgrespolicyplans/status]
     verbs: [get, list, watch, patch, update]
   - apiGroups: [pgroles.io]
     resources: [postgrespolicies]

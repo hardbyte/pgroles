@@ -234,6 +234,8 @@ fn digest(changes: &[Change], versions: &BTreeMap<String, String>) -> String {
             target: "default/postgres-credentials:url",
             target_identity: &target_identity(),
             password_source_versions: versions,
+            owned_roles: &[],
+            owned_schemas: &[],
         },
     )
     .expect("every generated role has a password source version")
@@ -377,6 +379,8 @@ fn digest_binds_mode_and_target() {
                 target: "default/postgres-credentials:url",
                 target_identity: &target_identity(),
                 password_source_versions: &versions,
+                owned_roles: &[],
+                owned_schemas: &[],
             },
         )
         .expect("digest");
@@ -388,6 +392,8 @@ fn digest_binds_mode_and_target() {
                 target: "default/other-credentials:url",
                 target_identity: &target_identity(),
                 password_source_versions: &versions,
+                owned_roles: &[],
+                owned_schemas: &[],
             },
         )
         .expect("digest");
@@ -402,6 +408,8 @@ fn digest_binds_mode_and_target() {
                     ..target_identity()
                 },
                 password_source_versions: &versions,
+                owned_roles: &[],
+                owned_schemas: &[],
             },
         )
         .expect("digest");
@@ -416,6 +424,8 @@ fn digest_binds_mode_and_target() {
                     ..target_identity()
                 },
                 password_source_versions: &versions,
+                owned_roles: &[],
+                owned_schemas: &[],
             },
         )
         .expect("digest");
@@ -493,6 +503,8 @@ fn password_material_never_reaches_the_hashed_bytes() {
                 target: "default/postgres-credentials:url",
                 target_identity: &target_identity(),
                 password_source_versions: &versions,
+                owned_roles: &[],
+                owned_schemas: &[],
             },
         )
         .expect("digest inputs");
