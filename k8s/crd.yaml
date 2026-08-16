@@ -555,7 +555,8 @@
                     "description": "Reconciliation mode: `apply` executes SQL, `observe` computes drift only.",
                     "enum": [
                       "apply",
-                      "observe"
+                      "observe",
+                      "plan"
                     ],
                     "type": "string"
                   },
@@ -1128,10 +1129,11 @@
                     "type": "string"
                   },
                   "last_reconcile_mode": {
-                    "description": "Policy reconcile mode.",
+                    "description": "Policy reconcile mode.\n\nDeliberately not `PartialEq`: `plan` is a deprecated spelling of `observe`\nthat must behave identically everywhere, and an `==` comparison is exactly\nthe kind of site that forgets one of the two. Compare through\n[`PolicyMode::never_executes`] and [`PolicyMode::is_deprecated_spelling`],\nor match exhaustively.",
                     "enum": [
                       "apply",
-                      "observe"
+                      "observe",
+                      "plan"
                     ],
                     "nullable": true,
                     "type": "string"

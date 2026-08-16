@@ -42,6 +42,7 @@ struct Metrics {
     policy_conflicts_total: Counter<u64>,
     invalid_spec_total: Counter<u64>,
     deprecated_approval_unset_total: Counter<u64>,
+    deprecated_mode_plan_total: Counter<u64>,
     database_connection_failures_total: Counter<u64>,
     apply_total: Counter<u64>,
     apply_statements_total: Counter<u64>,
@@ -154,6 +155,15 @@ impl OperatorObservability {
             metrics
                 .deprecated_approval_unset_total
                 .add(1, &[KeyValue::new("inferred", inferred.to_string())]);
+        }
+    }
+
+    /// Count a reconcile of a policy spelled `mode: plan`, the deprecated
+    /// alias of `observe`, for the same fleet-wide-exposure reason as
+    /// [`Self::record_deprecated_approval_unset`].
+    pub fn record_deprecated_mode_plan(&self) {
+        if let Some(metrics) = &self.metrics {
+            metrics.deprecated_mode_plan_total.add(1, &[]);
         }
     }
 
@@ -508,6 +518,13 @@ impl Metrics {
                 .with_description(
                     "Reconciles of a PostgresPolicy that omits spec.approval and relies on the \
                      deprecated inference from spec.mode",
+                )
+                .build(),
+            deprecated_mode_plan_total: meter
+                .u64_counter("pgroles.deprecated.mode_plan")
+                .with_description(
+                    "Reconciliations of policies using mode: plan, the deprecated spelling of \
+                     observe",
                 )
                 .build(),
             database_connection_failures_total: meter

@@ -406,6 +406,32 @@ jobs:
           wait_for_last_error_contains insufficient-privileges-policy "permission denied to create role"
           assert_role_absent insufficient-privileges-user
 
+          # The deprecated `mode: plan` spelling stays accepted — a GitOps
+          # controller re-applies existing manifests on every sync, so the
+          # rename must not reject them — behaves exactly as observe, and
+          # says so on a condition.
+          kubectl apply -f - <<'LEGACY'
+          apiVersion: pgroles.io/v1alpha1
+          kind: PostgresPolicy
+          metadata:
+            name: legacy-plan-mode-policy
+            namespace: default
+          spec:
+            connection:
+              secretRef:
+                name: postgres-credentials
+            mode: plan
+            interval: 30s
+            roles:
+              - name: legacy_plan_mode_user
+                login: false
+          LEGACY
+          wait_for_ready_status_reason legacy-plan-mode-policy True Planned
+          wait_for_condition_status legacy-plan-mode-policy ModeValueDeprecated True
+          kubectl get pgr legacy-plan-mode-policy -o jsonpath='{.spec.mode}' | grep -qx "plan"
+          assert_role_absent legacy_plan_mode_user
+          kubectl delete pgr legacy-plan-mode-policy --wait=true
+
           kubectl apply -f k8s/samples/observe-policy.yaml
           wait_for_ready_status_reason observe-policy True Planned
           wait_for_drift_status observe-policy True

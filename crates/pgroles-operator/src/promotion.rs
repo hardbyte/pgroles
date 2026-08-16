@@ -272,7 +272,7 @@ pub fn promotion_action(
     mode: PolicyMode,
     approval: ApprovalMode,
 ) -> PromotionAction {
-    let never_executes = mode == PolicyMode::Observe;
+    let never_executes = mode.never_executes();
     let enforcement_suspended = !never_executes && approval == ApprovalMode::Manual;
 
     match promotion {

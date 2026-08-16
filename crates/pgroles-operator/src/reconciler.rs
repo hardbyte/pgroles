@@ -820,6 +820,15 @@ async fn reconcile_apply_inner(
         );
         ctx.observability.record_deprecated_approval_unset(inferred);
     }
+    if resource.spec.mode.is_deprecated_spelling() {
+        tracing::warn!(
+            name,
+            namespace,
+            "spec.mode is `plan`, the deprecated spelling of `observe`; behaviour is identical, \
+             and a future release removes the value — change the manifest to `mode: observe`"
+        );
+        ctx.observability.record_deprecated_mode_plan();
+    }
 
     // Update status to "Reconciling".
     // Note: do NOT clear last_error here — it should persist until a successful
@@ -1258,7 +1267,7 @@ async fn apply_under_lock(
         }
     };
 
-    if resource.spec.mode == PolicyMode::Observe {
+    if resource.spec.mode.never_executes() {
         let drift_detected = !changes.is_empty();
         let ready_message = if drift_detected {
             format!("Plan computed; {} change(s) pending", summary.total)
@@ -2969,6 +2978,7 @@ where
     // was set while this reconcile ran, the snapshot would re-add a condition
     // that no longer applies.
     apply_approval_deprecation_condition(&latest, &mut status);
+    apply_mode_deprecation_condition(&latest, &mut status);
     clear_stale_approval_ignored_condition(&latest, &mut status);
 
     let patch = serde_json::json!({
@@ -3010,6 +3020,18 @@ fn apply_approval_deprecation_condition(
     ));
 }
 
+/// Carry a `ModeValueDeprecated` condition while `spec.mode` is spelled
+/// `plan`; writing `observe` clears it on the next reconcile.
+fn apply_mode_deprecation_condition(resource: &PostgresPolicy, status: &mut PostgresPolicyStatus) {
+    if !resource.spec.mode.is_deprecated_spelling() {
+        status.conditions.retain(|condition| {
+            condition.condition_type != crate::crd::CONDITION_MODE_VALUE_DEPRECATED
+        });
+        return;
+    }
+    status.set_condition(crate::crd::mode_value_deprecated_condition());
+}
+
 /// Clear `ApprovalIgnored` for any policy that is not in observe mode. The observe
 /// path maintains the condition itself; this only stops a stale one surviving a
 /// switch to `mode: apply`, where an approval is no longer ignored.
@@ -3017,7 +3039,7 @@ fn clear_stale_approval_ignored_condition(
     resource: &PostgresPolicy,
     status: &mut PostgresPolicyStatus,
 ) {
-    if resource.spec.mode != PolicyMode::Observe {
+    if !resource.spec.mode.never_executes() {
         status
             .conditions
             .retain(|condition| condition.condition_type != crate::crd::CONDITION_APPROVAL_IGNORED);

@@ -143,22 +143,40 @@ fn default_interval() -> String {
 }
 
 /// Policy reconcile mode.
-#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+///
+/// Deliberately not `PartialEq`: `plan` is a deprecated spelling of `observe`
+/// that must behave identically everywhere, and an `==` comparison is exactly
+/// the kind of site that forgets one of the two. Compare through
+/// [`PolicyMode::never_executes`] and [`PolicyMode::is_deprecated_spelling`],
+/// or match exhaustively.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum PolicyMode {
     #[default]
     Apply,
-    /// Compute and publish plans, never execute. Renamed from `plan` so that
-    /// "plan" names exactly one artifact, the `PostgresPolicyPlan` (ADR-001).
-    ///
-    /// The alias is deserialization-only crash safety, not an accepted value:
-    /// the CRD schema rejects `plan` on every write, but objects *stored*
-    /// before the rename — a spec applied under the old schema, or a
-    /// `status.lastReconcileMode` the operator itself wrote — must still
-    /// deserialize, or the operator could never reconcile them onto the new
-    /// value. Serialization always emits `observe`.
-    #[serde(alias = "plan")]
+    /// Compute and publish plans, never execute. The current name: "plan"
+    /// should name exactly one artifact, the `PostgresPolicyPlan` (ADR-001).
     Observe,
+    /// Deprecated spelling of `observe`, kept as an accepted schema value so
+    /// existing manifests — including ones a GitOps controller re-applies on
+    /// every sync — keep working across the rename. Behaviour is identical to
+    /// `observe` in every path; policies using it report a
+    /// `ModeValueDeprecated` condition and count toward
+    /// `pgroles.deprecated.mode_plan`. A future release removes the value.
+    Plan,
+}
+
+impl PolicyMode {
+    /// Whether this mode never executes SQL — `observe`, under either
+    /// spelling.
+    pub fn never_executes(self) -> bool {
+        matches!(self, PolicyMode::Observe | PolicyMode::Plan)
+    }
+
+    /// Whether this is the deprecated `plan` spelling of `observe`.
+    pub fn is_deprecated_spelling(self) -> bool {
+        matches!(self, PolicyMode::Plan)
+    }
 }
 
 /// Convergence strategy for how aggressively to converge the database.
@@ -200,7 +218,7 @@ impl PostgresPolicySpec {
             Some(mode) => mode.clone(),
             None => match self.mode {
                 PolicyMode::Apply => ApprovalMode::Auto,
-                PolicyMode::Observe => ApprovalMode::Manual,
+                PolicyMode::Observe | PolicyMode::Plan => ApprovalMode::Manual,
             },
         }
     }
@@ -2379,6 +2397,9 @@ pub fn conflict_condition(reason: &str, message: &str) -> PolicyCondition {
 /// inferred from `spec.mode`. Removed once the field becomes required.
 pub const CONDITION_APPROVAL_UNSET: &str = "ApprovalUnset";
 
+/// Condition type for `spec.mode: plan`, the deprecated spelling of `observe`.
+pub const CONDITION_MODE_VALUE_DEPRECATED: &str = "ModeValueDeprecated";
+
 /// Condition type reporting that a plan carries an approval annotation which
 /// cannot take effect, because `spec.mode: observe` never executes.
 pub const CONDITION_APPROVAL_IGNORED: &str = "ApprovalIgnored";
@@ -2421,6 +2442,22 @@ pub fn approval_unset_condition(inferred: ApprovalMode) -> PolicyCondition {
              This inference is deprecated and will become an error in a future release: set \
              `approval: {inferred}` explicitly to keep the current behaviour."
         )),
+        last_transition_time: Some(now_rfc3339()),
+    }
+}
+
+/// Helper to create a "ModeValueDeprecated" condition.
+pub fn mode_value_deprecated_condition() -> PolicyCondition {
+    PolicyCondition {
+        condition_type: CONDITION_MODE_VALUE_DEPRECATED.to_string(),
+        status: "True".to_string(),
+        reason: Some("PlanSpelledObserve".to_string()),
+        message: Some(
+            "spec.mode is `plan`, the deprecated spelling of `observe`. Behaviour is identical: \
+             plans are computed and published, nothing executes. Change the manifest to \
+             `mode: observe` — a future release removes the `plan` value."
+                .to_string(),
+        ),
         last_transition_time: Some(now_rfc3339()),
     }
 }
@@ -5139,25 +5176,36 @@ retirements:
         assert_eq!(auto_json, serde_json::Value::String("auto".to_string()));
     }
 
-    /// The legacy `plan` value deserializes (a stored spec or a
-    /// `lastReconcileMode` the operator wrote before the rename must not brick
-    /// reconciliation) but is never emitted, and the schema never admits it —
-    /// so a write forces the migration while a read survives it.
+    /// The deprecation window for the `plan` → `observe` rename: the legacy
+    /// value stays an accepted schema value (a GitOps controller re-applies
+    /// the manifest on every sync, so rejecting it on write would break the
+    /// policy at upgrade time), and it behaves as `observe` in every path
+    /// while identifying itself as the deprecated spelling. Removal is a
+    /// later release's breaking change.
     #[test]
-    fn the_legacy_plan_mode_value_reads_as_observe_and_never_writes_back() {
+    fn the_legacy_plan_mode_value_is_accepted_and_behaves_as_observe() {
         let legacy: PolicyMode = serde_json::from_str("\"plan\"").unwrap();
-        assert_eq!(legacy, PolicyMode::Observe);
+        assert!(legacy.never_executes());
+        assert!(legacy.is_deprecated_spelling());
+        assert!(PolicyMode::Observe.never_executes());
+        assert!(!PolicyMode::Observe.is_deprecated_spelling());
+        assert!(!PolicyMode::Apply.never_executes());
+
+        // The deprecated spelling round-trips: the operator must not rewrite
+        // a user's spec value, and `lastReconcileMode` reports what the spec
+        // says.
         assert_eq!(
-            serde_json::to_value(PolicyMode::Observe).unwrap(),
-            serde_json::Value::String("observe".to_string())
+            serde_json::to_value(PolicyMode::Plan).unwrap(),
+            serde_json::Value::String("plan".to_string())
         );
 
         let schema = serde_json::to_value(schemars::schema_for!(PolicyMode)).unwrap();
         let rendered = schema.to_string();
         assert!(rendered.contains("observe"));
         assert!(
-            !rendered.contains("\"plan\""),
-            "the schema must reject the legacy value on write: {rendered}"
+            rendered.contains("\"plan\""),
+            "the schema must keep accepting the deprecated value during the \
+             deprecation window: {rendered}"
         );
     }
 
