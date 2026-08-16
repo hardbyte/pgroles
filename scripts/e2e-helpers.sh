@@ -393,11 +393,19 @@ conditions.append({
 })
 print(json.dumps({'status': {
     'conditions': conditions,
-    'decidedBy': {'username': 'e2e-reviewer'},
+    'decidedBy': {'username': '${DECIDE_BY:-e2e-reviewer}'},
 }}))
 ")" || return 1
 
-  kubectl patch pgplan "$plan" --subresource=status --type=merge -p "$merged"
+  # DECIDE_AS impersonates the writer (the read above stays cluster-admin so
+  # a low-privilege identity can still be tested against a readable plan);
+  # DECIDE_BY forges the claimed decider, for asserting that an admission
+  # layer replaces it with the authenticated identity.
+  if [ -n "${DECIDE_AS:-}" ]; then
+    kubectl --as="$DECIDE_AS" patch pgplan "$plan" --subresource=status --type=merge -p "$merged"
+  else
+    kubectl patch pgplan "$plan" --subresource=status --type=merge -p "$merged"
+  fi
 }
 
 approve_plan() {

@@ -1,0 +1,56 @@
+# Test identities for the plan-decision admission E2E. Mirrors
+# ephemeral-access-e2e-rbac.yaml: one identity holds the logical `approve`
+# verb through the shipped pgroles-plan-approver ClusterRole, and one holds
+# raw patch on plans/status *without* it — the caller the Kyverno policy
+# exists to stop.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: plan-approver
+  namespace: default
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: plan-status-writer
+  namespace: default
+---
+# Raw status access with no approve verb. Kubernetes RBAC alone cannot
+# distinguish this caller from a reviewer; the admission policy must.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: pgroles-plan-status-writer-e2e
+rules:
+  - apiGroups: [pgroles.io]
+    resources: [postgrespolicyplans, postgrespolicyplans/status]
+    verbs: [get, list, watch, patch, update]
+  - apiGroups: [pgroles.io]
+    resources: [postgrespolicies]
+    verbs: [get]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: pgroles-plan-approver-e2e
+subjects:
+  - kind: ServiceAccount
+    name: plan-approver
+    namespace: default
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: pgroles-plan-approver
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: pgroles-plan-status-writer-e2e
+subjects:
+  - kind: ServiceAccount
+    name: plan-status-writer
+    namespace: default
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: pgroles-plan-status-writer-e2e

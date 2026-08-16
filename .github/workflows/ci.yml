@@ -1595,6 +1595,14 @@ jobs:
       - name: Run ephemeral access lifecycle E2E
         run: scripts/e2e-ephemeral-access.sh "${{ matrix.secure }}"
 
+      # Rides in this job to reuse its Kyverno install: the plan-decision
+      # policy is the sibling of the ephemeral one, and this is the only place
+      # its approve-verb SAR, decidedBy overwrite, and operator exemption run
+      # against a live admission chain.
+      - name: Run plan decision admission E2E
+        if: matrix.secure == 'true'
+        run: scripts/e2e-plan-decision-admission.sh
+
       - name: Diagnostics
         if: failure()
         run: |
