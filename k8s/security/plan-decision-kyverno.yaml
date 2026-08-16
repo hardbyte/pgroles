@@ -184,4 +184,6 @@ rules:
     verbs: [get, list, watch]
   - apiGroups: [pgroles.io]
     resources: [postgrespolicyplans/status]
-    verbs: [patch, update]
+    # get is required in practice: `kubectl patch --subresource=status` reads
+    # the status subresource before writing it.
+    verbs: [get, patch, update]
