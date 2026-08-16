@@ -624,9 +624,11 @@ pub struct RoleRetirement {
 /// should never learn about a limit from the second command.
 ///
 /// Lengths are counted in characters, matching OpenAPI `maxLength` (and
-/// therefore the API server) rather than PostgreSQL's byte-counted
-/// `NAMEDATALEN`. For identifiers the two agree on every name that is not
-/// already going to be truncated by the server.
+/// therefore the API server) — except that identifier-bounded values are
+/// additionally held to PostgreSQL's byte-counted `NAMEDATALEN - 1 = 63`,
+/// which the schema cannot express: a 63-character multibyte name would pass
+/// admission and then be silently truncated by the server. Expanded role
+/// names (`role_pattern` output) get the same byte check at expansion time.
 ///
 /// One bound has no schema counterpart and is enforced only here: `config`
 /// keys are held to [`MAX_IDENTIFIER`], because Kubernetes structural schemas
@@ -650,6 +652,21 @@ pub fn validate_bounds(manifest: &PolicyManifest) -> Result<(), ManifestError> {
                 context: context.to_string(),
                 value: value.to_string(),
                 actual,
+                limit,
+            });
+        }
+        // PostgreSQL's NAMEDATALEN limit is 63 *bytes*, not characters: a
+        // 63-character multibyte identifier passes the schema (OpenAPI
+        // `maxLength` counts characters) but the server silently truncates it,
+        // which is precisely the surprise these bounds exist to prevent. For
+        // identifier-bounded values, enforce the byte form too.
+        if limit == MAX_IDENTIFIER && value.len() > limit as usize {
+            return Err(ManifestError::ValueTooLong {
+                context: format!(
+                    "{context} (bytes; PostgreSQL identifiers are limited to 63 bytes)"
+                ),
+                value: value.to_string(),
+                actual: value.len(),
                 limit,
             });
         }
@@ -916,6 +933,23 @@ pub fn expand_manifest(manifest: &PolicyManifest) -> Result<ExpandedManifest, Ma
                 .role_pattern
                 .replace("{schema}", &schema_binding.name)
                 .replace("{profile}", profile_name);
+
+            // The inputs are bounded, but their *composition* is only checked
+            // here: a pattern, schema and profile that each fit can expand to
+            // a name PostgreSQL would silently truncate at 63 bytes — and a
+            // truncated name is a different role than the one reviewed.
+            if role_name.len() > 63 {
+                return Err(ManifestError::ValueTooLong {
+                    context: format!(
+                        "role name expanded from role_pattern \"{}\" for schema \"{}\" (bytes; \
+                         PostgreSQL identifiers are limited to 63 bytes)",
+                        schema_binding.role_pattern, schema_binding.name
+                    ),
+                    value: role_name.clone(),
+                    actual: role_name.len(),
+                    limit: 63,
+                });
+            }
 
             // Expand profile config — substitute {schema}/{profile} in VALUES
             // only. Keys are literal PostgreSQL parameter names; a `{schema}`
@@ -1241,6 +1275,36 @@ mod tests {
         let yaml = format!("roles:\n  - name: {}\n", "r".repeat(63));
         let manifest = parse_manifest(&yaml).expect("manifest parses");
         assert!(expand_manifest(&manifest).is_ok());
+    }
+
+    /// PostgreSQL truncates identifiers at 63 *bytes*. A 32-character name of
+    /// two-byte characters passes the schema's character count and must still
+    /// be rejected here, or the server would silently create a different role
+    /// than the one reviewed.
+    #[test]
+    fn bounds_reject_an_identifier_over_63_bytes_even_under_63_characters() {
+        let name = "é".repeat(32); // 32 chars, 64 bytes
+        let yaml = format!("roles:\n  - name: {name}\n");
+        let manifest = parse_manifest(&yaml).expect("manifest parses");
+        assert!(matches!(
+            expand_manifest(&manifest),
+            Err(ManifestError::ValueTooLong { actual, limit, .. }) if actual == 64 && limit == 63
+        ));
+    }
+
+    /// Each input fits, the composition does not: the expanded role name is
+    /// what PostgreSQL sees, so it is what the byte limit is checked against.
+    #[test]
+    fn bounds_reject_an_expanded_role_name_over_63_bytes() {
+        let schema = "s".repeat(40);
+        let yaml = format!(
+            "profiles:\n  editor:\n    grants: []\nschemas:\n  - name: {schema}\n    profiles: [editor]\n    role_pattern: '{{schema}}-very-long-suffix-{{profile}}'\n"
+        );
+        let manifest = parse_manifest(&yaml).expect("manifest parses");
+        assert!(matches!(
+            expand_manifest(&manifest),
+            Err(ManifestError::ValueTooLong { limit, .. }) if limit == 63
+        ));
     }
 
     #[test]

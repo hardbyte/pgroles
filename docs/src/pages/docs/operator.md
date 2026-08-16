@@ -81,7 +81,7 @@ kubectl get pgr myapp-roles -n default
 ```
 
 ```text
-NAME           READY   MODE   DRIFT   CHANGES   LAST RECONCILE   AGE
+NAME           READY   MODE      DRIFT   CHANGES   LAST RECONCILE   AGE
 myapp-roles    True    observe   True    3         2s               2s
 ```
 

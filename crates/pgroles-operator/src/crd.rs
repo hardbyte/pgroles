@@ -148,6 +148,16 @@ fn default_interval() -> String {
 pub enum PolicyMode {
     #[default]
     Apply,
+    /// Compute and publish plans, never execute. Renamed from `plan` so that
+    /// "plan" names exactly one artifact, the `PostgresPolicyPlan` (ADR-001).
+    ///
+    /// The alias is deserialization-only crash safety, not an accepted value:
+    /// the CRD schema rejects `plan` on every write, but objects *stored*
+    /// before the rename — a spec applied under the old schema, or a
+    /// `status.lastReconcileMode` the operator itself wrote — must still
+    /// deserialize, or the operator could never reconcile them onto the new
+    /// value. Serialization always emits `observe`.
+    #[serde(alias = "plan")]
     Observe,
 }
 
@@ -1077,6 +1087,10 @@ pub struct PlanOrigin {
     /// binding at all. Both fields are absent for non-candidate origins.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub content_digest: Option<String>,
+    /// Version tag of the encoding `contentDigest` was computed under.
+    /// Digests from different encodings are never comparable, so promotion
+    /// recognition only matches digests carrying the same tag. Absent for
+    /// non-candidate origins.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub content_digest_encoding: Option<String>,
     /// UID of the `PostgresPolicy` the candidate proposes content for. The
@@ -1131,7 +1145,30 @@ pub struct PolicyPlanRef {
     ).message("decision identity is write-once"),
     validation = Rule::new(
         "self.conditions.exists(c, (c.type == 'Approved' || c.type == 'Denied') && c.status == 'True') == has(self.decidedBy)"
-    ).message("a terminal plan decision and decidedBy identity must be recorded together")
+    ).message("a terminal plan decision and decidedBy identity must be recorded together"),
+    // The approval-binding fields are write-once. Execution gates on the
+    // recorded digest matching freshly recomputed effects, and the identity
+    // downgrade check reads these values — so anyone holding plans/status
+    // patch (every plan approver does) who could rewrite them could point an
+    // existing approval at different effects or a different server. The
+    // operator writes each of these exactly once, when it first materialises
+    // the plan's status; a legitimate rewrite repeats the same value, which
+    // equality admits.
+    validation = Rule::new(
+        "!has(oldSelf.changeDigest) || (has(self.changeDigest) && self.changeDigest == oldSelf.changeDigest)"
+    ).message("changeDigest is write-once"),
+    validation = Rule::new(
+        "!has(oldSelf.changeDigestEncoding) || (has(self.changeDigestEncoding) && self.changeDigestEncoding == oldSelf.changeDigestEncoding)"
+    ).message("changeDigestEncoding is write-once"),
+    validation = Rule::new(
+        "!has(oldSelf.targetPhysicalIdentity) || (has(self.targetPhysicalIdentity) && self.targetPhysicalIdentity == oldSelf.targetPhysicalIdentity)"
+    ).message("targetPhysicalIdentity is write-once"),
+    validation = Rule::new(
+        "!has(oldSelf.targetLogicalFingerprint) || (has(self.targetLogicalFingerprint) && self.targetLogicalFingerprint == oldSelf.targetLogicalFingerprint)"
+    ).message("targetLogicalFingerprint is write-once"),
+    validation = Rule::new(
+        "!has(oldSelf.physicalIdentityAvailable) || (has(self.physicalIdentityAvailable) && self.physicalIdentityAvailable == oldSelf.physicalIdentityAvailable)"
+    ).message("physicalIdentityAvailable is write-once")
 )]
 #[serde(rename_all = "camelCase")]
 pub struct PostgresPolicyPlanStatus {
@@ -5068,6 +5105,28 @@ retirements:
         assert_eq!(manual_json, serde_json::Value::String("manual".to_string()));
         let auto_json = serde_json::to_value(&ApprovalMode::Auto).unwrap();
         assert_eq!(auto_json, serde_json::Value::String("auto".to_string()));
+    }
+
+    /// The legacy `plan` value deserializes (a stored spec or a
+    /// `lastReconcileMode` the operator wrote before the rename must not brick
+    /// reconciliation) but is never emitted, and the schema never admits it —
+    /// so a write forces the migration while a read survives it.
+    #[test]
+    fn the_legacy_plan_mode_value_reads_as_observe_and_never_writes_back() {
+        let legacy: PolicyMode = serde_json::from_str("\"plan\"").unwrap();
+        assert_eq!(legacy, PolicyMode::Observe);
+        assert_eq!(
+            serde_json::to_value(PolicyMode::Observe).unwrap(),
+            serde_json::Value::String("observe".to_string())
+        );
+
+        let schema = serde_json::to_value(schemars::schema_for!(PolicyMode)).unwrap();
+        let rendered = schema.to_string();
+        assert!(rendered.contains("observe"));
+        assert!(
+            !rendered.contains("\"plan\""),
+            "the schema must reject the legacy value on write: {rendered}"
+        );
     }
 
     #[test]

@@ -1319,8 +1319,28 @@ jobs:
           assert_role_absent promo_sneaky_user
 
           echo "--- Test: approving a candidate plan executes nothing by itself ---"
+          # Prove the negative against a completed reconcile rather than a
+          # fixed sleep: capture the policy's last successful reconcile time,
+          # approve, and wait for it to move past the baseline — at that point
+          # the operator has reconciled with the approval visible, so the role
+          # staying absent is meaningful.
+          reconcile_baseline=$(kubectl get pgr promo-policy \
+            -o jsonpath='{.status.last_successful_reconcile_time}')
           approve_plan "$cand_plan"
-          sleep 20
+          for i in $(seq 1 20); do
+            reconcile_now=$(kubectl get pgr promo-policy \
+              -o jsonpath='{.status.last_successful_reconcile_time}' 2>/dev/null || true)
+            if [ -n "$reconcile_now" ] && [ "$reconcile_now" != "$reconcile_baseline" ]; then
+              echo "promo-policy reconciled after the approval ($reconcile_baseline -> $reconcile_now)"
+              break
+            fi
+            if [ "$i" -eq 20 ]; then
+              echo "::error::promo-policy did not reconcile within 60s of approving the candidate plan"
+              exit 1
+            fi
+            echo "Waiting for promo-policy to reconcile after the approval... ($i/20)"
+            sleep 3
+          done
           assert_role_absent promo_new_user
 
           echo "--- Test: promoting the approved content executes it ---"

@@ -98,6 +98,7 @@
                         "type": "string"
                       },
                       "contentDigestEncoding": {
+                        "description": "Version tag of the encoding `contentDigest` was computed under.\nDigests from different encodings are never comparable, so promotion\nrecognition only matches digests carrying the same tag. Absent for\nnon-candidate origins.",
                         "nullable": true,
                         "type": "string"
                       },
@@ -506,6 +507,26 @@
                   {
                     "message": "a terminal plan decision and decidedBy identity must be recorded together",
                     "rule": "self.conditions.exists(c, (c.type == 'Approved' || c.type == 'Denied') && c.status == 'True') == has(self.decidedBy)"
+                  },
+                  {
+                    "message": "changeDigest is write-once",
+                    "rule": "!has(oldSelf.changeDigest) || (has(self.changeDigest) && self.changeDigest == oldSelf.changeDigest)"
+                  },
+                  {
+                    "message": "changeDigestEncoding is write-once",
+                    "rule": "!has(oldSelf.changeDigestEncoding) || (has(self.changeDigestEncoding) && self.changeDigestEncoding == oldSelf.changeDigestEncoding)"
+                  },
+                  {
+                    "message": "targetPhysicalIdentity is write-once",
+                    "rule": "!has(oldSelf.targetPhysicalIdentity) || (has(self.targetPhysicalIdentity) && self.targetPhysicalIdentity == oldSelf.targetPhysicalIdentity)"
+                  },
+                  {
+                    "message": "targetLogicalFingerprint is write-once",
+                    "rule": "!has(oldSelf.targetLogicalFingerprint) || (has(self.targetLogicalFingerprint) && self.targetLogicalFingerprint == oldSelf.targetLogicalFingerprint)"
+                  },
+                  {
+                    "message": "physicalIdentityAvailable is write-once",
+                    "rule": "!has(oldSelf.physicalIdentityAvailable) || (has(self.physicalIdentityAvailable) && self.physicalIdentityAvailable == oldSelf.physicalIdentityAvailable)"
                   }
                 ]
               }

@@ -85,7 +85,7 @@ spec:
           # treated as a reviewer decision, or the operator would need the
           # approve verb and would have its own decidedBy overwritten.
           - key: >-
-              {{ length(request.object.status.conditions[?(type == 'Approved' || type == 'Denied') && status == 'True']) }}
+              {{ length(request.object.status.conditions[?(type == 'Approved' || type == 'Denied') && status == 'True'] || `[]`) }}
             operator: GreaterThan
             value: >-
               {{ length(request.oldObject.status.conditions[?(type == 'Approved' || type == 'Denied') && status == 'True'] || `[]`) }}
@@ -122,7 +122,7 @@ spec:
           # treated as a reviewer decision, or the operator would need the
           # approve verb and would have its own decidedBy overwritten.
           - key: >-
-              {{ length(request.object.status.conditions[?(type == 'Approved' || type == 'Denied') && status == 'True']) }}
+              {{ length(request.object.status.conditions[?(type == 'Approved' || type == 'Denied') && status == 'True'] || `[]`) }}
             operator: GreaterThan
             value: >-
               {{ length(request.oldObject.status.conditions[?(type == 'Approved' || type == 'Denied') && status == 'True'] || `[]`) }}

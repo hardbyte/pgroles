@@ -200,8 +200,22 @@ pub async fn reconcile_candidates(
         }
 
         // A denied plan is terminal for the candidate too: it has no other
-        // plan coming, and the revision is a successor object.
-        if plan_was_denied(ctx, candidate, &namespace).await? {
+        // plan coming, and the revision is a successor object. A failure to
+        // *read* the plans is handled like a failed adoption — logged, this
+        // candidate skipped — because a proposal must never abort the parent's
+        // pass over its siblings.
+        let denied = match plan_was_denied(ctx, candidate, &namespace).await {
+            Ok(denied) => denied,
+            Err(err) => {
+                tracing::warn!(
+                    candidate = %candidate.name_any(),
+                    %err,
+                    "failed to read this candidate's plans; skipping this cycle"
+                );
+                continue;
+            }
+        };
+        if denied {
             mark_superseded(
                 ctx,
                 candidate,
@@ -570,11 +584,28 @@ async fn resolve_target<'a>(
         Err(err) => return Err(ReconcileError::SqlExec(err)),
     };
 
-    let physical = pgroles_inspect::detect_system_identifier(&pool).await?;
-    let logical = ctx
-        .resolve_database_target_fingerprint(namespace, &connection)
-        .await
-        .map_err(Box::new)?;
+    // Everything below can fail, and `AdvisoryLock` has no `Drop` release —
+    // dropping it would return a connection to the pool with the session-level
+    // lock still held, blocking every later reconcile of this database. Any
+    // error past this point must release the lock before propagating.
+    let identity_lookup: Result<_, ReconcileError> = async {
+        let physical = pgroles_inspect::detect_system_identifier(&pool).await?;
+        let logical = ctx
+            .resolve_database_target_fingerprint(namespace, &connection)
+            .await
+            .map_err(Box::new)?;
+        Ok((physical, logical))
+    }
+    .await;
+    let (physical, logical) = match identity_lookup {
+        Ok(identities) => identities,
+        Err(err) => {
+            if let Some(lock) = advisory_lock {
+                lock.release().await;
+            }
+            return Err(err);
+        }
+    };
     tracing::info!(
         candidate = %candidate.name_any(),
         policy = %policy.name_any(),
@@ -718,10 +749,12 @@ async fn adopt_candidate(
         owner_references.retain(|owner| !owner.controller.unwrap_or(false));
         owner_references.push(policy_owner_reference(policy));
         let patch = serde_json::json!({ "metadata": { "ownerReferences": owner_references } });
+        // A merge patch, so no `.force()`: kube validates that `force` is only
+        // legal on `Patch::Apply` and would reject this call client-side.
         *candidate = api
             .patch(
                 &name,
-                &PatchParams::apply("pgroles-operator").force(),
+                &PatchParams::apply("pgroles-operator"),
                 &Patch::Merge(&patch),
             )
             .await?;

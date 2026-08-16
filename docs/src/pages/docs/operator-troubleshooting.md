@@ -248,7 +248,8 @@ and the full lifecycle.
 
 A superseded plan names its cause in the `Superseded=True` condition message —
 effects changed, effects cleared, replaced by a newer plan, the policy stopped
-referencing it, or the target moved (reason `TargetChanged`,
+referencing it, another candidate's content was promoted and applied (reason
+`SupersededByPromotion`), or the target moved (reason `TargetChanged`,
 `TargetIdentityUnavailable`, or `TargetIdentityAppeared`).
 
 ## Transient and infrastructure failures

@@ -205,13 +205,20 @@ async fn main() -> anyhow::Result<()> {
         .filter_map(|plan| async move { plan.ok() })
         .flat_map(move |plan| {
             let policy_store = plan_policy_store.clone();
-            // Map the plan back to its parent by controller-owner UID.
+            // Map the plan back to its parent by UID, never by name.
             //
             // This used to compare the plan's `pgroles.io/policy` label against
             // `metadata.name`, but that label is truncated at the 63-character label
             // limit while a policy name may be up to 253. For any longer name the
             // comparison never matched, so plan status changes silently stopped
             // waking the policy reconciler. The UID is exact at any name length.
+            //
+            // A candidate-origin plan is controller-owned by its *candidate*,
+            // not the policy, so the owner UID maps to nothing — yet the
+            // decision recorded on it is the parent's work: promotion runs in
+            // the parent's reconcile. Those plans carry the policy's UID in
+            // `spec.origin.policyUid`; without this fallback a candidate-plan
+            // approval sat inert until the policy's periodic interval.
             let parent_policy_uid = plan
                 .metadata
                 .owner_references
@@ -219,17 +226,25 @@ async fn main() -> anyhow::Result<()> {
                 .unwrap_or_default()
                 .iter()
                 .find(|owner| owner.controller.unwrap_or(false))
-                .map(|owner| owner.uid.clone());
+                .map(|owner| owner.uid.clone())
+                .filter(|uid| !uid.is_empty());
+            let origin_policy_uid = plan
+                .spec
+                .origin
+                .as_ref()
+                .and_then(|origin| origin.policy_uid.clone())
+                .filter(|uid| !uid.is_empty());
 
-            let refs: Vec<ObjectRef<PostgresPolicy>> = match parent_policy_uid {
-                Some(uid) if !uid.is_empty() => policy_store
-                    .state()
-                    .into_iter()
-                    .filter(|policy| policy.metadata.uid.as_deref() == Some(uid.as_str()))
-                    .map(|policy| ObjectRef::from_obj(policy.as_ref()))
-                    .collect(),
-                _ => Vec::new(),
-            };
+            let refs: Vec<ObjectRef<PostgresPolicy>> = policy_store
+                .state()
+                .into_iter()
+                .filter(|policy| {
+                    let uid = policy.metadata.uid.as_deref();
+                    parent_policy_uid.as_deref().is_some_and(|p| Some(p) == uid)
+                        || origin_policy_uid.as_deref().is_some_and(|o| Some(o) == uid)
+                })
+                .map(|policy| ObjectRef::from_obj(policy.as_ref()))
+                .collect();
             stream::iter(refs)
         });
 

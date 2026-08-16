@@ -379,12 +379,18 @@ Two source documents may reference the same schema only when they manage disjoin
 ## Size limits
 
 Every collection and string in policy content carries an explicit limit. The
-same limits are enforced by `pgroles validate` and by the Kubernetes API
-server, so a manifest that passes one is accepted by the other.
+same numeric limits are enforced by `pgroles validate` and by the Kubernetes
+API server, with two caveats. First, the units differ at the margin:
+PostgreSQL truncates identifiers at 63 *bytes* of UTF-8 (`NAMEDATALEN - 1`),
+while the OpenAPI schema's `maxLength` counts *characters* — a 63-character
+identifier containing multi-byte characters passes schema validation but
+exceeds PostgreSQL's byte limit. Second, the OpenAPI schema cannot bound map
+keys, so `config` keys are bounded by CLI/manifest validation only, not by the
+API server.
 
 | Field | Limit |
 |---|---|
-| Identifiers — role, schema, owner, member and profile names | 63 characters (PostgreSQL's `NAMEDATALEN - 1`; longer names are silently truncated by the server) |
+| Identifiers — role, schema, owner, member and profile names | 63 (PostgreSQL's `NAMEDATALEN - 1`, which is 63 *bytes* of UTF-8 and silently truncated by the server; the OpenAPI `maxLength` bound counts characters) |
 | Object names, comments, config values | 256 characters |
 | `role_pattern` | 128 characters |
 | `profiles` | 64 entries, each with ≤ 64 `grants` and ≤ 32 `default_privileges` |

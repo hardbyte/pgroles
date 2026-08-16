@@ -355,7 +355,7 @@ approval is not an indefinite authorisation.
 | `Promoted=False, reason=PromotedWithoutApproval` | The content was promoted while this candidate's plan held no approval |
 | `Promoted=False, reason=PromotionDigestMismatch` | The policy's content changed into something that is not this approved candidate |
 | `Promoted=False, reason=PromotionNotExecuted` | The content was promoted into a policy in `mode: observe`, which never executes |
-| `Promoted=False, reason=SupersededByPromotion` | Another candidate was promoted; this one's approved plan was retired |
+| `Promoted=False, reason=SupersededByPromotion` | Another candidate was promoted; this candidate carries this condition, while its retired plan records the same reason on its own `Superseded=True` condition |
 
 Rejection is recorded on the plan (`Denied=True`, phase `Rejected`); the
 candidate reflects it as `Superseded=True, reason=PlanDenied`. Both are
@@ -373,8 +373,9 @@ execute.
 grants, 63-character identifiers and the rest of the table in the [manifest
 reference](/docs/manifest-reference#size-limits). They are required by the
 whole-spec immutability rule's CEL cost budget, and they apply to
-`PostgresPolicy` too. Policies too large to embed can pass content by
-reference; the digest binding is identical either way.
+`PostgresPolicy` too. Content too large to embed has no supported form today;
+`spec.contentRef` is planned for that case (see the callout at the top of this
+page), with the same digest binding.
 
 `spec.content` also emits no OpenAPI defaults, unlike `PostgresPolicy.spec`.
 An API-server default is written into the stored object, so if a default value

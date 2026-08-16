@@ -277,8 +277,15 @@ assert_secret_has_keys() {
 
 assert_secret_absent() {
   local name="$1"
-  if kubectl get secret "$name" -o name >/dev/null 2>&1; then
+  local err
+  if err="$(kubectl get secret "$name" -o name 2>&1 >/dev/null)"; then
     echo "::error::Secret $name exists but should not"
+    return 1
+  fi
+  # Only NotFound proves absence; any other failure (API outage, RBAC, typo in
+  # the resource kind) must not be mistaken for the Secret not existing.
+  if ! printf '%s' "$err" | grep -q "NotFound"; then
+    echo "::error::could not query Secret $name: $err"
     return 1
   fi
   echo "Secret $name is absent as expected"
@@ -289,10 +296,17 @@ assert_secret_absent() {
 # so a single check could simply have run before the first reconcile.
 assert_secret_absent_stable() {
   local name="$1"
+  local err
   for i in $(seq 1 6); do
     sleep 5
-    if kubectl get secret "$name" -o name >/dev/null 2>&1; then
+    if err="$(kubectl get secret "$name" -o name 2>&1 >/dev/null)"; then
       echo "::error::Secret $name appeared while its plan was still unapproved"
+      return 1
+    fi
+    # Only NotFound proves absence; any other failure must not be mistaken for
+    # the Secret not existing.
+    if ! printf '%s' "$err" | grep -q "NotFound"; then
+      echo "::error::could not query Secret $name: $err"
       return 1
     fi
     echo "Secret $name still absent (attempt $i/6)"
@@ -477,7 +491,10 @@ assert_no_pending_plan_stable() {
   for i in $(seq 1 6); do
     sleep 5
     local pending
-    pending="$(kubectl get pgplan -l "pgroles.io/policy=$policy" \
+    # Candidate-owned plans also carry the policy label (plus
+    # pgroles.io/candidate); exclude them so a candidate's Pending plan does
+    # not fail an assertion about the policy's own plan queue.
+    pending="$(kubectl get pgplan -l "pgroles.io/policy=$policy,!pgroles.io/candidate" \
       -o jsonpath='{.items[?(@.status.phase=="Pending")].metadata.name}' 2>/dev/null || true)"
     if [ -n "$pending" ]; then
       echo "::error::$policy has a pending plan it should not: $pending"
@@ -489,13 +506,15 @@ assert_no_pending_plan_stable() {
 
 get_plan_count() {
   local policy="$1"
-  kubectl get pgplan -l "pgroles.io/policy=$policy" --no-headers 2>/dev/null | wc -l | tr -d ' '
+  # Exclude candidate-owned plans, which also carry the policy label.
+  kubectl get pgplan -l "pgroles.io/policy=$policy,!pgroles.io/candidate" --no-headers 2>/dev/null | wc -l | tr -d ' '
 }
 
 # -- Candidate helpers --------------------------------------------------------
 
 wait_for_candidate_phase() {
   local candidate="$1" expected_phase="$2"
+  local phase
   for i in $(seq 1 30); do
     phase="$(kubectl get pgcand "$candidate" -o jsonpath='{.status.phase}' 2>/dev/null || true)"
     if [ "$phase" = "$expected_phase" ]; then

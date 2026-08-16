@@ -2559,8 +2559,21 @@ mod tests {
             SupersedeCause::EffectsCleared,
             SupersedeCause::ReplacedByNewerPlan,
             SupersedeCause::PolicyStoppedPlanning,
+            SupersedeCause::SupersededByPromotion,
             SupersedeCause::TargetChanged(TargetIdentityReason::TargetChanged),
         ];
+        // A new variant must be added to `causes` above or this stops
+        // compiling — the coverage of this test is enforced, not remembered.
+        for cause in causes {
+            match cause {
+                SupersedeCause::EffectsChanged
+                | SupersedeCause::EffectsCleared
+                | SupersedeCause::ReplacedByNewerPlan
+                | SupersedeCause::PolicyStoppedPlanning
+                | SupersedeCause::SupersededByPromotion
+                | SupersedeCause::TargetChanged(_) => {}
+            }
+        }
 
         let mut messages = std::collections::BTreeSet::new();
         for cause in causes {
@@ -2593,6 +2606,13 @@ mod tests {
         ] {
             assert_eq!(cause.reason(), "Superseded", "{cause:?}");
         }
+
+        // Promotion names itself: it is the one supersede a reviewer resolves
+        // by filing a successor candidate, not by re-reviewing this plan.
+        assert_eq!(
+            SupersedeCause::SupersededByPromotion.reason(),
+            crate::crd::candidate_reason::SUPERSEDED_BY_PROMOTION
+        );
 
         assert_eq!(
             SupersedeCause::TargetChanged(TargetIdentityReason::TargetIdentityUnavailable).reason(),

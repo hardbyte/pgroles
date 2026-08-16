@@ -1128,11 +1128,10 @@
                     "type": "string"
                   },
                   "last_reconcile_mode": {
-                    "description": "The reconciliation mode used for the last successful reconcile.",
+                    "description": "Policy reconcile mode.",
                     "enum": [
                       "apply",
-                      "observe",
-                      null
+                      "observe"
                     ],
                     "nullable": true,
                     "type": "string"

@@ -186,7 +186,7 @@ struct ParentHandoff {
     target_identity: Option<pgroles_core::approval::TargetIdentity>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub(crate) struct ResolvedPassword {
     pub(crate) cleartext: String,
     pub(crate) source_version: String,
@@ -195,6 +195,17 @@ pub(crate) struct ResolvedPassword {
     /// materialized only once the plan is about to execute, so a plan that is
     /// never approved leaves no credential behind (#181).
     pub(crate) pending_materialization: Option<PendingGeneratedSecret>,
+}
+
+// Manual so `{:?}` can never print the password: the derived form would.
+impl std::fmt::Debug for ResolvedPassword {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ResolvedPassword")
+            .field("cleartext", &"[redacted]")
+            .field("source_version", &self.source_version)
+            .field("pending_materialization", &self.pending_materialization)
+            .finish()
+    }
 }
 
 impl ResolvedPassword {
@@ -953,20 +964,33 @@ async fn reconcile_apply_inner(
             outcome,
             ReconcileOutcome::Reconciled | ReconcileOutcome::Planned
         );
-        let has_actionable_plan =
-            crate::plan::get_current_actionable_plan(&ctx.kube_client, resource)
-                .await
-                .unwrap_or(None)
-                .is_some();
-        let planning = crate::candidate::CandidatePlanning {
-            pool: &pool,
-            identity,
-            target_identity,
-            overlay_edges: &handoff.overlay_edges,
-            gate: crate::candidate::parent_gate(converged, has_actionable_plan),
-        };
-        if let Err(err) = crate::candidate::reconcile_candidates(ctx, resource, &planning).await {
-            tracing::warn!(name, namespace, %err, "candidate planning failed");
+        // An API failure here is not "no plan": treating it as one would open
+        // the gate while the parent may in fact hold an actionable plan, and
+        // the candidate would be planned against a state the database is not
+        // in yet. Skip candidate planning for this cycle instead.
+        match crate::plan::get_current_actionable_plan(&ctx.kube_client, resource).await {
+            Ok(actionable) => {
+                let planning = crate::candidate::CandidatePlanning {
+                    pool: &pool,
+                    identity,
+                    target_identity,
+                    overlay_edges: &handoff.overlay_edges,
+                    gate: crate::candidate::parent_gate(converged, actionable.is_some()),
+                };
+                if let Err(err) =
+                    crate::candidate::reconcile_candidates(ctx, resource, &planning).await
+                {
+                    tracing::warn!(name, namespace, %err, "candidate planning failed");
+                }
+            }
+            Err(err) => {
+                tracing::warn!(
+                    name,
+                    namespace,
+                    %err,
+                    "could not read the policy's actionable plan; skipping candidate planning this cycle"
+                );
+            }
         }
     }
 
@@ -1051,16 +1075,14 @@ async fn apply_under_lock(
              connection.requirePhysicalIdentity is cleared.",
             reason.message()
         );
-        tracing::warn!(name, namespace, "{message}");
-        crate::events::publish_policy_warning(
-            &ctx.event_recorder,
+        emit_policy_warning(
+            ctx,
             resource,
             reason.as_str(),
             "TargetIdentity",
             message.clone(),
         )
-        .await
-        .ok();
+        .await;
         update_status(ctx, resource, |status| {
             status.set_condition(ready_condition(false, reason.as_str(), &message));
             status.set_condition(crate::crd::target_identity_blocked_condition(
@@ -1212,9 +1234,10 @@ async fn apply_under_lock(
     let effective_approval = resource.spec.effective_approval();
 
     // Is this reconcile the promotion of a reviewed candidate? Recognition is
-    // by content digest, computed over exactly the canonical form a candidate's
-    // is, and it runs here — under both locks, on the state just inspected —
-    // so that the plan it may hand back is checked against fresh effects.
+    // by content digest, computed over exactly the same canonical form a
+    // candidate's digest uses, and it runs here — under both locks, on the
+    // state just inspected — so that the plan it may hand back is checked
+    // against fresh effects.
     //
     // A failure to look candidates up degrades to the ordinary flow rather
     // than failing the reconcile: the ordinary flow can only ever execute a
@@ -1653,7 +1676,9 @@ async fn apply_under_lock(
                                 plan = %current_plan.name_any(),
                                 stored_digest = ?stored_digest,
                                 fresh_digest = %fresh_digest,
-                                "approved plan superseded: effects changed since approval"
+                                reason = supersede_cause.reason(),
+                                "approved plan superseded: {}",
+                                supersede_cause.message()
                             );
 
                             // The effects did not just move, they vanished —
@@ -1748,14 +1773,16 @@ async fn apply_under_lock(
                             // and claiming otherwise would misreport it.
                             let msg = if new_creation_result.is_failed_backoff() {
                                 format!(
-                                    "Plan {} can no longer be executed (effects changed since approval); {}",
+                                    "Plan {} can no longer be executed ({}); {}",
                                     current_plan.name_any(),
+                                    supersede_cause.message(),
                                     report.message,
                                 )
                             } else {
                                 format!(
-                                    "Plan {} superseded (DB state changed); {}",
+                                    "Plan {} superseded ({}); {}",
                                     current_plan.name_any(),
+                                    supersede_cause.message(),
                                     report.message,
                                 )
                             };

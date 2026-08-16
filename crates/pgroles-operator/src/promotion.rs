@@ -133,12 +133,23 @@ pub fn decide_promotion(
     // restarted before writing `Promoted=True` — must still be recognised on
     // the next reconcile, and re-recognising an already-executed promotion is
     // harmless: its effects are gone, so the plan clears rather than replays.
-    if let Some(matched) = open().find(|candidate| {
-        candidate
-            .content_digest
-            .as_deref()
-            .is_some_and(|digest| digest == policy_digest)
-    }) {
+    //
+    // Two open candidates can hold identical content, and only one of them the
+    // approval. Preferring the approved match keeps recognition independent of
+    // the API server's list order: the approval is for exactly this content,
+    // whichever object carries it.
+    let matches = || {
+        open().filter(|candidate| {
+            candidate
+                .content_digest
+                .as_deref()
+                .is_some_and(|digest| digest == policy_digest)
+        })
+    };
+    if let Some(matched) = matches()
+        .find(|candidate| candidate.approved_plan().is_some())
+        .or_else(|| matches().next())
+    {
         return match matched.approved_plan() {
             Some(plan) => Promotion::Approved {
                 candidate: matched.name.clone(),
@@ -395,14 +406,6 @@ pub async fn recognize(
         policy.spec.effective_approval(),
     );
 
-    // Remember the content before acting on it. The mismatch case fires on the
-    // transition, so recording the digest is what keeps it a single reported
-    // event rather than a warning re-emitted on every reconcile — and the
-    // condition it wrote stays on the candidate meanwhile.
-    if previous.as_deref() != Some(content_digest) {
-        stamp_content_digest(ctx, policy, content_digest).await?;
-    }
-
     let plan = match &action {
         PromotionAction::Ignore => None,
         PromotionAction::ExecuteApprovedPlan { candidate, plan } => {
@@ -484,6 +487,16 @@ pub async fn recognize(
             None
         }
     };
+
+    // Remember the content only now that the action was recorded. The mismatch
+    // case fires on the transition, so stamping first would let an interrupted
+    // reconcile lose the report for good: the next pass would read an unchanged
+    // digest and decide `Promotion::None`. Reporting is idempotent — a
+    // condition rewrite emits no duplicate Event — so a retry that repeats it
+    // is harmless, while a retry that skipped it would be silent forever.
+    if previous.as_deref() != Some(content_digest) {
+        stamp_content_digest(ctx, policy, content_digest).await?;
+    }
 
     Ok(plan)
 }
@@ -811,6 +824,36 @@ mod tests {
             with_plan(candidate("y", "sha256:yy"), "y-plan", true),
         ];
         assert!(stranded_by_promotion("y", &pending).is_empty());
+    }
+
+    /// Two open candidates with identical content, one approval between them:
+    /// the approved one is recognised regardless of list order, because the
+    /// approval is for exactly this content wherever it is recorded.
+    #[test]
+    fn identical_content_prefers_the_candidate_holding_the_approval() {
+        let unapproved_first = vec![
+            with_plan(candidate("first", "sha256:aa"), "first-plan", false),
+            with_plan(candidate("second", "sha256:aa"), "second-plan", true),
+        ];
+        assert_eq!(
+            decide_promotion("sha256:aa", Some("sha256:old"), &unapproved_first),
+            Promotion::Approved {
+                candidate: "second".to_string(),
+                plan: "second-plan".to_string(),
+                superseded: Vec::new(),
+            }
+        );
+        // With no approval anywhere, the first match still stands in.
+        let none_approved = vec![
+            with_plan(candidate("first", "sha256:aa"), "first-plan", false),
+            with_plan(candidate("second", "sha256:aa"), "second-plan", false),
+        ];
+        assert_eq!(
+            decide_promotion("sha256:aa", Some("sha256:old"), &none_approved),
+            Promotion::WithoutApproval {
+                candidate: "first".to_string()
+            }
+        );
     }
 
     #[test]
