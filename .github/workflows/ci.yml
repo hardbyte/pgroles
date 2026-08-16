@@ -188,8 +188,15 @@ jobs:
         # Omni: its first boot reinstalls extensions and runs a post-startup
         # script before the real server start, which overruns the ~50s window
         # that suits the vanilla images.
+        #
+        # The probe goes over TCP loopback deliberately: Omni's unix socket
+        # does not live where pg_isready looks by default (a socket probe
+        # never succeeds, so the runner declared the container unhealthy just
+        # as its init finished), and the vanilla images' init-phase temp
+        # server is socket-only, so TCP also cannot report healthy before the
+        # real server is up.
         options: >-
-          --health-cmd="pg_isready -U postgres"
+          --health-cmd="pg_isready -h 127.0.0.1 -p 5432 -U postgres"
           --health-interval=5s
           --health-timeout=5s
           --health-retries=48
