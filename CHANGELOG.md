@@ -9,11 +9,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- **`PostgresPolicyCandidate`: propose and review policy content without touching the live policy.** A candidate carries the same content schema as a `PostgresPolicy` and nothing about execution — interval, mode, approval and (unless `spec.target` overrides it for a preview) the connection all come from the parent. Its spec is immutable, enforced by the API server, so the version reviewed is the version approved; revising a proposal means filing a successor that names its predecessor in `spec.replaces`. The content schema emits no OpenAPI defaults, so the stored object always means the same as its source YAML and its content digest matches the digest computed from that YAML. (#182, #173)
+- **`PostgresPolicyCandidate`: propose and review policy content without touching the live policy.** A candidate points at an existing `PostgresPolicy` and carries only proposed content — roles, grants, memberships. Everything about execution (interval, mode, approval and, unless `spec.target` overrides it for a preview, the connection) comes from the policy it points at. Once created, a candidate cannot be edited — the API server rejects the write — so the version reviewed is exactly the version approved. To revise a proposal, file a successor:
+
+  ```yaml
+  apiVersion: pgroles.io/v1alpha1
+  kind: PostgresPolicyCandidate
+  metadata:
+    generateName: orders-change-
+  spec:
+    policyRef:
+      name: orders
+    replaces: orders-change-x7k2p   # marks the earlier draft superseded
+    content:
+      roles:
+        - name: reporting_reader
+          login: true
+  ```
+  (#182, #173)
 
 - **Candidates are planned inside the parent policy's reconcile.** Each open candidate gets its own `PostgresPolicyPlan`, computed with the parent's credentials and locks against post-enforcement database state, and reviewed and decided exactly like any other plan. Candidate planning never writes: no SQL in any state, and no generated-password Secrets. While the parent is failing or has a plan of its own awaiting a decision, candidates wait with `Ready=False, reason=BlockedByActivePolicy`; an active ephemeral grant that touches a candidate's effects sends its plan back for fresh review with `OverlayOverlap`. (#182, #173)
 
-- **Promotion: merging an approved candidate's content makes its reviewed plan the one that executes.** When a policy's content digest matches an approved open candidate, the operator adopts that candidate's plan — it never mints an approval of its own — and executes only if the effects recomputed under the lock still match the digest that was approved. Anything that is not a clean promotion is reported on the candidate rather than ignored: merged without approval (`PromotedWithoutApproval`, the ordinary manual flow takes over), content edited after approval (`PromotionDigestMismatch`, nothing executes and the message says the merged spec is not being enforced), or a parent in `mode: observe` (`PromotionNotExecuted`). There are no `pgroles candidate` CLI commands yet; the [candidate docs](https://hardbyte.github.io/pgroles/docs/operator-candidates/) give the `kubectl` and CI recipes. (#182, #173)
+- **Promotion: merging an approved candidate's content makes its reviewed plan the one that executes.** When a policy's content digest matches an approved open candidate, the operator adopts that candidate's plan — it never mints an approval of its own — and executes only if the effects recomputed under the lock still match the digest that was approved. Anything that is not a clean promotion is reported on the candidate rather than ignored: merged without approval (`PromotedWithoutApproval`, the ordinary manual flow takes over), content edited after approval (`PromotionDigestMismatch`, nothing executes and the message says the merged spec is not being enforced), or a parent in `mode: observe` (`PromotionNotExecuted`). There are no `pgroles candidate` CLI commands yet (#189 tracks them); the [candidate docs](https://hardbyte.github.io/pgroles/docs/operator-candidates/) give the `kubectl` and CI recipes. (#182, #173)
 
 - **Approvals are bound to the database they were reviewed against, not just the Secret that reaches it.** Every plan records the server's physical identity (`pg_control_system().system_identifier`, the storage lineage) and a logical fingerprint of the resolved host, port and database, and both are part of the approval digest. If either changes between approval and execution — or the physical identifier was readable at approval and is not at execution — the plan is superseded instead of executed. Set `spec.connection.requirePhysicalIdentity: true` to stop reconciliation entirely (`TargetIdentityBlocked`) when the identifier cannot be read, e.g. on engines that only speak the PostgreSQL protocol. (#180, #173)
 
