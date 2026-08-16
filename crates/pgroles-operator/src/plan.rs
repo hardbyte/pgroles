@@ -381,6 +381,14 @@ impl PlanOwner<'_> {
     }
 }
 
+/// The base pin a candidate-origin plan records, if any.
+fn plan_base_pin(plan: &PostgresPolicyPlan) -> Option<&str> {
+    plan.spec
+        .origin
+        .as_ref()
+        .and_then(|origin| origin.base_content_digest.as_deref())
+}
+
 /// Create or deduplicate a `PostgresPolicyPlan` for the given policy and changes.
 ///
 /// Returns the name of the plan resource (either existing or newly created).
@@ -394,14 +402,6 @@ impl PlanOwner<'_> {
 /// 6. Updates the plan status
 /// 7. Marks any older Pending plans with a different hash as Superseded
 #[allow(clippy::too_many_arguments)]
-/// The base pin a candidate-origin plan records, if any.
-fn plan_base_pin(plan: &PostgresPolicyPlan) -> Option<&str> {
-    plan.spec
-        .origin
-        .as_ref()
-        .and_then(|origin| origin.base_content_digest.as_deref())
-}
-
 pub async fn create_or_update_plan(
     client: &Client,
     policy: &PostgresPolicy,

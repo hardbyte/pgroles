@@ -173,9 +173,9 @@ pub fn decide_promotion(
             previous_digest == Some(pin) || previous_digest == Some(policy_digest)
         })
     };
-    if let Some(matched) = matches().find(|candidate| {
-        candidate.approved_plan().is_some_and(&base_is_fresh)
-    }) {
+    if let Some(matched) =
+        matches().find(|candidate| candidate.approved_plan().is_some_and(&base_is_fresh))
+    {
         let plan = matched
             .approved_plan()
             .expect("matched on an approved plan");
@@ -600,7 +600,10 @@ pub async fn recognize(
 /// own plan did (`approval: auto`, or a fresh approval after a
 /// `PromotedWithoutApproval` fallback) — where an approved candidate plan
 /// outranks a pending one for the same reason `decide_promotion` prefers it.
-fn select_promoted<'a>(facts: &'a [CandidateFacts], content_digest: &str) -> Option<&'a CandidateFacts> {
+fn select_promoted<'a>(
+    facts: &'a [CandidateFacts],
+    content_digest: &str,
+) -> Option<&'a CandidateFacts> {
     let matches = || {
         facts.iter().filter(|candidate| {
             !candidate.terminal
