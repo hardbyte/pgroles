@@ -26,23 +26,53 @@ use pgroles_core::manifest::{ObjectType, Privilege};
 use pgroles_core::model::{GrantKey, GrantState};
 
 /// A raw ACL row returned by our `aclexplode()` queries.
-#[derive(Debug, sqlx::FromRow)]
-struct AclRow {
+///
+/// Rows are kept verbatim by [`RawPrivilegeState`] so a single read over a
+/// union of scopes can be narrowed in memory to any scope it covers — the
+/// row-level predicates below are exactly the SQL `WHERE` clauses of the
+/// per-scope queries.
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub(crate) struct AclRow {
     /// The grantee role name. Privilege queries filter to managed roles in SQL;
     /// inventory queries synthesize NULL because they do not carry grantees.
-    grantee: Option<String>,
+    pub(crate) grantee: Option<String>,
     /// The privilege type as a single character (e.g. 'r' for SELECT).
-    privilege_type: String,
+    pub(crate) privilege_type: String,
     /// The schema name (NULL for database-level grants).
-    schema_name: Option<String>,
+    pub(crate) schema_name: Option<String>,
     /// The object name (the schema name itself for schema-level grants).
-    object_name: String,
+    pub(crate) object_name: String,
     /// The object type discriminator we embed in the query.
-    obj_type: String,
+    pub(crate) obj_type: String,
+}
+
+impl AclRow {
+    /// The schema this row is scoped by, mirroring the `n.nspname = ANY($1)`
+    /// predicate of every privilege query: schema-level rows carry the schema
+    /// in `object_name` (their `schema_name` is NULL by construction).
+    fn scoping_schema(&self) -> Option<&str> {
+        match self.obj_type.as_str() {
+            "schema" => Some(self.object_name.as_str()),
+            _ => self.schema_name.as_deref(),
+        }
+    }
+
+    /// Is this row inside `schemas` × `roles` — the scope a per-config query
+    /// would have asked the server for?
+    fn in_scope(&self, schemas: &BTreeSet<String>, roles: &BTreeSet<String>) -> bool {
+        let schema_matches = self
+            .scoping_schema()
+            .is_some_and(|schema| schemas.contains(schema));
+        let grantee_matches = self
+            .grantee
+            .as_deref()
+            .is_some_and(|grantee| roles.contains(grantee));
+        schema_matches && grantee_matches
+    }
 }
 
 #[derive(Debug, Clone, sqlx::FromRow)]
-struct GrantabilityRow {
+pub(crate) struct GrantabilityRow {
     schema_name: String,
     object_name: String,
     owner_name: String,
@@ -58,13 +88,48 @@ struct GrantabilityRow {
     can_usage: bool,
 }
 
+impl GrantabilityRow {
+    /// Narrow this row to the privileges a scope actually asks about.
+    ///
+    /// The grantability query computes each `can_*` as
+    /// `need AND (owner OR has_privilege(... WITH GRANT OPTION))`, so a row
+    /// read with every `need` set to true masks down, by simple conjunction,
+    /// to exactly the row a narrower `need` set would have produced. This is
+    /// what lets one grantability read serve many scopes.
+    fn masked(&self, needs: &BTreeSet<Privilege>) -> Self {
+        Self {
+            schema_name: self.schema_name.clone(),
+            object_name: self.object_name.clone(),
+            owner_name: self.owner_name.clone(),
+            obj_type: self.obj_type.clone(),
+            can_select: self.can_select && needs.contains(&Privilege::Select),
+            can_insert: self.can_insert && needs.contains(&Privilege::Insert),
+            can_update: self.can_update && needs.contains(&Privilege::Update),
+            can_delete: self.can_delete && needs.contains(&Privilege::Delete),
+            can_truncate: self.can_truncate && needs.contains(&Privilege::Truncate),
+            can_references: self.can_references && needs.contains(&Privilege::References),
+            can_trigger: self.can_trigger && needs.contains(&Privilege::Trigger),
+            can_execute: self.can_execute && needs.contains(&Privilege::Execute),
+            can_usage: self.can_usage && needs.contains(&Privilege::Usage),
+        }
+    }
+}
+
 pub(crate) struct PrivilegeInspectionResult {
     pub grants: BTreeMap<GrantKey, GrantState>,
     pub diagnostics: Vec<UnsatisfiableWildcardGrant>,
     pub wildcard_stats: WildcardInspectionStats,
 }
 
-struct WildcardScopeFilter {
+/// The `(object_type, schema)` pairs a set of wildcard grants selects over,
+/// each with the privileges wanted somewhere in that pair.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct WildcardScopeFilter {
+    scopes: BTreeMap<(ObjectType, String), BTreeSet<Privilege>>,
+}
+
+/// The array-per-column form the SQL `unnest(...)` scope CTE binds.
+struct WildcardScopeArrays {
     schema_names: Vec<String>,
     object_types: Vec<String>,
     need_select: Vec<bool>,
@@ -96,81 +161,101 @@ impl WildcardScopeFilter {
                 .extend(wildcard.privileges.iter().copied());
         }
 
-        let mut filter = Self {
-            schema_names: Vec::with_capacity(scopes.len()),
-            object_types: Vec::with_capacity(scopes.len()),
-            need_select: Vec::with_capacity(scopes.len()),
-            need_insert: Vec::with_capacity(scopes.len()),
-            need_update: Vec::with_capacity(scopes.len()),
-            need_delete: Vec::with_capacity(scopes.len()),
-            need_truncate: Vec::with_capacity(scopes.len()),
-            need_references: Vec::with_capacity(scopes.len()),
-            need_trigger: Vec::with_capacity(scopes.len()),
-            need_execute: Vec::with_capacity(scopes.len()),
-            need_usage: Vec::with_capacity(scopes.len()),
-        };
+        Self { scopes }
+    }
 
-        for ((object_type, schema), privileges) in scopes {
-            filter.schema_names.push(schema);
-            filter
-                .object_types
-                .push(object_type_label(object_type).to_string());
-            filter
-                .need_select
-                .push(privileges.contains(&Privilege::Select));
-            filter
-                .need_insert
-                .push(privileges.contains(&Privilege::Insert));
-            filter
-                .need_update
-                .push(privileges.contains(&Privilege::Update));
-            filter
-                .need_delete
-                .push(privileges.contains(&Privilege::Delete));
-            filter
-                .need_truncate
-                .push(privileges.contains(&Privilege::Truncate));
-            filter
-                .need_references
-                .push(privileges.contains(&Privilege::References));
-            filter
-                .need_trigger
-                .push(privileges.contains(&Privilege::Trigger));
-            filter
-                .need_execute
-                .push(privileges.contains(&Privilege::Execute));
-            filter
-                .need_usage
-                .push(privileges.contains(&Privilege::Usage));
+    /// A filter over `scopes` that asks about every privilege.
+    ///
+    /// Used for the shared grantability read: the resulting rows carry the
+    /// unmasked truth, which [`GrantabilityRow::masked`] narrows per scope.
+    pub(crate) fn from_scopes(scopes: &BTreeSet<(ObjectType, String)>) -> Self {
+        Self {
+            scopes: scopes
+                .iter()
+                .filter(|(object_type, _)| {
+                    !matches!(object_type, ObjectType::Schema | ObjectType::Database)
+                })
+                .map(|scope| (scope.clone(), all_privileges()))
+                .collect(),
         }
-
-        filter
     }
 
     fn is_empty(&self) -> bool {
-        self.schema_names.is_empty()
+        self.scopes.is_empty()
     }
 
     fn len(&self) -> usize {
-        self.schema_names.len()
+        self.scopes.len()
     }
 
     fn unique_schemas(&self) -> Vec<String> {
-        self.schema_names
-            .iter()
-            .cloned()
+        self.scopes
+            .keys()
+            .map(|(_, schema)| schema.clone())
             .collect::<BTreeSet<_>>()
             .into_iter()
             .collect()
     }
 
     fn contains(&self, object_type: ObjectType, schema_name: &str) -> bool {
-        self.schema_names
-            .iter()
-            .zip(&self.object_types)
-            .any(|(schema, obj_type)| {
-                schema == schema_name && obj_type == object_type_label(object_type)
-            })
+        self.scopes
+            .contains_key(&(object_type, schema_name.to_string()))
+    }
+
+    fn needs(&self, object_type: ObjectType, schema_name: &str) -> Option<&BTreeSet<Privilege>> {
+        self.scopes.get(&(object_type, schema_name.to_string()))
+    }
+
+    fn arrays(&self) -> WildcardScopeArrays {
+        let mut arrays = WildcardScopeArrays {
+            schema_names: Vec::with_capacity(self.scopes.len()),
+            object_types: Vec::with_capacity(self.scopes.len()),
+            need_select: Vec::with_capacity(self.scopes.len()),
+            need_insert: Vec::with_capacity(self.scopes.len()),
+            need_update: Vec::with_capacity(self.scopes.len()),
+            need_delete: Vec::with_capacity(self.scopes.len()),
+            need_truncate: Vec::with_capacity(self.scopes.len()),
+            need_references: Vec::with_capacity(self.scopes.len()),
+            need_trigger: Vec::with_capacity(self.scopes.len()),
+            need_execute: Vec::with_capacity(self.scopes.len()),
+            need_usage: Vec::with_capacity(self.scopes.len()),
+        };
+
+        for ((object_type, schema), privileges) in &self.scopes {
+            arrays.schema_names.push(schema.clone());
+            arrays
+                .object_types
+                .push(object_type_label(*object_type).to_string());
+            arrays
+                .need_select
+                .push(privileges.contains(&Privilege::Select));
+            arrays
+                .need_insert
+                .push(privileges.contains(&Privilege::Insert));
+            arrays
+                .need_update
+                .push(privileges.contains(&Privilege::Update));
+            arrays
+                .need_delete
+                .push(privileges.contains(&Privilege::Delete));
+            arrays
+                .need_truncate
+                .push(privileges.contains(&Privilege::Truncate));
+            arrays
+                .need_references
+                .push(privileges.contains(&Privilege::References));
+            arrays
+                .need_trigger
+                .push(privileges.contains(&Privilege::Trigger));
+            arrays
+                .need_execute
+                .push(privileges.contains(&Privilege::Execute));
+            arrays
+                .need_usage
+                .push(privileges.contains(&Privilege::Usage));
+        }
+
+        arrays
     }
 }
 
@@ -334,6 +419,7 @@ async fn fetch_object_inventory_for_wildcards(
         return Ok(BTreeMap::new());
     }
     let wildcard_schemas = filter.unique_schemas();
+    let arrays = filter.arrays();
 
     let rows = sqlx::query_as::<_, AclRow>(
         r#"
@@ -440,17 +526,17 @@ async fn fetch_object_inventory_for_wildcards(
         ORDER BY schema_name, obj_type, object_name
         "#,
     )
-    .bind(&filter.schema_names)
-    .bind(&filter.object_types)
-    .bind(&filter.need_select)
-    .bind(&filter.need_insert)
-    .bind(&filter.need_update)
-    .bind(&filter.need_delete)
-    .bind(&filter.need_truncate)
-    .bind(&filter.need_references)
-    .bind(&filter.need_trigger)
-    .bind(&filter.need_execute)
-    .bind(&filter.need_usage)
+    .bind(&arrays.schema_names)
+    .bind(&arrays.object_types)
+    .bind(&arrays.need_select)
+    .bind(&arrays.need_insert)
+    .bind(&arrays.need_update)
+    .bind(&arrays.need_delete)
+    .bind(&arrays.need_truncate)
+    .bind(&arrays.need_references)
+    .bind(&arrays.need_trigger)
+    .bind(&arrays.need_execute)
+    .bind(&arrays.need_usage)
     .bind(&wildcard_schemas)
     .fetch_all(pool)
     .await?;
@@ -490,12 +576,143 @@ pub async fn fetch_relation_inventory(
         .collect())
 }
 
+/// Every privilege row and wildcard-inventory entry inside one scope, exactly
+/// as the server returned it.
+///
+/// Nothing here is interpreted: this is the shared half of inspection, read
+/// once over the union of many scopes and narrowed in memory by
+/// [`derive_privileges`].
+pub(crate) struct RawPrivilegeState {
+    pub(crate) acl_rows: Vec<AclRow>,
+    /// Objects in each wildcard `(object_type, schema)` scope that was read.
+    pub(crate) inventory: BTreeMap<(ObjectType, String), BTreeSet<String>>,
+}
+
+/// The unmasked grantability of every object in a set of wildcard scopes,
+/// together with the executor those answers are about.
+pub(crate) struct RawGrantability {
+    pub(crate) executor: String,
+    pub(crate) rows: BTreeMap<(ObjectType, String, String), GrantabilityRow>,
+}
+
+/// Read privilege rows and wildcard inventory for a scope.
+///
+/// `managed_schemas` × `managed_roles` bound the ACL rows and
+/// `wildcard_scopes` the inventory, so the result covers every narrower scope
+/// contained in those three.
+pub(crate) async fn read_raw_privileges(
+    pool: &PgPool,
+    managed_schemas: &[&str],
+    managed_roles: &[&str],
+    wildcard_scopes: &BTreeSet<(ObjectType, String)>,
+) -> Result<RawPrivilegeState, sqlx::Error> {
+    let mut inventory: BTreeMap<(ObjectType, String), BTreeSet<String>> = BTreeMap::new();
+    if !wildcard_scopes.is_empty() {
+        let filter = WildcardScopeFilter::from_scopes(wildcard_scopes);
+        for ((object_type, schema_name), object_names) in
+            fetch_object_inventory_for_wildcards(pool, &filter).await?
+        {
+            inventory.insert(
+                (object_type, schema_name),
+                object_names.into_iter().collect(),
+            );
+        }
+    }
+
+    // Run all the independent queries and collect results.
+    // We use separate queries per object type rather than one giant UNION
+    // because the NULL-ACL handling (acldefault) differs per type.
+    let relation_rows = fetch_relation_privileges(pool, managed_schemas, managed_roles).await?;
+    let schema_rows = fetch_schema_privileges(pool, managed_schemas, managed_roles).await?;
+    let function_rows = fetch_function_privileges(pool, managed_schemas, managed_roles).await?;
+    let type_rows = fetch_type_privileges(pool, managed_schemas, managed_roles).await?;
+
+    Ok(RawPrivilegeState {
+        acl_rows: relation_rows
+            .into_iter()
+            .chain(schema_rows)
+            .chain(function_rows)
+            .chain(type_rows)
+            .collect(),
+        inventory,
+    })
+}
+
+/// Read the unmasked grantability of every object in `wildcard_scopes`.
+pub(crate) async fn read_raw_grantability(
+    pool: &PgPool,
+    wildcard_scopes: &BTreeSet<(ObjectType, String)>,
+) -> Result<RawGrantability, sqlx::Error> {
+    let executor = fetch_current_user(pool).await?;
+    let filter = WildcardScopeFilter::from_scopes(wildcard_scopes);
+    let rows = fetch_wildcard_grantability(pool, &filter).await?;
+    Ok(RawGrantability { executor, rows })
+}
+
+/// Read and derive privileges for a single scope.
+///
+/// The narrow path: read exactly this scope, then derive it. It is the same
+/// read-then-derive seam the shared snapshot uses, so the two cannot drift.
 pub(crate) async fn fetch_privileges_with_wildcards(
     pool: &PgPool,
     managed_schemas: &[&str],
     managed_roles: &[&str],
     wildcard_grants: &[WildcardGrantPattern],
 ) -> Result<PrivilegeInspectionResult, sqlx::Error> {
+    let wildcard_scopes = wildcard_scopes_of(wildcard_grants);
+    let raw = read_raw_privileges(pool, managed_schemas, managed_roles, &wildcard_scopes).await?;
+    let derived = derive_privileges(
+        &raw,
+        &managed_schemas.iter().map(|s| s.to_string()).collect(),
+        &managed_roles.iter().map(|s| s.to_string()).collect(),
+        wildcard_grants,
+    );
+    let grantability = if derived.unsatisfied.is_empty() {
+        None
+    } else {
+        Some(read_raw_grantability(pool, &wildcard_scopes_of(&derived.unsatisfied)).await?)
+    };
+    Ok(derived.finish(grantability.as_ref()))
+}
+
+/// The `(object_type, schema)` pairs a set of wildcard grants selects over.
+pub(crate) fn wildcard_scopes_of(
+    wildcard_grants: &[WildcardGrantPattern],
+) -> BTreeSet<(ObjectType, String)> {
+    wildcard_grants
+        .iter()
+        .filter(|wildcard| {
+            !matches!(
+                wildcard.object_type,
+                ObjectType::Schema | ObjectType::Database
+            )
+        })
+        .map(|wildcard| (wildcard.object_type, wildcard.schema.clone()))
+        .collect()
+}
+
+/// What a scope's privileges look like before wildcard normalization.
+///
+/// Split out of [`derive_privileges`] because the unsatisfiable-wildcard
+/// diagnostics are computed against the *pre*-normalization grants and may
+/// need a grantability read, which the caller performs between the two halves.
+pub(crate) struct DerivedPrivileges {
+    grants: BTreeMap<GrantKey, GrantState>,
+    inventory: BTreeMap<(ObjectType, String), BTreeSet<String>>,
+    wildcard_grants: Vec<WildcardGrantPattern>,
+    /// Wildcards with at least one matching object missing a desired
+    /// privilege. Empty means no grantability read is needed at all.
+    pub(crate) unsatisfied: Vec<WildcardGrantPattern>,
+    pub(crate) wildcard_stats: WildcardInspectionStats,
+}
+
+/// Narrow a raw read to one scope, reproducing the per-scope queries in memory.
+pub(crate) fn derive_privileges(
+    raw: &RawPrivilegeState,
+    managed_schemas: &BTreeSet<String>,
+    managed_roles: &BTreeSet<String>,
+    wildcard_grants: &[WildcardGrantPattern],
+) -> DerivedPrivileges {
     let mut grants: BTreeMap<GrantKey, GrantState> = BTreeMap::new();
     let has_wildcards = !wildcard_grants.is_empty();
     let wildcard_scope_filter = WildcardScopeFilter::from_wildcards(wildcard_grants);
@@ -504,35 +721,21 @@ pub(crate) async fn fetch_privileges_with_wildcards(
         configured_scopes: wildcard_scope_filter.len(),
         ..WildcardInspectionStats::default()
     };
-    let mut inventory: BTreeMap<(ObjectType, String), BTreeSet<String>> = BTreeMap::new();
 
-    if has_wildcards {
-        for ((object_type, schema_name), object_names) in
-            fetch_object_inventory_for_wildcards(pool, &wildcard_scope_filter).await?
-        {
-            inventory.insert(
-                (object_type, schema_name),
-                object_names.into_iter().collect(),
-            );
-        }
-    }
-    // Run all the independent queries and collect results.
-    // We use separate queries per object type rather than one giant UNION
-    // because the NULL-ACL handling (acldefault) differs per type.
-
-    let relation_rows = fetch_relation_privileges(pool, managed_schemas, managed_roles).await?;
-    let schema_rows = fetch_schema_privileges(pool, managed_schemas, managed_roles).await?;
-    let function_rows = fetch_function_privileges(pool, managed_schemas, managed_roles).await?;
-    let type_rows = fetch_type_privileges(pool, managed_schemas, managed_roles).await?;
-
-    let all_rows: Vec<AclRow> = relation_rows
-        .into_iter()
-        .chain(schema_rows)
-        .chain(function_rows)
-        .chain(type_rows)
+    let mut inventory: BTreeMap<(ObjectType, String), BTreeSet<String>> = raw
+        .inventory
+        .iter()
+        .filter(|((object_type, schema), _)| wildcard_scope_filter.contains(*object_type, schema))
+        .map(|(scope, names)| (scope.clone(), names.clone()))
         .collect();
 
-    for row in &all_rows {
+    let rows: Vec<&AclRow> = raw
+        .acl_rows
+        .iter()
+        .filter(|row| row.in_scope(managed_schemas, managed_roles))
+        .collect();
+
+    for row in &rows {
         if has_wildcards
             && let Some(object_type) = obj_type_str_to_object_type(&row.obj_type)
             && !matches!(object_type, ObjectType::Schema | ObjectType::Database)
@@ -547,7 +750,7 @@ pub(crate) async fn fetch_privileges_with_wildcards(
     }
     wildcard_stats.inventory_objects = inventory.values().map(BTreeSet::len).sum();
 
-    for row in all_rows {
+    for row in rows {
         let Some(grantee) = row.grantee.as_ref() else {
             continue;
         };
@@ -585,36 +788,71 @@ pub(crate) async fn fetch_privileges_with_wildcards(
         entry.privileges.insert(privilege);
     }
 
-    let unsatisfied_wildcards = if has_wildcards {
+    let unsatisfied = if has_wildcards {
         unsatisfied_wildcard_grants(&grants, &inventory, wildcard_grants)
     } else {
         Vec::new()
     };
-    wildcard_stats.unsatisfied_grants = unsatisfied_wildcards.len();
+    wildcard_stats.unsatisfied_grants = unsatisfied.len();
 
-    let diagnostics = if unsatisfied_wildcards.is_empty() {
-        Vec::new()
-    } else {
-        let executor = fetch_current_user(pool).await?;
-        let grantability_filter = WildcardScopeFilter::from_wildcards(&unsatisfied_wildcards);
-        wildcard_stats.unsatisfied_scopes = grantability_filter.len();
-        let grantability = fetch_wildcard_grantability(pool, &grantability_filter).await?;
-        wildcard_stats.grantability_queries = 1;
-        wildcard_stats.grantability_objects = grantability.len();
-        detect_unsatisfiable_wildcards(&grants, &grantability, &unsatisfied_wildcards, &executor)
-    };
-
-    let grants = if has_wildcards {
-        normalize_wildcard_grants(grants, &inventory, wildcard_grants)
-    } else {
-        grants
-    };
-
-    Ok(PrivilegeInspectionResult {
+    DerivedPrivileges {
         grants,
-        diagnostics,
+        inventory,
+        wildcard_grants: wildcard_grants.to_vec(),
+        unsatisfied,
         wildcard_stats,
-    })
+    }
+}
+
+impl DerivedPrivileges {
+    /// Finish the derivation, given grantability for the unsatisfied wildcards
+    /// (`None` when [`Self::unsatisfied`] is empty and none was read).
+    pub(crate) fn finish(
+        mut self,
+        grantability: Option<&RawGrantability>,
+    ) -> PrivilegeInspectionResult {
+        let diagnostics = match (self.unsatisfied.is_empty(), grantability) {
+            (false, Some(raw)) => {
+                let filter = WildcardScopeFilter::from_wildcards(&self.unsatisfied);
+                self.wildcard_stats.unsatisfied_scopes = filter.len();
+                // Narrow the shared read to exactly the rows and privileges a
+                // per-scope grantability query would have returned.
+                let scoped: BTreeMap<(ObjectType, String, String), GrantabilityRow> = raw
+                    .rows
+                    .iter()
+                    .filter_map(|((object_type, schema, object), row)| {
+                        filter.needs(*object_type, schema).map(|needs| {
+                            (
+                                (*object_type, schema.clone(), object.clone()),
+                                row.masked(needs),
+                            )
+                        })
+                    })
+                    .collect();
+                self.wildcard_stats.grantability_queries = 1;
+                self.wildcard_stats.grantability_objects = scoped.len();
+                detect_unsatisfiable_wildcards(
+                    &self.grants,
+                    &scoped,
+                    &self.unsatisfied,
+                    &raw.executor,
+                )
+            }
+            _ => Vec::new(),
+        };
+
+        let grants = if self.wildcard_grants.is_empty() {
+            self.grants
+        } else {
+            normalize_wildcard_grants(self.grants, &self.inventory, &self.wildcard_grants)
+        };
+
+        PrivilegeInspectionResult {
+            grants,
+            diagnostics,
+            wildcard_stats: self.wildcard_stats,
+        }
+    }
 }
 
 async fn fetch_current_user(pool: &PgPool) -> Result<String, sqlx::Error> {
@@ -679,6 +917,7 @@ async fn fetch_wildcard_grantability(
         return Ok(BTreeMap::new());
     }
     let wildcard_schemas = filter.unique_schemas();
+    let arrays = filter.arrays();
 
     let rows = sqlx::query_as::<_, GrantabilityRow>(
         r#"
@@ -853,17 +1092,17 @@ async fn fetch_wildcard_grantability(
         ORDER BY schema_name, obj_type, object_name
         "#,
     )
-    .bind(&filter.schema_names)
-    .bind(&filter.object_types)
-    .bind(&filter.need_select)
-    .bind(&filter.need_insert)
-    .bind(&filter.need_update)
-    .bind(&filter.need_delete)
-    .bind(&filter.need_truncate)
-    .bind(&filter.need_references)
-    .bind(&filter.need_trigger)
-    .bind(&filter.need_execute)
-    .bind(&filter.need_usage)
+    .bind(&arrays.schema_names)
+    .bind(&arrays.object_types)
+    .bind(&arrays.need_select)
+    .bind(&arrays.need_insert)
+    .bind(&arrays.need_update)
+    .bind(&arrays.need_delete)
+    .bind(&arrays.need_truncate)
+    .bind(&arrays.need_references)
+    .bind(&arrays.need_trigger)
+    .bind(&arrays.need_execute)
+    .bind(&arrays.need_usage)
     .bind(&wildcard_schemas)
     .fetch_all(pool)
     .await?;
@@ -1654,11 +1893,12 @@ mod tests {
             },
         ]);
 
-        assert_eq!(filter.schema_names, vec!["app"]);
-        assert_eq!(filter.object_types, vec!["table"]);
-        assert_eq!(filter.need_select, vec![true]);
-        assert_eq!(filter.need_insert, vec![true]);
-        assert_eq!(filter.need_update, vec![false]);
+        let arrays = filter.arrays();
+        assert_eq!(arrays.schema_names, vec!["app"]);
+        assert_eq!(arrays.object_types, vec!["table"]);
+        assert_eq!(arrays.need_select, vec![true]);
+        assert_eq!(arrays.need_insert, vec![true]);
+        assert_eq!(arrays.need_update, vec![false]);
     }
 
     #[test]

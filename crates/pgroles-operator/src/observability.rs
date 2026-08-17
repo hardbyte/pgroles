@@ -38,6 +38,8 @@ struct Metrics {
     wildcard_unsatisfied_grants_total: Counter<u64>,
     plan_total: Counter<u64>,
     plan_changes_total: Counter<u64>,
+    candidate_planning_duration_ms: Histogram<u64>,
+    candidate_inspections: Histogram<u64>,
     lock_contention_total: Counter<u64>,
     policy_conflicts_total: Counter<u64>,
     invalid_spec_total: Counter<u64>,
@@ -222,6 +224,40 @@ impl OperatorObservability {
             metrics
                 .wildcard_unsatisfied_grants_total
                 .add(stats.wildcard.unsatisfied_grants as u64, &[]);
+        }
+    }
+
+    /// How long planning one candidate took, end to end.
+    ///
+    /// Paired with [`Self::record_candidate_inspections`]: together they say
+    /// whether candidate planning cost still scales with the number of open
+    /// candidates, which is what issue #191 set out to bound.
+    pub fn record_candidate_planning(&self, duration: Duration) {
+        if let Some(metrics) = &self.metrics {
+            metrics
+                .candidate_planning_duration_ms
+                .record(duration.as_millis() as u64, &[]);
+        }
+    }
+
+    /// How many database inspections one reconcile's candidate pass performed,
+    /// and how many candidates it covered.
+    ///
+    /// With the shared snapshot this is 1 for any number of candidates on the
+    /// parent's own target; a value that tracks the candidate count means
+    /// candidates are falling back to inspecting individually.
+    pub fn record_candidate_inspections(&self, inspections: usize, candidates: usize) {
+        if candidates == 0 {
+            return;
+        }
+        if let Some(metrics) = &self.metrics {
+            metrics.candidate_inspections.record(
+                inspections as u64,
+                &[KeyValue::new(
+                    "candidates",
+                    request_count_bucket(candidates),
+                )],
+            );
         }
     }
 
@@ -492,6 +528,18 @@ impl Metrics {
             wildcard_unsatisfied_grants_total: meter
                 .u64_counter("pgroles.wildcard.unsatisfied_grants")
                 .with_description("Wildcard grants missing privileges before grantability checks")
+                .build(),
+            candidate_planning_duration_ms: meter
+                .u64_histogram("pgroles.candidate.planning.duration")
+                .with_unit("ms")
+                .with_description("Duration of planning one candidate, in milliseconds")
+                .build(),
+            candidate_inspections: meter
+                .u64_histogram("pgroles.candidate.inspections")
+                .with_description(
+                    "Database inspections performed by one reconcile's candidate pass, \
+                     bucketed by how many candidates that pass covered",
+                )
                 .build(),
             plan_total: meter
                 .u64_counter("pgroles.plan.total")

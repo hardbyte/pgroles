@@ -12,10 +12,11 @@ mod privileges;
 mod public_grants;
 mod roles;
 mod safety;
+mod snapshot;
 mod version;
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use sqlx::PgPool;
 use thiserror::Error;
@@ -39,6 +40,7 @@ pub use roles::fetch_roles;
 pub use safety::{
     DropRoleSafetyAssessment, DropRoleSafetyIssue, DropRoleSafetyReport, inspect_drop_role_safety,
 };
+pub use snapshot::RawInspection;
 pub use version::{PgVersion, detect_pg_version};
 
 // ---------------------------------------------------------------------------
@@ -49,6 +51,12 @@ pub use version::{PgVersion, detect_pg_version};
 pub enum InspectError {
     #[error("database query error: {0}")]
     Database(#[from] sqlx::Error),
+    /// A [`RawInspection`] was asked to derive an [`InspectConfig`] whose
+    /// scope it never read. Deriving anyway would silently under-report —
+    /// missing roles, schemas or wildcard objects the caller asked about — so
+    /// this is a hard error, not a narrower answer.
+    #[error("inspection scope not covered by the shared snapshot: {0}")]
+    ScopeNotCovered(String),
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -246,12 +254,6 @@ pub struct InspectionStats {
     pub wildcard: WildcardInspectionStats,
 }
 
-impl InspectionStats {
-    fn record_phase(&mut self, phase: &'static str, duration: Duration) {
-        self.phase_durations.insert(phase, duration);
-    }
-}
-
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct WildcardInspectionStats {
     pub configured_grants: usize,
@@ -408,6 +410,62 @@ impl InspectConfig {
         }
     }
 
+    /// The narrowest scope containing every one of `configs`.
+    ///
+    /// A [`RawInspection`] read over this scope covers each member, so one
+    /// read can serve every config in the set. Wildcard patterns are merged
+    /// per `(role, object_type, schema)` so a pattern's privileges are the
+    /// union of what the members ask for; `include_database_privileges` is a
+    /// logical OR, since a read that includes them serves a config that does
+    /// not want them (the derivation drops them).
+    pub fn union_of<'a, I>(configs: I) -> Self
+    where
+        I: IntoIterator<Item = &'a InspectConfig>,
+    {
+        let mut managed_roles: BTreeSet<String> = BTreeSet::new();
+        let mut managed_schemas: BTreeSet<String> = BTreeSet::new();
+        let mut privilege_schemas: BTreeSet<String> = BTreeSet::new();
+        let mut include_database_privileges = false;
+        type WildcardKey = (String, pgroles_core::manifest::ObjectType, String);
+        let mut wildcard_map: BTreeMap<WildcardKey, BTreeSet<pgroles_core::manifest::Privilege>> =
+            BTreeMap::new();
+
+        for config in configs {
+            managed_roles.extend(config.managed_roles.iter().cloned());
+            managed_schemas.extend(config.managed_schemas.iter().cloned());
+            privilege_schemas.extend(config.privilege_schemas.iter().cloned());
+            include_database_privileges |= config.include_database_privileges;
+            for pattern in &config.wildcard_grants {
+                wildcard_map
+                    .entry((
+                        pattern.role.clone(),
+                        pattern.object_type,
+                        pattern.schema.clone(),
+                    ))
+                    .or_default()
+                    .extend(pattern.privileges.iter().copied());
+            }
+        }
+
+        Self {
+            managed_roles: managed_roles.into_iter().collect(),
+            managed_schemas: managed_schemas.into_iter().collect(),
+            privilege_schemas: privilege_schemas.into_iter().collect(),
+            include_database_privileges,
+            wildcard_grants: wildcard_map
+                .into_iter()
+                .map(
+                    |((role, object_type, schema), privileges)| WildcardGrantPattern {
+                        role,
+                        object_type,
+                        schema,
+                        privileges,
+                    },
+                )
+                .collect(),
+        }
+    }
+
     /// Extend the managed role scope with additional explicit role names.
     pub fn with_additional_roles<I>(mut self, roles: I) -> Self
     where
@@ -534,152 +592,16 @@ pub async fn inspect(pool: &PgPool, config: &InspectConfig) -> Result<RoleGraph,
 
 /// Inspect the current database state and return diagnostics for desired-state
 /// intent that cannot be satisfied by the current executor.
+///
+/// Read-then-derive over a single config: exactly the shared path
+/// ([`RawInspection`]) with a scope of one, so a caller inspecting one config
+/// and a caller deriving it from a wider snapshot run the same code.
 pub async fn inspect_with_diagnostics(
     pool: &PgPool,
     config: &InspectConfig,
 ) -> Result<InspectionResult, InspectError> {
-    let mut graph = RoleGraph::default();
-    let mut diagnostics = InspectionDiagnostics::default();
-    let mut stats = InspectionStats::default();
-
-    // Build &str slices for the query functions
-    let role_refs: Vec<&str> = config.managed_roles.iter().map(|s| s.as_str()).collect();
-    let schema_refs: Vec<&str> = config.managed_schemas.iter().map(|s| s.as_str()).collect();
-    let privilege_schema_refs: Vec<&str> = config
-        .privilege_schemas
-        .iter()
-        .map(|s| s.as_str())
-        .collect();
-
-    // --- Roles ---
-    debug!(
-        count = role_refs.len(),
-        "inspecting managed roles from pg_roles"
-    );
-    let phase_started_at = Instant::now();
-    let role_rows = fetch_roles(pool, Some(&role_refs)).await?;
-    stats.record_phase("roles", phase_started_at.elapsed());
-    for row in &role_rows {
-        graph.roles.insert(row.rolname.clone(), row.to_role_state());
-    }
-    stats.roles = graph.roles.len();
-    debug!(found = graph.roles.len(), "roles inspected");
-
-    // --- Memberships ---
-    debug!("inspecting memberships from pg_auth_members");
-    let phase_started_at = Instant::now();
-    let membership_rows = fetch_memberships(pool, Some(&role_refs)).await?;
-    stats.record_phase("memberships", phase_started_at.elapsed());
-    for row in &membership_rows {
-        graph.memberships.insert(row.to_membership_edge());
-    }
-    // Also add memberships where the member (not the group) is a managed role.
-    // This captures cases like "user@example.com is a member of inventory-editor"
-    // where inventory-editor is the group (managed) and user@example.com is the member.
-    // The fetch above already handles this (filters on group role = managed).
-    stats.memberships = graph.memberships.len();
-    debug!(found = graph.memberships.len(), "memberships inspected");
-
-    // --- Schemas ---
-    if !schema_refs.is_empty() {
-        debug!(schemas = ?schema_refs, "inspecting schemas from pg_namespace");
-        let phase_started_at = Instant::now();
-        let schema_rows = fetch_schemas(pool, &schema_refs).await?;
-        stats.record_phase("schemas", phase_started_at.elapsed());
-        for row in &schema_rows {
-            graph.schemas.insert(
-                row.schema_name.clone(),
-                pgroles_core::model::SchemaState {
-                    owner: Some(row.owner_name.clone()),
-                    owner_privileges: row.owner_privileges(),
-                },
-            );
-        }
-        stats.schemas = graph.schemas.len();
-        debug!(found = graph.schemas.len(), "schemas inspected");
-    }
-
-    // --- Object privileges ---
-    if !privilege_schema_refs.is_empty() {
-        debug!(
-            schemas = ?privilege_schema_refs,
-            "inspecting object privileges via aclexplode"
-        );
-        let phase_started_at = Instant::now();
-        let privilege_result = privileges::fetch_privileges_with_wildcards(
-            pool,
-            &privilege_schema_refs,
-            &role_refs,
-            &config.wildcard_grants,
-        )
-        .await?;
-        stats.record_phase("object_privileges", phase_started_at.elapsed());
-        stats.wildcard = privilege_result.wildcard_stats;
-        diagnostics
-            .unsatisfiable_wildcard_grants
-            .extend(privilege_result.diagnostics);
-        let privilege_grants = privilege_result.grants;
-        for (key, state) in privilege_grants {
-            graph.grants.insert(key, state);
-        }
-        remove_redundant_schema_owner_grants(&mut graph);
-        stats.grants = graph.grants.len();
-        debug!(found = graph.grants.len(), "privilege grants inspected");
-
-        debug!(
-            schemas = ?privilege_schema_refs,
-            "inspecting column-level grants via pg_attribute.attacl"
-        );
-        let phase_started_at = Instant::now();
-        diagnostics.column_level_grants =
-            privileges::fetch_column_level_grants(pool, &privilege_schema_refs).await?;
-        stats.record_phase("column_level_grants", phase_started_at.elapsed());
-        if !diagnostics.column_level_grants.is_empty() {
-            debug!(
-                found = diagnostics.column_level_grants.len(),
-                "column-level grants detected (unmanaged)"
-            );
-        }
-    }
-
-    // --- Database-level privileges ---
-    if config.include_database_privileges {
-        debug!("inspecting database-level privileges");
-        let phase_started_at = Instant::now();
-        let db_grants = fetch_database_privileges(pool, &role_refs).await?;
-        stats.record_phase("database_privileges", phase_started_at.elapsed());
-        for (key, state) in db_grants {
-            graph.grants.insert(key, state);
-        }
-        stats.grants = graph.grants.len();
-        debug!(
-            total = graph.grants.len(),
-            "grants after database privileges"
-        );
-    }
-
-    // --- Default privileges ---
-    if !privilege_schema_refs.is_empty() {
-        debug!("inspecting default privileges from pg_default_acl");
-        let phase_started_at = Instant::now();
-        let default_privs =
-            fetch_default_privileges(pool, &privilege_schema_refs, &role_refs).await?;
-        stats.record_phase("default_privileges", phase_started_at.elapsed());
-        for (key, state) in default_privs {
-            graph.default_privileges.insert(key, state);
-        }
-        stats.default_privileges = graph.default_privileges.len();
-        debug!(
-            found = graph.default_privileges.len(),
-            "default privileges inspected"
-        );
-    }
-
-    Ok(InspectionResult {
-        graph,
-        diagnostics,
-        stats,
-    })
+    let raw = RawInspection::read(pool, config).await?;
+    raw.derive(pool, config).await
 }
 
 /// Fetch the names of all non-system schemas in the target database.
@@ -749,7 +671,7 @@ pub async fn fetch_schemas(
     Ok(rows)
 }
 
-fn remove_redundant_schema_owner_grants(graph: &mut RoleGraph) {
+pub(crate) fn remove_redundant_schema_owner_grants(graph: &mut RoleGraph) {
     // Keep ordinary owner CREATE/USAGE management in SchemaState instead of the
     // grants map. This avoids noisy self-grants while still preserving drift
     // when the owner's ordinary privileges have been revoked.

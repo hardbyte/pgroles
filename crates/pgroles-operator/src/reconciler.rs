@@ -541,6 +541,9 @@ fn retry_class_for_reconcile_error(error: &ReconcileError) -> RetryClass {
 fn inspect_error_is_non_transient(error: &pgroles_inspect::InspectError) -> bool {
     match error {
         pgroles_inspect::InspectError::Database(error) => sqlx_error_is_non_transient(error),
+        // A scope the shared snapshot never read: a programming error in the
+        // caller, not something a retry can fix.
+        pgroles_inspect::InspectError::ScopeNotCovered(_) => true,
     }
 }
 
@@ -3223,6 +3226,7 @@ impl ReconcileError {
                         SqlErrorKind::Transient => "DatabaseInspectionFailed",
                     }
                 }
+                pgroles_inspect::InspectError::ScopeNotCovered(_) => "DatabaseInspectionFailed",
             },
             ReconcileError::SqlExec(error) => match classify_sqlx_error(error) {
                 SqlErrorKind::InsufficientPrivileges => "InsufficientPrivileges",
