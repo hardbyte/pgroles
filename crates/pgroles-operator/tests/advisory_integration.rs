@@ -81,3 +81,63 @@ async fn the_canonical_key_contends_within_and_not_across_databases() {
     lock_b.release().await;
     lock_c.release().await;
 }
+
+/// Dropping a lock without releasing it must not strand the session lock.
+///
+/// `release()` is async, so `Drop` cannot call it; the ways to get here are a
+/// cancelled reconcile — controller shutdown, or a timeout wrapped around the
+/// locked phase — and a future refactor that adds an early return between
+/// acquire and release. The dangerous outcome would be sqlx handing the
+/// connection back to the pool with the lock still held: the next checkout
+/// would re-enter the lock as its own while every other session stayed blocked
+/// out until `max_lifetime` recycled it. `Drop` detaches and closes instead,
+/// and closing the socket is what makes PostgreSQL free the session's locks.
+///
+/// The assertion is deliberately made from a *separate* pool. Checking that
+/// the same pool can re-acquire would pass even in the broken case, because
+/// re-entering one's own session lock succeeds.
+#[tokio::test]
+#[ignore]
+async fn a_dropped_lock_frees_the_session_lock_for_other_sessions() {
+    let holder = PgPool::connect(&database_url())
+        .await
+        .expect("failed to connect the holding pool");
+    let observer = PgPool::connect(&database_url())
+        .await
+        .expect("failed to connect the observing pool");
+
+    let lock = advisory::try_acquire(&holder, "ns/dropped/KEY")
+        .await
+        .expect("advisory acquire must not error")
+        .expect("first acquire must succeed");
+
+    // Precondition: while held, another session genuinely cannot take it —
+    // otherwise the release assertion below would prove nothing.
+    assert!(
+        advisory::try_acquire(&observer, "ns/observer/KEY")
+            .await
+            .expect("advisory acquire must not error")
+            .is_none(),
+        "another session must not acquire a held lock"
+    );
+
+    drop(lock);
+
+    // The close is dispatched onto the runtime by `Drop`, so give the server a
+    // moment to notice the socket going away before concluding it is stuck.
+    let freed = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        loop {
+            if let Some(acquired) = advisory::try_acquire(&observer, "ns/observer/KEY")
+                .await
+                .expect("advisory acquire must not error")
+            {
+                return acquired;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .expect("a dropped lock must free its session lock for other sessions");
+
+    freed.release().await;
+}
