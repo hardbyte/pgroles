@@ -672,7 +672,8 @@ pub(crate) async fn fetch_privileges_with_wildcards(
     } else {
         Some(read_raw_grantability(pool, &wildcard_scopes_of(&derived.unsatisfied)).await?)
     };
-    Ok(derived.finish(grantability.as_ref()))
+    // This path reads grantability for itself, so it always paid for the query.
+    Ok(derived.finish(grantability.as_ref(), grantability.is_some()))
 }
 
 /// The `(object_type, schema)` pairs a set of wildcard grants selects over.
@@ -807,9 +808,16 @@ pub(crate) fn derive_privileges(
 impl DerivedPrivileges {
     /// Finish the derivation, given grantability for the unsatisfied wildcards
     /// (`None` when [`Self::unsatisfied`] is empty and none was read).
+    ///
+    /// `read_performed` says whether *this* derivation paid for the read.
+    /// A shared snapshot reads grantability at most once and reuses it for
+    /// every later derivation, so counting a query per derivation would report
+    /// K queries for one query — in the metric that exists to show the read
+    /// count no longer tracks the candidate count.
     pub(crate) fn finish(
         mut self,
         grantability: Option<&RawGrantability>,
+        read_performed: bool,
     ) -> PrivilegeInspectionResult {
         let diagnostics = match (self.unsatisfied.is_empty(), grantability) {
             (false, Some(raw)) => {
@@ -829,7 +837,7 @@ impl DerivedPrivileges {
                         })
                     })
                     .collect();
-                self.wildcard_stats.grantability_queries = 1;
+                self.wildcard_stats.grantability_queries = usize::from(read_performed);
                 self.wildcard_stats.grantability_objects = scoped.len();
                 detect_unsatisfiable_wildcards(
                     &self.grants,

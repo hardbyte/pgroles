@@ -669,8 +669,8 @@ jobs:
         run: |
           kubectl get pgr,pgplan,pgcand,pgeap,pgear -A -o wide || true
           kubectl get pgr,pgplan,pgcand -A -o yaml || true
-          kubectl -n pgroles-system logs deployment/pgroles-operator --tail=-1 || true
-          kubectl -n pgroles-system logs deployment/pgroles-operator --previous --tail=-1 || true
+          kubectl -n pgroles-system logs deployment/pgroles-operator --tail=2000 || true
+          kubectl -n pgroles-system logs deployment/pgroles-operator --previous --tail=2000 || true
           kubectl get events -A --sort-by=.lastTimestamp | tail -100 || true
 
       - name: Cleanup
@@ -747,8 +747,8 @@ jobs:
         run: |
           kubectl get pgr,pgplan,pgcand,pgeap,pgear -A -o wide || true
           kubectl get pgr,pgplan,pgcand -A -o yaml || true
-          kubectl -n pgroles-system logs deployment/pgroles-operator --tail=-1 || true
-          kubectl -n pgroles-system logs deployment/pgroles-operator --previous --tail=-1 || true
+          kubectl -n pgroles-system logs deployment/pgroles-operator --tail=2000 || true
+          kubectl -n pgroles-system logs deployment/pgroles-operator --previous --tail=2000 || true
           kubectl get events -A --sort-by=.lastTimestamp | tail -100 || true
 
       - name: Cleanup
@@ -782,8 +782,8 @@ jobs:
         run: |
           docker build -f docker/Dockerfile --target cli -t pgroles-cli:e2e .
           container="$(docker create pgroles-cli:e2e)"
+          trap 'docker rm -f "$container" >/dev/null 2>&1 || true' EXIT
           docker cp "$container:/usr/local/bin/pgroles" /usr/local/bin/pgroles
-          docker rm "$container"
           pgroles --version
 
       - name: Run plan lifecycle scenarios
@@ -1871,8 +1871,8 @@ jobs:
         run: |
           kubectl get pgr,pgplan,pgcand,pgeap,pgear -A -o wide || true
           kubectl get pgr,pgplan,pgcand -A -o yaml || true
-          kubectl -n pgroles-system logs deployment/pgroles-operator --tail=-1 || true
-          kubectl -n pgroles-system logs deployment/pgroles-operator --previous --tail=-1 || true
+          kubectl -n pgroles-system logs deployment/pgroles-operator --tail=2000 || true
+          kubectl -n pgroles-system logs deployment/pgroles-operator --previous --tail=2000 || true
           kubectl get events -A --sort-by=.lastTimestamp | tail -100 || true
 
       - name: Cleanup

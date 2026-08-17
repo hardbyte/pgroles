@@ -798,6 +798,10 @@ mod tests {
         });
         observability.record_plan_result("drift");
         observability.record_planned_changes(2);
+        observability.record_candidate_planning(Duration::from_millis(37));
+        // Non-zero: `record_candidate_inspections` returns early on zero
+        // candidates, which would leave the instrument unexercised.
+        observability.record_candidate_inspections(1, 12);
         observability.record_apply_result("success");
         observability.record_apply_statements(4);
         observability.record_ephemeral_transition("Active", "MembershipsGranted");
@@ -818,6 +822,13 @@ mod tests {
         assert!(metric_exists(&metrics, "pgroles.reconcile.total"));
         assert!(metric_exists(&metrics, "pgroles.reconcile.duration"));
         assert!(metric_exists(&metrics, "pgroles.inspect.duration"));
+        assert!(metric_exists(
+            &metrics,
+            "pgroles.candidate.planning.duration"
+        ));
+        // A histogram, not a counter — the interesting value is the
+        // inspections-per-pass distribution, so there is no sum to assert on.
+        assert!(metric_exists(&metrics, "pgroles.candidate.inspections"));
         assert_eq!(u64_sum_value(&metrics, "pgroles.inspect.items"), Some(119));
         assert_eq!(
             u64_sum_value(&metrics, "pgroles.ephemeral_access.transitions"),

@@ -276,13 +276,27 @@ pub fn string_at(object: &Value, path: &str) -> Option<String> {
 pub fn abbreviate_digest(digest: &str) -> String {
     const KEEP: usize = 12;
 
+    // Truncation is by character, not byte: these values come from
+    // `status.contentDigest` and `spec.origin.baseContentDigest`, which are
+    // cluster data rather than anything this process validated. A byte slice
+    // landing inside a multi-byte character would panic the whole listing
+    // instead of printing one degraded cell.
+    fn head(value: &str) -> Option<&str> {
+        value
+            .char_indices()
+            .nth(KEEP)
+            .map(|(boundary, _)| &value[..boundary])
+    }
+
     match digest.split_once(':') {
-        Some((algorithm, hex)) if hex.len() > KEEP => {
-            format!("{algorithm}:{}…", &hex[..KEEP])
-        }
-        Some(_) => digest.to_string(),
-        None if digest.len() > KEEP => format!("{}…", &digest[..KEEP]),
-        None => digest.to_string(),
+        Some((algorithm, hex)) => match head(hex) {
+            Some(head) => format!("{algorithm}:{head}…"),
+            None => digest.to_string(),
+        },
+        None => match head(digest) {
+            Some(head) => format!("{head}…"),
+            None => digest.to_string(),
+        },
     }
 }
 
@@ -1055,6 +1069,20 @@ roles:
             "sha256:0123456789ab…"
         );
         assert_eq!(abbreviate_digest("short"), "short");
+    }
+
+    #[test]
+    fn abbreviate_digest_does_not_panic_on_a_malformed_multibyte_digest() {
+        // The digest is read from the cluster, so a listing must degrade rather
+        // than abort if it is not the hex string it is supposed to be. Byte 12
+        // falls inside a character in both of these.
+        assert_eq!(
+            abbreviate_digest("sha256:ααααααααααααααα"),
+            "sha256:αααααααααααα…"
+        );
+        assert_eq!(abbreviate_digest("ααααααααααααααα"), "αααααααααααα…");
+        // Exactly KEEP characters is not truncated, multi-byte or not.
+        assert_eq!(abbreviate_digest("αααααααααααα"), "αααααααααααα");
     }
 
     fn planned_candidate() -> Value {

@@ -226,7 +226,10 @@ fn derived_inspections_match_narrow_inspections_across_differing_scopes() {
             DROP SCHEMA IF EXISTS "{app}" CASCADE;
             DROP SCHEMA IF EXISTS "{ops}" CASCADE;
             DROP SCHEMA IF EXISTS "{empty}" CASCADE;
+            -- Database-level privileges are a dependency of the role, so every
+            -- role granted one must be revoked before it can be dropped.
             REVOKE ALL ON DATABASE "{database}" FROM "{shared}";
+            REVOKE ALL ON DATABASE "{database}" FROM "{only_b}";
             DROP ROLE IF EXISTS "{shared}";
             DROP ROLE IF EXISTS "{only_a}";
             DROP ROLE IF EXISTS "{only_b}";
@@ -261,6 +264,7 @@ fn derived_inspections_match_narrow_inspections_across_differing_scopes() {
         GRANT EXECUTE ON FUNCTION "{app}".noop() TO "{shared}";
         GRANT SELECT (id) ON "{app}".gadgets TO "{only_a}";
         GRANT CONNECT ON DATABASE "{database}" TO "{shared}";
+        GRANT CONNECT ON DATABASE "{database}" TO "{only_b}";
         ALTER DEFAULT PRIVILEGES FOR ROLE "{owner}" IN SCHEMA "{app}"
             GRANT SELECT ON TABLES TO "{shared}";
         ALTER DEFAULT PRIVILEGES FOR ROLE "{owner}" IN SCHEMA "{ops}"
@@ -290,7 +294,11 @@ grants:
 
     // B: disjoint roles and schemas from A, a wildcard that is NOT satisfied
     // (the sequence has no wildcard grant for this role on tables), and
-    // database privileges switched on.
+    // database privileges switched on. The CONNECT grant names the connected
+    // database and a role B actually manages, so the database axis is compared
+    // against real rows — naming an unrelated database would make both sides
+    // empty and the assertion vacuous on the one axis `derive` newly filters
+    // by `managed_roles`.
     let config_b = config_from_yaml(
         &format!(
             r#"
@@ -305,8 +313,9 @@ grants:
     object: {{ type: schema, name: "{ops}" }}
   - role: "{only_b}"
     privileges: [CONNECT]
-    object: {{ type: database, name: mydb }}
-"#
+    object: {{ type: database, name: "{database}" }}
+"#,
+            database = current_database(),
         ),
         true,
     );
@@ -395,7 +404,12 @@ grants:
             &pool,
             &snapshot,
             &configs,
-            &[ObjectType::Schema, ObjectType::Table, ObjectType::Sequence],
+            &[
+                ObjectType::Schema,
+                ObjectType::Table,
+                ObjectType::Sequence,
+                ObjectType::Database,
+            ],
         )
         .await;
     });

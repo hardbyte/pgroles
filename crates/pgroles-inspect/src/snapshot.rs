@@ -183,6 +183,17 @@ impl RawInspection {
     /// the inventory read ignores them and the grantability read asks about
     /// all of them, so only the `(object_type, schema)` pairs must be covered.
     pub fn covers(&self, config: &InspectConfig) -> bool {
+        self.uncovered_axis(config).is_none()
+    }
+
+    /// The first axis of `config` this snapshot did not read, described well
+    /// enough to act on.
+    ///
+    /// `covers` alone cannot say *what* was missing, and the reconciler treats
+    /// the resulting error as non-transient — so without this an operator sees
+    /// a permanent inspection failure and no way to tell which role, schema or
+    /// wildcard caused it.
+    fn uncovered_axis(&self, config: &InspectConfig) -> Option<String> {
         let roles: BTreeSet<&str> = self
             .scope
             .managed_roles
@@ -203,22 +214,39 @@ impl RawInspection {
             .collect();
         let wildcard_scopes = privileges::wildcard_scopes_of(&self.scope.wildcard_grants);
 
-        (!config.include_database_privileges || self.scope.include_database_privileges)
-            && config
-                .managed_roles
-                .iter()
-                .all(|role| roles.contains(role.as_str()))
-            && config
-                .managed_schemas
-                .iter()
-                .all(|schema| schemas.contains(schema.as_str()))
-            && config
-                .privilege_schemas
-                .iter()
-                .all(|schema| privilege_schemas.contains(schema.as_str()))
-            && privileges::wildcard_scopes_of(&config.wildcard_grants)
-                .iter()
-                .all(|scope| wildcard_scopes.contains(scope))
+        if config.include_database_privileges && !self.scope.include_database_privileges {
+            return Some("database privileges were not read".to_string());
+        }
+        if let Some(role) = config
+            .managed_roles
+            .iter()
+            .find(|role| !roles.contains(role.as_str()))
+        {
+            return Some(format!("managed role {role:?} was not read"));
+        }
+        if let Some(schema) = config
+            .managed_schemas
+            .iter()
+            .find(|schema| !schemas.contains(schema.as_str()))
+        {
+            return Some(format!("managed schema {schema:?} was not read"));
+        }
+        if let Some(schema) = config
+            .privilege_schemas
+            .iter()
+            .find(|schema| !privilege_schemas.contains(schema.as_str()))
+        {
+            return Some(format!("privilege schema {schema:?} was not read"));
+        }
+        if let Some((object_type, schema)) = privileges::wildcard_scopes_of(&config.wildcard_grants)
+            .into_iter()
+            .find(|scope| !wildcard_scopes.contains(scope))
+        {
+            return Some(format!(
+                "wildcard scope {object_type:?} in schema {schema:?} was not read"
+            ));
+        }
+        None
     }
 
     /// Produce the inspection `config` would have produced on its own.
@@ -230,11 +258,8 @@ impl RawInspection {
         pool: &PgPool,
         config: &InspectConfig,
     ) -> Result<InspectionResult, InspectError> {
-        if !self.covers(config) {
-            return Err(InspectError::ScopeNotCovered(
-                "the requested inspection scope is not contained in this snapshot's scope"
-                    .to_string(),
-            ));
+        if let Some(axis) = self.uncovered_axis(config) {
+            return Err(InspectError::ScopeNotCovered(axis));
         }
 
         let started = Instant::now();
@@ -290,12 +315,13 @@ impl RawInspection {
                 &managed_roles,
                 &config.wildcard_grants,
             );
-            let grantability = if derived.unsatisfied.is_empty() {
-                None
+            let (grantability, read_performed) = if derived.unsatisfied.is_empty() {
+                (None, false)
             } else {
-                Some(self.grantability(pool).await?)
+                let (raw, fetched) = self.grantability(pool).await?;
+                (Some(raw), fetched)
             };
-            let result = derived.finish(grantability.as_deref());
+            let result = derived.finish(grantability.as_deref(), read_performed);
 
             stats.wildcard = result.wildcard_stats;
             diagnostics
@@ -345,14 +371,20 @@ impl RawInspection {
     }
 
     /// The grantability read, performed at most once per snapshot.
-    async fn grantability(&self, pool: &PgPool) -> Result<Arc<RawGrantability>, InspectError> {
+    /// Returns the grantability read and whether *this* call performed it, so
+    /// the caller can attribute the query cost to the one derivation that paid
+    /// it instead of to every derivation that read the cache.
+    async fn grantability(
+        &self,
+        pool: &PgPool,
+    ) -> Result<(Arc<RawGrantability>, bool), InspectError> {
         if let Some(cached) = self
             .grantability
             .lock()
             .expect("grantability cache poisoned")
             .clone()
         {
-            return Ok(cached);
+            return Ok((cached, false));
         }
 
         let scopes = privileges::wildcard_scopes_of(&self.scope.wildcard_grants);
@@ -362,7 +394,10 @@ impl RawInspection {
             .grantability
             .lock()
             .expect("grantability cache poisoned");
-        Ok(cache.get_or_insert(fresh).clone())
+        // Reported as a query even if another derivation raced ahead and its
+        // value is the one cached: this call did hit the database, and the
+        // metric is a count of queries issued, not of cache slots won.
+        Ok((cache.get_or_insert(fresh).clone(), true))
     }
 }
 

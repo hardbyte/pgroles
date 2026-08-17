@@ -241,7 +241,11 @@ fn classify_open_candidates(
 
         if budget_remaining > 0 {
             budget_remaining -= 1;
-        } else if !exempt {
+        } else {
+            // The keep label exempts a candidate from the TTL, not from the
+            // budget. Exempting it here would make the label a way to opt out
+            // of the bound entirely — 40 kept candidates would plan all 40 —
+            // which is the cost this function exists to hold down.
             verdicts.insert(candidate.name_any(), NotPlanned::OverBudget);
         }
     }
@@ -1634,6 +1638,43 @@ mod tests {
         let verdicts = classify_open_candidates(&candidates, now);
         assert_eq!(verdicts.get("kept"), None);
         assert_eq!(verdicts.get("queued"), Some(&NotPlanned::OverBudget));
+    }
+
+    #[test]
+    fn the_keep_label_cannot_be_used_to_exceed_the_budget() {
+        let now = Timestamp::now();
+        // The case above only shows a kept candidate spending a slot while one
+        // is left. The bound is only real if the label also fails to buy a slot
+        // once they are gone — otherwise labelling every candidate `keep` plans
+        // every candidate, and the budget bounds nothing.
+        let mut candidates: Vec<PostgresPolicyCandidate> = (0..DEFAULT_MAX_OPEN_CANDIDATES)
+            .map(|i| open_candidate(&format!("live-{i:03}"), now, 5))
+            .collect();
+        candidates.push(keep(open_candidate("kept-over", now, 4)));
+
+        let verdicts = classify_open_candidates(&candidates, now);
+        assert_eq!(
+            verdicts.get("kept-over"),
+            Some(&NotPlanned::OverBudget),
+            "keep exempts from the TTL, not from the budget"
+        );
+
+        // The strong form: an entire fleet of kept candidates is still bounded,
+        // and the survivors are the oldest, exactly as for unlabelled ones.
+        let all_kept: Vec<PostgresPolicyCandidate> = (0..DEFAULT_MAX_OPEN_CANDIDATES + 8)
+            .map(|i| keep(open_candidate(&format!("k-{i:03}"), now, 5)))
+            .collect();
+        let verdicts = classify_open_candidates(&all_kept, now);
+        assert_eq!(
+            verdicts.len(),
+            8,
+            "everything past the budget must be queued however it is labelled"
+        );
+        assert_eq!(verdicts.get("k-000"), None);
+        assert_eq!(
+            verdicts.get(&format!("k-{:03}", DEFAULT_MAX_OPEN_CANDIDATES)),
+            Some(&NotPlanned::OverBudget)
+        );
     }
 
     #[test]
