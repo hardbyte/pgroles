@@ -3,7 +3,7 @@ title: CLI commands
 description: Reference for all pgroles CLI commands and options.
 ---
 
-The `pgroles` CLI provides eight commands for managing PostgreSQL role policies. {% .lead %}
+The `pgroles` CLI provides nine commands for managing PostgreSQL role policies. {% .lead %}
 
 ---
 
@@ -289,6 +289,46 @@ The command patches the policy annotation `reconcile.pgroles.io/requestedAt` wit
 | `-n`, `--namespace` | Kubernetes namespace containing the `PostgresPolicy` (default: `default`) |
 | `--wait` | Poll the policy until `status.lastHandledReconcileAt` reaches the requested timestamp |
 | `--timeout` | Maximum wait duration, e.g. `30s`, `2m`, or `1m30s` (default: `2m`). Requires `--wait` |
+
+## candidate
+
+Propose policy content for review, and read what the operator planned for it. See [Candidates and promotion](/docs/operator-candidates) for the workflow these commands serve; this section is the flag reference.
+
+All four subcommands talk to Kubernetes using your current kubeconfig context, and take `-n` / `--namespace` (default: `default`). No database connection is involved: the operator does the planning.
+
+```shell
+pgroles candidate create --policy orders -f policy.yaml
+pgroles candidate list --policy orders
+pgroles candidate status orders-x7k2p
+pgroles candidate diff orders-x7k2p
+```
+
+### create
+
+Files a `PostgresPolicyCandidate` carrying the content of a local manifest. The content is validated first through the same path as `pgroles validate`, so a manifest the API server would reject on [size limits](/docs/manifest-reference#size-limits) fails locally with the same field-level message. The object is created with `generateName`, so concurrent filings never collide, and the assigned name is printed.
+
+| Flag | Description |
+|---|---|
+| `--policy` | Name of the `PostgresPolicy` this candidate proposes content for (required) |
+| `-f`, `--file` | Manifest holding the proposed content (required) |
+| `--replaces` | Name of an earlier candidate this one supersedes; must belong to the same policy |
+| `-n`, `--namespace` | Kubernetes namespace (default: `default`) |
+
+The manifest may be a bare pgroles manifest, a `PostgresPolicy` CR — whose `connection`, `interval`, `mode`, `suspend` and `approval` are dropped, since a candidate takes those from its parent — or a `PostgresPolicyCandidate` CR. A key with no candidate counterpart is rejected rather than silently pruned server-side.
+
+### list
+
+One row per candidate filed against the policy: phase, abbreviated content digest, plan name, and the `Ready` / `Superseded` / `Promoted` conditions with their reasons. A policy with no candidates says so; a policy that does not exist is a distinct error.
+
+### status
+
+One candidate in detail — phase, full content digest, conditions with their messages, and its plan: the plan's phase, its decision and the identity that made it, whether it is still current or has been superseded, the applied base it is pinned to, and any promotion outcome. A candidate with no plan yet reports that rather than printing an empty plan section.
+
+### diff
+
+Prints the reviewed plan's SQL on stdout — what approving the candidate would execute. It reads `status.sqlInline`, falling back to the gzipped ConfigMap in `status.sqlRef` when the plan is too large to inline. A plan whose SQL survives only as a truncated preview is an error rather than a short diff. Context lines go to stderr, so stdout pipes cleanly into a file or a reviewer's pager.
+
+Deciding a plan is deliberately not a CLI verb: a decision is a status write gated by admission so that `decidedBy` records an authenticated identity. Approve and reject with `kubectl` — see [Deciding a plan](/docs/operator-plan-approval#deciding-a-plan).
 
 ## graph
 

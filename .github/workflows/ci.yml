@@ -772,6 +772,20 @@ jobs:
         with:
           cluster-name: pgroles-e2e-plans
 
+      # The candidate scenarios below drive the `pgroles` CLI against this live
+      # cluster, so the binary has to exist on the runner. Built from the
+      # Dockerfile's existing `cli` target rather than with a second cargo
+      # toolchain: `setup-e2e` has just built the operator image, so the shared
+      # `base` stage and the cargo registry/target cache mounts are warm and
+      # only the CLI crate itself is compiled.
+      - name: Build the pgroles CLI
+        run: |
+          docker build -f docker/Dockerfile --target cli -t pgroles-cli:e2e .
+          container="$(docker create pgroles-cli:e2e)"
+          docker cp "$container:/usr/local/bin/pgroles" /usr/local/bin/pgroles
+          docker rm "$container"
+          pgroles --version
+
       - name: Run plan lifecycle scenarios
         run: |
           source scripts/e2e-helpers.sh
@@ -1660,6 +1674,136 @@ jobs:
           kubectl delete pgcand stale-x fresh-y --wait=true
           # Restore the policy content to the set it held before this test.
           write_promo_policy promo_new_user promo_other_user promo_y_user dup_promo_user
+
+          echo "--- Test: the pgroles CLI files and reads a candidate (#189) ---"
+          # The CLI is the same workflow through a different door, so it is
+          # exercised against the live cluster and every answer it prints is
+          # checked against what kubectl reports for the same object.
+
+          candidates_before="$(kubectl get pgcand -o name | wc -l)"
+
+          # Rejected before anything is sent: the CLI validates through the same
+          # path as `pgroles validate`, so a candidate the API server would
+          # refuse on the identifier bound fails locally first.
+          cat >/tmp/cli-cand-invalid.yaml <<'MANIFEST'
+          roles:
+            - name: this_role_name_is_far_too_long_for_postgresql_which_truncates_at_63_chars
+              login: true
+          MANIFEST
+          if pgroles candidate create --policy promo-policy \
+              -f /tmp/cli-cand-invalid.yaml >/tmp/cli-invalid.txt 2>&1; then
+            echo "::error::the CLI filed a candidate whose role name exceeds the identifier bound"
+            cat /tmp/cli-invalid.txt
+            exit 1
+          fi
+          cat /tmp/cli-invalid.txt
+          grep -q 'exceeds the limit of 63' /tmp/cli-invalid.txt \
+            || { echo "::error::local validation did not report the field-level bound"; exit 1; }
+          # Nothing reached the cluster.
+          test "$(kubectl get pgcand -o name | wc -l)" -eq "$candidates_before" \
+            || { echo "::error::a rejected candidate was filed anyway"; kubectl get pgcand; exit 1; }
+
+          # A candidate is a complete desired-state snapshot, so the manifest
+          # carries the policy's current roles plus the proposed one.
+          cat >/tmp/cli-cand.yaml <<'MANIFEST'
+          roles:
+            - name: promo_base_user
+              login: true
+            - name: promo_new_user
+              login: true
+            - name: promo_other_user
+              login: true
+            - name: promo_y_user
+              login: true
+            - name: dup_promo_user
+              login: true
+            - name: cli_candidate_user
+              login: true
+          MANIFEST
+          pgroles candidate create --policy promo-policy -f /tmp/cli-cand.yaml \
+            | tee /tmp/cli-create.txt
+          # `generateName` means the CLI, not the caller, learns the name.
+          cli_cand="$(sed -n 's|^Created postgrespolicycandidate/\([^ ]*\) .*|\1|p' /tmp/cli-create.txt)"
+          test -n "$cli_cand" \
+            || { echo "::error::the CLI did not print the generated candidate name"; exit 1; }
+          kubectl get pgcand "$cli_cand" >/dev/null \
+            || { echo "::error::the CLI reported a candidate the cluster does not have"; exit 1; }
+          # The server assigned the name from the policy-derived prefix.
+          case "$cli_cand" in
+            promo-policy-*) ;;
+            *) echo "::error::unexpected generateName prefix on '$cli_cand'"; exit 1 ;;
+          esac
+
+          wait_for_candidate_phase "$cli_cand" Planned
+          cli_plan=$(wait_for_candidate_plan_ref "$cli_cand")
+
+          # list: the CLI's row must agree with kubectl on phase and plan.
+          pgroles candidate list --policy promo-policy | tee /tmp/cli-list.txt
+          cli_row="$(grep "^${cli_cand}[[:space:]]" /tmp/cli-list.txt)"
+          test -n "$cli_row" \
+            || { echo "::error::$cli_cand is missing from the CLI's list output"; exit 1; }
+          kubectl_phase="$(kubectl get pgcand "$cli_cand" -o jsonpath='{.status.phase}')"
+          grep -q "$kubectl_phase" <<<"$cli_row" \
+            || { echo "::error::list phase disagrees with kubectl ($kubectl_phase): $cli_row"; exit 1; }
+          grep -q "$cli_plan" <<<"$cli_row" \
+            || { echo "::error::list plan ref disagrees with kubectl ($cli_plan): $cli_row"; exit 1; }
+
+          # A policy that does not exist must not read as a policy with no
+          # candidates: empty output is never ambiguous.
+          if pgroles candidate list --policy no-such-policy >/tmp/cli-list-missing.txt 2>&1; then
+            echo "::error::listing candidates of a nonexistent policy succeeded"
+            cat /tmp/cli-list-missing.txt
+            exit 1
+          fi
+          cat /tmp/cli-list-missing.txt
+
+          # status: the plan and the full content digest must be kubectl's.
+          pgroles candidate status "$cli_cand" | tee /tmp/cli-status.txt
+          cli_digest="$(get_candidate_digest "$cli_cand")"
+          test -n "$cli_digest" || { echo "::error::candidate has no contentDigest"; exit 1; }
+          grep -q "$cli_digest" /tmp/cli-status.txt \
+            || { echo "::error::status omits the content digest kubectl reports"; exit 1; }
+          grep -q "$cli_plan" /tmp/cli-status.txt \
+            || { echo "::error::status omits the plan kubectl reports"; exit 1; }
+          # Undecided plan, and the CLI says so rather than leaving it blank.
+          grep -q 'Decision:      none recorded' /tmp/cli-status.txt \
+            || { echo "::error::status did not report the plan as undecided"; exit 1; }
+
+          if pgroles candidate status no-such-candidate >/tmp/cli-status-missing.txt 2>&1; then
+            echo "::error::status of a nonexistent candidate succeeded"
+            exit 1
+          fi
+          cat /tmp/cli-status-missing.txt
+
+          # diff: byte-for-byte the SQL the kubectl recipe extracts, whether it
+          # came from sqlInline or the gzipped sqlRef ConfigMap.
+          cli_sql="$(pgroles candidate diff "$cli_cand" 2>/dev/null)"
+          kubectl_sql="$(get_plan_sql "$cli_plan")"
+          test -n "$cli_sql" \
+            || { echo "::error::the CLI printed no SQL for plan $cli_plan"; exit 1; }
+          test "$cli_sql" = "$kubectl_sql" || {
+            echo "::error::CLI diff disagrees with the kubectl recipe for $cli_plan"
+            diff <(echo "$kubectl_sql") <(echo "$cli_sql") || true
+            exit 1
+          }
+          # It is a proposal, not an execution: nothing of it reached PostgreSQL.
+          grep -q 'cli_candidate_user' <<<"$cli_sql" \
+            || { echo "::error::the plan SQL does not mention the proposed role"; exit 1; }
+          assert_role_absent cli_candidate_user
+
+          # A successor must belong to the same policy as the candidate it
+          # replaces; the CLI refuses to file one that does not.
+          if pgroles candidate create --policy basic-policy -f /tmp/cli-cand.yaml \
+              --replaces "$cli_cand" >/tmp/cli-replaces.txt 2>&1; then
+            echo "::error::the CLI filed a successor replacing another policy's candidate"
+            cat /tmp/cli-replaces.txt
+            exit 1
+          fi
+          cat /tmp/cli-replaces.txt
+          grep -q 'not basic-policy' /tmp/cli-replaces.txt \
+            || { echo "::error::the refusal did not name the policy mismatch"; exit 1; }
+
+          kubectl delete pgcand "$cli_cand" --wait=true
 
           # Cleanup
           kubectl delete pgcand --all --wait=true
