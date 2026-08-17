@@ -1424,6 +1424,58 @@ jobs:
           wait_for_plan_phase "$base_plan" Applied
           assert_role_exists promo_base_user
 
+          echo "--- Test: the open-candidate budget queues the excess and plans the rest (#191) ---"
+          # The unit tests pin the classification itself; what only a live
+          # cluster shows is the wiring — that an over-budget candidate is
+          # reported rather than silently dropped, that it is NOT deleted, and
+          # that being over budget does not stop its elders from planning.
+          #
+          # The TTL half deliberately has no E2E: it is fourteen days long, and
+          # a knob to shorten it would exist only for the test. Its
+          # classification is unit-tested and it shares mark_superseded with the
+          # scenarios above.
+          budget=32
+          kubectl delete pgcand --all --wait=true
+
+          # One over the budget, oldest first. Created in order so the API
+          # server's creationTimestamps rank them the way the operator sorts.
+          for i in $(seq 0 "$budget"); do
+            file_candidate "$(printf 'budget-%03d' "$i")" "$(printf 'budget_user_%03d' "$i")"
+          done
+
+          # The newest is the one over budget: the oldest keep their slots, so a
+          # flood of new proposals cannot evict what is already under review.
+          newest="$(printf 'budget-%03d' "$budget")"
+          wait_for_candidate_condition "$newest" Ready False CandidateBudgetExceeded
+
+          # It is queued, not discarded — the object is still there, still not
+          # terminal, and carries no plan.
+          kubectl get pgcand "$newest" >/dev/null \
+            || { echo "::error::an over-budget candidate was deleted"; exit 1; }
+          over_phase="$(kubectl get pgcand "$newest" -o jsonpath='{.status.phase}')"
+          case "$over_phase" in
+            Promoted|Superseded)
+              echo "::error::an over-budget candidate went terminal (phase=$over_phase)"
+              exit 1
+              ;;
+          esac
+          over_plan="$(kubectl get pgcand "$newest" -o jsonpath='{.status.planRef.name}' 2>/dev/null || true)"
+          test -z "$over_plan" \
+            || { echo "::error::an over-budget candidate was planned anyway ($over_plan)"; exit 1; }
+
+          # And the budget did not cost the others their planning.
+          wait_for_candidate_condition budget-000 Ready True Planned
+          wait_for_candidate_condition "$(printf 'budget-%03d' "$((budget - 1))")" Ready True Planned
+
+          # Freeing a slot lets the queued candidate through, which is what
+          # makes CandidateBudgetExceeded a queue rather than a rejection.
+          kubectl delete pgcand budget-000 --wait=true
+          wait_for_candidate_condition "$newest" Ready True Planned
+
+          # No role cleanup needed: candidate planning never executes SQL, so
+          # none of budget_user_* was ever created.
+          kubectl delete pgcand --all --wait=true
+
           echo "--- Test: a candidate is planned and writes nothing ---"
           file_candidate promo-cand-1 promo_new_user
           wait_for_candidate_phase promo-cand-1 Planned
