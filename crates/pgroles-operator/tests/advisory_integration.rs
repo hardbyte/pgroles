@@ -15,18 +15,25 @@
 
 use pgroles_operator::advisory;
 use sqlx::PgPool;
+use std::sync::LazyLock;
+use tokio::sync::Mutex;
 
 fn database_url() -> String {
     std::env::var("DATABASE_URL").expect("DATABASE_URL must be set for live DB tests")
 }
 
-// One test, both directions in sequence: the harness runs tests in one binary
-// in parallel, and with a canonical key two concurrent tests against the same
-// database would contend with *each other* — the first acquire below would
-// flake on whichever test ran second.
+/// Every test in this file takes the lock the tests are *about*, and the key is
+/// canonical per database — so two of them running concurrently contend with
+/// each other and whichever ran second would fail its very first acquire. The
+/// harness runs a binary's tests in parallel by default, so they serialize here
+/// rather than relying on the caller passing `--test-threads=1`.
+static ONE_AT_A_TIME: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+
 #[tokio::test]
 #[ignore]
 async fn the_canonical_key_contends_within_and_not_across_databases() {
+    let _serial = ONE_AT_A_TIME.lock().await;
+
     // Two separate pools to the same database, as if resolved through two
     // different Secrets.
     let pool_a = PgPool::connect(&database_url())
@@ -99,6 +106,8 @@ async fn the_canonical_key_contends_within_and_not_across_databases() {
 #[tokio::test]
 #[ignore]
 async fn a_dropped_lock_frees_the_session_lock_for_other_sessions() {
+    let _serial = ONE_AT_A_TIME.lock().await;
+
     let holder = PgPool::connect(&database_url())
         .await
         .expect("failed to connect the holding pool");
