@@ -408,6 +408,37 @@ are pruned by the same bounded retention loop as plans; label a candidate
 `pgroles.io/keep=true` to exempt it. Plans also expire after a TTL — an
 approval is not an indefinite authorisation.
 
+## Bounding open candidates
+
+Retention prunes what is already finished. Two separate bounds apply to
+proposals that are still open, because planning them is work the parent policy
+does while holding its locks — an unbounded number of open candidates would
+slow enforcement of the live policy in proportion to how many people are
+proposing changes to it.
+
+**A budget.** At most 32 open candidates per policy are planned in one pass.
+The oldest are kept: the failure this guards against is a CI loop filing a
+candidate per push, and evicting the newest protects proposals already under
+review from being pushed out by the flood. Nothing is deleted — a candidate
+over the budget reports `Ready=False, reason=CandidateBudgetExceeded` and is
+planned as soon as enough older proposals are decided or expire.
+
+**A TTL.** An open candidate that nobody decides within 14 days of being filed
+is marked `Superseded=True, reason=Expired`: at that point it is abandoned
+rather than under review, and retention prunes it in the ordinary way. The TTL
+runs from creation and nothing else — consulting each candidate's plan for a
+decision would put per-candidate reads back into the parent's critical
+section, which is what these bounds exist to avoid. A proposal that genuinely
+is still in flight after two weeks can be labelled `pgroles.io/keep=true`,
+which exempts it from both the TTL and eviction (it still occupies a budget
+slot, so the exemption cannot be used to enlarge the budget).
+
+Planning the candidates that *are* in budget costs one database inspection per
+reconcile, not one per candidate: their inspection scopes are unioned, the
+database is read once, and each candidate's own scoped inspection is derived
+from that read. A candidate with a `spec.target` override is a different
+database and still inspects for itself.
+
 ## Conditions
 
 `status.phase` is a printable summary; conditions are the source of truth.
@@ -419,9 +450,11 @@ approval is not an indefinite authorisation.
 | `Ready=False, reason=BlockedByActivePolicy` | Parent is failing or awaiting its own approval; will re-plan |
 | `Ready=False, reason=OverlayOverlap` | An ephemeral grant overlaps this candidate's effects; fresh review required |
 | `Ready=False, reason=PlanningFailed` | The candidate could not be planned at all; the message carries the error |
+| `Ready=False, reason=CandidateBudgetExceeded` | The policy is at its open-candidate budget and older proposals are ahead in the queue. Not terminal, and nothing is deleted — it plans once they are decided or expire |
 | `Superseded=True, reason=Replaced` | A successor candidate named this one in `spec.replaces` |
 | `Superseded=True, reason=EffectsChanged` | Replanning produced a different change digest; the fresh plan awaits its own decision |
 | `Superseded=True, reason=PlanDenied` | The candidate's plan was rejected (terminal) |
+| `Superseded=True, reason=Expired` | Nobody decided this candidate within the open-candidate TTL, so it is treated as abandoned (terminal). Label it `pgroles.io/keep=true` to exempt it |
 | `Promoted=True, reason=Promoted` | This candidate's content was promoted and executed (terminal) |
 | `Promoted=False, reason=PromotedWithoutApproval` | The content was promoted while this candidate's plan held no approval |
 | `Promoted=False, reason=PromotionDigestMismatch` | The policy's content changed into something that is not this approved candidate |

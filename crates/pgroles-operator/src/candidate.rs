@@ -45,6 +45,9 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference;
+// Re-exported by k8s-openapi, which is where `creation_timestamp` gets its
+// type from — so comparing against it needs no new dependency.
+use k8s_openapi::jiff::{SignedDuration, Timestamp};
 use kube::api::{Api, DeleteParams, ListParams, Patch, PatchParams};
 use kube::{Resource, ResourceExt};
 use tracing::info;
@@ -68,6 +71,27 @@ use crate::reconciler::{ReconcileError, ResolvedPassword};
 /// pruned. Deleting a candidate cascades to the plan it owns and to that
 /// plan's SQL ConfigMap.
 const DEFAULT_MAX_TERMINAL_CANDIDATES: usize = 10;
+
+/// Maximum *open* candidates per policy that are planned in one pass.
+///
+/// Distinct from [`DEFAULT_MAX_TERMINAL_CANDIDATES`], which prunes what is
+/// already finished. This bounds work that has not happened yet: a CI loop
+/// filing a candidate per push can otherwise unbound the planning the parent
+/// does under its locks. Candidates past the budget are not deleted — they are
+/// somebody's proposal — they are left unplanned with a `Ready=False` reason
+/// that says so.
+const DEFAULT_MAX_OPEN_CANDIDATES: usize = 32;
+
+/// How long an undecided candidate stays open before it is treated as
+/// abandoned rather than under review.
+///
+/// Deliberately measured from creation and nothing else. Consulting each
+/// candidate's plan for a decision would reintroduce per-candidate I/O in the
+/// parent's critical section, which is the cost this whole area exists to
+/// bound. Two weeks is long enough that an approved-but-unmerged proposal has
+/// stopped being in flight; `pgroles.io/keep=true` is the escape hatch for one
+/// that genuinely is.
+const DEFAULT_OPEN_CANDIDATE_TTL: SignedDuration = SignedDuration::from_hours(14 * 24);
 
 // ---------------------------------------------------------------------------
 // The parent gate
@@ -158,6 +182,74 @@ enum CandidateOutcome {
 }
 
 // ---------------------------------------------------------------------------
+// Open-candidate admission: TTL and budget
+// ---------------------------------------------------------------------------
+
+/// Why an open candidate is not being planned this pass.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NotPlanned {
+    /// Undecided past the TTL: abandoned, not under review. Terminal.
+    Expired,
+    /// Past the open-candidate budget. Not terminal: it plans as soon as
+    /// enough of its elders finish.
+    OverBudget,
+}
+
+/// Decide, for every candidate, whether it is planned this pass.
+///
+/// Pure — takes `now` rather than reading the clock — so the policy is
+/// unit-testable without a cluster, and computed before the shared inspection
+/// so that a candidate which will not be planned does not widen the read.
+///
+/// TTL is applied first: expiring an abandoned proposal frees budget for a
+/// live one. The budget then keeps the *oldest* survivors, which is the
+/// deliberate choice — the failure this bounds is a runaway loop filing new
+/// candidates, and evicting the newest protects proposals already under review
+/// from being pushed out by the flood. A candidate labelled
+/// `pgroles.io/keep=true` is exempt from both, and is still counted against
+/// the budget so the exemption cannot be used to enlarge it.
+fn classify_open_candidates(
+    candidates: &[PostgresPolicyCandidate],
+    now: Timestamp,
+) -> BTreeMap<String, NotPlanned> {
+    let mut verdicts = BTreeMap::new();
+    let mut budget_remaining = DEFAULT_MAX_OPEN_CANDIDATES;
+
+    // `candidates` is already sorted oldest-first by the caller, which is what
+    // makes "keep the oldest" a single pass.
+    for candidate in candidates {
+        if candidate_phase(candidate).is_terminal() {
+            continue;
+        }
+        let exempt = is_retention_exempt(candidate);
+
+        let expired = !exempt
+            && candidate
+                .metadata
+                .creation_timestamp
+                .as_ref()
+                .is_some_and(|created| {
+                    // `Timestamp - Timestamp` yields a calendar `Span`;
+                    // `duration_since` is the fixed-length difference, which is
+                    // what a TTL wants.
+                    now.duration_since(created.0) > DEFAULT_OPEN_CANDIDATE_TTL
+                });
+        if expired {
+            verdicts.insert(candidate.name_any(), NotPlanned::Expired);
+            continue;
+        }
+
+        if budget_remaining > 0 {
+            budget_remaining -= 1;
+        } else if !exempt {
+            verdicts.insert(candidate.name_any(), NotPlanned::OverBudget);
+        }
+    }
+
+    verdicts
+}
+
+// ---------------------------------------------------------------------------
 // Entry point
 // ---------------------------------------------------------------------------
 
@@ -196,10 +288,15 @@ pub async fn reconcile_candidates(
 
     let overlay_pairs = membership_overlay_pairs(planning.overlay_edges);
 
+    // Which candidates are not planned this pass — abandoned past the TTL, or
+    // past the open-candidate budget. Decided before the shared read so an
+    // unplanned candidate does not widen it.
+    let not_planned = classify_open_candidates(&candidates, Timestamp::now());
+
     // One database read for the whole pass, over the union of every
     // candidate's scope, taken before the loop so N candidates cost one
     // inspection instead of N while the parent's locks are held.
-    let shared = shared_inspection(planning, &candidates).await;
+    let shared = shared_inspection(planning, &candidates, &not_planned).await;
 
     for candidate in &mut candidates {
         // First touch: adopt the candidate and stamp the identity everything
@@ -215,6 +312,30 @@ pub async fn reconcile_candidates(
 
         if candidate_phase(candidate).is_terminal() {
             continue;
+        }
+
+        // Not planned this pass: abandoned, or queued behind its elders.
+        match not_planned.get(&candidate.name_any()) {
+            Some(NotPlanned::Expired) => {
+                mark_superseded(
+                    ctx,
+                    candidate,
+                    candidate_reason::EXPIRED,
+                    &format!(
+                        "no decision within {} days of being filed, so this proposal is \
+                         treated as abandoned; file a successor to revive it, or label \
+                         it pgroles.io/keep=true to exempt it",
+                        DEFAULT_OPEN_CANDIDATE_TTL.as_hours() / 24
+                    ),
+                )
+                .await?;
+                continue;
+            }
+            Some(NotPlanned::OverBudget) => {
+                mark_over_budget(ctx, candidate).await?;
+                continue;
+            }
+            None => {}
         }
 
         // A denied plan is terminal for the candidate too: it has no other
@@ -446,6 +567,7 @@ impl SharedInspection {
 async fn shared_inspection(
     planning: &CandidatePlanning<'_>,
     candidates: &[PostgresPolicyCandidate],
+    not_planned: &BTreeMap<String, NotPlanned>,
 ) -> SharedInspection {
     if !matches!(planning.gate, ParentGate::Stable) {
         return SharedInspection::none();
@@ -454,7 +576,12 @@ async fn shared_inspection(
     let configs: Vec<pgroles_inspect::InspectConfig> = candidates
         .iter()
         .filter(|candidate| {
-            !candidate_phase(candidate).is_terminal() && candidate.spec.target.is_none()
+            !candidate_phase(candidate).is_terminal()
+                && candidate.spec.target.is_none()
+                // An expired or over-budget candidate is never planned, so
+                // letting its scope into the union would make the read wider
+                // than the work — the opposite of the point of the budget.
+                && !not_planned.contains_key(&candidate.name_any())
         })
         .filter_map(|candidate| {
             candidate_inputs(candidate, planning.overlay_edges)
@@ -1071,6 +1198,48 @@ async fn record_outcome(
     }
 }
 
+/// Report that a candidate is queued behind the open-candidate budget.
+///
+/// Nothing is deleted and the candidate is not terminal: it is planned as soon
+/// as enough older proposals are decided or expire. Like [`block_candidate`],
+/// a candidate can sit here for many cycles, so the Event is published once per
+/// transition rather than once per pass.
+async fn mark_over_budget(
+    ctx: &OperatorContext,
+    candidate: &mut PostgresPolicyCandidate,
+) -> Result<(), ReconcileError> {
+    let message = format!(
+        "this policy already has {DEFAULT_MAX_OPEN_CANDIDATES} open candidates being \
+         planned; this one is planned once older proposals are decided or expire"
+    );
+    let already_over_budget = candidate.status.as_ref().is_some_and(|status| {
+        status.conditions.iter().any(|c| {
+            c.condition_type == "Ready"
+                && c.status == "False"
+                && c.reason.as_deref() == Some(candidate_reason::OVER_BUDGET)
+        })
+    });
+    write_status(ctx, candidate, |status| {
+        set_condition_in(
+            &mut status.conditions,
+            ready_condition(false, candidate_reason::OVER_BUDGET, &message),
+        );
+    })
+    .await?;
+    if !already_over_budget {
+        crate::events::publish_candidate_event(
+            &ctx.event_recorder,
+            candidate,
+            true,
+            candidate_reason::OVER_BUDGET,
+            message,
+        )
+        .await
+        .ok();
+    }
+    Ok(())
+}
+
 async fn block_candidate(
     ctx: &OperatorContext,
     candidate: &mut PostgresPolicyCandidate,
@@ -1342,6 +1511,153 @@ mod tests {
                 content,
             },
         )
+    }
+
+    // -----------------------------------------------------------------
+    // Open-candidate admission: TTL and budget
+    // -----------------------------------------------------------------
+
+    /// An open candidate `age_hours` old, in the order
+    /// `classify_open_candidates` expects (oldest first).
+    fn open_candidate(name: &str, now: Timestamp, age_hours: i64) -> PostgresPolicyCandidate {
+        let mut candidate = candidate(name, PolicyContent::default());
+        candidate.metadata.creation_timestamp =
+            Some(k8s_openapi::apimachinery::pkg::apis::meta::v1::Time(
+                now - SignedDuration::from_hours(age_hours),
+            ));
+        candidate
+    }
+
+    /// The TTL in hours, so fixtures can sit either side of it precisely.
+    const TTL_HOURS: i64 = DEFAULT_OPEN_CANDIDATE_TTL.as_hours();
+
+    fn keep(mut candidate: PostgresPolicyCandidate) -> PostgresPolicyCandidate {
+        candidate
+            .metadata
+            .labels
+            .get_or_insert_with(Default::default)
+            .insert("pgroles.io/keep".to_string(), "true".to_string());
+        candidate
+    }
+
+    #[test]
+    fn an_undecided_candidate_expires_once_it_is_past_the_ttl() {
+        let now = Timestamp::now();
+        let candidates = vec![
+            open_candidate("abandoned", now, TTL_HOURS + 1),
+            // Exactly at the TTL is not yet past it.
+            open_candidate("borderline", now, TTL_HOURS),
+            open_candidate("fresh", now, 1),
+        ];
+
+        let verdicts = classify_open_candidates(&candidates, now);
+        assert_eq!(verdicts.get("abandoned"), Some(&NotPlanned::Expired));
+        assert_eq!(verdicts.get("borderline"), None);
+        assert_eq!(verdicts.get("fresh"), None);
+    }
+
+    #[test]
+    fn the_budget_keeps_the_oldest_and_queues_the_rest() {
+        let now = Timestamp::now();
+        // Oldest first, as the caller sorts them.
+        let candidates: Vec<PostgresPolicyCandidate> = (0..DEFAULT_MAX_OPEN_CANDIDATES + 3)
+            .map(|i| {
+                // All well inside the TTL, so this test isolates the budget.
+                open_candidate(
+                    &format!("candidate-{i:03}"),
+                    now,
+                    (DEFAULT_MAX_OPEN_CANDIDATES + 3 - i) as i64,
+                )
+            })
+            .collect();
+
+        let verdicts = classify_open_candidates(&candidates, now);
+        assert_eq!(verdicts.len(), 3, "exactly the excess is queued");
+        for i in 0..DEFAULT_MAX_OPEN_CANDIDATES {
+            assert_eq!(
+                verdicts.get(&format!("candidate-{i:03}")),
+                None,
+                "the oldest proposals keep planning — a flood of new ones must not \
+                 evict what is already under review"
+            );
+        }
+        for i in DEFAULT_MAX_OPEN_CANDIDATES..DEFAULT_MAX_OPEN_CANDIDATES + 3 {
+            assert_eq!(
+                verdicts.get(&format!("candidate-{i:03}")),
+                Some(&NotPlanned::OverBudget)
+            );
+        }
+    }
+
+    #[test]
+    fn an_expired_candidate_does_not_consume_a_budget_slot() {
+        let now = Timestamp::now();
+        // Every budget slot is filled by an abandoned proposal, with one live
+        // candidate behind them: if expiry still spent a slot, the live one
+        // would be queued behind a wall of proposals nobody is reviewing.
+        //
+        // Note this is *not* a test of TTL-before-budget ordering, which is
+        // unobservable: the caller sorts oldest-first and expiry is by age, so
+        // every expired candidate already precedes every live one.
+        let mut candidates: Vec<PostgresPolicyCandidate> = (0..DEFAULT_MAX_OPEN_CANDIDATES)
+            .map(|i| open_candidate(&format!("stale-{i:03}"), now, TTL_HOURS + 10))
+            .collect();
+        candidates.push(open_candidate("live", now, 1));
+
+        let verdicts = classify_open_candidates(&candidates, now);
+        assert_eq!(
+            verdicts.get("live"),
+            None,
+            "a live candidate must not be queued behind abandoned ones"
+        );
+        assert_eq!(verdicts.get("stale-000"), Some(&NotPlanned::Expired));
+    }
+
+    #[test]
+    fn a_kept_candidate_is_exempt_from_both_but_still_occupies_a_slot() {
+        let now = Timestamp::now();
+        let ancient = keep(open_candidate("ancient", now, TTL_HOURS + 100));
+        assert_eq!(
+            classify_open_candidates(std::slice::from_ref(&ancient), now).get("ancient"),
+            None,
+            "pgroles.io/keep=true exempts a candidate from the TTL"
+        );
+
+        // The exemption must not be a way to enlarge the budget: a kept
+        // candidate still consumes a slot, so the one behind it is queued.
+        let mut candidates: Vec<PostgresPolicyCandidate> = (0..DEFAULT_MAX_OPEN_CANDIDATES - 1)
+            .map(|i| open_candidate(&format!("live-{i:03}"), now, 5))
+            .collect();
+        candidates.push(keep(open_candidate("kept", now, 4)));
+        candidates.push(open_candidate("queued", now, 3));
+
+        let verdicts = classify_open_candidates(&candidates, now);
+        assert_eq!(verdicts.get("kept"), None);
+        assert_eq!(verdicts.get("queued"), Some(&NotPlanned::OverBudget));
+    }
+
+    #[test]
+    fn terminal_candidates_are_neither_expired_nor_counted_against_the_budget() {
+        let now = Timestamp::now();
+        // Terminal candidates are retention's business, not the budget's;
+        // counting them would let finished work crowd out live proposals.
+        let mut candidates: Vec<PostgresPolicyCandidate> = (0..DEFAULT_MAX_OPEN_CANDIDATES)
+            .map(|i| {
+                let mut c = open_candidate(&format!("done-{i:03}"), now, TTL_HOURS + 5);
+                c.status = Some(PostgresPolicyCandidateStatus {
+                    phase: CandidatePhase::Promoted,
+                    ..Default::default()
+                });
+                c
+            })
+            .collect();
+        candidates.push(open_candidate("live", now, 1));
+
+        let verdicts = classify_open_candidates(&candidates, now);
+        assert!(
+            verdicts.is_empty(),
+            "terminal candidates are invisible to both the TTL and the budget"
+        );
     }
 
     #[test]
