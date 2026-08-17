@@ -7,9 +7,60 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`PostgresPolicyCandidate`: propose and review policy content without touching the live policy.** A candidate points at an existing `PostgresPolicy` and carries only proposed content — roles, grants, memberships. Everything about execution (interval, mode, approval and, unless `spec.target` overrides it for a preview, the connection) comes from the policy it points at. Once created, a candidate cannot be edited — the API server rejects the write — so the version reviewed is exactly the version approved. To revise a proposal, file a successor:
+
+  ```yaml
+  apiVersion: pgroles.io/v1alpha1
+  kind: PostgresPolicyCandidate
+  metadata:
+    generateName: orders-change-
+  spec:
+    policyRef:
+      name: orders
+    replaces: orders-change-x7k2p   # marks the earlier draft superseded
+    content:
+      roles:
+        - name: reporting_reader
+          login: true
+  ```
+  (#182, #173)
+
+- **Candidates are planned inside the parent policy's reconcile.** Each open candidate gets its own `PostgresPolicyPlan`, computed with the parent's credentials and locks against post-enforcement database state, and reviewed and decided exactly like any other plan. Candidate planning never writes: no SQL in any state, and no generated-password Secrets. While the parent is failing or has a plan of its own awaiting a decision, candidates wait with `Ready=False, reason=BlockedByActivePolicy`; an active ephemeral grant that touches a candidate's effects sends its plan back for fresh review with `OverlayOverlap`. (#182, #173)
+
+- **Promotion: merging an approved candidate's content makes its reviewed plan the one that executes.** When a policy's content digest matches an approved open candidate, the operator adopts that candidate's plan — it never mints an approval of its own — and executes only if the effects recomputed under the lock still match the digest that was approved. Anything that is not a clean promotion is reported on the candidate rather than ignored: merged without approval (`PromotedWithoutApproval`, the ordinary manual flow takes over), content edited after approval (`PromotionDigestMismatch`, nothing executes and the message says the merged spec is not being enforced), or a parent in `mode: observe` (`PromotionNotExecuted`). There are no `pgroles candidate` CLI commands yet (#189 tracks them); the [candidate docs](https://hardbyte.github.io/pgroles/docs/operator-candidates/) give the `kubectl` and CI recipes. (#182, #173)
+
+- **Approvals are bound to the database they were reviewed against, not just the Secret that reaches it.** Every plan records the server's physical identity (`pg_control_system().system_identifier`, the storage lineage) and a logical fingerprint of the resolved host, port and database, and both are part of the approval digest. If either changes between approval and execution — or the physical identifier was readable at approval and is not at execution — the plan is superseded instead of executed. Set `spec.connection.requirePhysicalIdentity: true` to stop reconciliation entirely (`TargetIdentityBlocked`) when the identifier cannot be read, e.g. on engines that only speak the PostgreSQL protocol. (#180, #173)
+
 ### Changed
 
-- **`PostgresPolicy` now tells Kubernetes which field identifies an entry in `spec.schemas`, `spec.roles`, and `spec.retirements`.** They are lists of named objects, but the CRD emitted them as plain arrays, so the API server treated each list as an opaque unit: server-side apply replaced the whole list rather than merging per entry, and duplicate names were accepted. They are now map-lists keyed by `name`, `name`, and `role` respectively. **Upgrade note:** a manifest containing two entries with the same key in one of those three lists is now rejected by the API server at `kubectl apply` time. Such a manifest was never applied silently — the API server accepted the write, and the policy then failed to reconcile, because `expand_manifest` rejects duplicate schemas, roles, and retirements. The rejection simply moves from reconcile time, where it surfaced as a policy that would not converge, to admission time, where it surfaces as a failed write. `memberships`, `grants`, and `default_privileges` are deliberately left as plain arrays: the same role legitimately appears across several `memberships` entries, and the natural keys for the other two are composite. (#126)
+- **`spec.mode: plan` is renamed to `spec.mode: observe`, with a deprecation window.** "Plan" now names exactly one thing, the `PostgresPolicyPlan` resource; the `ApprovalIgnored` reason `PlanModeNeverExecutes` is now `ObserveModeNeverExecutes`. The old value keeps working: `mode: plan` stays an accepted schema value with identical behaviour, so a GitOps controller re-applying an existing manifest is unaffected by the upgrade. A policy using it reports a `ModeValueDeprecated` condition, warns in the operator log, and counts toward `pgroles.deprecated.mode_plan`.
+  **Upgrade:** change `mode: plan` to `mode: observe` in your manifests at your convenience — a future release removes the `plan` value, and that removal will be the breaking change.
+
+- **BREAKING: policy content now has explicit size limits.** Identifiers (role, schema, owner, member names) are capped at 63 characters *and* 63 bytes — the point past which PostgreSQL silently truncates — and every list and map has a bound: 1024 roles, 4096 grants, 2048 memberships, and so on (full table in the [manifest reference](https://hardbyte.github.io/pgroles/docs/manifest-reference/)). The bounds apply to `PostgresPolicy`, to candidates, and to `pgroles validate` alike, and they are what makes candidate immutability enforceable by the API server.
+  **Upgrade:** a policy exceeding a limit is rejected on its next apply with a field-level error. Each limit sits at least 20× above the corresponding count in the largest policy known to run in production; previously the same policy would eventually have hit an opaque `etcdserver: request is too large`. (#182, #173)
+
+- **BREAKING: the approval digest encoding is now `pgroles.io/approval-effect/v2`**, which binds the target identity above.
+  **Upgrade:** on the first reconcile after upgrading, every open plan is superseded and replaced by an equivalent plan under v2, and recorded decisions do not carry over — open plans need one fresh approval. Nothing executes in the meantime. Deliberately, a `pg_upgrade` (fresh `system_identifier`) or a blue-green cutover also moves the identity and invalidates any approval open across it; re-approve the fresh plan afterwards. (#180)
+
+- **URL-mode connections bind the endpoint they resolve to**, not only the Secret name and key — editing the URL inside a referenced Secret is no longer invisible to an open approval. Credentials stay excluded, so password and token rotation still do not invalidate approvals. (#180, #185)
+
+- **Generated password Secrets are created when the approved plan executes, not when it is proposed.** A plan that is rejected or never approved no longer leaves a credential in the cluster. Existing Secrets are read and reused, and `approval: auto` behaves as before. Deleting a generated Secret still rotates the password on the next apply — the policy now warns first with a `GeneratedSecretMissing` Event instead of rotating silently. (#181, #174)
+
+- **`spec.schemas`, `spec.roles` and `spec.retirements` are now map-lists** (keyed by `name`, `name` and `role`), so server-side apply merges entries instead of replacing whole lists, and a manifest with duplicate keys is rejected at `kubectl apply` instead of failing later at reconcile time. `memberships`, `grants` and `default_privileges` stay plain arrays: their natural keys are composite or legitimately repeat. (#126)
+
+### Fixed
+
+- The plan approval documentation now describes the mechanism that exists — a decision written to the plan's status subresource together with `decidedBy` — with working `kubectl` commands for both approval and rejection. The CLI commands it used to invent are gone; what genuinely remains unbuilt is confined to one callout. (#184, #173)
+- A superseded plan names why it was superseded — effects changed, effects vanished, replaced by a newer plan, or the target moved — instead of always claiming the database changed. A moved target reports the specific identity reason. (#184)
+- `kubectl get pgplan -o wide` shows the change digest a decision actually binds (`Digest` column), not just the SQL preview hash. (#184)
+- Superseding a plan no longer tries to rewrite the decision recorded on it — a write the plan CRD itself rejects, which left decided plans stuck actionable against a real API server. A plan is voided by its phase, with the cause on a `Superseded=True` condition, and the decision record stays exactly as the reviewer left it. (#185, #182)
+- The operator's RBAC now covers the candidate `patch` (adoption) and `delete` (retention) it actually performs. (#182)
+- A crash between retiring a plan and creating its replacement can no longer leave a policy with nothing actionable: the old plan is retired only after the replacement is visible, on every path. (#185)
+- `status.current_plan_ref` is cleared before the plan it points at is retired, so an interrupted reconcile leaves a findable pending plan rather than a dangling reference. (#185)
+- A `mode: observe` policy now retires its pending plan when drift disappears out of band, instead of reporting `InSync` while `current_plan_ref` points at a stale plan. (#185)
+- A change set waiting out its failure-retry window is reported as `PlanFailedRetryBackoff` instead of "awaiting approval" beside a Failed plan with no decision to make. (#185)
 
 ## [0.9.0] - 2026-08-14
 

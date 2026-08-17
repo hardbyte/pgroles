@@ -20,13 +20,14 @@ use sha2::{Digest, Sha256};
 use tracing::info;
 
 use crate::crd::{
-    ChangeSummary, CrdReconciliationMode, LABEL_DATABASE_IDENTITY, LABEL_PLAN, LABEL_POLICY,
-    PlanPhase, PlanReference, PolicyCondition, PolicyPlanRef, PostgresPolicy, PostgresPolicyPlan,
-    PostgresPolicyPlanSpec, PostgresPolicyPlanStatus, SqlCompression, SqlRef,
+    ChangeSummary, CrdReconciliationMode, LABEL_CANDIDATE, LABEL_DATABASE_IDENTITY, LABEL_PLAN,
+    LABEL_POLICY, PlanOrigin, PlanPhase, PlanReference, PolicyCondition, PolicyPlanRef,
+    PostgresPolicy, PostgresPolicyCandidate, PostgresPolicyPlan, PostgresPolicyPlanSpec,
+    PostgresPolicyPlanStatus, SqlCompression, SqlRef, is_retention_exempt,
 };
 use crate::k8s_names::{LabelValue, truncate_name_prefix};
 use crate::reconciler::ReconcileError;
-use pgroles_core::approval::APPROVAL_EFFECT_ENCODING_V1;
+use pgroles_core::approval::{APPROVAL_EFFECT_ENCODING_V2, TargetIdentity};
 
 /// Result of plan creation — distinguishes genuinely new plans from
 /// deduplication hits so callers can decide whether to emit events.
@@ -34,21 +35,36 @@ use pgroles_core::approval::APPROVAL_EFFECT_ENCODING_V1;
 pub enum PlanCreationResult {
     /// A new plan was created with the given name.
     Created(String),
-    /// An existing plan with the same hash was found (deduplication).
+    /// An existing pending plan with the same effects was found
+    /// (deduplication). The returned plan is actionable: it is awaiting a
+    /// decision and holds exactly the effects just computed.
     Deduplicated(String),
+    /// A plan holding exactly these effects failed recently and is still
+    /// inside its retry window, so no new plan was opened. The returned plan
+    /// is *Failed*, not pending — nothing is awaiting approval, and callers
+    /// must not report it as if it were.
+    DeduplicatedFailed(String),
 }
 
 impl PlanCreationResult {
     /// Return the plan name regardless of variant.
     pub fn plan_name(&self) -> &str {
         match self {
-            PlanCreationResult::Created(name) | PlanCreationResult::Deduplicated(name) => name,
+            PlanCreationResult::Created(name)
+            | PlanCreationResult::Deduplicated(name)
+            | PlanCreationResult::DeduplicatedFailed(name) => name,
         }
     }
 
     /// True when a new plan was actually created.
     pub fn is_created(&self) -> bool {
         matches!(self, PlanCreationResult::Created(_))
+    }
+
+    /// True when the identical change set recently failed and the referenced
+    /// plan is in its backoff window rather than awaiting a decision.
+    pub fn is_failed_backoff(&self) -> bool {
+        matches!(self, PlanCreationResult::DeduplicatedFailed(_))
     }
 }
 
@@ -129,6 +145,91 @@ impl PreparedPlanSql {
 // Plan approval check
 // ---------------------------------------------------------------------------
 
+/// Why a plan is being retired.
+///
+/// The `Approved=False` condition a supersede writes is often the only record a
+/// reviewer sees of why the plan they were looking at disappeared. A single
+/// fixed message ("database state changed") named the least common cause and
+/// misdescribed the rest — an effect-neutral policy edit, effects that vanished
+/// before a decision, a moved target — so every call site names its own.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SupersedeCause {
+    /// The effects this plan described are not the effects the policy would
+    /// produce now.
+    EffectsChanged,
+    /// The effects are gone entirely: applied out of band, or edited away.
+    /// No replacement plan is opened.
+    EffectsCleared,
+    /// A newer plan holds the current effects; this one is redundant.
+    ReplacedByNewerPlan,
+    /// The database the plan was computed against is not the one it would now
+    /// execute against. Carries the specific target-identity verdict.
+    TargetChanged(pgroles_core::approval::TargetIdentityReason),
+    /// The policy stopped pointing at this plan — it moved out of a planning
+    /// state, or its pending changes were resolved another way.
+    PolicyStoppedPlanning,
+    /// A different candidate's content was promoted and executed. This plan
+    /// was computed against a base that no longer exists, and its approval can
+    /// never authorise anything.
+    SupersededByPromotion,
+    /// The policy's content moved after this candidate plan was computed
+    /// against it. A candidate is a complete desired-state snapshot, so even
+    /// effect-identical SQL does not prove the snapshot preserves what the
+    /// base has come to manage since; the plan is replaced by one computed
+    /// against — and pinned to — the current base.
+    BaseContentChanged,
+}
+
+impl SupersedeCause {
+    /// Condition `reason` string. Kept to the existing `Superseded` value for
+    /// the generic causes so status consumers keep matching; a target change
+    /// reports the identity reason, which is what an operator must act on.
+    pub fn reason(self) -> &'static str {
+        match self {
+            SupersedeCause::TargetChanged(reason) => reason.as_str(),
+            // Promotion is the one supersede a reviewer can act on by filing a
+            // successor candidate, so it names itself rather than hiding
+            // behind the generic reason.
+            SupersedeCause::SupersededByPromotion => {
+                crate::crd::candidate_reason::SUPERSEDED_BY_PROMOTION
+            }
+            // A base change is likewise actionable — re-review the fresh
+            // plan pinned to the current base — so it names itself too.
+            SupersedeCause::BaseContentChanged => "SupersededByBaseChange",
+            _ => "Superseded",
+        }
+    }
+
+    /// Human-readable condition `message`.
+    pub fn message(self) -> &'static str {
+        match self {
+            SupersedeCause::EffectsChanged => {
+                "the policy's effects changed since this plan was computed, so it no longer \
+                 describes what would happen"
+            }
+            SupersedeCause::EffectsCleared => {
+                "the changes this plan described are no longer pending, so there is nothing left \
+                 to execute"
+            }
+            SupersedeCause::ReplacedByNewerPlan => {
+                "a newer plan holds the current effects and replaces this one"
+            }
+            SupersedeCause::TargetChanged(reason) => reason.message(),
+            SupersedeCause::PolicyStoppedPlanning => {
+                "the policy no longer references this plan, so it will never be executed"
+            }
+            SupersedeCause::SupersededByPromotion => {
+                "another candidate's content was promoted and executed, so this plan describes a \
+                 change against a base that no longer exists"
+            }
+            SupersedeCause::BaseContentChanged => {
+                "the policy's content changed after this candidate plan was computed against it; \
+                 a fresh plan pinned to the current base replaces it and needs its own review"
+            }
+        }
+    }
+}
+
 /// Result of checking a plan's approval annotations.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PlanApprovalState {
@@ -179,6 +280,115 @@ pub fn check_plan_approval(plan: &PostgresPolicyPlan) -> PlanApprovalState {
 // Plan creation
 // ---------------------------------------------------------------------------
 
+/// Binding that turns an ordinary policy plan into a candidate-origin plan.
+///
+/// A candidate plan is the reviewable artifact for a proposal that is not the
+/// desired state yet, so it is owned by the candidate (ADR-001 Decision 3) and
+/// carries the identity a later promotion is checked against: the candidate's
+/// name and UID, its content digest and encoding, and the parent policy's UID.
+/// The rest of the binding — reconciliation mode, target identity and the
+/// semantic change digest — is what every plan already records.
+#[derive(Debug, Clone, Copy)]
+pub struct CandidatePlanBinding<'a> {
+    pub candidate: &'a PostgresPolicyCandidate,
+    pub content_digest: &'a str,
+    pub content_digest_encoding: &'a str,
+    /// Canonical digest of the policy content this plan was computed against.
+    pub base_content_digest: &'a str,
+}
+
+/// The plan-identity binding a candidate-origin plan records.
+///
+/// Everything a later promotion has to be checked against that is not already
+/// on the plan: which candidate produced it, that candidate's content digest
+/// and the encoding it was computed under, and the parent policy's UID. The
+/// remaining halves of the binding — reconciliation mode, target identity and
+/// the approval-effect change digest — are plan fields every plan carries.
+pub(crate) fn candidate_plan_origin(
+    binding: CandidatePlanBinding<'_>,
+    policy: &PostgresPolicy,
+) -> PlanOrigin {
+    PlanOrigin {
+        kind: PostgresPolicyCandidate::kind(&()).to_string(),
+        name: binding.candidate.name_any(),
+        uid: binding.candidate.metadata.uid.clone().unwrap_or_default(),
+        content_digest: Some(binding.content_digest.to_string()),
+        content_digest_encoding: Some(binding.content_digest_encoding.to_string()),
+        policy_uid: policy.metadata.uid.clone(),
+        base_content_digest: Some(binding.base_content_digest.to_string()),
+    }
+}
+
+/// Which object owns a plan and the artifacts beneath it.
+///
+/// Ownership is the exact filter for every list, dedup, supersede and delete
+/// path in this module, so it is threaded as one value rather than re-derived
+/// from the policy at each site.
+#[derive(Debug, Clone, Copy)]
+enum PlanOwner<'a> {
+    Policy(&'a PostgresPolicy),
+    Candidate(&'a PostgresPolicyCandidate),
+}
+
+impl PlanOwner<'_> {
+    fn uid(&self) -> Option<&str> {
+        match self {
+            PlanOwner::Policy(policy) => policy.metadata.uid.as_deref(),
+            PlanOwner::Candidate(candidate) => candidate.metadata.uid.as_deref(),
+        }
+    }
+
+    fn name(&self) -> String {
+        match self {
+            PlanOwner::Policy(policy) => policy.name_any(),
+            PlanOwner::Candidate(candidate) => candidate.name_any(),
+        }
+    }
+
+    /// The `.metadata.generation` of the object whose spec defines this plan's
+    /// effects. Revalidation provenance is keyed on the owner: a candidate's
+    /// plan derives from the candidate's immutable content, so stamping the
+    /// *policy's* generation on it would claim a confirmation against a spec
+    /// the plan is not computed from.
+    fn generation(&self) -> i64 {
+        match self {
+            PlanOwner::Policy(policy) => policy.metadata.generation.unwrap_or(0),
+            PlanOwner::Candidate(candidate) => candidate.metadata.generation.unwrap_or(0),
+        }
+    }
+
+    fn owner_reference(&self) -> OwnerReference {
+        match self {
+            PlanOwner::Policy(policy) => build_owner_reference(policy),
+            PlanOwner::Candidate(candidate) => OwnerReference {
+                api_version: PostgresPolicyCandidate::api_version(&()).to_string(),
+                kind: PostgresPolicyCandidate::kind(&()).to_string(),
+                name: candidate.name_any(),
+                uid: candidate.metadata.uid.clone().unwrap_or_default(),
+                controller: Some(true),
+                block_owner_deletion: Some(true),
+            },
+        }
+    }
+
+    fn owns<K: Resource>(&self, resource: &K) -> bool {
+        // An owner with no UID cannot prove ownership of anything; refuse to
+        // match rather than treat an empty UID as a wildcard.
+        let Some(uid) = self.uid() else {
+            return false;
+        };
+        is_owned_by_uid(resource, uid)
+    }
+}
+
+/// The base pin a candidate-origin plan records, if any.
+fn plan_base_pin(plan: &PostgresPolicyPlan) -> Option<&str> {
+    plan.spec
+        .origin
+        .as_ref()
+        .and_then(|origin| origin.base_content_digest.as_deref())
+}
+
 /// Create or deduplicate a `PostgresPolicyPlan` for the given policy and changes.
 ///
 /// Returns the name of the plan resource (either existing or newly created).
@@ -200,12 +410,33 @@ pub async fn create_or_update_plan(
     inspect_config: &pgroles_inspect::InspectConfig,
     reconciliation_mode: CrdReconciliationMode,
     database_identity: &str,
+    target_identity: &TargetIdentity,
     change_summary: &ChangeSummary,
     password_source_versions: &BTreeMap<String, String>,
+    candidate: Option<CandidatePlanBinding<'_>>,
 ) -> Result<PlanCreationResult, ReconcileError> {
     let namespace = policy.namespace().ok_or(ReconcileError::NoNamespace)?;
     let policy_name = policy.name_any();
     let generation = policy.metadata.generation.unwrap_or(0);
+    // Everything below is keyed on the owner, not the policy: a candidate plan
+    // is owned by its candidate so that deleting the proposal prunes the plan
+    // and its SQL artifact with it.
+    let owner = match candidate {
+        Some(binding) => PlanOwner::Candidate(binding.candidate),
+        None => PlanOwner::Policy(policy),
+    };
+    let owner_name = owner.name();
+    // The base precondition for candidate plans. A plan pinned to a different
+    // base than the content the policy carries now is superseded even when its
+    // change digest is identical: same SQL does not prove the snapshot
+    // preserves what the base has come to manage since. The one exception is
+    // the base moving to the candidate's *own* content — the merge being
+    // promoted is not a staleness event against itself, and treating it as
+    // one would void every approval at the moment it is being used.
+    let expected_base: Option<&str> = candidate.and_then(|binding| {
+        (binding.base_content_digest != binding.content_digest)
+            .then_some(binding.base_content_digest)
+    });
 
     // 1. Render the full executable SQL (not redacted). This is a review
     //    artifact only — never an execution payload, and never the approval
@@ -220,7 +451,10 @@ pub async fn create_or_update_plan(
         changes,
         reconciliation_mode,
         database_identity,
+        target_identity,
         password_source_versions,
+        &inspect_config.managed_roles,
+        &inspect_config.managed_schemas,
     )?;
 
     // 3. Hash the rendered SQL for preview diagnostics.
@@ -232,18 +466,25 @@ pub async fn create_or_update_plan(
     // 5. Render redacted SQL for display (passwords masked).
     let redacted_sql = render_redacted_sql(changes, sql_context);
 
-    cleanup_old_plans_best_effort(client, policy, None).await;
+    // Candidate plans are pruned by candidate retention (their owner cascades),
+    // never by the policy's plan retention, which would not see them anyway.
+    if candidate.is_none() {
+        cleanup_old_plans_best_effort(client, policy, None).await;
+    }
 
     let plans_api: Api<PostgresPolicyPlan> = Api::namespaced(client.clone(), &namespace);
 
-    // 4. List existing plans for this policy.
-    let selector = policy_selector(&policy_name);
+    // 4. List existing plans for this owner.
+    let selector = match candidate {
+        Some(binding) => candidate_selector(&binding.candidate.name_any()),
+        None => policy_selector(&policy_name),
+    };
     // The label narrows server-side; owner UID is the exact filter.
     let existing_plans: Vec<PostgresPolicyPlan> = plans_api
         .list(&ListParams::default().labels_from(&selector))
         .await?
         .into_iter()
-        .filter(|plan| is_owned_by_policy(plan, policy))
+        .filter(|plan| owner.owns(plan))
         .collect();
 
     // 5. Check for duplicate pending plan with the same effects.
@@ -251,6 +492,7 @@ pub async fn create_or_update_plan(
         if let Some(ref status) = plan.status
             && status.phase == PlanPhase::Pending
             && plan_matches_digest(status, &change_digest)
+            && expected_base.is_none_or(|base| plan_base_pin(plan) == Some(base))
         {
             // Identical plan already exists — return early (deduplicated).
             let plan_name = plan.name_any();
@@ -259,6 +501,18 @@ pub async fn create_or_update_plan(
                 policy = %policy_name,
                 "existing pending plan has identical change digest, skipping creation"
             );
+            // This pending plan *is* the replacement: it is already visible and
+            // holds exactly these effects, so any stale approved plan can be
+            // retired now without leaving the policy with nothing actionable.
+            supersede_stale_plans(
+                &plans_api,
+                &existing_plans,
+                &policy_name,
+                &plan_name,
+                &change_digest,
+                expected_base,
+            )
+            .await?;
             return Ok(PlanCreationResult::Deduplicated(plan_name));
         }
     }
@@ -290,20 +544,23 @@ pub async fn create_or_update_plan(
                     age_secs = now_ts - failed_ts,
                     "recently-failed plan has identical change digest, skipping creation"
                 );
-                return Ok(PlanCreationResult::Deduplicated(plan_name));
+                // Deliberately no supersede sweep here: nothing new became
+                // visible, so retiring a still-actionable plan would leave the
+                // policy holding neither a decision nor a plan to make one on.
+                return Ok(PlanCreationResult::DeduplicatedFailed(plan_name));
             }
         }
     }
 
     // 6. Generate a plan name using timestamp plus SQL hash. The hash suffix
     // makes same-second retries after content persistence failures idempotent.
-    let plan_name = generate_plan_name(&policy_name, &sql_hash);
+    let plan_name = generate_plan_name(&owner_name, &sql_hash);
     let prepared_sql = prepare_plan_sql(&plan_name, &redacted_sql)?;
 
     // 7. Persist SQL content before materialising the visible plan resource.
     let sql_configmap_name = create_plan_sql_configmap(
         client,
-        policy,
+        owner,
         &namespace,
         &policy_name,
         database_identity,
@@ -311,8 +568,8 @@ pub async fn create_or_update_plan(
     )
     .await?;
 
-    // 8. Build ownerReference pointing to the parent policy.
-    let owner_ref = build_owner_reference(policy);
+    // 8. Build ownerReference pointing to the owning policy or candidate.
+    let owner_ref = owner.owner_reference();
 
     // 9. Create the plan resource.
     let plan = PostgresPolicyPlan::new(
@@ -326,20 +583,27 @@ pub async fn create_or_update_plan(
             owned_roles: inspect_config.managed_roles.clone(),
             owned_schemas: inspect_config.managed_schemas.clone(),
             managed_database_identity: database_identity.to_string(),
-            origin: None,
+            origin: candidate.map(|binding| candidate_plan_origin(binding, policy)),
             scope: None,
         },
     );
     let mut plan = plan;
     plan.metadata.namespace = Some(namespace.clone());
     plan.metadata.owner_references = Some(vec![owner_ref.clone()]);
-    plan.metadata.labels = Some(BTreeMap::from([
+    let mut plan_labels = BTreeMap::from([
         (LABEL_POLICY.to_string(), sanitize_label_value(&policy_name)),
         (
             LABEL_DATABASE_IDENTITY.to_string(),
             sanitize_label_value(database_identity),
         ),
-    ]));
+    ]);
+    if let Some(binding) = candidate {
+        plan_labels.insert(
+            LABEL_CANDIDATE.to_string(),
+            sanitize_label_value(&binding.candidate.name_any()),
+        );
+    }
+    plan.metadata.labels = Some(plan_labels);
 
     // Annotations for quick visibility in kubectl describe / Lens.
     let sql_preview = redacted_sql.lines().take(5).collect::<Vec<_>>().join("\n");
@@ -382,7 +646,7 @@ pub async fn create_or_update_plan(
                 // 215-byte-truncated policy prefix, so two policies sharing that
                 // prefix can in principle collide, and this is otherwise the one
                 // mutation site the owner-UID discipline does not cover.
-                if !is_owned_by_policy(&existing, policy) {
+                if !owner.owns(&existing) {
                     // Roll back only the ConfigMap this reconcile created. The
                     // orphan reaper would collect it eventually — it carries our
                     // UID — but leaving it is a pointless transient orphan. One
@@ -390,7 +654,7 @@ pub async fn create_or_update_plan(
                     rollback_plan_sql_configmap(client, &namespace, sql_configmap_name.as_ref())
                         .await;
                     return Err(ReconcileError::PlanSqlStorage(format!(
-                        "plan {plan_name} already exists and is owned by another policy"
+                        "plan {plan_name} already exists and is owned by another object"
                     )));
                 }
                 if !should_patch_existing_plan_status(&existing) {
@@ -443,9 +707,12 @@ pub async fn create_or_update_plan(
         applied_at: None,
         last_error: None,
         sql_hash: Some(sql_hash),
-        change_digest: Some(change_digest),
-        change_digest_encoding: Some(APPROVAL_EFFECT_ENCODING_V1.to_string()),
-        revalidated_generation: Some(generation),
+        change_digest: Some(change_digest.clone()),
+        change_digest_encoding: Some(APPROVAL_EFFECT_ENCODING_V2.to_string()),
+        target_physical_identity: target_identity.physical.clone(),
+        target_logical_fingerprint: target_identity.logical.clone(),
+        physical_identity_available: Some(target_identity.has_physical()),
+        revalidated_generation: Some(owner.generation()),
         revalidated_at: Some(crate::crd::now_rfc3339()),
         applying_since: None,
         failed_at: None,
@@ -471,34 +738,19 @@ pub async fn create_or_update_plan(
         return Err(err.into());
     }
 
-    // 12. Mark any existing Pending plans as Superseded after the new plan is
+    // 12. Retire the plans this one replaces, only now that the new plan is
     // fully visible. This avoids losing the current actionable plan if SQL
-    // persistence fails before the replacement is materialised.
-    for plan in &existing_plans {
-        if let Some(ref status) = plan.status
-            && status.phase == PlanPhase::Pending
-            && plan.name_any() != plan_name
-        {
-            let old_plan_name = plan.name_any();
-            info!(
-                plan = %old_plan_name,
-                policy = %policy_name,
-                "marking existing pending plan as Superseded"
-            );
-            let superseded_status = PostgresPolicyPlanStatus {
-                phase: PlanPhase::Superseded,
-                ..status.clone()
-            };
-            let patch = serde_json::json!({ "status": superseded_status });
-            plans_api
-                .patch_status(
-                    &old_plan_name,
-                    &PatchParams::apply("pgroles-operator"),
-                    &Patch::Merge(&patch),
-                )
-                .await?;
-        }
-    }
+    // persistence fails before the replacement is materialised, which is why
+    // no caller may supersede ahead of calling in here.
+    supersede_stale_plans(
+        &plans_api,
+        &existing_plans,
+        &owner_name,
+        &plan_name,
+        &change_digest,
+        expected_base,
+    )
+    .await?;
 
     info!(
         plan = %plan_name,
@@ -508,6 +760,81 @@ pub async fn create_or_update_plan(
     );
 
     Ok(PlanCreationResult::Created(plan_name))
+}
+
+/// Whether a pre-existing plan is retired by the plan that now holds
+/// `new_digest`.
+///
+/// Pending plans are always retired: at most one plan may await a decision, and
+/// the replacement is the one that describes what would happen now. Approved
+/// plans are retired only when their effects differ from the replacement's —
+/// an approval that still describes the current effects is a live decision and
+/// is never discarded, while one that does not can no longer authorise
+/// anything and must be voided rather than left looking actionable.
+pub(crate) fn supersedes_after_create(status: &PostgresPolicyPlanStatus, new_digest: &str) -> bool {
+    match status.phase {
+        PlanPhase::Pending => true,
+        PlanPhase::Approved => !plan_matches_digest(status, new_digest),
+        _ => false,
+    }
+}
+
+/// Retire the plans replaced by `new_plan_name`.
+///
+/// Called only once the replacement plan is visible with its status written —
+/// crash safety for the whole plan pointer rests on that ordering, so callers
+/// must never supersede ahead of creating.
+async fn supersede_stale_plans(
+    plans_api: &Api<PostgresPolicyPlan>,
+    existing_plans: &[PostgresPolicyPlan],
+    policy_name: &str,
+    new_plan_name: &str,
+    new_digest: &str,
+    expected_base: Option<&str>,
+) -> Result<(), ReconcileError> {
+    for plan in existing_plans {
+        let Some(ref status) = plan.status else {
+            continue;
+        };
+        let old_plan_name = plan.name_any();
+        // A live plan pinned to a different base is stale even when its
+        // change digest still matches — see the base precondition in
+        // `create_or_update_plan`.
+        let base_stale = expected_base.is_some_and(|base| {
+            matches!(status.phase, PlanPhase::Pending | PlanPhase::Approved)
+                && plan_base_pin(plan) != Some(base)
+        });
+        if old_plan_name == new_plan_name
+            || (!supersedes_after_create(status, new_digest) && !base_stale)
+        {
+            continue;
+        }
+        let cause = if base_stale {
+            SupersedeCause::BaseContentChanged
+        } else {
+            SupersedeCause::ReplacedByNewerPlan
+        };
+
+        info!(
+            plan = %old_plan_name,
+            policy = %policy_name,
+            phase = ?status.phase,
+            "marking existing plan as Superseded"
+        );
+        // The plan is void along with its phase — but the decision on it is
+        // terminal and write-once, so the record of who approved what is left
+        // untouched. See `superseded_status`.
+        let patch = serde_json::json!({ "status": superseded_status(status, cause) });
+        plans_api
+            .patch_status(
+                &old_plan_name,
+                &PatchParams::apply("pgroles-operator"),
+                &Patch::Merge(&patch),
+            )
+            .await?;
+    }
+
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -684,7 +1011,7 @@ struct PlanSqlConfigMap {
 
 async fn create_plan_sql_configmap(
     client: &Client,
-    policy: &PostgresPolicy,
+    owner: PlanOwner<'_>,
     namespace: &str,
     policy_name: &str,
     database_identity: &str,
@@ -700,7 +1027,7 @@ async fn create_plan_sql_configmap(
     };
 
     let configmap = build_plan_sql_configmap_object(
-        policy,
+        owner,
         namespace,
         policy_name,
         database_identity,
@@ -724,9 +1051,9 @@ async fn create_plan_sql_configmap(
             // adopting would then share one artifact between two policies,
             // whose lifetime is tied to the *other* policy's garbage
             // collection.
-            if is_owned_by_another_policy(&existing, policy) {
+            if is_owned_by_another(&existing, owner) {
                 return Err(ReconcileError::PlanSqlStorage(format!(
-                    "plan SQL ConfigMap {configmap_name} is owned by another policy"
+                    "plan SQL ConfigMap {configmap_name} is owned by another object"
                 )));
             }
             validate_existing_sql_configmap(&existing, prepared_sql)?;
@@ -740,7 +1067,7 @@ async fn create_plan_sql_configmap(
 }
 
 fn build_plan_sql_configmap_object(
-    policy: &PostgresPolicy,
+    owner: PlanOwner<'_>,
     namespace: &str,
     policy_name: &str,
     database_identity: &str,
@@ -761,7 +1088,7 @@ fn build_plan_sql_configmap_object(
         metadata: k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta {
             name: Some(configmap_name.clone()),
             namespace: Some(namespace.to_string()),
-            owner_references: Some(vec![build_owner_reference(policy)]),
+            owner_references: Some(vec![owner.owner_reference()]),
             labels: Some(BTreeMap::from([
                 (LABEL_POLICY.to_string(), sanitize_label_value(policy_name)),
                 (
@@ -930,8 +1257,11 @@ pub async fn cleanup_old_plans(
     }
 
     // Collect terminal plans sorted by creation timestamp (oldest first).
+    // `pgroles.io/keep=true` exempts an object from the bound: retention is a
+    // cap on unbounded growth, not a policy about what an operator may keep.
     let mut terminal_plans: Vec<&PostgresPolicyPlan> = existing_plans
         .iter()
+        .filter(|plan| !is_retention_exempt(*plan))
         .filter(|plan| {
             plan.status
                 .as_ref()
@@ -1165,20 +1495,41 @@ fn render_redacted_sql(
 /// This is the approval identity — see `pgroles_core::approval`. Unlike the
 /// SQL hash it is stable across recomputation of unchanged effects, which is
 /// what makes a password-bearing plan approvable at all.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn compute_change_digest(
     changes: &[pgroles_core::diff::Change],
     reconciliation_mode: CrdReconciliationMode,
     database_identity: &str,
+    target_identity: &TargetIdentity,
     password_source_versions: &BTreeMap<String, String>,
+    owned_roles: &[String],
+    owned_schemas: &[String],
 ) -> Result<String, ReconcileError> {
     Ok(pgroles_core::approval::compute_change_digest(
         changes,
         &pgroles_core::approval::EffectDigestInputs {
             reconciliation_mode: reconciliation_mode.into(),
             target: database_identity,
+            target_identity,
             password_source_versions,
+            owned_roles,
+            owned_schemas,
         },
     )?)
+}
+
+/// The target identity a stored plan was computed against.
+///
+/// A plan written before this field existed reports neither identity and no
+/// availability marker; it cannot match anything observed now, and its digest
+/// encoding is older too, so it supersedes rather than executing.
+pub(crate) fn plan_target_identity(
+    status: &crate::crd::PostgresPolicyPlanStatus,
+) -> TargetIdentity {
+    TargetIdentity {
+        physical: status.target_physical_identity.clone(),
+        logical: status.target_logical_fingerprint.clone(),
+    }
 }
 
 /// Whether a stored plan status carries the given change digest under the
@@ -1192,7 +1543,7 @@ pub(crate) fn plan_matches_digest(
     status: &crate::crd::PostgresPolicyPlanStatus,
     change_digest: &str,
 ) -> bool {
-    status.change_digest_encoding.as_deref() == Some(APPROVAL_EFFECT_ENCODING_V1)
+    status.change_digest_encoding.as_deref() == Some(APPROVAL_EFFECT_ENCODING_V2)
         && status.change_digest.as_deref() == Some(change_digest)
 }
 
@@ -1263,6 +1614,18 @@ fn policy_selector(policy_name: &str) -> Selector {
     Expression::Equal(LABEL_POLICY.to_string(), sanitize_label_value(policy_name)).into()
 }
 
+/// Label selector matching every plan produced for one candidate.
+///
+/// Lossy in exactly the way [`policy_selector`] is, and paired with the same
+/// owner-UID check.
+fn candidate_selector(candidate_name: &str) -> Selector {
+    Expression::Equal(
+        LABEL_CANDIDATE.to_string(),
+        sanitize_label_value(candidate_name),
+    )
+    .into()
+}
+
 /// Is `resource` owned by `policy`, by controller-owner UID?
 ///
 /// The exact ownership test. The `pgroles.io/policy` label is lossy, and a
@@ -1280,13 +1643,18 @@ fn is_owned_by_policy<K: Resource>(resource: &K, policy: &PostgresPolicy) -> boo
         // treat an empty UID as a wildcard.
         return false;
     };
+    is_owned_by_uid(resource, policy_uid)
+}
+
+/// Is `resource` controlled by the object with this UID?
+pub(crate) fn is_owned_by_uid<K: Resource>(resource: &K, uid: &str) -> bool {
     resource
         .meta()
         .owner_references
         .as_deref()
         .unwrap_or_default()
         .iter()
-        .any(|owner| owner.uid == policy_uid && owner.controller.unwrap_or(false))
+        .any(|owner| owner.uid == uid && owner.controller.unwrap_or(false))
 }
 
 /// Does `resource` carry a controller owner that is *not* `policy`?
@@ -1298,8 +1666,8 @@ fn is_owned_by_policy<K: Resource>(resource: &K, policy: &PostgresPolicy) -> boo
 ///
 /// Fails closed: a policy with no UID cannot prove ownership of anything, so
 /// every owned object counts as another's.
-fn is_owned_by_another_policy<K: Resource>(resource: &K, policy: &PostgresPolicy) -> bool {
-    let policy_uid = policy.metadata.uid.as_deref();
+fn is_owned_by_another<K: Resource>(resource: &K, owner_object: PlanOwner<'_>) -> bool {
+    let policy_uid = owner_object.uid();
     resource
         .meta()
         .owner_references
@@ -1543,6 +1911,14 @@ pub async fn mark_plan_failed(
 ///
 /// Callers provide `reason` and `message` to distinguish auto-approval from
 /// manual approval in the plan's conditions.
+///
+/// When a terminal decision is already recorded — a reviewer approved this
+/// plan, which is the whole of the manual path and of an adopted candidate
+/// plan — only the phase advances. The decision, its reason and message, and
+/// `decidedBy` are the reviewer's record: rewriting them would overwrite what
+/// a human said with the operator's own boilerplate, and resending the whole
+/// array from a watch-backed read could drop a decision that landed after that
+/// read. This is the same reasoning as [`mark_plan_rejected`].
 pub async fn mark_plan_approved(
     client: &Client,
     plan: &PostgresPolicyPlan,
@@ -1553,7 +1929,20 @@ pub async fn mark_plan_approved(
     let plan_name = plan.name_any();
     let plans_api: Api<PostgresPolicyPlan> = Api::namespaced(client.clone(), &namespace);
 
-    let mut status = plan.status.clone().unwrap_or_default();
+    let existing = plan.status.clone().unwrap_or_default();
+    if has_terminal_decision(&existing) {
+        let patch = serde_json::json!({ "status": { "phase": PlanPhase::Approved } });
+        plans_api
+            .patch_status(
+                &plan_name,
+                &PatchParams::apply("pgroles-operator"),
+                &Patch::Merge(&patch),
+            )
+            .await?;
+        return Ok(());
+    }
+
+    let mut status = existing;
     status.phase = PlanPhase::Approved;
     set_plan_condition(&mut status.conditions, "Approved", "True", reason, message);
     // Under `approval: auto` the operator itself is the decider, and the CEL
@@ -1604,24 +1993,72 @@ pub async fn mark_plan_rejected(
     Ok(())
 }
 
-/// Mark a plan as Superseded (database state changed since approval).
+/// Whether a terminal decision — `Approved=True` or `Denied=True` — is
+/// recorded on this status.
+///
+/// This is exactly the predicate the CRD's CEL rules key off: once it is true,
+/// the set of decisions that are true is frozen and `decidedBy` is write-once.
+pub(crate) fn has_terminal_decision(status: &PostgresPolicyPlanStatus) -> bool {
+    status.conditions.iter().any(|c| {
+        (c.condition_type == "Approved" || c.condition_type == "Denied") && c.status == "True"
+    })
+}
+
+/// The status a supersede writes: the plan is voided by its *phase*, and the
+/// cause is recorded on a `Superseded` condition.
+///
+/// Voiding must never be expressed by flipping a recorded decision. The plan
+/// CRD holds a decision terminal — the set of decision types that are `True`
+/// may not change once non-empty — and pairs any terminal decision with a
+/// write-once `decidedBy`. Writing `Approved=False` over a real approval
+/// breaks both rules at once, so against a live API server the write is
+/// rejected and the stale approved plan stays actionable. Execution gates on
+/// phase (`get_current_actionable_plan` only considers `Pending`/`Approved`)
+/// plus a digest match, so `Superseded` alone is what makes a plan
+/// unexecutable; the decision record is left exactly as the reviewer left it.
+///
+/// A plan that was never decided has no decision to preserve, so the
+/// retirement cause is also stamped on its already-`False` `Approved`
+/// condition, where reviewers have always read it.
+pub(crate) fn superseded_status(
+    status: &PostgresPolicyPlanStatus,
+    cause: SupersedeCause,
+) -> PostgresPolicyPlanStatus {
+    let mut next = status.clone();
+    next.phase = PlanPhase::Superseded;
+    set_plan_condition(
+        &mut next.conditions,
+        crate::crd::CONDITION_SUPERSEDED,
+        "True",
+        cause.reason(),
+        cause.message(),
+    );
+    if !has_terminal_decision(status) {
+        set_plan_condition(
+            &mut next.conditions,
+            "Approved",
+            "False",
+            cause.reason(),
+            cause.message(),
+        );
+    }
+    next
+}
+
+/// Mark a plan as Superseded, recording `cause` on a `Superseded` condition so
+/// the reason the plan was retired survives on the object.
+///
+/// Safe to call on a plan carrying a human decision: see [`superseded_status`].
 pub async fn mark_plan_superseded(
     client: &Client,
     plan: &PostgresPolicyPlan,
+    cause: SupersedeCause,
 ) -> Result<(), ReconcileError> {
     let namespace = plan.namespace().ok_or(ReconcileError::NoNamespace)?;
     let plan_name = plan.name_any();
     let plans_api: Api<PostgresPolicyPlan> = Api::namespaced(client.clone(), &namespace);
 
-    let mut status = plan.status.clone().unwrap_or_default();
-    status.phase = PlanPhase::Superseded;
-    set_plan_condition(
-        &mut status.conditions,
-        "Approved",
-        "False",
-        "Superseded",
-        "Database state changed since plan was approved",
-    );
+    let status = superseded_status(&plan.status.clone().unwrap_or_default(), cause);
 
     let patch = serde_json::json!({ "status": status });
     plans_api
@@ -1770,9 +2207,104 @@ pub async fn record_plan_revalidation(
 mod tests {
     use super::*;
     use crate::crd::CrdReconciliationMode;
+    use crate::crd::{LocalObjectReference, PolicyContent, PostgresPolicyCandidateSpec};
     use base64::Engine as _;
     use flate2::read::GzDecoder;
     use std::io::Read;
+
+    fn test_plan_spec() -> PostgresPolicyPlanSpec {
+        PostgresPolicyPlanSpec {
+            policy_ref: PolicyPlanRef {
+                name: "orders".to_string(),
+            },
+            policy_generation: 1,
+            reconciliation_mode: CrdReconciliationMode::Authoritative,
+            owned_roles: Vec::new(),
+            owned_schemas: Vec::new(),
+            managed_database_identity: "default/db/DATABASE_URL".to_string(),
+            origin: None,
+            scope: None,
+        }
+    }
+
+    fn test_candidate(name: &str, uid: &str) -> PostgresPolicyCandidate {
+        let mut candidate = PostgresPolicyCandidate::new(
+            name,
+            PostgresPolicyCandidateSpec {
+                policy_ref: LocalObjectReference {
+                    name: "orders".to_string(),
+                },
+                replaces: None,
+                target: None,
+                content: PolicyContent::default(),
+            },
+        );
+        candidate.metadata.namespace = Some("default".to_string());
+        candidate.metadata.uid = Some(uid.to_string());
+        candidate
+    }
+
+    #[test]
+    fn a_candidate_plan_binds_the_candidate_the_content_and_the_policy() {
+        let mut policy = PostgresPolicy::new("orders", test_policy_spec());
+        policy.metadata.uid = Some("policy-uid".to_string());
+        let candidate = test_candidate("orders-change-x7k2p", "candidate-uid");
+
+        let origin = candidate_plan_origin(
+            CandidatePlanBinding {
+                candidate: &candidate,
+                content_digest: "sha256:abc",
+                content_digest_encoding: pgroles_core::candidate::CANDIDATE_CONTENT_ENCODING_V1,
+                base_content_digest: "sha256:base",
+            },
+            &policy,
+        );
+
+        assert_eq!(origin.kind, "PostgresPolicyCandidate");
+        assert_eq!(origin.name, "orders-change-x7k2p");
+        assert_eq!(origin.uid, "candidate-uid");
+        assert_eq!(origin.content_digest.as_deref(), Some("sha256:abc"));
+        assert_eq!(
+            origin.content_digest_encoding.as_deref(),
+            Some(pgroles_core::candidate::CANDIDATE_CONTENT_ENCODING_V1)
+        );
+        // The policy's UID, not its name: a delete-and-recreate of the same
+        // name is a different policy, and a plan reviewed against the old one
+        // must not read as bound to the new one.
+        assert_eq!(origin.policy_uid.as_deref(), Some("policy-uid"));
+    }
+
+    #[test]
+    fn a_candidate_plan_is_owned_by_the_candidate_not_the_policy() {
+        // ADR-001 Decision 3: plan pruning cascades from candidate deletion.
+        let mut policy = PostgresPolicy::new("orders", test_policy_spec());
+        policy.metadata.uid = Some("policy-uid".to_string());
+        let candidate = test_candidate("orders-change-x7k2p", "candidate-uid");
+
+        let owner = PlanOwner::Candidate(&candidate).owner_reference();
+        assert_eq!(owner.kind, "PostgresPolicyCandidate");
+        assert_eq!(owner.uid, "candidate-uid");
+        assert_eq!(owner.controller, Some(true));
+        assert_eq!(owner.block_owner_deletion, Some(true));
+
+        let mut plan = PostgresPolicyPlan::new("plan", test_plan_spec());
+        plan.metadata.owner_references = Some(vec![owner]);
+        assert!(PlanOwner::Candidate(&candidate).owns(&plan));
+        // The policy's own retention loop filters by its UID, so a candidate
+        // plan is invisible to it — which is what keeps it alive for review.
+        assert!(!is_owned_by_policy(&plan, &policy));
+    }
+
+    #[test]
+    fn the_keep_label_exempts_a_terminal_object_from_retention() {
+        let mut plan = PostgresPolicyPlan::new("plan", test_plan_spec());
+        assert!(!crate::crd::is_retention_exempt(&plan));
+        plan.metadata.labels = Some(BTreeMap::from([(
+            crate::crd::LABEL_KEEP.to_string(),
+            "true".to_string(),
+        )]));
+        assert!(crate::crd::is_retention_exempt(&plan));
+    }
 
     /// A minimal spec — the ownership tests only care about metadata.
     fn test_policy_spec() -> crate::crd::PostgresPolicySpec {
@@ -1783,6 +2315,7 @@ mod tests {
                 }),
                 secret_key: Some("DATABASE_URL".to_string()),
                 params: None,
+                require_physical_identity: None,
             },
             interval: "5m".to_string(),
             suspend: false,
@@ -1843,22 +2376,22 @@ mod tests {
 
         let mut ours = test_plan("plan-1", PlanPhase::Pending, None);
         ours.metadata.owner_references = Some(vec![build_owner_reference(&mine)]);
-        assert!(!is_owned_by_another_policy(&ours, &mine));
+        assert!(!is_owned_by_another(&ours, PlanOwner::Policy(&mine)));
 
         let mut rival = test_plan("plan-2", PlanPhase::Pending, None);
         rival.metadata.owner_references = Some(vec![build_owner_reference(&theirs)]);
-        assert!(is_owned_by_another_policy(&rival, &mine));
+        assert!(is_owned_by_another(&rival, PlanOwner::Policy(&mine)));
 
         // An orphan belongs to nobody, so it does not block us.
         let orphan = test_plan("plan-3", PlanPhase::Pending, None);
-        assert!(!is_owned_by_another_policy(&orphan, &mine));
+        assert!(!is_owned_by_another(&orphan, PlanOwner::Policy(&mine)));
 
         // A non-controller owner reference is not a claim either.
         let mut non_controller = build_owner_reference(&theirs);
         non_controller.controller = Some(false);
         let mut referenced = test_plan("plan-4", PlanPhase::Pending, None);
         referenced.metadata.owner_references = Some(vec![non_controller]);
-        assert!(!is_owned_by_another_policy(&referenced, &mine));
+        assert!(!is_owned_by_another(&referenced, PlanOwner::Policy(&mine)));
     }
 
     /// Fail closed: without a UID we cannot prove anything is ours, so every
@@ -1871,11 +2404,11 @@ mod tests {
 
         let mut claimed = test_plan("plan-1", PlanPhase::Pending, None);
         claimed.metadata.owner_references = Some(vec![build_owner_reference(&owner)]);
-        assert!(is_owned_by_another_policy(&claimed, &no_uid));
+        assert!(is_owned_by_another(&claimed, PlanOwner::Policy(&no_uid)));
 
         // ...but an orphan is still nobody's.
         let orphan = test_plan("plan-2", PlanPhase::Pending, None);
-        assert!(!is_owned_by_another_policy(&orphan, &no_uid));
+        assert!(!is_owned_by_another(&orphan, PlanOwner::Policy(&no_uid)));
     }
 
     #[test]
@@ -2072,6 +2605,255 @@ mod tests {
         ]);
         let plan = test_plan("plan-1", PlanPhase::Pending, Some(annotations));
         assert_eq!(check_plan_approval(&plan), PlanApprovalState::Pending);
+    }
+
+    /// The supersede condition is often the only trace a reviewer sees of why
+    /// the plan they were looking at vanished. Every cause must describe
+    /// itself; the previous single message claimed the database had changed
+    /// even when it was an effect-neutral policy edit that retired the plan.
+    #[test]
+    fn every_supersede_cause_names_its_own_reason() {
+        use pgroles_core::approval::TargetIdentityReason;
+
+        let causes = [
+            SupersedeCause::EffectsChanged,
+            SupersedeCause::EffectsCleared,
+            SupersedeCause::ReplacedByNewerPlan,
+            SupersedeCause::PolicyStoppedPlanning,
+            SupersedeCause::SupersededByPromotion,
+            SupersedeCause::BaseContentChanged,
+            SupersedeCause::TargetChanged(TargetIdentityReason::TargetChanged),
+        ];
+        // A new variant must be added to `causes` above or this stops
+        // compiling — the coverage of this test is enforced, not remembered.
+        for cause in causes {
+            match cause {
+                SupersedeCause::EffectsChanged
+                | SupersedeCause::EffectsCleared
+                | SupersedeCause::ReplacedByNewerPlan
+                | SupersedeCause::PolicyStoppedPlanning
+                | SupersedeCause::SupersededByPromotion
+                | SupersedeCause::BaseContentChanged
+                | SupersedeCause::TargetChanged(_) => {}
+            }
+        }
+
+        let mut messages = std::collections::BTreeSet::new();
+        for cause in causes {
+            let message = cause.message();
+            assert!(!message.is_empty(), "{cause:?} has no message");
+            assert!(
+                messages.insert(message),
+                "{cause:?} reuses another cause's message"
+            );
+            assert!(
+                !message.contains("Database state changed since plan was approved"),
+                "{cause:?} still carries the old catch-all message"
+            );
+        }
+    }
+
+    /// The generic causes keep reporting `Superseded` so status consumers and
+    /// runbooks matching on that reason keep working. A target change is the
+    /// exception: it is a distinct operational fault and reports the identity
+    /// verdict a human has to act on.
+    #[test]
+    fn supersede_reasons_stay_stable_except_for_a_moved_target() {
+        use pgroles_core::approval::TargetIdentityReason;
+
+        for cause in [
+            SupersedeCause::EffectsChanged,
+            SupersedeCause::EffectsCleared,
+            SupersedeCause::ReplacedByNewerPlan,
+            SupersedeCause::PolicyStoppedPlanning,
+        ] {
+            assert_eq!(cause.reason(), "Superseded", "{cause:?}");
+        }
+
+        // Promotion names itself: it is the one supersede a reviewer resolves
+        // by filing a successor candidate, not by re-reviewing this plan.
+        assert_eq!(
+            SupersedeCause::SupersededByPromotion.reason(),
+            crate::crd::candidate_reason::SUPERSEDED_BY_PROMOTION
+        );
+
+        assert_eq!(
+            SupersedeCause::TargetChanged(TargetIdentityReason::TargetIdentityUnavailable).reason(),
+            "TargetIdentityUnavailable"
+        );
+    }
+
+    /// Rust model of the two CRD CEL rules a supersede write has to satisfy,
+    /// for a status update from `old` to `new`:
+    ///
+    /// * "plan decisions are terminal" — the decision types that are `True`
+    ///   may not change once the old set is non-empty.
+    /// * "a terminal plan decision and decidedBy identity must be recorded
+    ///   together" — `decidedBy` is present exactly when a decision is `True`.
+    ///
+    /// Kept beside the code that produces the write, because there is no live
+    /// API server in unit tests to reject it.
+    fn cel_admits(
+        old: &crate::crd::PostgresPolicyPlanStatus,
+        new: &crate::crd::PostgresPolicyPlanStatus,
+    ) -> Result<(), &'static str> {
+        let true_decisions = |status: &crate::crd::PostgresPolicyPlanStatus| -> Vec<String> {
+            status
+                .conditions
+                .iter()
+                .filter(|c| {
+                    (c.condition_type == "Approved" || c.condition_type == "Denied")
+                        && c.status == "True"
+                })
+                .map(|c| c.condition_type.clone())
+                .collect()
+        };
+
+        let old_decisions = true_decisions(old);
+        if !old_decisions.is_empty() && old_decisions != true_decisions(new) {
+            return Err("plan decisions are terminal");
+        }
+        if old.decided_by.is_some()
+            && new.decided_by.as_ref().map(|d| &d.username)
+                != old.decided_by.as_ref().map(|d| &d.username)
+        {
+            return Err("decision identity is write-once");
+        }
+        if true_decisions(new).is_empty() != new.decided_by.is_none() {
+            return Err(
+                "a terminal plan decision and decidedBy identity must be recorded together",
+            );
+        }
+        Ok(())
+    }
+
+    /// Retiring a plan a human approved must not touch the decision. Voiding
+    /// is expressed by the phase alone; `Approved=True` and `decidedBy` are
+    /// terminal and write-once, and rewriting them is a write the API server
+    /// rejects — leaving the stale plan actionable.
+    #[test]
+    fn superseding_an_approved_plan_preserves_the_decision() {
+        let plan = test_plan_with_decisions("plan-1", PlanPhase::Approved, &[("Approved", "True")]);
+        let old = plan.status.clone().expect("status");
+        let new = superseded_status(&old, SupersedeCause::EffectsChanged);
+
+        assert_eq!(new.phase, PlanPhase::Superseded);
+        let approved = new
+            .conditions
+            .iter()
+            .find(|c| c.condition_type == "Approved")
+            .expect("Approved condition preserved");
+        assert_eq!(approved.status, "True");
+        assert_eq!(
+            new.decided_by.as_ref().map(|d| d.username.as_str()),
+            Some("reviewer@example.com")
+        );
+        let superseded = new
+            .conditions
+            .iter()
+            .find(|c| c.condition_type == crate::crd::CONDITION_SUPERSEDED)
+            .expect("Superseded condition recorded");
+        assert_eq!(superseded.status, "True");
+        assert_eq!(
+            superseded.message.as_deref(),
+            Some(SupersedeCause::EffectsChanged.message())
+        );
+
+        // And the write the API server would see is admissible.
+        assert_eq!(cel_admits(&old, &new), Ok(()));
+    }
+
+    /// A denied plan is retired the same way: the `Denied=True` record stands.
+    #[test]
+    fn superseding_a_denied_plan_preserves_the_decision() {
+        let plan = test_plan_with_decisions("plan-1", PlanPhase::Rejected, &[("Denied", "True")]);
+        let old = plan.status.clone().expect("status");
+        let new = superseded_status(&old, SupersedeCause::SupersededByPromotion);
+
+        assert!(
+            new.conditions
+                .iter()
+                .any(|c| c.condition_type == "Denied" && c.status == "True")
+        );
+        assert!(
+            !new.conditions
+                .iter()
+                .any(|c| c.condition_type == "Approved")
+        );
+        assert_eq!(cel_admits(&old, &new), Ok(()));
+    }
+
+    /// A plan nobody decided has no decision to protect, so the cause still
+    /// lands on the `Approved=False` condition reviewers read — and that write
+    /// is admissible because the old decision set was empty.
+    #[test]
+    fn superseding_a_pending_plan_still_records_the_cause_on_approved() {
+        let plan = test_plan_with_decisions("plan-1", PlanPhase::Pending, &[("Approved", "False")]);
+        let old = plan.status.clone().expect("status");
+        let new = superseded_status(&old, SupersedeCause::ReplacedByNewerPlan);
+
+        let approved = new
+            .conditions
+            .iter()
+            .find(|c| c.condition_type == "Approved")
+            .expect("Approved condition");
+        assert_eq!(approved.status, "False");
+        assert_eq!(
+            approved.message.as_deref(),
+            Some(SupersedeCause::ReplacedByNewerPlan.message())
+        );
+        assert!(
+            new.conditions
+                .iter()
+                .any(|c| c.condition_type == crate::crd::CONDITION_SUPERSEDED)
+        );
+        assert_eq!(cel_admits(&old, &new), Ok(()));
+    }
+
+    /// The regression this guards: the old supersede wrote `Approved=False`
+    /// unconditionally, and the model rejects that write on an approved plan
+    /// for exactly the reason a real API server does.
+    #[test]
+    fn voiding_an_approval_by_flipping_the_condition_is_rejected() {
+        let plan = test_plan_with_decisions("plan-1", PlanPhase::Approved, &[("Approved", "True")]);
+        let old = plan.status.clone().expect("status");
+        let mut new = old.clone();
+        new.phase = PlanPhase::Superseded;
+        set_plan_condition(
+            &mut new.conditions,
+            "Approved",
+            "False",
+            SupersedeCause::EffectsChanged.reason(),
+            SupersedeCause::EffectsChanged.message(),
+        );
+
+        assert_eq!(cel_admits(&old, &new), Err("plan decisions are terminal"));
+    }
+
+    /// A superseded plan is not executable even with its approval intact: the
+    /// only way to reach execution is a plan the policy picks as actionable,
+    /// and that selection is by phase.
+    #[test]
+    fn a_superseded_plan_is_not_actionable_even_when_approved() {
+        let plan = test_plan_with_decisions("plan-1", PlanPhase::Approved, &[("Approved", "True")]);
+        let superseded = superseded_status(
+            &plan.status.clone().expect("status"),
+            SupersedeCause::SupersededByPromotion,
+        );
+
+        // `check_plan_approval` still reads the preserved decision — that is
+        // the record, not the gate.
+        let mut retired = plan.clone();
+        retired.status = Some(superseded.clone());
+        assert_eq!(check_plan_approval(&retired), PlanApprovalState::Approved);
+
+        // The gate is the phase, which `get_current_actionable_plan` filters on.
+        assert!(!matches!(
+            superseded.phase,
+            PlanPhase::Pending | PlanPhase::Approved
+        ));
+        // And a replacement never re-retires it, so it cannot be resurrected.
+        assert!(!supersedes_after_create(&superseded, "some-other-digest"));
     }
 
     #[test]
@@ -2575,6 +3357,13 @@ mod tests {
         }
     }
 
+    fn test_target_identity() -> TargetIdentity {
+        TargetIdentity {
+            physical: Some("7412330000000000001".to_string()),
+            logical: Some("sha256:endpoint".to_string()),
+        }
+    }
+
     fn digest_for(
         changes: &[pgroles_core::diff::Change],
         versions: &BTreeMap<String, String>,
@@ -2583,7 +3372,10 @@ mod tests {
             changes,
             CrdReconciliationMode::default(),
             "default/db-credentials:DATABASE_URL",
+            &test_target_identity(),
             versions,
+            &[],
+            &[],
         )
         .expect("digest")
     }
@@ -2676,7 +3468,7 @@ mod tests {
         let pending = PostgresPolicyPlanStatus {
             phase: PlanPhase::Pending,
             change_digest: Some(planned.clone()),
-            change_digest_encoding: Some(APPROVAL_EFFECT_ENCODING_V1.to_string()),
+            change_digest_encoding: Some(APPROVAL_EFFECT_ENCODING_V2.to_string()),
             revalidated_generation: Some(1),
             ..Default::default()
         };
@@ -2693,6 +3485,114 @@ mod tests {
             &pending,
             &digest_for(&edited, &versions)
         ));
+    }
+
+    #[test]
+    fn creating_a_replacement_retires_the_pending_plan_it_replaces() {
+        // The retirement is what step 12 performs *after* the replacement is
+        // visible; no caller may supersede ahead of it, so this predicate is
+        // the only thing deciding which plans a create retires.
+        let versions = password_versions("app", "role-passwords:app:1");
+        let old_digest = digest_for(&[grant_change("app")], &versions);
+        let new_digest = digest_for(&[grant_change("reporting")], &versions);
+
+        let pending = PostgresPolicyPlanStatus {
+            phase: PlanPhase::Pending,
+            change_digest: Some(old_digest.clone()),
+            change_digest_encoding: Some(APPROVAL_EFFECT_ENCODING_V2.to_string()),
+            ..Default::default()
+        };
+        // At most one plan may await a decision, so a pending plan is retired
+        // whether or not its effects moved.
+        assert!(supersedes_after_create(&pending, &new_digest));
+        assert!(supersedes_after_create(&pending, &old_digest));
+    }
+
+    #[test]
+    fn creating_a_replacement_voids_an_approval_that_no_longer_describes_the_effects() {
+        let versions = password_versions("app", "role-passwords:app:1");
+        let approved_digest = digest_for(&[grant_change("app")], &versions);
+        let fresh_digest = digest_for(&[grant_change("reporting")], &versions);
+
+        let approved = PostgresPolicyPlanStatus {
+            phase: PlanPhase::Approved,
+            change_digest: Some(approved_digest.clone()),
+            change_digest_encoding: Some(APPROVAL_EFFECT_ENCODING_V2.to_string()),
+            ..Default::default()
+        };
+
+        // The decision described effects the policy no longer produces: void.
+        assert!(supersedes_after_create(&approved, &fresh_digest));
+        // Still the current effects — a live decision, never discarded by a
+        // create that happens to run beside it.
+        assert!(!supersedes_after_create(&approved, &approved_digest));
+    }
+
+    #[test]
+    fn creating_a_plan_never_disturbs_a_settled_one() {
+        for phase in [
+            PlanPhase::Applied,
+            PlanPhase::Failed,
+            PlanPhase::Rejected,
+            PlanPhase::Superseded,
+            PlanPhase::Applying,
+        ] {
+            let status = PostgresPolicyPlanStatus {
+                phase,
+                ..Default::default()
+            };
+            assert!(!supersedes_after_create(&status, "any-digest"));
+        }
+    }
+
+    #[test]
+    fn a_recently_failed_identical_plan_is_reported_apart_from_a_pending_one() {
+        // Callers word the policy status off these variants: one plan is
+        // awaiting a decision, the other has already failed and is waiting out
+        // its retry window.
+        let pending = PlanCreationResult::Deduplicated("plan-a".to_string());
+        assert_eq!(pending.plan_name(), "plan-a");
+        assert!(!pending.is_created());
+        assert!(!pending.is_failed_backoff());
+
+        let failed = PlanCreationResult::DeduplicatedFailed("plan-b".to_string());
+        assert_eq!(failed.plan_name(), "plan-b");
+        assert!(!failed.is_created());
+        assert!(failed.is_failed_backoff());
+
+        let created = PlanCreationResult::Created("plan-c".to_string());
+        assert!(created.is_created());
+        assert!(!created.is_failed_backoff());
+    }
+
+    /// A candidate-origin plan's provenance names the candidate's generation,
+    /// not the parent policy's: the candidate is the spec the plan derives
+    /// from, and its immutability means the value is stamped once, honestly.
+    #[test]
+    fn a_candidate_plans_provenance_is_the_candidates_own_generation() {
+        let mut policy = PostgresPolicy::new(
+            "orders",
+            serde_json::from_value(serde_json::json!({
+                "connection": { "secretRef": { "name": "db" } },
+            }))
+            .expect("minimal policy spec"),
+        );
+        policy.metadata.generation = Some(5);
+        let mut candidate = PostgresPolicyCandidate::new(
+            "orders-change-x7k2p",
+            crate::crd::PostgresPolicyCandidateSpec {
+                policy_ref: crate::crd::LocalObjectReference {
+                    name: "orders".to_string(),
+                },
+                replaces: None,
+                target: None,
+                content: Default::default(),
+            },
+        );
+        candidate.metadata.generation = Some(1);
+
+        assert_eq!(PlanOwner::Policy(&policy).generation(), 5);
+        assert_eq!(PlanOwner::Candidate(&candidate).generation(), 1);
     }
 
     #[test]
@@ -2716,7 +3616,7 @@ mod tests {
 
         let current = PostgresPolicyPlanStatus {
             change_digest: Some(digest.clone()),
-            change_digest_encoding: Some(APPROVAL_EFFECT_ENCODING_V1.to_string()),
+            change_digest_encoding: Some(APPROVAL_EFFECT_ENCODING_V2.to_string()),
             ..Default::default()
         };
         assert!(plan_matches_digest(&current, &digest));
@@ -2738,7 +3638,7 @@ mod tests {
 
         let different_effects = PostgresPolicyPlanStatus {
             change_digest: Some("sha256:0000".to_string()),
-            change_digest_encoding: Some(APPROVAL_EFFECT_ENCODING_V1.to_string()),
+            change_digest_encoding: Some(APPROVAL_EFFECT_ENCODING_V2.to_string()),
             ..Default::default()
         };
         assert!(!plan_matches_digest(&different_effects, &digest));
@@ -2754,7 +3654,7 @@ mod tests {
         let pending = PostgresPolicyPlanStatus {
             phase: PlanPhase::Pending,
             change_digest: Some(planned),
-            change_digest_encoding: Some(APPROVAL_EFFECT_ENCODING_V1.to_string()),
+            change_digest_encoding: Some(APPROVAL_EFFECT_ENCODING_V2.to_string()),
             ..Default::default()
         };
         let empty_digest = digest_for(&[], &versions);
@@ -2769,7 +3669,7 @@ mod tests {
         let empty_plan = PostgresPolicyPlanStatus {
             phase: PlanPhase::Pending,
             change_digest: Some(empty_digest.clone()),
-            change_digest_encoding: Some(APPROVAL_EFFECT_ENCODING_V1.to_string()),
+            change_digest_encoding: Some(APPROVAL_EFFECT_ENCODING_V2.to_string()),
             ..Default::default()
         };
         assert_eq!(
@@ -2786,7 +3686,7 @@ mod tests {
         let pending = PostgresPolicyPlanStatus {
             phase: PlanPhase::Pending,
             change_digest: Some(digest_for(&original, &versions)),
-            change_digest_encoding: Some(APPROVAL_EFFECT_ENCODING_V1.to_string()),
+            change_digest_encoding: Some(APPROVAL_EFFECT_ENCODING_V2.to_string()),
             ..Default::default()
         };
 
@@ -2826,7 +3726,7 @@ mod tests {
         let approved = PostgresPolicyPlanStatus {
             phase: PlanPhase::Approved,
             change_digest: Some(approved_digest.clone()),
-            change_digest_encoding: Some(APPROVAL_EFFECT_ENCODING_V1.to_string()),
+            change_digest_encoding: Some(APPROVAL_EFFECT_ENCODING_V2.to_string()),
             ..Default::default()
         };
 
@@ -2864,6 +3764,74 @@ mod tests {
         }
     }
 
+    /// Repointing the connection at a different database must invalidate the
+    /// approval, even though every effect and the Kubernetes reference are
+    /// unchanged. This is the #180 gap: `DatabaseIdentity` names a Secret and
+    /// key, and both survive the repointing.
+    #[test]
+    fn an_approval_does_not_carry_over_to_a_moved_target() {
+        let versions = BTreeMap::new();
+        let changes = [grant_change("reporting")];
+
+        let approved = PostgresPolicyPlanStatus {
+            change_digest: Some(digest_for(&changes, &versions)),
+            change_digest_encoding: Some(APPROVAL_EFFECT_ENCODING_V2.to_string()),
+            target_physical_identity: test_target_identity().physical,
+            target_logical_fingerprint: test_target_identity().logical,
+            physical_identity_available: Some(true),
+            ..Default::default()
+        };
+
+        // Same Secret, same key, same effects — different endpoint behind it.
+        let moved = TargetIdentity {
+            logical: Some("sha256:other-endpoint".to_string()),
+            ..test_target_identity()
+        };
+        let fresh_digest = compute_change_digest(
+            &changes,
+            CrdReconciliationMode::default(),
+            "default/db-credentials:DATABASE_URL",
+            &moved,
+            &versions,
+            &[],
+            &[],
+        )
+        .expect("digest");
+
+        assert_eq!(
+            decide_approved_plan(Some(&approved), &fresh_digest, true),
+            ApprovedPlanDecision::Replace,
+        );
+        assert_eq!(
+            pgroles_core::approval::evaluate_target_identity(
+                &plan_target_identity(&approved),
+                &moved,
+                false,
+            ),
+            pgroles_core::approval::TargetIdentityVerdict::Superseded(
+                pgroles_core::approval::TargetIdentityReason::TargetChanged
+            ),
+        );
+    }
+
+    /// A plan written before the identity fields existed reports neither, so
+    /// it can never be shown to hold the current target — which is the
+    /// fail-closed direction, and matches its older digest encoding.
+    #[test]
+    fn a_plan_without_recorded_identities_matches_nothing_observed() {
+        let legacy = PostgresPolicyPlanStatus::default();
+
+        assert_eq!(plan_target_identity(&legacy), TargetIdentity::default());
+        assert_ne!(
+            pgroles_core::approval::evaluate_target_identity(
+                &plan_target_identity(&legacy),
+                &test_target_identity(),
+                false,
+            ),
+            pgroles_core::approval::TargetIdentityVerdict::Proceed,
+        );
+    }
+
     /// The same no-op trap as the pending arm: if the approved effects are
     /// applied by hand before the plan executes, superseding it must not leave
     /// a zero-change replacement demanding a second approval.
@@ -2873,7 +3841,7 @@ mod tests {
         let approved = PostgresPolicyPlanStatus {
             phase: PlanPhase::Approved,
             change_digest: Some(digest_for(&[grant_change("reporting")], &versions)),
-            change_digest_encoding: Some(APPROVAL_EFFECT_ENCODING_V1.to_string()),
+            change_digest_encoding: Some(APPROVAL_EFFECT_ENCODING_V2.to_string()),
             ..Default::default()
         };
         let empty_digest = digest_for(&[], &versions);
@@ -2889,7 +3857,7 @@ mod tests {
         let approved_empty = PostgresPolicyPlanStatus {
             phase: PlanPhase::Approved,
             change_digest: Some(empty_digest.clone()),
-            change_digest_encoding: Some(APPROVAL_EFFECT_ENCODING_V1.to_string()),
+            change_digest_encoding: Some(APPROVAL_EFFECT_ENCODING_V2.to_string()),
             ..Default::default()
         };
         assert_eq!(
@@ -2959,7 +3927,10 @@ mod tests {
             &pgroles_core::approval::EffectDigestInputs {
                 reconciliation_mode: CrdReconciliationMode::default().into(),
                 target: "default/db-credentials:DATABASE_URL",
+                target_identity: &test_target_identity(),
                 password_source_versions: &versions,
+                owned_roles: &[],
+                owned_schemas: &[],
             },
         )
         .expect("canonical bytes");

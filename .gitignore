@@ -20,3 +20,6 @@ Thumbs.db
 
 # OpenCode
 .opencode/
+
+# TLC Toolbox trace output
+correctness/races/*_TTrace_*

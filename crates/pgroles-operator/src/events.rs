@@ -11,7 +11,7 @@ use kube::runtime::events::{Event, EventType, Recorder};
 
 use crate::crd::{
     EphemeralAccessRequest, EphemeralAccessRequestPhase, PolicyCondition, PostgresPolicy,
-    PostgresPolicyPlan, PostgresPolicyStatus,
+    PostgresPolicyCandidate, PostgresPolicyPlan, PostgresPolicyStatus,
 };
 
 /// Publish a request lifecycle Event on the request object itself.
@@ -55,6 +55,48 @@ pub async fn publish_status_events(
     Ok(())
 }
 
+/// Publish a Warning Event on a policy for a condition that has no status
+/// representation of its own.
+pub async fn publish_policy_warning(
+    recorder: &Recorder,
+    policy: &PostgresPolicy,
+    reason: &str,
+    action: &str,
+    note: String,
+) -> Result<(), kube::Error> {
+    let reference: ObjectReference = policy.object_ref(&());
+    recorder
+        .publish(&event(EventType::Warning, reason, action, note), &reference)
+        .await
+}
+
+/// Publish a candidate lifecycle Event on the candidate itself.
+///
+/// On the candidate rather than the policy: a policy may carry many open
+/// proposals, and a stream of their transitions on the policy's Event list
+/// would bury the policy's own. `reason` is the condition reason the same
+/// transition writes, so `kubectl describe` and `kubectl get` agree.
+pub async fn publish_candidate_event(
+    recorder: &Recorder,
+    candidate: &PostgresPolicyCandidate,
+    warning: bool,
+    reason: &str,
+    note: String,
+) -> Result<(), kube::Error> {
+    let reference: ObjectReference = candidate.object_ref(&());
+    let event_type = if warning {
+        EventType::Warning
+    } else {
+        EventType::Normal
+    };
+    recorder
+        .publish(
+            &event(event_type, reason, "CandidateLifecycle", note),
+            &reference,
+        )
+        .await
+}
+
 /// Publish a plan lifecycle event on the parent policy.
 pub async fn publish_plan_event(
     recorder: &Recorder,
@@ -95,6 +137,12 @@ pub async fn publish_plan_event(
             "PlanLifecycle",
             format!("Plan {plan_name} applied successfully"),
         ),
+        PlanEventType::TargetIdentityChanged { reason, detail } => event(
+            EventType::Warning,
+            &reason,
+            "TargetIdentity",
+            format!("Plan {plan_name} cannot execute: {detail}"),
+        ),
         PlanEventType::ApplyFailed { error } => event(
             EventType::Warning,
             "ApplyFailed",
@@ -119,6 +167,10 @@ pub enum PlanEventType {
     ApplySucceeded,
     /// Plan execution failed.
     ApplyFailed { error: String },
+    /// The database the plan was approved against is not the one it would now
+    /// execute against, or an identity bound at approval can no longer be
+    /// read. `reason` is the machine-readable condition reason.
+    TargetIdentityChanged { reason: String, detail: String },
 }
 
 fn derive_status_events(
@@ -198,7 +250,7 @@ fn derive_status_events(
         crate::crd::CONDITION_APPROVAL_IGNORED,
     ) {
         let note = condition_message(new_status, crate::crd::CONDITION_APPROVAL_IGNORED)
-            .unwrap_or_else(|| "Plan approval has no effect in plan mode".to_string());
+            .unwrap_or_else(|| "Plan approval has no effect in observe mode".to_string());
         events.push(event(
             EventType::Warning,
             "ApprovalIgnored",

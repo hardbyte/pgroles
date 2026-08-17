@@ -24,11 +24,35 @@ runs:
       shell: bash
       run: kind create cluster --name ${{ inputs.cluster-name }} --wait 60s
 
+    # Ship gate for ADR-001 Decision 1. PostgresPolicyCandidate carries a
+    # whole-spec `self == oldSelf` CEL rule, and the API server refuses a CRD
+    # whose static cost estimate exceeds StaticEstimatedCostLimit (10,000,000).
+    # That estimate is derived from the schema's declared bounds and cannot be
+    # computed reliably outside a real apiserver, so it is checked against one
+    # here. A cost rejection must be recognisable as such and not as a generic
+    # apply failure, hence the separate step and the explicit grep.
+    - name: "CEL cost gate: PostgresPolicyCandidate CRD is admissible"
+      shell: bash
+      run: |
+        if ! output=$(kubectl apply -f k8s/postgrespolicycandidate-crd.yaml 2>&1); then
+          echo "$output"
+          if grep -qi 'estimated cost' <<<"$output"; then
+            echo "::error::PostgresPolicyCandidate CRD exceeded the CEL static cost limit. \
+        The whole-spec immutability rule is not admissible with the current schema bounds; \
+        see ADR-001 Decision 1 for the ranked fallbacks."
+          else
+            echo "::error::PostgresPolicyCandidate CRD was rejected by the API server."
+          fi
+          exit 1
+        fi
+        echo "$output"
+
     - name: Install CRDs
       shell: bash
       run: |
         kubectl apply -f k8s/crd.yaml
         kubectl apply -f k8s/postgrespolicyplan-crd.yaml
+        kubectl apply -f k8s/postgrespolicycandidate-crd.yaml
         kubectl apply -f k8s/ephemeralaccesspolicy-crd.yaml
         kubectl apply -f k8s/ephemeralaccessrequest-crd.yaml
 
@@ -128,6 +152,30 @@ runs:
           sleep 5
         done
         echo "::error::Operator health check failed"
-        kubectl get pgr basic-policy -o yaml
-        kubectl -n pgroles-system logs deployment/pgroles-operator --tail=50
         exit 1
+
+    # Everything a post-mortem needs, in the job log, whenever any setup step
+    # fails. A failure with only a 50-line log tail has already cost this repo
+    # one round of misdiagnosis; dump complete state instead.
+    - name: Setup diagnostics
+      if: failure()
+      shell: bash
+      run: |
+        echo "::group::pgroles resources"
+        kubectl get pgr,pgplan,pgcand,pgeap,pgear -A -o wide || true
+        kubectl get pgr -A -o yaml || true
+        echo "::endgroup::"
+        echo "::group::operator deployment and pods"
+        kubectl -n pgroles-system get pods -o wide || true
+        kubectl -n pgroles-system describe deployment/pgroles-operator || true
+        kubectl -n pgroles-system describe pods -l app=pgroles-operator || true
+        echo "::endgroup::"
+        echo "::group::operator logs (current)"
+        kubectl -n pgroles-system logs deployment/pgroles-operator --tail=-1 || true
+        echo "::endgroup::"
+        echo "::group::operator logs (previous container, if restarted)"
+        kubectl -n pgroles-system logs deployment/pgroles-operator --previous --tail=-1 || true
+        echo "::endgroup::"
+        echo "::group::events"
+        kubectl get events -A --sort-by=.lastTimestamp || true
+        echo "::endgroup::"

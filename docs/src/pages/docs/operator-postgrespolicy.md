@@ -38,7 +38,7 @@ spec:
 
   interval: "5m"   # reconciliation interval (supports 5m, 1h, 30s, 1h30m)
   suspend: false   # set true to pause reconciliation
-  mode: apply      # apply changes, or use plan for non-mutating drift preview
+  mode: apply      # apply changes, or use observe for non-mutating drift preview
   approval: auto   # auto applies immediately; manual gates behind a reviewed plan
   reconciliation_mode: authoritative  # authoritative | additive | adopt
 
@@ -136,7 +136,7 @@ spec:
 - `password.generate.secretName` — override the generated Secret name. If omitted, the operator derives a Kubernetes-safe name from `{policy}-pgr-{role}`.
 - `password.generate.secretKey` — key written into the generated Secret. Defaults to `password`.
 
-Generated Secrets are created in the same namespace as the `PostgresPolicy`, owned by that policy, and include both the cleartext password and a SCRAM verifier. The cleartext password is written at `password.generate.secretKey` (default `password`) and the SCRAM verifier is written at the fixed key `verifier`. `password.generate.secretKey` must not be `verifier`; the CRD rejects that value. Deleting the generated Secret causes the operator to recreate it and rotate the PostgreSQL password on the next reconcile.
+Generated Secrets are created in the same namespace as the `PostgresPolicy`, owned by that policy, and include both the cleartext password and a SCRAM verifier. The cleartext password is written at `password.generate.secretKey` (default `password`) and the SCRAM verifier is written at the fixed key `verifier`. `password.generate.secretKey` must not be `verifier`; the CRD rejects that value. Deleting the generated Secret causes the operator to recreate it and rotate the PostgreSQL password on the next reconcile, reporting a `GeneratedSecretMissing` Warning Event as it does. The Secret is created only while an approved plan executes, so under `approval: manual` it appears when the plan applies, not when it is proposed.
 
 ### Validation and reconcile semantics
 
@@ -144,7 +144,7 @@ Generated Secrets are created in the same namespace as the `PostgresPolicy`, own
 - Exactly one of `password.secretRef` or `password.generate` must be set.
 - Password values are redacted in operator logs and in the SQL preview stored on `PostgresPolicyPlan`.
 - If the referenced Secret or key is missing, the operator sets `Ready=False` and `Degraded=True` with reason `SecretMissing` or `SecretFetchFailed`, and retries on the normal interval.
-- Password updates are driven by password-source Secret changes. After a successful `apply`, unchanged password sources do not create permanent drift in later `plan` reconciles.
+- Password updates are driven by password-source Secret changes. After a successful `apply`, unchanged password sources do not create permanent drift in later `observe` reconciles.
 - pgroles cannot detect direct password changes made in PostgreSQL outside the operator, because PostgreSQL does not expose comparable password state safely.
 
 The controller also emits Kubernetes Events for notable state transitions. These are intended for `kubectl describe` and quick operational debugging, not as a durable audit trail or alerting mechanism.

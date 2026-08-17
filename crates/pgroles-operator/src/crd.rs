@@ -9,6 +9,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 
+use pgroles_core::bounds::*;
 use pgroles_core::manifest::{
     DefaultPrivilege, Grant, Membership, ObjectType, Privilege, RoleRetirement, SchemaBinding,
 };
@@ -60,7 +61,7 @@ pub struct PostgresPolicySpec {
     #[serde(default)]
     pub suspend: bool,
 
-    /// Reconciliation mode: `apply` executes SQL, `plan` computes drift only.
+    /// Reconciliation mode: `apply` executes SQL, `observe` computes drift only.
     #[serde(default)]
     pub mode: PolicyMode,
 
@@ -75,10 +76,12 @@ pub struct PostgresPolicySpec {
 
     /// Default owner for ALTER DEFAULT PRIVILEGES (e.g. "app_owner").
     #[serde(default)]
+    #[schemars(length(min = 1, max = MAX_IDENTIFIER))]
     pub default_owner: Option<String>,
 
     /// Reusable privilege profiles.
     #[serde(default)]
+    #[schemars(extend("maxProperties" = MAX_PROFILES))]
     pub profiles: std::collections::HashMap<String, ProfileSpec>,
 
     /// Schema bindings that expand profiles into concrete roles/grants.
@@ -86,6 +89,7 @@ pub struct PostgresPolicySpec {
     /// Keyed by `name` so server-side apply merges entries per schema instead
     /// of replacing the whole list. The API server also rejects duplicate keys.
     #[serde(default)]
+    #[schemars(length(max = MAX_SCHEMAS))]
     #[x_kube(merge_strategy = ListMerge::Map(vec!["name".into()]))]
     pub schemas: Vec<SchemaBinding>,
 
@@ -93,19 +97,23 @@ pub struct PostgresPolicySpec {
     ///
     /// Keyed by `name`; see `schemas`.
     #[serde(default)]
+    #[schemars(length(max = MAX_ROLES))]
     #[x_kube(merge_strategy = ListMerge::Map(vec!["name".into()]))]
     pub roles: Vec<RoleSpec>,
 
     /// One-off grants.
     #[serde(default)]
+    #[schemars(length(max = MAX_GRANTS))]
     pub grants: Vec<Grant>,
 
     /// One-off default privileges.
     #[serde(default)]
+    #[schemars(length(max = MAX_DEFAULT_PRIVILEGES))]
     pub default_privileges: Vec<DefaultPrivilege>,
 
     /// Membership edges.
     #[serde(default)]
+    #[schemars(length(max = MAX_MEMBERSHIPS))]
     pub memberships: Vec<Membership>,
 
     /// Explicit role-retirement workflows for roles that should be removed.
@@ -114,6 +122,7 @@ pub struct PostgresPolicySpec {
     /// `name`. Retiring one role twice was never meaningful, so the key is
     /// unambiguous.
     #[serde(default)]
+    #[schemars(length(max = MAX_RETIREMENTS))]
     #[x_kube(merge_strategy = ListMerge::Map(vec!["role".into()]))]
     pub retirements: Vec<RoleRetirement>,
 
@@ -122,7 +131,7 @@ pub struct PostgresPolicySpec {
     /// When `auto`, plans are approved and applied immediately.
     ///
     /// Omitting this is deprecated. It is still inferred from `mode`
-    /// (`apply` → `auto`, `plan` → `manual`) so existing policies keep working,
+    /// (`apply` → `auto`, `observe` → `manual`) so existing policies keep working,
     /// but the policy reports an `ApprovalUnset` condition until the field is
     /// set, and a future release will reject a policy that omits it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -134,12 +143,40 @@ fn default_interval() -> String {
 }
 
 /// Policy reconcile mode.
-#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+///
+/// Deliberately not `PartialEq`: `plan` is a deprecated spelling of `observe`
+/// that must behave identically everywhere, and an `==` comparison is exactly
+/// the kind of site that forgets one of the two. Compare through
+/// [`PolicyMode::never_executes`] and [`PolicyMode::is_deprecated_spelling`],
+/// or match exhaustively.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum PolicyMode {
     #[default]
     Apply,
+    /// Compute and publish plans, never execute. The current name: "plan"
+    /// should name exactly one artifact, the `PostgresPolicyPlan` (ADR-001).
+    Observe,
+    /// Deprecated spelling of `observe`, kept as an accepted schema value so
+    /// existing manifests — including ones a GitOps controller re-applies on
+    /// every sync — keep working across the rename. Behaviour is identical to
+    /// `observe` in every path; policies using it report a
+    /// `ModeValueDeprecated` condition and count toward
+    /// `pgroles.deprecated.mode_plan`. A future release removes the value.
     Plan,
+}
+
+impl PolicyMode {
+    /// Whether this mode never executes SQL — `observe`, under either
+    /// spelling.
+    pub fn never_executes(self) -> bool {
+        matches!(self, PolicyMode::Observe | PolicyMode::Plan)
+    }
+
+    /// Whether this is the deprecated `plan` spelling of `observe`.
+    pub fn is_deprecated_spelling(self) -> bool {
+        matches!(self, PolicyMode::Plan)
+    }
 }
 
 /// Convergence strategy for how aggressively to converge the database.
@@ -158,13 +195,14 @@ pub enum CrdReconciliationMode {
 /// Approval mode for plans generated by this policy.
 ///
 /// Set this explicitly. When omitted it is currently inferred from `spec.mode`
-/// (`apply` implies `auto`, `plan` implies `manual`), which leaves a policy's
+/// (`apply` implies `auto`, `observe` implies `manual`), which leaves a policy's
 /// execution gate invisible on the object. That inference is deprecated: a
 /// policy relying on it reports an `ApprovalUnset` status condition, and a
 /// future release will reject a policy that omits this field.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 pub enum ApprovalMode {
-    /// Plans require explicit approval annotation before execution.
+    /// Plans require an explicit terminal `Approved` decision on the plan's
+    /// status subresource before execution.
     #[serde(rename = "manual")]
     Manual,
     /// Plans are approved and applied automatically.
@@ -174,13 +212,13 @@ pub enum ApprovalMode {
 
 impl PostgresPolicySpec {
     /// Resolve the effective approval mode, inferring from `mode` when not set.
-    /// `apply` → `Auto` (backward compat), `plan` → `Manual`.
+    /// `apply` → `Auto` (backward compat), `observe` → `Manual`.
     pub fn effective_approval(&self) -> ApprovalMode {
         match &self.approval {
             Some(mode) => mode.clone(),
             None => match self.mode {
                 PolicyMode::Apply => ApprovalMode::Auto,
-                PolicyMode::Plan => ApprovalMode::Manual,
+                PolicyMode::Observe | PolicyMode::Plan => ApprovalMode::Manual,
             },
         }
     }
@@ -201,6 +239,21 @@ pub const LABEL_DATABASE_IDENTITY: &str = "pgroles.io/database-identity";
 
 /// Label key for the plan name on SQL storage resources.
 pub const LABEL_PLAN: &str = "pgroles.io/plan";
+/// Label key for the parent candidate name on candidate-origin plans.
+pub const LABEL_CANDIDATE: &str = "pgroles.io/candidate";
+/// Label exempting an object from bounded retention. Set to `"true"` on a
+/// terminal candidate (or plan) to keep it past the retention bound.
+pub const LABEL_KEEP: &str = "pgroles.io/keep";
+
+/// Is this object exempt from bounded retention?
+pub fn is_retention_exempt<K: kube::Resource>(resource: &K) -> bool {
+    resource
+        .meta()
+        .labels
+        .as_ref()
+        .and_then(|labels| labels.get(LABEL_KEEP))
+        .is_some_and(|value| value == "true")
+}
 /// Routing hint for requests resolved from one access-policy UID.
 pub const LABEL_ACCESS_POLICY_UID: &str = "pgroles.io/access-policy-uid";
 /// Routing hint for requests resolved against one target-policy UID.
@@ -259,9 +312,26 @@ pub struct ConnectionSpec {
     /// or a reference to a Secret key. Mutually exclusive with `secretRef`.
     #[serde(default)]
     pub params: Option<ConnectionParams>,
+
+    /// Refuse to plan or execute unless the target's *physical* identity —
+    /// `pg_control_system().system_identifier` — can be read.
+    ///
+    /// Off by default: every mainstream managed PostgreSQL exposes the
+    /// identifier, but PostgreSQL-protocol engines that are not PostgreSQL
+    /// (CockroachDB, Spanner's PostgreSQL interface, Redshift, Aurora DSQL) do
+    /// not implement it, and those targets run on the logical identity alone.
+    /// Set it where a real PostgreSQL is expected and losing the strongest
+    /// half of the target binding should stop reconciliation rather than
+    /// silently weaken it.
+    #[serde(default)]
+    pub require_physical_identity: Option<bool>,
 }
 
 impl ConnectionSpec {
+    /// Whether the physical target identity is mandatory for this connection.
+    pub fn requires_physical_identity(&self) -> bool {
+        self.require_physical_identity.unwrap_or(false)
+    }
     /// Effective secret key for URL mode. Defaults to `DATABASE_URL`.
     pub fn effective_secret_key(&self) -> &str {
         self.secret_key.as_deref().unwrap_or("DATABASE_URL")
@@ -289,19 +359,24 @@ impl ConnectionSpec {
         }
     }
 
-    /// Deterministic identity key for this connection spec.
+    /// Deterministic identity key for per-database locking and conflict
+    /// detection.
     ///
     /// - URL mode: `{secret_ref.name}/{secret_key}`
     /// - Params mode: canonical representation of the params
     ///
     /// Uses `\0` as field separator since null bytes cannot appear in K8s names
     /// or secret values, avoiding ambiguity from colons in literal values.
-    /// Deterministic identity key for per-database locking and conflict detection.
     ///
-    /// Identifies the target database (host + port + dbname) but NOT the
-    /// credentials. Two policies targeting the same database with different
-    /// users should still be considered as targeting the same database for
-    /// locking and overlap checks.
+    /// This is a *Kubernetes-level* key, not a database identity. In URL mode
+    /// it names only the Secret and key, so repointing that Secret at a
+    /// different server leaves it unchanged; in params mode it covers host,
+    /// port and dbname only when those are literals, and covers the Secret
+    /// reference (not its value) when they are not. Two policies targeting the
+    /// same database with different credentials do share it, which is what
+    /// locking and overlap checks need. What the database actually *is* comes
+    /// from the resolved target identity bound into the approval digest — see
+    /// `pgroles_core::approval::TargetIdentity`.
     pub fn identity_key(&self) -> String {
         if let Some(ref secret_ref) = self.secret_ref {
             format!("{}/{}", secret_ref.name, self.effective_secret_key())
@@ -526,8 +601,10 @@ impl ConnectionAuth {
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct SecretKeySelector {
     /// Name of the Secret.
+    #[schemars(length(min = 1, max = MAX_K8S_NAME))]
     pub name: String,
     /// Key within the Secret.
+    #[schemars(length(min = 1, max = MAX_SECRET_KEY))]
     pub key: String,
 }
 
@@ -535,6 +612,7 @@ pub struct SecretKeySelector {
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct SecretReference {
     /// Name of the Secret.
+    #[schemars(length(min = 1, max = MAX_K8S_NAME))]
     pub name: String,
 }
 
@@ -550,9 +628,11 @@ pub struct ProfileSpec {
     pub inherit: Option<bool>,
 
     #[serde(default)]
+    #[schemars(length(max = MAX_PROFILE_GRANTS))]
     pub grants: Vec<ProfileGrantSpec>,
 
     #[serde(default)]
+    #[schemars(length(max = MAX_PROFILE_DEFAULT_PRIVILEGES))]
     pub default_privileges: Vec<DefaultPrivilegeGrantSpec>,
 
     /// Role-level configuration parameter defaults for generated roles,
@@ -560,12 +640,14 @@ pub struct ProfileSpec {
     /// `{schema}` and `{profile}` placeholders, substituted per `schema x
     /// profile` expansion (e.g. `search_path: "{schema}"`).
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    #[schemars(extend("maxProperties" = MAX_CONFIG_ENTRIES))]
     pub config: std::collections::BTreeMap<String, pgroles_core::manifest::ConfigValue>,
 }
 
 /// Grant template within a profile.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct ProfileGrantSpec {
+    #[schemars(length(min = 1, max = MAX_PRIVILEGES))]
     pub privileges: Vec<Privilege>,
     #[serde(alias = "on")]
     pub object: ProfileObjectTargetSpec,
@@ -577,6 +659,7 @@ pub struct ProfileObjectTargetSpec {
     #[serde(rename = "type")]
     pub object_type: ObjectType,
     #[serde(default)]
+    #[schemars(length(min = 1, max = MAX_OBJECT_NAME))]
     pub name: Option<String>,
 }
 
@@ -584,7 +667,9 @@ pub struct ProfileObjectTargetSpec {
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct DefaultPrivilegeGrantSpec {
     #[serde(default)]
+    #[schemars(length(min = 1, max = MAX_IDENTIFIER))]
     pub role: Option<String>,
+    #[schemars(length(min = 1, max = MAX_PRIVILEGES))]
     pub privileges: Vec<Privilege>,
     pub on_type: ObjectType,
 }
@@ -592,6 +677,7 @@ pub struct DefaultPrivilegeGrantSpec {
 /// A concrete role definition (CRD-compatible version).
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct RoleSpec {
+    #[schemars(length(min = 1, max = MAX_IDENTIFIER))]
     pub name: String,
     /// Treat this role as externally managed. The operator may reference it in
     /// grants, ownership, and memberships, but will not create, alter, drop,
@@ -615,6 +701,7 @@ pub struct RoleSpec {
     #[serde(default)]
     pub connection_limit: Option<i32>,
     #[serde(default)]
+    #[schemars(length(max = MAX_OBJECT_NAME))]
     pub comment: Option<String>,
     /// Password source for this role. Either a reference to an existing Secret
     /// or a request for the operator to generate one.
@@ -622,12 +709,14 @@ pub struct RoleSpec {
     pub password: Option<PasswordSpec>,
     /// Password expiration timestamp (ISO 8601, e.g. "2025-12-31T00:00:00Z").
     #[serde(default)]
+    #[schemars(length(max = MAX_TIMESTAMP))]
     pub password_valid_until: Option<String>,
     /// Role-level configuration parameter defaults, applied via
     /// `ALTER ROLE ... SET parameter = value` (e.g. `role: combined`,
     /// `search_path: app`). Settings present on the role in the database but
     /// absent here are RESET in authoritative mode.
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    #[schemars(extend("maxProperties" = MAX_CONFIG_ENTRIES))]
     pub config: std::collections::BTreeMap<String, pgroles_core::manifest::ConfigValue>,
 }
 
@@ -657,6 +746,7 @@ pub struct PasswordSpec {
     /// Key within the referenced Secret. Defaults to the role name.
     /// Only used with `secretRef`.
     #[serde(default)]
+    #[schemars(length(min = 1, max = MAX_SECRET_KEY))]
     pub secret_key: Option<String>,
     /// Generate a random password and store it in a new Kubernetes Secret.
     /// Mutually exclusive with `secretRef`.
@@ -677,7 +767,7 @@ impl PasswordSpec {
 }
 
 /// Configuration for operator-generated passwords.
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct GeneratePasswordSpec {
     /// Password length. Defaults to 32. Minimum 16, maximum 128.
@@ -685,9 +775,11 @@ pub struct GeneratePasswordSpec {
     pub length: Option<u32>,
     /// Override the generated Secret name. Defaults to `{policy}-pgr-{role}`.
     #[serde(default)]
+    #[schemars(length(min = 1, max = MAX_K8S_NAME))]
     pub secret_name: Option<String>,
     /// Key within the generated Secret. Defaults to `password`.
     #[serde(default)]
+    #[schemars(length(min = 1, max = MAX_SECRET_KEY))]
     pub secret_key: Option<String>,
 }
 
@@ -868,6 +960,18 @@ pub struct PostgresPolicyStatus {
     /// Reference to the current/latest plan for this policy.
     #[serde(default)]
     pub current_plan_ref: Option<PlanReference>,
+
+    /// Canonical digest of this policy's own content, computed by exactly the
+    /// same function as a candidate's `status.contentDigest` (note the wire
+    /// names differ: this status object serialises snake_case, so the field is
+    /// `status.content_digest` here).
+    ///
+    /// Promotion is recognised by comparing the two. The value is also the
+    /// operator's memory of what the content was on the previous reconcile,
+    /// which is how an edited-after-approval promotion is distinguished from a
+    /// policy that simply has not changed while a candidate is under review.
+    #[serde(default)]
+    pub content_digest: Option<String>,
 }
 
 /// A condition on the `PostgresPolicy` resource.
@@ -941,7 +1045,7 @@ pub struct ChangeSummary {
 ///
 /// Represents a computed reconciliation plan for a `PostgresPolicy`. Plans are
 /// created by the operator and may require explicit approval before execution.
-#[derive(CustomResource, Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[derive(CustomResource, KubeSchema, Debug, Clone, Serialize, Deserialize)]
 #[kube(
     group = "pgroles.io",
     version = "v1alpha1",
@@ -957,9 +1061,20 @@ pub struct ChangeSummary {
     printcolumn = r#"{"name":"SQL Stmts","type":"integer","jsonPath":".status.sqlStatements","priority":1}"#,
     printcolumn = r#"{"name":"Phase","type":"string","jsonPath":".status.phase"}"#,
     printcolumn = r#"{"name":"SQL","type":"string","jsonPath":".status.sqlRef.name","priority":1}"#,
+    printcolumn = r#"{"name":"Digest","type":"string","jsonPath":".status.changeDigest","priority":1}"#,
     printcolumn = r#"{"name":"Hash","type":"string","jsonPath":".status.sqlHash","priority":1}"#,
     printcolumn = r#"{"name":"Age","type":"date","jsonPath":".metadata.creationTimestamp"}"#
 )]
+// Promotion trusts `spec.origin` — the candidate identity, its content
+// digest, and the base pin — so it must not be editable by anyone holding
+// plan `patch`. Origin equality is cheap to estimate because every origin
+// field is a bounded string; the rest of the spec stays mutable (it is
+// operator-written bookkeeping, and `owned_roles` is unbounded, which would
+// sink a whole-spec rule at the CEL cost gate).
+#[x_kube(validation = Rule::new(
+    "!has(oldSelf.origin) || (has(self.origin) && self.origin == oldSelf.origin)"
+)
+.message("plan origin is immutable once set"))]
 #[serde(rename_all = "camelCase")]
 pub struct PostgresPolicyPlanSpec {
     /// Reference to the policy that generated this plan.
@@ -988,9 +1103,46 @@ pub struct PostgresPolicyPlanSpec {
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct PlanOrigin {
+    #[schemars(length(max = 63))]
     pub kind: String,
+    #[schemars(length(max = 253))]
     pub name: String,
+    #[schemars(length(max = 63))]
     pub uid: String,
+    /// Canonical content digest of the originating candidate, and the encoding
+    /// it was computed under.
+    ///
+    /// This is what binds the reviewed plan to the content that will later be
+    /// promoted. It lives on the origin rather than in an annotation because a
+    /// promotion check that can be edited by anyone holding `patch` is not a
+    /// binding at all. Both fields are absent for non-candidate origins.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(length(max = 128))]
+    pub content_digest: Option<String>,
+    /// Version tag of the encoding `contentDigest` was computed under.
+    /// Digests from different encodings are never comparable, so promotion
+    /// recognition only matches digests carrying the same tag. Absent for
+    /// non-candidate origins.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(length(max = 64))]
+    pub content_digest_encoding: Option<String>,
+    /// UID of the `PostgresPolicy` the candidate proposes content for. The
+    /// plan's `spec.policyRef` names it; the UID is what survives a
+    /// delete-and-recreate of the same name.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(length(max = 63))]
+    pub policy_uid: Option<String>,
+    /// Canonical content digest of the *policy* content this candidate plan
+    /// was computed against — the applied base. A candidate is a complete
+    /// desired-state snapshot, so an approval is only meaningful against the
+    /// base it was reviewed on: identical SQL effects do not prove the
+    /// snapshot still preserves everything the base has come to manage since.
+    /// Promotion refuses to adopt a plan whose base pin no longer matches the
+    /// content the policy carried before the merge, and planning supersedes
+    /// the plan as soon as the base moves. Absent for non-candidate origins.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(length(max = 128))]
+    pub base_content_digest: Option<String>,
 }
 
 /// Scope enforced when executing a non-durable plan.
@@ -1038,7 +1190,30 @@ pub struct PolicyPlanRef {
     ).message("decision identity is write-once"),
     validation = Rule::new(
         "self.conditions.exists(c, (c.type == 'Approved' || c.type == 'Denied') && c.status == 'True') == has(self.decidedBy)"
-    ).message("a terminal plan decision and decidedBy identity must be recorded together")
+    ).message("a terminal plan decision and decidedBy identity must be recorded together"),
+    // The approval-binding fields are write-once. Execution gates on the
+    // recorded digest matching freshly recomputed effects, and the identity
+    // downgrade check reads these values — so anyone holding plans/status
+    // patch (every plan approver does) who could rewrite them could point an
+    // existing approval at different effects or a different server. The
+    // operator writes each of these exactly once, when it first materialises
+    // the plan's status; a legitimate rewrite repeats the same value, which
+    // equality admits.
+    validation = Rule::new(
+        "!has(oldSelf.changeDigest) || (has(self.changeDigest) && self.changeDigest == oldSelf.changeDigest)"
+    ).message("changeDigest is write-once"),
+    validation = Rule::new(
+        "!has(oldSelf.changeDigestEncoding) || (has(self.changeDigestEncoding) && self.changeDigestEncoding == oldSelf.changeDigestEncoding)"
+    ).message("changeDigestEncoding is write-once"),
+    validation = Rule::new(
+        "!has(oldSelf.targetPhysicalIdentity) || (has(self.targetPhysicalIdentity) && self.targetPhysicalIdentity == oldSelf.targetPhysicalIdentity)"
+    ).message("targetPhysicalIdentity is write-once"),
+    validation = Rule::new(
+        "!has(oldSelf.targetLogicalFingerprint) || (has(self.targetLogicalFingerprint) && self.targetLogicalFingerprint == oldSelf.targetLogicalFingerprint)"
+    ).message("targetLogicalFingerprint is write-once"),
+    validation = Rule::new(
+        "!has(oldSelf.physicalIdentityAvailable) || (has(self.physicalIdentityAvailable) && self.physicalIdentityAvailable == oldSelf.physicalIdentityAvailable)"
+    ).message("physicalIdentityAvailable is write-once")
 )]
 #[serde(rename_all = "camelCase")]
 pub struct PostgresPolicyPlanStatus {
@@ -1100,14 +1275,35 @@ pub struct PostgresPolicyPlanStatus {
     /// from different encodings are never comparable.
     #[serde(default)]
     pub change_digest_encoding: Option<String>,
-    /// The policy generation this plan was most recently confirmed current
-    /// against.
+    /// `pg_control_system().system_identifier` as read from the target when
+    /// this plan was computed — the storage lineage the approval is bound to.
+    /// Absent on engines that do not expose it.
+    #[serde(default)]
+    pub target_physical_identity: Option<String>,
+    /// Fingerprint of the resolved connection endpoint (host, port, database)
+    /// this plan was computed against.
+    #[serde(default)]
+    pub target_logical_fingerprint: Option<String>,
+    /// Whether the physical identity was readable when this plan was computed.
     ///
-    /// A pending plan is revalidated on every reconcile. When the policy
+    /// Recorded explicitly rather than inferred from
+    /// `target_physical_identity` being set, so that "the identifier could not
+    /// be read" is distinguishable from "this plan predates the field". The
+    /// difference matters at execution: a plan that had the identifier and now
+    /// does not is a downgrade and fails closed.
+    #[serde(default)]
+    pub physical_identity_available: Option<bool>,
+    /// The owning object's `.metadata.generation` this plan was most recently
+    /// confirmed current against — the policy's for an ordinary plan, the
+    /// candidate's for a candidate-origin plan.
+    ///
+    /// A pending policy plan is revalidated on every reconcile. When the policy
     /// changes but the resulting effects do not, the plan — and any decision
     /// recorded on it — is retained and this advances to the new generation.
-    /// It is provenance, never approval identity: `change_digest` is what a
-    /// decision binds.
+    /// A candidate's spec is immutable, so a candidate plan's provenance is
+    /// stamped once at creation; its ongoing revalidation is the digest
+    /// deduplication itself. It is provenance, never approval identity:
+    /// `change_digest` is what a decision binds.
     #[serde(default)]
     pub revalidated_generation: Option<i64>,
     /// When the plan was most recently confirmed current.
@@ -1828,99 +2024,182 @@ impl PostgresPolicySpec {
 // Conversion: CRD spec → core manifest types
 // ---------------------------------------------------------------------------
 
-impl PostgresPolicySpec {
-    /// Convert the CRD spec into a `PolicyManifest` for use with the core library.
-    pub fn to_policy_manifest(&self) -> pgroles_core::manifest::PolicyManifest {
-        use pgroles_core::manifest::{
-            DefaultPrivilegeGrant, MemberSpec, PolicyManifest, Profile, ProfileGrant,
-            ProfileObjectTarget, RoleDefinition,
-        };
+/// Build a core `PolicyManifest` from the shared policy-content fields.
+///
+/// `PostgresPolicySpec` and `PolicyContent` carry the same content by
+/// construction (ADR-001 Decision 1 keeps promotion a pure content copy), so
+/// they must also convert identically — a divergence here would mean a
+/// candidate is planned as something other than what promoting it produces.
+#[allow(clippy::too_many_arguments)]
+fn build_policy_manifest<'a>(
+    default_owner: Option<&str>,
+    profiles: impl Iterator<Item = (&'a String, &'a ProfileSpec)>,
+    schemas: &[SchemaBinding],
+    roles: &[RoleSpec],
+    grants: &[Grant],
+    default_privileges: &[DefaultPrivilege],
+    memberships: &[Membership],
+    retirements: &[RoleRetirement],
+) -> pgroles_core::manifest::PolicyManifest {
+    use pgroles_core::manifest::{
+        DefaultPrivilegeGrant, MemberSpec, PolicyManifest, Profile, ProfileGrant,
+        ProfileObjectTarget, RoleDefinition,
+    };
 
-        let profiles = self
-            .profiles
-            .iter()
-            .map(|(name, spec)| {
-                let profile = Profile {
-                    login: spec.login,
-                    inherit: spec.inherit,
-                    grants: spec
-                        .grants
-                        .iter()
-                        .map(|g| ProfileGrant {
-                            privileges: g.privileges.clone(),
-                            object: ProfileObjectTarget {
-                                object_type: g.object.object_type,
-                                name: g.object.name.clone(),
-                            },
-                        })
-                        .collect(),
-                    default_privileges: spec
-                        .default_privileges
-                        .iter()
-                        .map(|dp| DefaultPrivilegeGrant {
-                            role: dp.role.clone(),
-                            privileges: dp.privileges.clone(),
-                            on_type: dp.on_type,
-                        })
-                        .collect(),
-                    config: spec.config.clone(),
-                };
-                (name.clone(), profile)
-            })
-            .collect();
-
-        let roles = self
-            .roles
-            .iter()
-            .map(|r| RoleDefinition {
-                name: r.name.clone(),
-                external: r.external,
-                login: r.login,
-                superuser: r.superuser,
-                createdb: r.createdb,
-                createrole: r.createrole,
-                inherit: r.inherit,
-                replication: r.replication,
-                bypassrls: r.bypassrls,
-                connection_limit: r.connection_limit,
-                comment: r.comment.clone(),
-                password: None, // K8s passwords are resolved separately via Secret refs
-                password_valid_until: r.password_valid_until.clone(),
-                config: r.config.clone(),
-            })
-            .collect();
-
-        // Memberships need MemberSpec conversion — the core type should
-        // already be compatible since we use it directly in the CRD spec.
-        // But we need to ensure the serde aliases work. Let's rebuild to be safe.
-        let memberships = self
-            .memberships
-            .iter()
-            .map(|m| pgroles_core::manifest::Membership {
-                role: m.role.clone(),
-                members: m
-                    .members
+    let profiles = profiles
+        .map(|(name, spec)| {
+            let profile = Profile {
+                login: spec.login,
+                inherit: spec.inherit,
+                grants: spec
+                    .grants
                     .iter()
-                    .map(|ms| MemberSpec {
-                        name: ms.name.clone(),
-                        inherit: ms.inherit,
-                        admin: ms.admin,
+                    .map(|g| ProfileGrant {
+                        privileges: g.privileges.clone(),
+                        object: ProfileObjectTarget {
+                            object_type: g.object.object_type,
+                            name: g.object.name.clone(),
+                        },
                     })
                     .collect(),
-            })
-            .collect();
+                default_privileges: spec
+                    .default_privileges
+                    .iter()
+                    .map(|dp| DefaultPrivilegeGrant {
+                        role: dp.role.clone(),
+                        privileges: dp.privileges.clone(),
+                        on_type: dp.on_type,
+                    })
+                    .collect(),
+                config: spec.config.clone(),
+            };
+            (name.clone(), profile)
+        })
+        .collect();
 
-        PolicyManifest {
+    let roles = roles
+        .iter()
+        .map(|r| RoleDefinition {
+            name: r.name.clone(),
+            external: r.external,
+            login: r.login,
+            superuser: r.superuser,
+            createdb: r.createdb,
+            createrole: r.createrole,
+            inherit: r.inherit,
+            replication: r.replication,
+            bypassrls: r.bypassrls,
+            connection_limit: r.connection_limit,
+            comment: r.comment.clone(),
+            password: None, // K8s passwords are resolved separately via Secret refs
+            password_valid_until: r.password_valid_until.clone(),
+            config: r.config.clone(),
+        })
+        .collect();
+
+    let memberships = memberships
+        .iter()
+        .map(|m| pgroles_core::manifest::Membership {
+            role: m.role.clone(),
+            members: m
+                .members
+                .iter()
+                .map(|ms| MemberSpec {
+                    name: ms.name.clone(),
+                    inherit: ms.inherit,
+                    admin: ms.admin,
+                })
+                .collect(),
+        })
+        .collect();
+
+    PolicyManifest {
+        default_owner: default_owner.map(str::to_string),
+        auth_providers: Vec::new(),
+        profiles,
+        schemas: schemas.to_vec(),
+        roles,
+        grants: grants.to_vec(),
+        default_privileges: default_privileges.to_vec(),
+        memberships,
+        retirements: retirements.to_vec(),
+    }
+}
+
+impl PolicyContent {
+    /// Convert candidate content into a `PolicyManifest`.
+    ///
+    /// Identical to [`PostgresPolicySpec::to_policy_manifest`] by construction
+    /// — see [`build_policy_manifest`].
+    pub fn to_policy_manifest(&self) -> pgroles_core::manifest::PolicyManifest {
+        build_policy_manifest(
+            self.default_owner.as_deref(),
+            self.profiles.iter(),
+            &self.schemas,
+            &self.roles,
+            &self.grants,
+            &self.default_privileges,
+            &self.memberships,
+            &self.retirements,
+        )
+    }
+
+    /// The canonical content digest of this content.
+    ///
+    /// The single entry point, so a policy and a candidate can never be
+    /// digested through different code.
+    pub fn content_digest(&self) -> String {
+        pgroles_core::candidate::compute_content_digest(self)
+    }
+}
+
+impl PostgresPolicySpec {
+    /// Project the policy's content fields into [`PolicyContent`].
+    ///
+    /// The inverse of promotion: promotion copies `candidate.spec.content`
+    /// into `policy.spec`, and this reads that content back out. Both
+    /// directions are pure field moves — [`PolicyContent`] exists precisely so
+    /// that the projection is total and lossless — which is what lets the same
+    /// content produce the same digest on either kind.
+    pub fn policy_content(&self) -> PolicyContent {
+        PolicyContent {
+            reconciliation_mode: self.reconciliation_mode,
             default_owner: self.default_owner.clone(),
-            auth_providers: Vec::new(),
-            profiles,
+            profiles: self
+                .profiles
+                .iter()
+                .map(|(name, spec)| (name.clone(), spec.clone()))
+                .collect(),
             schemas: self.schemas.clone(),
-            roles,
+            roles: self.roles.clone(),
             grants: self.grants.clone(),
             default_privileges: self.default_privileges.clone(),
-            memberships,
+            memberships: self.memberships.clone(),
             retirements: self.retirements.clone(),
         }
+    }
+
+    /// The canonical content digest of this policy's content.
+    ///
+    /// Computed over [`PolicyContent`], not over the spec, so promoting a
+    /// candidate byte-for-byte yields the identical digest — the property
+    /// `promoting_candidate_content_yields_the_candidates_digest` pins.
+    pub fn content_digest(&self) -> String {
+        self.policy_content().content_digest()
+    }
+
+    /// Convert the CRD spec into a `PolicyManifest` for use with the core library.
+    pub fn to_policy_manifest(&self) -> pgroles_core::manifest::PolicyManifest {
+        build_policy_manifest(
+            self.default_owner.as_deref(),
+            self.profiles.iter(),
+            &self.schemas,
+            &self.roles,
+            &self.grants,
+            &self.default_privileges,
+            &self.memberships,
+            &self.retirements,
+        )
     }
 
     /// Derive a conservative ownership claim set from the policy spec.
@@ -2085,6 +2364,24 @@ pub fn paused_condition(message: &str) -> PolicyCondition {
     }
 }
 
+/// Condition type set when the target's identity stops the policy dead.
+///
+/// Distinct from `Drifted`/`Degraded`: nothing here is retried into
+/// convergence. Either the deployment requires an identity the target cannot
+/// answer with, or the target is not the one the operator was pointed at.
+pub const CONDITION_TARGET_IDENTITY_BLOCKED: &str = "TargetIdentityBlocked";
+
+/// Helper to create a `TargetIdentityBlocked` condition.
+pub fn target_identity_blocked_condition(reason: &str, message: &str) -> PolicyCondition {
+    PolicyCondition {
+        condition_type: CONDITION_TARGET_IDENTITY_BLOCKED.to_string(),
+        status: "True".to_string(),
+        reason: Some(reason.to_string()),
+        message: Some(message.to_string()),
+        last_transition_time: Some(now_rfc3339()),
+    }
+}
+
 /// Helper to create a "Conflict" condition.
 pub fn conflict_condition(reason: &str, message: &str) -> PolicyCondition {
     PolicyCondition {
@@ -2100,13 +2397,16 @@ pub fn conflict_condition(reason: &str, message: &str) -> PolicyCondition {
 /// inferred from `spec.mode`. Removed once the field becomes required.
 pub const CONDITION_APPROVAL_UNSET: &str = "ApprovalUnset";
 
+/// Condition type for `spec.mode: plan`, the deprecated spelling of `observe`.
+pub const CONDITION_MODE_VALUE_DEPRECATED: &str = "ModeValueDeprecated";
+
 /// Condition type reporting that a plan carries an approval annotation which
-/// cannot take effect, because `spec.mode: plan` never executes.
+/// cannot take effect, because `spec.mode: observe` never executes.
 pub const CONDITION_APPROVAL_IGNORED: &str = "ApprovalIgnored";
 
 /// Helper to create an "ApprovalIgnored" condition.
 ///
-/// Approving a plan under `spec.mode: plan` is accepted by the API server and
+/// Approving a plan under `spec.mode: observe` is accepted by the API server and
 /// then does nothing at all, which is indistinguishable from an operator that
 /// has stalled. Say so on the object, and name the combination that does gate
 /// an apply.
@@ -2114,9 +2414,9 @@ pub fn approval_ignored_condition(plan_name: &str) -> PolicyCondition {
     PolicyCondition {
         condition_type: CONDITION_APPROVAL_IGNORED.to_string(),
         status: "True".to_string(),
-        reason: Some("PlanModeNeverExecutes".to_string()),
+        reason: Some("ObserveModeNeverExecutes".to_string()),
         message: Some(format!(
-            "Plan {plan_name} is approved, but spec.mode is `plan`, so it will never execute and \
+            "Plan {plan_name} is approved, but spec.mode is `observe`, so it will never execute and \
              no SQL will run. For a reviewed apply use `mode: apply` with `approval: manual`."
         )),
         last_transition_time: Some(now_rfc3339()),
@@ -2146,6 +2446,22 @@ pub fn approval_unset_condition(inferred: ApprovalMode) -> PolicyCondition {
     }
 }
 
+/// Helper to create a "ModeValueDeprecated" condition.
+pub fn mode_value_deprecated_condition() -> PolicyCondition {
+    PolicyCondition {
+        condition_type: CONDITION_MODE_VALUE_DEPRECATED.to_string(),
+        status: "True".to_string(),
+        reason: Some("PlanSpelledObserve".to_string()),
+        message: Some(
+            "spec.mode is `plan`, the deprecated spelling of `observe`. Behaviour is identical: \
+             plans are computed and published, nothing executes. Change the manifest to \
+             `mode: observe` — a future release removes the `plan` value."
+                .to_string(),
+        ),
+        last_transition_time: Some(now_rfc3339()),
+    }
+}
+
 /// Helper to create a "Drifted" condition.
 pub fn drifted_condition(status: bool, reason: &str, message: &str) -> PolicyCondition {
     PolicyCondition {
@@ -2154,6 +2470,407 @@ pub fn drifted_condition(status: bool, reason: &str, message: &str) -> PolicyCon
         reason: Some(reason.to_string()),
         message: Some(message.to_string()),
         last_transition_time: Some(now_rfc3339()),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// PostgresPolicyCandidate CRD
+// ---------------------------------------------------------------------------
+
+/// The policy-content subset of `PostgresPolicySpec`.
+///
+/// This is everything a policy *declares about PostgreSQL* and nothing about
+/// how or when it is executed: no connection, interval, mode, approval or
+/// suspend. Those always come from the parent `PostgresPolicy` (a candidate
+/// may override only the connection, via `spec.target`).
+///
+/// Promotion is a pure content copy — `candidate.spec.content` becomes
+/// `policy.spec` with no conversion — so the field names, types and bounds
+/// here must stay identical to their `PostgresPolicySpec` counterparts. The
+/// `candidate_content_matches_policy_content` test holds that line.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+pub struct PolicyContent {
+    /// Convergence strategy: how aggressively to converge the database.
+    #[serde(default)]
+    pub reconciliation_mode: CrdReconciliationMode,
+
+    /// Default owner for ALTER DEFAULT PRIVILEGES (e.g. "app_owner").
+    #[serde(default)]
+    #[schemars(length(min = 1, max = MAX_IDENTIFIER))]
+    pub default_owner: Option<String>,
+
+    /// Reusable privilege profiles.
+    ///
+    /// A `BTreeMap` rather than the policy's `HashMap`: the content digest is
+    /// computed over a canonical serialization, and deterministic iteration
+    /// order is one less thing that has to be normalised later.
+    #[serde(default)]
+    #[schemars(extend("maxProperties" = MAX_PROFILES))]
+    pub profiles: std::collections::BTreeMap<String, ProfileSpec>,
+
+    /// Schema bindings that expand profiles into concrete roles/grants.
+    #[serde(default)]
+    #[schemars(length(max = MAX_SCHEMAS))]
+    pub schemas: Vec<SchemaBinding>,
+
+    /// One-off role definitions.
+    #[serde(default)]
+    #[schemars(length(max = MAX_ROLES))]
+    pub roles: Vec<RoleSpec>,
+
+    /// One-off grants.
+    #[serde(default)]
+    #[schemars(length(max = MAX_GRANTS))]
+    pub grants: Vec<Grant>,
+
+    /// One-off default privileges.
+    #[serde(default)]
+    #[schemars(length(max = MAX_DEFAULT_PRIVILEGES))]
+    pub default_privileges: Vec<DefaultPrivilege>,
+
+    /// Membership edges.
+    #[serde(default)]
+    #[schemars(length(max = MAX_MEMBERSHIPS))]
+    pub memberships: Vec<Membership>,
+
+    /// Explicit role-retirement workflows for roles that should be removed.
+    #[serde(default)]
+    #[schemars(length(max = MAX_RETIREMENTS))]
+    pub retirements: Vec<RoleRetirement>,
+}
+
+/// A one-shot, immutable proposal of policy content.
+///
+/// The operator plans a candidate in its parent policy's execution context and
+/// publishes a `PostgresPolicyPlan` for review; the active policy keeps
+/// enforcing throughout. A candidate never executes SQL in any state, and its
+/// spec cannot be edited — revising a proposal means creating a successor that
+/// names the earlier one in `spec.replaces`.
+///
+/// See `docs/src/pages/docs/operator-candidates.md` for the behaviour and
+/// `docs/design/adr-001-candidate-api.md` for the API mechanics.
+#[derive(CustomResource, KubeSchema, Debug, Clone, Serialize, Deserialize)]
+#[kube(
+    group = "pgroles.io",
+    version = "v1alpha1",
+    kind = "PostgresPolicyCandidate",
+    namespaced,
+    status = "PostgresPolicyCandidateStatus",
+    shortname = "pgcand",
+    category = "pgroles",
+    printcolumn = r#"{"name":"Policy","type":"string","jsonPath":".spec.policyRef.name"}"#,
+    printcolumn = r#"{"name":"Phase","type":"string","jsonPath":".status.phase"}"#,
+    printcolumn = r#"{"name":"Plan","type":"string","jsonPath":".status.planRef.name"}"#,
+    printcolumn = r#"{"name":"Digest","type":"string","jsonPath":".status.contentDigest","priority":1}"#,
+    printcolumn = r#"{"name":"Age","type":"date","jsonPath":".metadata.creationTimestamp"}"#
+)]
+// Whole-spec immutability, the same rule `EphemeralAccessRequest` carries. It
+// is only admissible because every string, list and map reachable from here is
+// bounded — see `pgroles_core::bounds` and ADR-001 Decision 1. Transition
+// rules skip CREATE, so this evaluates only on an attempted edit.
+#[x_kube(validation = Rule::new("self == oldSelf").message("candidate spec is immutable"))]
+#[serde(rename_all = "camelCase")]
+pub struct PostgresPolicyCandidateSpec {
+    /// The `PostgresPolicy` this candidate proposes content for. Resolved in
+    /// the candidate's own namespace: an owner reference cannot cross
+    /// namespaces, so neither can this.
+    pub policy_ref: LocalObjectReference,
+
+    /// Name of an earlier candidate this one supersedes.
+    ///
+    /// Supersession is always explicit. The operator never infers it from
+    /// creator identity, because CI typically files every team's candidates
+    /// under one service account.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(length(min = 1, max = MAX_K8S_NAME))]
+    pub replaces: Option<String>,
+
+    /// Preview the content against a different connection than the parent
+    /// policy's. Credentials, locking and the plan's bound target identity all
+    /// follow the override, which is why such a plan is a preview and never a
+    /// migration step.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target: Option<CandidateTarget>,
+
+    /// The proposed policy content.
+    pub content: PolicyContent,
+}
+
+/// Connection override for a candidate.
+#[derive(KubeSchema, Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CandidateTarget {
+    pub connection_ref: CandidateConnectionRef,
+}
+
+/// Reference to a Secret carrying the override connection URL.
+///
+/// Mirrors `ConnectionSpec`'s URL mode (`secretRef.name` + `secretKey`) in one
+/// flattened object: a candidate previews a single destination, so the
+/// structured-params mode has nothing to add here.
+#[derive(KubeSchema, Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CandidateConnectionRef {
+    /// Name of the Secret in the candidate's namespace.
+    #[schemars(length(min = 1, max = MAX_K8S_NAME))]
+    pub secret_name: String,
+    /// Key within the Secret holding the connection URL.
+    #[schemars(length(min = 1, max = MAX_SECRET_KEY))]
+    pub key: String,
+}
+
+/// Status of a `PostgresPolicyCandidate`.
+///
+/// `phase` is a printable summary; conditions are the source of truth.
+#[derive(KubeSchema, Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PostgresPolicyCandidateStatus {
+    #[serde(default)]
+    pub phase: CandidatePhase,
+
+    /// Canonical digest of `spec.content`, computed by
+    /// `pgroles_core::candidate::compute_content_digest`. This is what
+    /// promotion is verified against.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(length(max = 128))]
+    pub content_digest: Option<String>,
+
+    /// The `PostgresPolicyPlan` produced for this candidate.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plan_ref: Option<PlanReference>,
+
+    #[serde(default)]
+    #[schemars(length(max = 16))]
+    pub conditions: Vec<PolicyCondition>,
+
+    /// The `.metadata.generation` that was last observed. A candidate spec is
+    /// immutable, so this advances at most once.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observed_generation: Option<i64>,
+}
+
+/// Printable lifecycle summary for a candidate.
+#[derive(JsonSchema, Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub enum CandidatePhase {
+    /// Filed, not yet planned.
+    #[default]
+    Pending,
+    /// A current plan exists for this candidate.
+    Planned,
+    /// This candidate's content was promoted and executed.
+    Promoted,
+    /// Replaced by a successor, or its plan was denied.
+    Superseded,
+    /// The plan it was reviewed against no longer describes its effects.
+    Stale,
+}
+
+impl CandidatePhase {
+    /// A terminal candidate is never planned again.
+    ///
+    /// `Stale` is deliberately *not* terminal: it names a plan that no longer
+    /// describes the candidate's effects, and the next reconcile replans it.
+    /// The docs express supersession-by-replacement and plan denial as
+    /// `Superseded`, which is where terminality lives.
+    pub fn is_terminal(self) -> bool {
+        matches!(self, CandidatePhase::Promoted | CandidatePhase::Superseded)
+    }
+}
+
+/// Condition reasons for a `PostgresPolicyCandidate`.
+///
+/// These are the strings in the conditions table of
+/// `docs/src/pages/docs/operator-candidates.md`; status consumers match on
+/// them, so they are constants rather than literals at each call site.
+pub mod candidate_reason {
+    /// `Ready=True` — a current plan exists for this candidate.
+    pub const PLANNED: &str = "Planned";
+    /// `Ready=True` — the content is already the database's state, so there is
+    /// nothing to review. Not terminal: the content may diverge again.
+    pub const NO_EFFECTS: &str = "NoEffects";
+    /// `Ready=False` — the parent is failing or awaiting its own approval.
+    pub const BLOCKED_BY_ACTIVE_POLICY: &str = "BlockedByActivePolicy";
+    /// `Ready=False` — an ephemeral overlay overlaps this candidate's effects.
+    pub const OVERLAY_OVERLAP: &str = "OverlayOverlap";
+    /// `Ready=False` — the candidate could not be planned at all.
+    pub const PLANNING_FAILED: &str = "PlanningFailed";
+    /// `Superseded=True` — a successor named this candidate in `spec.replaces`.
+    pub const REPLACED: &str = "Replaced";
+    /// `Superseded=True` — replanning produced a different change digest.
+    pub const EFFECTS_CHANGED: &str = "EffectsChanged";
+    /// `Superseded=True` — the candidate's plan was denied (terminal).
+    pub const PLAN_DENIED: &str = "PlanDenied";
+    /// `Promoted=True` — this candidate's content became the policy's and
+    /// executed (terminal).
+    pub const PROMOTED: &str = "Promoted";
+    /// `Ready=False` — this candidate's content was promoted into the policy
+    /// while its plan held no approval, so the promotion executes nothing on
+    /// the approval it never had: the policy falls back to its ordinary
+    /// manual-plan flow.
+    pub const PROMOTED_WITHOUT_APPROVAL: &str = "PromotedWithoutApproval";
+    /// `Ready=False` — the policy's content changed to something that is *not*
+    /// this approved candidate: edited after approval, or rebased.
+    pub const PROMOTION_DIGEST_MISMATCH: &str = "PromotionDigestMismatch";
+    /// `Ready=False` — the policy's content *is* this approved candidate, but
+    /// the base moved between planning and merge, so the approval reviewed a
+    /// snapshot of a desired state that no longer exists. Nothing executes on
+    /// it; the ordinary manual flow takes over.
+    pub const PROMOTION_BASE_CHANGED: &str = "PromotionBaseChanged";
+    /// `Ready=False` — the content was promoted but the policy never executes
+    /// (`mode: observe`), so the candidate cannot reach `Promoted`.
+    pub const PROMOTION_NOT_EXECUTED: &str = "PromotionNotExecuted";
+    /// `Superseded=True` on a *plan* — another candidate's content was
+    /// promoted and executed, so this plan's approval can never be used.
+    pub const SUPERSEDED_BY_PROMOTION: &str = "SupersededByPromotion";
+}
+
+/// Condition type recording that a candidate is terminal.
+pub const CONDITION_SUPERSEDED: &str = "Superseded";
+
+/// Condition type carrying everything promotion has to say about a candidate.
+///
+/// `Promoted=True` is terminal: the content was promoted and executed.
+/// `Promoted=False` reports a promotion that did *not* complete — merged
+/// without approval, merged edited, or merged into a policy that never
+/// executes — and is deliberately a separate condition from `Ready`, which
+/// belongs to the planning lifecycle and is rewritten on every cycle.
+pub const CONDITION_PROMOTED: &str = "Promoted";
+
+/// Helper to create a candidate `Promoted` condition.
+pub fn promoted_condition(promoted: bool, reason: &str, message: &str) -> PolicyCondition {
+    PolicyCondition {
+        condition_type: CONDITION_PROMOTED.to_string(),
+        status: if promoted { "True" } else { "False" }.to_string(),
+        reason: Some(reason.to_string()),
+        message: Some(message.to_string()),
+        last_transition_time: Some(now_rfc3339()),
+    }
+}
+
+/// Set a condition on a bare condition list, preserving the transition time
+/// when the status value is unchanged.
+///
+/// The same rule [`PostgresPolicyStatus::set_condition`] applies, lifted to the
+/// list so candidate and plan statuses share it.
+pub fn set_condition_in(conditions: &mut Vec<PolicyCondition>, new: PolicyCondition) {
+    if let Some(existing) = conditions
+        .iter()
+        .find(|c| c.condition_type == new.condition_type)
+        && existing.status == new.status
+    {
+        let mut updated = new;
+        updated.last_transition_time = existing.last_transition_time.clone();
+        conditions.retain(|c| c.condition_type != updated.condition_type);
+        conditions.push(updated);
+        return;
+    }
+    conditions.retain(|c| c.condition_type != new.condition_type);
+    conditions.push(new);
+}
+
+/// Helper to create a candidate `Superseded` condition.
+pub fn superseded_condition(reason: &str, message: &str) -> PolicyCondition {
+    PolicyCondition {
+        condition_type: CONDITION_SUPERSEDED.to_string(),
+        status: "True".to_string(),
+        reason: Some(reason.to_string()),
+        message: Some(message.to_string()),
+        last_transition_time: Some(now_rfc3339()),
+    }
+}
+
+impl std::fmt::Display for CandidatePhase {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let name = match self {
+            CandidatePhase::Pending => "Pending",
+            CandidatePhase::Planned => "Planned",
+            CandidatePhase::Promoted => "Promoted",
+            CandidatePhase::Superseded => "Superseded",
+            CandidatePhase::Stale => "Stale",
+        };
+        f.write_str(name)
+    }
+}
+
+/// The generated `PostgresPolicyCandidate` CRD, with every OpenAPI `default`
+/// removed from under `spec.content`.
+///
+/// **Always use this instead of `PostgresPolicyCandidate::crd()`** — the raw
+/// derive emits schema defaults, which candidates must not have (ADR-001,
+/// Decision 2): a schema default is materialised into the stored object at
+/// write time, so if a default value ever changed, a stored candidate would
+/// keep the old value while the identical source manifest now means the new
+/// one. `self == oldSelf` would fail on byte-identical input, and — worse —
+/// the content digest of the stored object would no longer match the digest
+/// computed from the YAML it came from.
+///
+/// This is a post-processor rather than a per-field schemars attribute because
+/// the content types are shared with the CLI and with `PostgresPolicy`:
+/// `#[serde(default)]` is what makes deserialisation work and is exactly what
+/// schemars reads to emit `default`, and schemars offers no way to keep one
+/// without the other. Stripping the emitted schema afterwards keeps serde
+/// defaults fully intact — they are a deserialisation concern and never
+/// reached the schema's semantics anyway — and leaves `PostgresPolicy`'s own
+/// defaults untouched, as the ADR requires for now.
+pub fn postgres_policy_candidate_crd()
+-> k8s_openapi::apiextensions_apiserver::pkg::apis::apiextensions::v1::CustomResourceDefinition {
+    use kube::CustomResourceExt;
+
+    let mut crd = PostgresPolicyCandidate::crd();
+    for version in &mut crd.spec.versions {
+        let Some(content) = version
+            .schema
+            .as_mut()
+            .and_then(|s| s.open_api_v3_schema.as_mut())
+            .and_then(|s| s.properties.as_mut())
+            .and_then(|p| p.get_mut("spec"))
+            .and_then(|s| s.properties.as_mut())
+            .and_then(|p| p.get_mut("content"))
+        else {
+            continue;
+        };
+        strip_schema_defaults(content);
+    }
+    crd
+}
+
+/// Remove `default` from a schema and everything beneath it.
+fn strip_schema_defaults(
+    schema: &mut k8s_openapi::apiextensions_apiserver::pkg::apis::apiextensions::v1::JSONSchemaProps,
+) {
+    use k8s_openapi::apiextensions_apiserver::pkg::apis::apiextensions::v1::{
+        JSONSchemaPropsOrArray, JSONSchemaPropsOrBool,
+    };
+
+    schema.default = None;
+
+    if let Some(properties) = schema.properties.as_mut() {
+        for child in properties.values_mut() {
+            strip_schema_defaults(child);
+        }
+    }
+    if let Some(JSONSchemaPropsOrBool::Schema(child)) = schema.additional_properties.as_mut() {
+        strip_schema_defaults(child);
+    }
+    match schema.items.as_mut() {
+        Some(JSONSchemaPropsOrArray::Schema(child)) => strip_schema_defaults(child),
+        Some(JSONSchemaPropsOrArray::Schemas(children)) => {
+            children.iter_mut().for_each(strip_schema_defaults)
+        }
+        None => {}
+    }
+    for branch in [
+        schema.all_of.as_mut(),
+        schema.any_of.as_mut(),
+        schema.one_of.as_mut(),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        branch.iter_mut().for_each(strip_schema_defaults);
+    }
+    if let Some(child) = schema.not.as_mut() {
+        strip_schema_defaults(child);
     }
 }
 
@@ -2249,6 +2966,7 @@ mod tests {
                 }),
                 secret_key: Some("DATABASE_URL".to_string()),
                 params: None,
+                require_physical_identity: None,
             },
             interval: "5m".to_string(),
             suspend: false,
@@ -2311,6 +3029,7 @@ mod tests {
                 }),
                 secret_key: Some("DATABASE_URL".to_string()),
                 params: None,
+                require_physical_identity: None,
             },
             interval: "5m".to_string(),
             suspend: false,
@@ -2394,6 +3113,7 @@ mod tests {
                 }),
                 secret_key: Some("DATABASE_URL".to_string()),
                 params: None,
+                require_physical_identity: None,
             },
             interval: "5m".to_string(),
             suspend: false,
@@ -2467,6 +3187,7 @@ mod tests {
             }),
             secret_key: Some("DATABASE_URL".to_string()),
             params: None,
+            require_physical_identity: None,
         };
         let identity = DatabaseIdentity::from_connection("prod", &conn);
         assert_eq!(identity.as_str(), "prod/db-creds/DATABASE_URL");
@@ -2495,6 +3216,7 @@ mod tests {
                 ssl_mode_secret: None,
                 set_role: None,
             }),
+            require_physical_identity: None,
         };
         let user_b = ConnectionSpec {
             secret_ref: None,
@@ -2515,6 +3237,7 @@ mod tests {
                 ssl_mode_secret: None,
                 set_role: None,
             }),
+            require_physical_identity: None,
         };
 
         assert_eq!(
@@ -2553,6 +3276,7 @@ mod tests {
                 ssl_mode_secret: None,
                 set_role: None,
             }),
+            require_physical_identity: None,
         };
         let secret_conn = ConnectionSpec {
             secret_ref: None,
@@ -2576,6 +3300,7 @@ mod tests {
                 ssl_mode_secret: None,
                 set_role: None,
             }),
+            require_physical_identity: None,
         };
 
         assert_ne!(
@@ -2606,6 +3331,7 @@ mod tests {
                 ssl_mode_secret: None,
                 set_role: None,
             }),
+            require_physical_identity: None,
         };
         let conn_with_ssl = ConnectionSpec {
             secret_ref: None,
@@ -2626,6 +3352,7 @@ mod tests {
                 ssl_mode_secret: None,
                 set_role: None,
             }),
+            require_physical_identity: None,
         };
 
         assert_ne!(
@@ -2656,6 +3383,7 @@ mod tests {
                 ssl_mode_secret: None,
                 set_role: None,
             }),
+            require_physical_identity: None,
         });
 
         let err = spec.validate_connection_spec().unwrap_err();
@@ -2686,6 +3414,7 @@ mod tests {
                 ssl_mode_secret: None,
                 set_role: None,
             }),
+            require_physical_identity: None,
         });
 
         let err = spec.validate_connection_spec().unwrap_err();
@@ -2722,6 +3451,7 @@ mod tests {
             }),
             secret_key: Some("DATABASE_URL".into()),
             params: None,
+            require_physical_identity: None,
         }
     }
 
@@ -2751,6 +3481,7 @@ mod tests {
                 ssl_mode_secret: None,
                 set_role: None,
             }),
+            require_physical_identity: None,
         }
     }
 
@@ -2791,6 +3522,7 @@ mod tests {
                 ssl_mode_secret: None,
                 set_role: None,
             }),
+            require_physical_identity: None,
         });
         assert!(matches!(
             spec.validate_connection_spec(),
@@ -2804,6 +3536,7 @@ mod tests {
             secret_ref: None,
             secret_key: None,
             params: None,
+            require_physical_identity: None,
         });
         assert!(spec.validate_connection_spec().is_err());
     }
@@ -2829,6 +3562,7 @@ mod tests {
                 ssl_mode_secret: None,
                 set_role: None,
             }),
+            require_physical_identity: None,
         });
         assert!(spec.validate_connection_spec().is_err());
     }
@@ -2866,6 +3600,7 @@ mod tests {
                 secret_ref: None,
                 secret_key: None,
                 params: Some(params_with_set_role(Some(role.into()))),
+                require_physical_identity: None,
             });
             assert!(
                 spec.validate_connection_spec().is_ok(),
@@ -2888,6 +3623,7 @@ mod tests {
                 secret_ref: None,
                 secret_key: None,
                 params: Some(params_with_set_role(Some(role.into()))),
+                require_physical_identity: None,
             });
             let err = spec
                 .validate_connection_spec()
@@ -2905,6 +3641,7 @@ mod tests {
             secret_ref: None,
             secret_key: None,
             params: Some(params_with_set_role(Some("   ".into()))),
+            require_physical_identity: None,
         });
         assert!(matches!(
             spec.validate_connection_spec(),
@@ -2918,11 +3655,13 @@ mod tests {
             secret_ref: None,
             secret_key: None,
             params: Some(params_with_set_role(None)),
+            require_physical_identity: None,
         };
         let conn_with_role = ConnectionSpec {
             secret_ref: None,
             secret_key: None,
             params: Some(params_with_set_role(Some("cloudsqlsuperuser".into()))),
+            require_physical_identity: None,
         };
         assert_ne!(
             conn_no_role.cache_key("ns"),
@@ -2955,6 +3694,7 @@ mod tests {
                 ssl_mode_secret: None,
                 set_role: None,
             }),
+            require_physical_identity: None,
         });
 
         assert!(spec.validate_connection_spec().is_ok());
@@ -2985,6 +3725,7 @@ mod tests {
                 ssl_mode_secret: None,
                 set_role: None,
             }),
+            require_physical_identity: None,
         });
 
         assert!(matches!(
@@ -3017,6 +3758,7 @@ mod tests {
                 ssl_mode_secret: None,
                 set_role: None,
             }),
+            require_physical_identity: None,
         });
 
         assert!(matches!(
@@ -3055,6 +3797,7 @@ mod tests {
                     ssl_mode_secret: None,
                     set_role: None,
                 }),
+                require_physical_identity: None,
             });
             assert!(
                 spec.validate_connection_spec().is_ok(),
@@ -3087,6 +3830,7 @@ mod tests {
                 ssl_mode_secret: None,
                 set_role: None,
             }),
+            require_physical_identity: None,
         });
         assert!(spec.validate_connection_spec().is_err());
     }
@@ -3115,6 +3859,7 @@ mod tests {
                 ssl_mode_secret: None,
                 set_role: None,
             }),
+            require_physical_identity: None,
         });
         assert!(matches!(
             spec.validate_connection_spec(),
@@ -3143,6 +3888,7 @@ mod tests {
                 ssl_mode_secret: None,
                 set_role: None,
             }),
+            require_physical_identity: None,
         });
         assert!(matches!(
             spec.validate_connection_spec(),
@@ -3465,6 +4211,7 @@ params:
             }),
             secret_key: Some("DATABASE_URL".to_string()),
             params: None,
+            require_physical_identity: None,
         };
         let a = DatabaseIdentity::from_connection("prod", &conn_a);
         let b = DatabaseIdentity::from_connection("prod", &conn_a);
@@ -3481,6 +4228,7 @@ params:
             }),
             secret_key: Some("DATABASE_URL".to_string()),
             params: None,
+            require_physical_identity: None,
         };
         let conn_b = ConnectionSpec {
             secret_ref: Some(SecretReference {
@@ -3488,6 +4236,7 @@ params:
             }),
             secret_key: Some("CUSTOM_URL".to_string()),
             params: None,
+            require_physical_identity: None,
         };
         let a = DatabaseIdentity::from_connection("prod", &conn_a);
         let b = DatabaseIdentity::from_connection("prod", &conn_b);
@@ -3830,6 +4579,7 @@ retirements:
                 }),
                 secret_key: Some("DATABASE_URL".to_string()),
                 params: None,
+                require_physical_identity: None,
             },
             interval: "5m".to_string(),
             suspend: false,
@@ -3860,6 +4610,7 @@ retirements:
                 }),
                 secret_key: Some("DATABASE_URL".to_string()),
                 params: None,
+                require_physical_identity: None,
             },
             interval: "5m".to_string(),
             suspend: false,
@@ -3962,6 +4713,7 @@ retirements:
                 }),
                 secret_key: Some("DATABASE_URL".to_string()),
                 params: None,
+                require_physical_identity: None,
             },
             interval: "5m".to_string(),
             suspend: false,
@@ -4014,6 +4766,7 @@ retirements:
                 }),
                 secret_key: Some("DATABASE_URL".to_string()),
                 params: None,
+                require_physical_identity: None,
             },
             interval: "5m".to_string(),
             suspend: false,
@@ -4066,6 +4819,7 @@ retirements:
                 }),
                 secret_key: Some("DATABASE_URL".to_string()),
                 params: None,
+                require_physical_identity: None,
             },
             interval: "5m".to_string(),
             suspend: false,
@@ -4122,6 +4876,7 @@ retirements:
                 }),
                 secret_key: Some("DATABASE_URL".to_string()),
                 params: None,
+                require_physical_identity: None,
             },
             interval: "5m".to_string(),
             suspend: false,
@@ -4176,6 +4931,7 @@ retirements:
                 }),
                 secret_key: Some("DATABASE_URL".to_string()),
                 params: None,
+                require_physical_identity: None,
             },
             interval: "5m".to_string(),
             suspend: false,
@@ -4231,6 +4987,7 @@ retirements:
                 }),
                 secret_key: Some("DATABASE_URL".to_string()),
                 params: None,
+                require_physical_identity: None,
             },
             interval: "5m".to_string(),
             suspend: false,
@@ -4285,6 +5042,7 @@ retirements:
                 }),
                 secret_key: Some("DATABASE_URL".to_string()),
                 params: None,
+                require_physical_identity: None,
             },
             interval: "5m".to_string(),
             suspend: false,
@@ -4368,6 +5126,7 @@ retirements:
                 }),
                 secret_key: Some("DATABASE_URL".into()),
                 params: None,
+                require_physical_identity: None,
             },
             interval: "5m".into(),
             suspend: false,
@@ -4387,9 +5146,9 @@ retirements:
         // apply mode with no explicit approval → Auto
         assert_eq!(base.effective_approval(), ApprovalMode::Auto);
 
-        // plan mode with no explicit approval → Manual
+        // observe mode with no explicit approval → Manual
         let plan = PostgresPolicySpec {
-            mode: PolicyMode::Plan,
+            mode: PolicyMode::Observe,
             ..base.clone()
         };
         assert_eq!(plan.effective_approval(), ApprovalMode::Manual);
@@ -4415,6 +5174,39 @@ retirements:
         assert_eq!(manual_json, serde_json::Value::String("manual".to_string()));
         let auto_json = serde_json::to_value(&ApprovalMode::Auto).unwrap();
         assert_eq!(auto_json, serde_json::Value::String("auto".to_string()));
+    }
+
+    /// The deprecation window for the `plan` → `observe` rename: the legacy
+    /// value stays an accepted schema value (a GitOps controller re-applies
+    /// the manifest on every sync, so rejecting it on write would break the
+    /// policy at upgrade time), and it behaves as `observe` in every path
+    /// while identifying itself as the deprecated spelling. Removal is a
+    /// later release's breaking change.
+    #[test]
+    fn the_legacy_plan_mode_value_is_accepted_and_behaves_as_observe() {
+        let legacy: PolicyMode = serde_json::from_str("\"plan\"").unwrap();
+        assert!(legacy.never_executes());
+        assert!(legacy.is_deprecated_spelling());
+        assert!(PolicyMode::Observe.never_executes());
+        assert!(!PolicyMode::Observe.is_deprecated_spelling());
+        assert!(!PolicyMode::Apply.never_executes());
+
+        // The deprecated spelling round-trips: the operator must not rewrite
+        // a user's spec value, and `lastReconcileMode` reports what the spec
+        // says.
+        assert_eq!(
+            serde_json::to_value(PolicyMode::Plan).unwrap(),
+            serde_json::Value::String("plan".to_string())
+        );
+
+        let schema = serde_json::to_value(schemars::schema_for!(PolicyMode)).unwrap();
+        let rendered = schema.to_string();
+        assert!(rendered.contains("observe"));
+        assert!(
+            rendered.contains("\"plan\""),
+            "the schema must keep accepting the deprecated value during the \
+             deprecation window: {rendered}"
+        );
     }
 
     #[test]
@@ -4481,10 +5273,11 @@ retirements:
                 }),
                 secret_key: Some("DATABASE_URL".into()),
                 params: None,
+                require_physical_identity: None,
             },
             interval: "5m".into(),
             suspend: false,
-            mode: PolicyMode::Plan,
+            mode: PolicyMode::Observe,
             reconciliation_mode: CrdReconciliationMode::Authoritative,
             default_owner: None,
             profiles: Default::default(),
@@ -4500,7 +5293,7 @@ retirements:
         assert_eq!(
             spec.effective_approval(),
             ApprovalMode::Auto,
-            "explicit Auto should override Plan mode's default of Manual"
+            "explicit Auto should override Observe mode's default of Manual"
         );
     }
 
@@ -4730,6 +5523,236 @@ retirements:
             let schema = &value["spec"]["versions"][0]["schema"]["openAPIV3Schema"];
             assert_bounded_strings_and_collections(schema, kind);
         }
+    }
+
+    /// Every string, list and map reachable from `spec` must be bounded: the
+    /// whole-spec `self == oldSelf` rule is only admissible to the API server
+    /// if its static cost estimate is finite, and an unbounded collection
+    /// makes that estimate unbounded. This is the local half of the ship gate
+    /// in ADR-001 Decision 1 — the other half applies the CRD to a real
+    /// apiserver in CI.
+    #[test]
+    fn candidate_spec_bounds_every_string_collection_and_map() {
+        let value =
+            serde_json::to_value(postgres_policy_candidate_crd()).expect("CRD should serialize");
+        let spec = &value["spec"]["versions"][0]["schema"]["openAPIV3Schema"]["properties"]["spec"];
+        assert_bounded_strings_and_collections(spec, "PostgresPolicyCandidate.spec");
+        assert_bounded_maps(spec, "PostgresPolicyCandidate.spec");
+    }
+
+    fn assert_bounded_maps(schema: &serde_json::Value, path: &str) {
+        if let serde_json::Value::Object(object) = schema {
+            if object.get("type").and_then(serde_json::Value::as_str) == Some("object")
+                && object.contains_key("additionalProperties")
+            {
+                assert!(
+                    object.contains_key("maxProperties"),
+                    "unbounded map schema at {path}"
+                );
+            }
+            for (name, child) in object {
+                assert_bounded_maps(child, &format!("{path}.{name}"));
+            }
+        }
+    }
+
+    /// The golden test for ADR-001 Decision 2: no `default` key may occur
+    /// anywhere under `spec.properties.content` in the generated CRD.
+    ///
+    /// A schema default is written into the stored object at admission time.
+    /// If a default value ever changed, every already-stored candidate would
+    /// keep the old value while the identical source YAML would now mean the
+    /// new one — breaking `self == oldSelf` on byte-identical input, and
+    /// detaching the stored object's content digest from the digest CI
+    /// computed for the same content.
+    #[test]
+    fn candidate_content_emits_no_openapi_defaults() {
+        let value =
+            serde_json::to_value(postgres_policy_candidate_crd()).expect("CRD should serialize");
+        let content = &value["spec"]["versions"][0]["schema"]["openAPIV3Schema"]["properties"]["spec"]
+            ["properties"]["content"];
+        assert!(content.is_object(), "spec.content should be in the schema");
+
+        fn find_default(schema: &serde_json::Value, path: &str, found: &mut Vec<String>) {
+            match schema {
+                serde_json::Value::Object(object) => {
+                    if object.contains_key("default") {
+                        found.push(path.to_string());
+                    }
+                    for (name, child) in object {
+                        find_default(child, &format!("{path}.{name}"), found);
+                    }
+                }
+                serde_json::Value::Array(items) => {
+                    for (index, child) in items.iter().enumerate() {
+                        find_default(child, &format!("{path}[{index}]"), found);
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        let mut found = Vec::new();
+        find_default(content, "spec.content", &mut found);
+        assert!(
+            found.is_empty(),
+            "spec.content must emit no OpenAPI defaults, found: {found:?}"
+        );
+    }
+
+    /// Serde defaults must survive the schema stripping: the operator still
+    /// resolves omitted content fields, it just does not let the API server do
+    /// it. Stripping the *schema* cannot affect this — the assertion is here
+    /// so that a future switch to some other suppression mechanism cannot
+    /// quietly take deserialisation with it.
+    #[test]
+    fn candidate_content_keeps_serde_defaults() {
+        let content: PolicyContent =
+            serde_json::from_str("{}").expect("empty content should deserialize");
+        assert_eq!(
+            content.reconciliation_mode,
+            CrdReconciliationMode::default()
+        );
+        assert!(content.roles.is_empty());
+        assert!(content.grants.is_empty());
+        assert!(content.profiles.is_empty());
+    }
+
+    /// The property the whole promotion gate rests on: promoting a candidate's
+    /// content into a policy produces the *identical* digest, so recognition
+    /// is exact rather than approximate. If this ever fails, promotion of a
+    /// reviewed candidate silently degrades to the manual-plan flow and no
+    /// approval is ever honoured.
+    #[test]
+    fn promoting_candidate_content_yields_the_candidates_digest() {
+        let content: PolicyContent = serde_json::from_value(serde_json::json!({
+            "reconciliation_mode": "additive",
+            "default_owner": "app_owner",
+            "profiles": { "reader": { "grants": [] } },
+            "schemas": [{ "name": "app", "profiles": ["reader"] }],
+            "roles": [{ "name": "reporting-reader", "login": true }],
+            "grants": [{
+                "role": "reporting-reader",
+                "privileges": ["CONNECT"],
+                "object": { "type": "database", "name": "orders" }
+            }],
+            "memberships": [{ "role": "reporting-reader", "members": [{ "name": "app_owner" }] }],
+        }))
+        .expect("content fixture");
+
+        // The GitOps promotion: the same content, pasted into a policy spec
+        // beside the execution fields, which the digest must ignore.
+        let mut spec_json = serde_json::to_value(&content).expect("content serializes");
+        let object = spec_json.as_object_mut().expect("content is an object");
+        object.insert(
+            "connection".to_string(),
+            serde_json::json!({ "secretRef": { "name": "db" } }),
+        );
+        object.insert("interval".to_string(), serde_json::json!("30s"));
+        object.insert("mode".to_string(), serde_json::json!("apply"));
+        object.insert("approval".to_string(), serde_json::json!("manual"));
+        object.insert("suspend".to_string(), serde_json::json!(false));
+        let spec: PostgresPolicySpec =
+            serde_json::from_value(spec_json).expect("promoted policy spec");
+
+        assert_eq!(spec.content_digest(), content.content_digest());
+        assert_eq!(
+            spec.content_digest(),
+            pgroles_core::candidate::compute_content_digest(&content),
+        );
+
+        // And the execution fields are genuinely outside the digest: changing
+        // one must not move it, or every interval bump would break promotion.
+        let mut other = spec.clone();
+        other.interval = "1h".to_string();
+        other.suspend = true;
+        assert_eq!(other.content_digest(), spec.content_digest());
+
+        // While a content edit must move it — that is the whole mechanism.
+        let mut edited = spec.clone();
+        edited.roles[0].login = Some(false);
+        assert_ne!(edited.content_digest(), spec.content_digest());
+    }
+
+    /// Promotion copies `candidate.spec.content` into `policy.spec` verbatim,
+    /// so the two schemas must describe the same fields with the same types.
+    /// A field added to one and not the other turns promotion into a lossy
+    /// conversion at the exact moment the content digest must be trusted.
+    #[test]
+    fn candidate_content_matches_policy_content() {
+        let policy = serde_json::to_value(PostgresPolicy::crd()).expect("CRD should serialize");
+        let policy_spec = &policy["spec"]["versions"][0]["schema"]["openAPIV3Schema"]["properties"]
+            ["spec"]["properties"];
+        let candidate =
+            serde_json::to_value(postgres_policy_candidate_crd()).expect("CRD should serialize");
+        let content = &candidate["spec"]["versions"][0]["schema"]["openAPIV3Schema"]["properties"]
+            ["spec"]["properties"]["content"]["properties"];
+
+        // Execution fields belong to the policy alone: a candidate carries no
+        // connection (unless `spec.target` overrides it), interval, mode,
+        // suspend or approval.
+        let execution = ["connection", "interval", "mode", "suspend", "approval"];
+        let policy_content: Vec<&String> = policy_spec
+            .as_object()
+            .expect("policy spec has properties")
+            .keys()
+            .filter(|k| !execution.contains(&k.as_str()))
+            .collect();
+        let mut candidate_content: Vec<&String> = content
+            .as_object()
+            .expect("candidate content has properties")
+            .keys()
+            .collect();
+        candidate_content.sort();
+        let mut policy_content = policy_content;
+        policy_content.sort();
+        assert_eq!(policy_content, candidate_content);
+
+        for field in &candidate_content {
+            let policy_field = &policy_spec[field.as_str()];
+            let candidate_field = &content[field.as_str()];
+            assert_eq!(
+                policy_field["type"], candidate_field["type"],
+                "spec.{field} and spec.content.{field} must have the same type"
+            );
+            assert_eq!(
+                policy_field["items"]["properties"]
+                    .as_object()
+                    .map(|o| o.keys().collect::<Vec<_>>()),
+                candidate_field["items"]["properties"]
+                    .as_object()
+                    .map(|o| o.keys().collect::<Vec<_>>()),
+                "spec.{field} and spec.content.{field} must have the same item fields"
+            );
+        }
+    }
+
+    #[test]
+    fn candidate_crd_exposes_operational_columns() {
+        let crd = postgres_policy_candidate_crd();
+        let columns: Vec<&str> = crd.spec.versions[0]
+            .additional_printer_columns
+            .as_deref()
+            .unwrap_or_default()
+            .iter()
+            .map(|c| c.name.as_str())
+            .collect();
+        assert_eq!(columns, ["Policy", "Phase", "Plan", "Digest", "Age"]);
+        assert_eq!(
+            crd.spec.names.short_names.as_deref(),
+            Some(["pgcand".to_string()].as_slice())
+        );
+        assert_eq!(
+            crd.spec.names.categories.as_deref(),
+            Some(["pgroles".to_string()].as_slice())
+        );
+        assert!(
+            crd.spec.versions[0]
+                .subresources
+                .as_ref()
+                .and_then(|s| s.status.as_ref())
+                .is_some()
+        );
     }
 
     #[test]

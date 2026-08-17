@@ -57,13 +57,13 @@ status:
 | Type | Meaning |
 | --- | --- |
 | `Ready` | `True` when the last reconciliation succeeded |
-| `Drifted` | `True` when changes are pending but not applied — in `mode: plan`, and in `mode: apply` with `approval: manual` while a plan awaits a decision |
+| `Drifted` | `True` when changes are pending but not applied — in `mode: observe`, and in `mode: apply` with `approval: manual` while a plan awaits a decision |
 | `Reconciling` | `True` while a reconciliation is in progress |
 | `Degraded` | `True` when the last reconciliation failed (includes error detail) |
 | `Conflict` | `True` when another policy targets the same database with overlapping ownership |
 | `Paused` | `True` while `spec.suspend` stops reconciliation |
 | `ApprovalUnset` | `True` while `spec.approval` is omitted and inferred from `spec.mode` (deprecated) |
-| `ApprovalIgnored` | `True` when a plan is approved but `spec.mode: plan` means it will never execute |
+| `ApprovalIgnored` | `True` when a plan is approved but `spec.mode: observe` means it will never execute |
 
 `ApprovalUnset` and `ApprovalIgnored` are advisory: they report a configuration
 that will not do what it looks like, and neither indicates a failed

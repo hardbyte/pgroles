@@ -375,3 +375,35 @@ Schema scope is split into explicit facets:
 | `bindings` | Manage profile expansion, grants, and default privileges tied to the schema |
 
 Two source documents may reference the same schema only when they manage disjoint facets. If two documents claim the same role, grant, default-privilege rule, membership selector, or schema facet, composition fails before any database inspection begins.
+
+## Size limits
+
+Every collection and string in policy content carries an explicit limit. The
+same numeric limits are enforced by `pgroles validate` and by the Kubernetes
+API server, with two caveats. First, the units differ at the margin:
+PostgreSQL truncates identifiers at 63 *bytes* of UTF-8 (`NAMEDATALEN - 1`),
+while the OpenAPI schema's `maxLength` counts *characters* — a 63-character
+identifier containing multi-byte characters passes schema validation but
+exceeds PostgreSQL's byte limit. Second, the OpenAPI schema cannot bound map
+keys, so `config` keys are bounded by CLI/manifest validation only, not by the
+API server.
+
+| Field | Limit |
+|---|---|
+| Identifiers — role, schema, owner, member and profile names | 63 (PostgreSQL's `NAMEDATALEN - 1`, which is 63 *bytes* of UTF-8 and silently truncated by the server; the OpenAPI `maxLength` bound counts characters) |
+| Object names, comments, config values | 256 characters |
+| `role_pattern` | 128 characters |
+| `profiles` | 128 entries, each with ≤ 64 `grants` and ≤ 32 `default_privileges` |
+| `schemas` | 1024 entries, each referencing ≤ 64 profiles |
+| `roles` | 1024 entries, each with ≤ 32 `config` entries |
+| `grants` | 4096 entries, each with ≤ 16 `privileges` |
+| `default_privileges` | 512 entries, each with ≤ 64 `grant` entries |
+| `memberships` | 2048 entries, each with ≤ 512 `members` |
+| `retirements` | 512 entries |
+
+Every object was always bounded, by the ~1.5MiB limit Kubernetes inherits from
+etcd — that limit was simply implicit, and produced an opaque
+`etcdserver: request is too large` rather than naming the field. Declaring the
+bounds is also what makes API-server-enforced immutability possible on
+[`PostgresPolicyCandidate`](/docs/operator-candidates): a CEL rule comparing a
+whole spec is only admissible if its cost can be estimated from the schema.

@@ -96,6 +96,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -121,6 +123,9 @@ jobs:
       - name: Chart README drift check
         run: scripts/check-helm-docs.sh
 
+      - name: Kyverno policy mirror drift check
+        run: scripts/check-kyverno-drift.sh
+
       - uses: astral-sh/setup-uv@v9.0.0
 
       - name: Validate Agent Skills
@@ -145,6 +150,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
 
       - uses: dtolnay/rust-toolchain@stable
 
@@ -157,31 +164,63 @@ jobs:
   # Job 3: Integration tests — with a live PostgreSQL
   # ---------------------------------------------------------------------------
   integration-test:
-    name: Integration Tests (PG${{ matrix.pg_version }})
+    name: Integration Tests (${{ matrix.database.name }})
     needs: stack-gate
     if: needs.stack-gate.outputs.run_heavy == 'true'
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
-        pg_version: ["16", "17", "18"]
+        # AlloyDB Omni is the containerised AlloyDB engine — the closest CI can
+        # get to the managed service, and close enough to catch engine-level
+        # divergence (catalog shape, pg_control_system, default GUCs).
+        database:
+          - { name: "PG16", image: "postgres:16" }
+          - { name: "PG17", image: "postgres:17" }
+          - { name: "PG18", image: "postgres:18" }
+          - { name: "AlloyDB Omni 16", image: "google/alloydbomni:16" }
     services:
       postgres:
-        image: postgres:${{ matrix.pg_version }}
+        image: ${{ matrix.database.image }}
         env:
           POSTGRES_PASSWORD: testpassword
           POSTGRES_DB: pgroles_test
         ports:
           - 5432:5432
+        # --shm-size for AlloyDB Omni's shared-memory appetite; harmless for
+        # the vanilla postgres images. The generous retry budget is also for
+        # Omni: its first boot reinstalls extensions and runs a post-startup
+        # script before the real server start, which overruns the ~50s window
+        # that suits the vanilla images.
+        #
+        # The probe goes over TCP loopback deliberately: Omni's unix socket
+        # does not live where pg_isready looks by default (a socket probe
+        # never succeeds, so the runner declared the container unhealthy just
+        # as its init finished), and the vanilla images' init-phase temp
+        # server is socket-only, so TCP also cannot report healthy before the
+        # real server is up.
         options: >-
-          --health-cmd="pg_isready -U postgres"
+          --health-cmd="pg_isready -h 127.0.0.1 -p 5432 -U postgres"
           --health-interval=5s
           --health-timeout=5s
-          --health-retries=10
+          --health-retries=48
+          --shm-size=1g
     env:
       DATABASE_URL: "postgres://postgres:testpassword@localhost:5432/pgroles_test"
     steps:
       - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      # POSTGRES_DB is a docker-entrypoint convention the postgres images
+      # honour; do not assume every engine image does. Create the test
+      # database explicitly if the entrypoint did not.
+      - name: Ensure test database exists
+        run: |
+          docker exec ${{ job.services.postgres.id }} \
+            psql -U postgres -tAc "SELECT 1 FROM pg_database WHERE datname='pgroles_test'" | grep -q 1 || \
+          docker exec ${{ job.services.postgres.id }} \
+            createdb -U postgres pgroles_test
 
       - uses: dtolnay/rust-toolchain@stable
 
@@ -215,6 +254,8 @@ jobs:
       DATABASE_URL: "postgres://postgres:testpassword@localhost:5432/pgroles_test"
     steps:
       - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
 
       - uses: docker/setup-buildx-action@v4
 
@@ -281,6 +322,8 @@ jobs:
       DATABASE_URL: "postgres://postgres:testpassword@localhost:5432/pgroles_test"
     steps:
       - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
 
       - uses: dtolnay/rust-toolchain@stable
 
@@ -304,6 +347,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
 
       - uses: ./.github/actions/setup-e2e
         with:
@@ -361,22 +406,48 @@ jobs:
           wait_for_last_error_contains insufficient-privileges-policy "permission denied to create role"
           assert_role_absent insufficient-privileges-user
 
-          kubectl apply -f k8s/samples/plan-policy.yaml
-          wait_for_ready_status_reason plan-policy True Planned
-          wait_for_drift_status plan-policy True
-          kubectl get pgr plan-policy -o jsonpath='{.status.last_reconcile_mode}' | grep -qx "plan"
-          plan_preview_plan="$(wait_for_current_plan_ref plan-policy)"
-          get_plan_sql "$plan_preview_plan" | grep -q 'CREATE ROLE \"plan-preview-user\"'
-          assert_role_absent plan-preview-user
-          wait_for_event_reason plan-policy DriftDetected
+          # The deprecated `mode: plan` spelling stays accepted — a GitOps
+          # controller re-applies existing manifests on every sync, so the
+          # rename must not reject them — behaves exactly as observe, and
+          # says so on a condition.
+          kubectl apply -f - <<'LEGACY'
+          apiVersion: pgroles.io/v1alpha1
+          kind: PostgresPolicy
+          metadata:
+            name: legacy-plan-mode-policy
+            namespace: default
+          spec:
+            connection:
+              secretRef:
+                name: postgres-credentials
+            mode: plan
+            interval: 30s
+            roles:
+              - name: legacy_plan_mode_user
+                login: false
+          LEGACY
+          wait_for_ready_status_reason legacy-plan-mode-policy True Planned
+          wait_for_condition_status legacy-plan-mode-policy ModeValueDeprecated True
+          kubectl get pgr legacy-plan-mode-policy -o jsonpath='{.spec.mode}' | grep -qx "plan"
+          assert_role_absent legacy_plan_mode_user
+          kubectl delete pgr legacy-plan-mode-policy --wait=true
 
-          # Approving a plan-mode plan can never execute. The policy must say so
-          # rather than look stalled, and must still not touch the database.
-          assert_condition_absent plan-policy ApprovalIgnored
+          kubectl apply -f k8s/samples/observe-policy.yaml
+          wait_for_ready_status_reason observe-policy True Planned
+          wait_for_drift_status observe-policy True
+          kubectl get pgr observe-policy -o jsonpath='{.status.last_reconcile_mode}' | grep -qx "observe"
+          plan_preview_plan="$(wait_for_current_plan_ref observe-policy)"
+          get_plan_sql "$plan_preview_plan" | grep -q 'CREATE ROLE \"observe-preview-user\"'
+          assert_role_absent observe-preview-user
+          wait_for_event_reason observe-policy DriftDetected
+
+          # Approving an observe-mode plan can never execute. The policy must say
+          # so rather than look stalled, and must still not touch the database.
+          assert_condition_absent observe-policy ApprovalIgnored
           approve_plan "$plan_preview_plan"
-          wait_for_condition_status plan-policy ApprovalIgnored True
-          wait_for_event_reason plan-policy ApprovalIgnored
-          assert_role_absent plan-preview-user
+          wait_for_condition_status observe-policy ApprovalIgnored True
+          wait_for_event_reason observe-policy ApprovalIgnored
+          assert_role_absent observe-preview-user
 
           # A decision is terminal, so there is no un-approving: removing the
           # retired annotation is a no-op, and the warning must persist rather
@@ -384,8 +455,43 @@ jobs:
           # for ApprovalIgnored to disappear — the mutable-annotation model that
           # write-once decisions replaced.
           kubectl annotate pgplan "$plan_preview_plan" pgroles.io/approved- --overwrite || true
-          wait_for_condition_status plan-policy ApprovalIgnored True
-          assert_role_absent plan-preview-user
+          wait_for_condition_status observe-policy ApprovalIgnored True
+          assert_role_absent observe-preview-user
+
+          # The write-once rules are the API server's own CEL, not the operator
+          # and not an admission add-on — so they must hold even for
+          # cluster-admin. Each of these writes is the attack the rule exists
+          # to stop: flipping a recorded decision, erasing the decider, and
+          # repointing an approval at different effects or a different server.
+          now="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          if kubectl patch pgplan "$plan_preview_plan" --subresource=status --type=merge -p '{
+              "status": {
+                "conditions": [{"type": "Denied", "status": "True",
+                  "reason": "Flipped", "message": "decision flip must be rejected",
+                  "lastTransitionTime": "'"$now"'"}],
+                "decidedBy": {"username": "e2e-reviewer"}
+              }
+            }'; then
+            echo "::error::flipping a terminal Approved decision to Denied was accepted"
+            exit 1
+          fi
+          if kubectl patch pgplan "$plan_preview_plan" --subresource=status --type=merge \
+            -p '{"status":{"decidedBy":{"username":"replacement-reviewer"}}}'; then
+            echo "::error::rewriting the write-once decision identity was accepted"
+            exit 1
+          fi
+          if kubectl patch pgplan "$plan_preview_plan" --subresource=status --type=merge \
+            -p '{"status":{"changeDigest":"sha256:forged"}}'; then
+            echo "::error::rewriting the approval-binding changeDigest was accepted"
+            exit 1
+          fi
+          if kubectl patch pgplan "$plan_preview_plan" --subresource=status --type=merge \
+            -p '{"status":{"targetPhysicalIdentity":"7000000000000000000"}}'; then
+            echo "::error::rewriting the bound target identity was accepted"
+            exit 1
+          fi
+          # And the decision the failed writes attacked is still intact.
+          test "$(kubectl get pgplan "$plan_preview_plan" -o jsonpath='{.status.decidedBy.username}')" = "e2e-reviewer"
 
           upsert_secret rotating-postgres-credentials \
             DATABASE_URL='postgres://postgres:devpassword@postgres.default.svc.cluster.local:5432/postgres'
@@ -558,6 +664,15 @@ jobs:
           kubectl -n pgroles-system logs deployment/otel-collector --tail=200
           exit 1
 
+      - name: Diagnostics
+        if: failure()
+        run: |
+          kubectl get pgr,pgplan,pgcand,pgeap,pgear -A -o wide || true
+          kubectl get pgr,pgplan,pgcand -A -o yaml || true
+          kubectl -n pgroles-system logs deployment/pgroles-operator --tail=-1 || true
+          kubectl -n pgroles-system logs deployment/pgroles-operator --previous --tail=-1 || true
+          kubectl get events -A --sort-by=.lastTimestamp | tail -100 || true
+
       - name: Cleanup
         if: always()
         run: kind delete cluster --name pgroles-e2e-operator
@@ -572,6 +687,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
 
       - uses: ./.github/actions/setup-e2e
         with:
@@ -625,6 +742,15 @@ jobs:
       - name: Run ephemeral request cache regression
         run: scripts/e2e-ephemeral-request-load.sh
 
+      - name: Diagnostics
+        if: failure()
+        run: |
+          kubectl get pgr,pgplan,pgcand,pgeap,pgear -A -o wide || true
+          kubectl get pgr,pgplan,pgcand -A -o yaml || true
+          kubectl -n pgroles-system logs deployment/pgroles-operator --tail=-1 || true
+          kubectl -n pgroles-system logs deployment/pgroles-operator --previous --tail=-1 || true
+          kubectl get events -A --sort-by=.lastTimestamp | tail -100 || true
+
       - name: Cleanup
         if: always()
         run: kind delete cluster --name pgroles-e2e-load
@@ -639,6 +765,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
 
       - uses: ./.github/actions/setup-e2e
         with:
@@ -697,6 +825,73 @@ jobs:
           # Cleanup
           kubectl delete pgr plan-approval-policy --wait=true
           pg_query "REASSIGN OWNED BY approval_test_user TO postgres; DROP OWNED BY approval_test_user; DROP ROLE IF EXISTS approval_test_user;"
+
+          # ================================================================
+          # Group A continued: target identity (#180)
+          # ================================================================
+
+          echo "--- Test: repointing the connection Secret supersedes the plan ---"
+          # One Postgres runs in this cluster, so the *physical* identity
+          # (system_identifier) is the same either way. Pointing the Secret at
+          # a different database on it changes the logical fingerprint — which
+          # is exactly the repointing case a Kubernetes reference cannot see,
+          # since `secretRef` names the same Secret and key throughout.
+          pg_query "SELECT 1 FROM pg_database WHERE datname='identity_alt'" | grep -qx 1 \
+            || pg_query "CREATE DATABASE identity_alt"
+
+          upsert_secret target-identity-credentials \
+            DATABASE_URL='postgres://postgres:devpassword@postgres.default.svc.cluster.local:5432/postgres'
+
+          kubectl apply -f - <<EOF
+          apiVersion: pgroles.io/v1alpha1
+          kind: PostgresPolicy
+          metadata:
+            name: target-identity-policy
+            namespace: default
+          spec:
+            connection:
+              secretRef:
+                name: target-identity-credentials
+            interval: "30s"
+            mode: apply
+            approval: manual
+            roles:
+              - name: target_identity_user
+                login: true
+          EOF
+
+          wait_for_ready_status_reason target-identity-policy True Planned
+          first_plan=$(wait_for_current_plan_ref target-identity-policy)
+
+          # Both identities are recorded. A real PostgreSQL always exposes
+          # pg_control_system(), so the physical half must be present here.
+          physical=$(kubectl get pgplan "$first_plan" -o jsonpath='{.status.targetPhysicalIdentity}')
+          logical=$(kubectl get pgplan "$first_plan" -o jsonpath='{.status.targetLogicalFingerprint}')
+          available=$(kubectl get pgplan "$first_plan" -o jsonpath='{.status.physicalIdentityAvailable}')
+          test -n "$physical" || { echo "::error::Expected targetPhysicalIdentity to be set"; exit 1; }
+          test -n "$logical" || { echo "::error::Expected targetLogicalFingerprint to be set"; exit 1; }
+          test "$available" = "true" || { echo "::error::Expected physicalIdentityAvailable=true, got $available"; exit 1; }
+
+          # Repoint at a different database. The plan was computed against the
+          # old target, so it can no longer authorise anything.
+          upsert_secret target-identity-credentials \
+            DATABASE_URL='postgres://postgres:devpassword@postgres.default.svc.cluster.local:5432/identity_alt'
+
+          wait_for_plan_phase "$first_plan" Superseded
+          second_plan=$(wait_for_current_plan_ref target-identity-policy)
+          test "$second_plan" != "$first_plan" || { echo "::error::Expected a fresh plan after repointing"; exit 1; }
+
+          moved_logical=$(kubectl get pgplan "$second_plan" -o jsonpath='{.status.targetLogicalFingerprint}')
+          test "$moved_logical" != "$logical" || { echo "::error::Logical fingerprint did not change after repointing"; exit 1; }
+          moved_physical=$(kubectl get pgplan "$second_plan" -o jsonpath='{.status.targetPhysicalIdentity}')
+          test "$moved_physical" = "$physical" || { echo "::error::Physical identity changed on the same cluster"; exit 1; }
+
+          # The approval never carried over: nothing ran against either database.
+          assert_role_absent target_identity_user
+
+          kubectl delete pgr target-identity-policy --wait=true
+          # The operator may still hold a pooled connection to it briefly.
+          pg_query "DROP DATABASE IF EXISTS identity_alt WITH (FORCE)" || true
 
           # ================================================================
           # Group A continued: Rejection
@@ -768,6 +963,97 @@ jobs:
           pg_query "REASSIGN OWNED BY auto_approved_user TO postgres; DROP OWNED BY auto_approved_user; DROP ROLE IF EXISTS auto_approved_user;"
 
           # ================================================================
+          # Group B2: passwords under manual approval (#181, #174)
+          # ================================================================
+
+          echo "--- Test: generated Secret is not created before approval ---"
+          upsert_secret manual-approval-passwords manual_ref_user='e2e_manual_pw!'
+          cat >/tmp/deferred-password-policy.yaml <<'EOF'
+          apiVersion: pgroles.io/v1alpha1
+          kind: PostgresPolicy
+          metadata:
+            name: deferred-password-policy
+            namespace: default
+          spec:
+            connection:
+              secretRef:
+                name: postgres-credentials
+            interval: "15s"
+            mode: apply
+            approval: manual
+            roles:
+              - name: deferred_gen_user
+                login: true
+                password:
+                  generate:
+                    length: 32
+                    secretName: deferred-gen-secret
+              - name: manual_ref_user
+                login: true
+                password:
+                  secretRef:
+                    name: manual-approval-passwords
+                  secretKey: manual_ref_user
+          EOF
+          kubectl apply -f /tmp/deferred-password-policy.yaml
+
+          wait_for_ready_status_reason deferred-password-policy True Planned
+          first_plan=$(wait_for_current_plan_ref deferred-password-policy)
+
+          # The credential must not exist while the plan is only proposed.
+          assert_secret_absent deferred-gen-secret
+          assert_secret_absent_stable deferred-gen-secret
+
+          echo "--- Test: rejection leaves no generated Secret behind ---"
+          reject_plan "$first_plan"
+          wait_for_plan_phase "$first_plan" Rejected
+          assert_secret_absent deferred-gen-secret
+          assert_role_absent deferred_gen_user
+
+          echo "--- Test: approval materializes the Secret exactly once ---"
+          # Rejection deliberately does not create a replacement in the same
+          # cycle, so wait for the next reconcile's plan rather than reusing the
+          # rejected one.
+          for i in $(seq 1 30); do
+            second_plan=$(kubectl get pgr deferred-password-policy \
+              -o jsonpath='{.status.current_plan_ref.name}' 2>/dev/null || true)
+            if [ -n "$second_plan" ] && [ "$second_plan" != "$first_plan" ]; then
+              break
+            fi
+            echo "Waiting for a replacement plan... ($i/30)"
+            sleep 3
+          done
+          test -n "$second_plan" && test "$second_plan" != "$first_plan" \
+            || { echo "::error::no replacement plan after rejection"; exit 1; }
+
+          assert_secret_absent deferred-gen-secret
+          approve_plan "$second_plan"
+          wait_for_plan_phase "$second_plan" Applied
+
+          assert_role_exists deferred_gen_user
+          assert_password_set deferred_gen_user
+          assert_role_exists manual_ref_user
+          assert_password_set manual_ref_user
+          assert_secret_has_keys deferred-gen-secret password verifier
+
+          gen_secret_count=$(kubectl get secret \
+            -l pgroles.io/policy=deferred-password-policy --no-headers 2>/dev/null | wc -l | tr -d ' ')
+          test "$gen_secret_count" -eq 1 \
+            || { echo "::error::expected exactly 1 generated Secret, got $gen_secret_count"; exit 1; }
+
+          # The regression #181's fix exists for: if the policy recorded the
+          # planning-time `:missing` sentinel instead of the version the created
+          # Secret reported, this next reconcile would plan another password
+          # change and demand a second approval.
+          wait_for_drift_status deferred-password-policy False
+          assert_no_pending_plan_stable deferred-password-policy
+          gen_password_hash="$(get_password_hash deferred_gen_user)"
+          wait_for_password_hash_stable deferred_gen_user "$gen_password_hash"
+
+          kubectl delete pgr deferred-password-policy --wait=true
+          pg_query "DROP ROLE IF EXISTS deferred_gen_user; DROP ROLE IF EXISTS manual_ref_user;"
+
+          # ================================================================
           # Group C: Plan supersede on policy change
           # ================================================================
 
@@ -783,7 +1069,7 @@ jobs:
               secretRef:
                 name: postgres-credentials
             interval: "30s"
-            mode: plan
+            mode: observe
             approval: manual
             roles:
               - name: supersede_user_v1
@@ -806,7 +1092,7 @@ jobs:
               secretRef:
                 name: postgres-credentials
             interval: "30s"
-            mode: plan
+            mode: observe
             approval: manual
             roles:
               - name: supersede_user_v1
@@ -859,7 +1145,7 @@ jobs:
               secretRef:
                 name: postgres-credentials
             interval: "30s"
-            mode: plan
+            mode: observe
             approval: manual
             roles:
               - name: cleanup_test_user
@@ -1061,6 +1347,338 @@ jobs:
           kubectl delete pgr restart-test --wait=true
           pg_query "REASSIGN OWNED BY restart_test_user TO postgres; DROP OWNED BY restart_test_user; DROP ROLE IF EXISTS restart_test_user;"
 
+      # ==================================================================
+      # Group F: candidates and promotion (#182)
+      #
+      # Extends this job rather than adding one: these scenarios need the same
+      # cluster, operator and PostgreSQL, and a second kind cluster would cost
+      # several minutes of CI for nothing.
+      # ==================================================================
+      - name: Run candidate and promotion scenarios
+        run: |
+          source scripts/e2e-helpers.sh
+
+          # Write the policy with the base role plus every role named in "$@",
+          # and apply it. This is the GitOps promotion: the same content the
+          # candidate carried, written into PostgresPolicy.spec.
+          write_promo_policy() {
+            cat >/tmp/promo-policy.yaml <<'POLICY'
+          apiVersion: pgroles.io/v1alpha1
+          kind: PostgresPolicy
+          metadata:
+            name: promo-policy
+            namespace: default
+          spec:
+            connection:
+              secretRef:
+                name: postgres-credentials
+            interval: "15s"
+            mode: apply
+            approval: manual
+            roles:
+              - name: promo_base_user
+                login: true
+          POLICY
+            local role
+            for role in "$@"; do
+              printf '    - name: %s\n      login: true\n' "$role" >>/tmp/promo-policy.yaml
+            done
+            kubectl apply -f /tmp/promo-policy.yaml
+          }
+
+          # A candidate proposing the base role plus every role named in "$2..".
+          file_candidate() {
+            local name="$1"; shift
+            {
+              printf 'apiVersion: pgroles.io/v1alpha1\n'
+              printf 'kind: PostgresPolicyCandidate\n'
+              printf 'metadata:\n  name: %s\n  namespace: default\n' "$name"
+              printf 'spec:\n  policyRef:\n    name: promo-policy\n'
+              printf '  content:\n    roles:\n      - name: promo_base_user\n        login: true\n'
+              local role
+              for role in "$@"; do
+                printf '      - name: %s\n        login: true\n' "$role"
+              done
+            } >"/tmp/$name.yaml"
+            kubectl apply -f "/tmp/$name.yaml"
+          }
+
+          echo "--- Test: base policy converges before any candidate exists ---"
+          write_promo_policy
+          base_plan=$(wait_for_pending_plan_ref promo-policy)
+          approve_plan "$base_plan"
+          wait_for_plan_phase "$base_plan" Applied
+          assert_role_exists promo_base_user
+
+          echo "--- Test: a candidate is planned and writes nothing ---"
+          file_candidate promo-cand-1 promo_new_user
+          wait_for_candidate_phase promo-cand-1 Planned
+          wait_for_candidate_condition promo-cand-1 Ready True Planned
+          cand_plan=$(wait_for_candidate_plan_ref promo-cand-1)
+
+          # The plan binds the content digest promotion is matched against, and
+          # the candidate that produced it.
+          cand_digest=$(get_candidate_digest promo-cand-1)
+          test -n "$cand_digest" || { echo "::error::candidate has no contentDigest"; exit 1; }
+          plan_digest=$(kubectl get pgplan "$cand_plan" -o jsonpath='{.spec.origin.contentDigest}')
+          test "$plan_digest" = "$cand_digest" \
+            || { echo "::error::plan contentDigest '$plan_digest' != candidate '$cand_digest'"; exit 1; }
+          origin_kind=$(kubectl get pgplan "$cand_plan" -o jsonpath='{.spec.origin.kind}')
+          test "$origin_kind" = "PostgresPolicyCandidate" \
+            || { echo "::error::expected a candidate-origin plan, got '$origin_kind'"; exit 1; }
+
+          # The active policy keeps enforcing, and the proposal executes nothing.
+          assert_role_exists promo_base_user
+          assert_role_absent promo_new_user
+
+          echo "--- Test: the candidate spec is immutable (CEL) ---"
+          if kubectl patch pgcand promo-cand-1 --type=merge \
+              -p '{"spec":{"content":{"roles":[{"name":"promo_sneaky_user","login":true}]}}}' \
+              2>/tmp/immutable.txt; then
+            echo "::error::editing a candidate spec was accepted; immutability is not in force"
+            exit 1
+          fi
+          cat /tmp/immutable.txt
+          grep -qi 'immutable' /tmp/immutable.txt \
+            || { echo "::error::the rejection did not name immutability"; exit 1; }
+          assert_role_absent promo_sneaky_user
+
+          echo "--- Test: approving a candidate plan executes nothing by itself ---"
+          # Prove the negative against a completed reconcile rather than a
+          # fixed sleep: capture the policy's last successful reconcile time,
+          # approve, and wait for it to move past the baseline — at that point
+          # the operator has reconciled with the approval visible, so the role
+          # staying absent is meaningful.
+          reconcile_baseline=$(kubectl get pgr promo-policy \
+            -o jsonpath='{.status.last_successful_reconcile_time}')
+          approve_plan "$cand_plan"
+          for i in $(seq 1 20); do
+            reconcile_now=$(kubectl get pgr promo-policy \
+              -o jsonpath='{.status.last_successful_reconcile_time}' 2>/dev/null || true)
+            if [ -n "$reconcile_now" ] && [ "$reconcile_now" != "$reconcile_baseline" ]; then
+              echo "promo-policy reconciled after the approval ($reconcile_baseline -> $reconcile_now)"
+              break
+            fi
+            if [ "$i" -eq 20 ]; then
+              echo "::error::promo-policy did not reconcile within 60s of approving the candidate plan"
+              exit 1
+            fi
+            echo "Waiting for promo-policy to reconcile after the approval... ($i/20)"
+            sleep 3
+          done
+          assert_role_absent promo_new_user
+
+          echo "--- Test: promoting the approved content executes it ---"
+          write_promo_policy promo_new_user
+          wait_for_plan_phase "$cand_plan" Applied
+          assert_role_exists promo_new_user
+          wait_for_candidate_phase promo-cand-1 Promoted
+          wait_for_candidate_condition promo-cand-1 Promoted True Promoted
+
+          # The policy records the content it converged on — the same digest,
+          # computed over the same canonical form, on both kinds.
+          policy_digest=$(get_policy_content_digest promo-policy)
+          test "$policy_digest" = "$cand_digest" \
+            || { echo "::error::policy digest '$policy_digest' != promoted candidate '$cand_digest'"; exit 1; }
+
+          echo "--- Test: promoting EDITED content falls back to the manual flow ---"
+          file_candidate promo-cand-2 promo_new_user promo_edited_user
+          wait_for_candidate_phase promo-cand-2 Planned
+          cand2_plan=$(wait_for_candidate_plan_ref promo-cand-2)
+          approve_plan "$cand2_plan"
+
+          # Merge something that is not what was approved.
+          write_promo_policy promo_new_user promo_other_user
+
+          wait_for_candidate_condition promo-cand-2 Promoted False PromotionDigestMismatch
+          # Nothing executed on an approval that does not cover this content —
+          # neither the approved candidate's role nor the merged one.
+          assert_role_absent promo_edited_user
+          assert_role_absent promo_other_user
+
+          # The merged content goes through the ordinary manual-plan flow.
+          fresh_plan=$(wait_for_pending_plan_ref promo-policy)
+          test "$fresh_plan" != "$cand2_plan" \
+            || { echo "::error::the policy adopted a candidate plan for content it does not describe"; exit 1; }
+          approve_plan "$fresh_plan"
+          wait_for_plan_phase "$fresh_plan" Applied
+          assert_role_exists promo_other_user
+
+          # The edited promotion never promoted the approved candidate.
+          phase=$(kubectl get pgcand promo-cand-2 -o jsonpath='{.status.phase}')
+          test "$phase" != "Promoted" \
+            || { echo "::error::a candidate whose content never applied reached Promoted"; exit 1; }
+
+          echo "--- Test: approving X and merging Y promotes Y and strands X ---"
+          file_candidate promo-cand-x promo_new_user promo_other_user promo_x_user
+          file_candidate promo-cand-y promo_new_user promo_other_user promo_y_user
+          wait_for_candidate_phase promo-cand-x Planned
+          wait_for_candidate_phase promo-cand-y Planned
+          plan_x=$(wait_for_candidate_plan_ref promo-cand-x)
+          plan_y=$(wait_for_candidate_plan_ref promo-cand-y)
+          approve_plan "$plan_x"
+          approve_plan "$plan_y"
+
+          write_promo_policy promo_new_user promo_other_user promo_y_user
+
+          wait_for_plan_phase "$plan_y" Applied
+          wait_for_candidate_phase promo-cand-y Promoted
+          assert_role_exists promo_y_user
+          # X was approved against a base this promotion replaced: its approval
+          # is retired rather than left executable, and nothing of X ran.
+          wait_for_plan_phase "$plan_x" Superseded
+          reason=$(kubectl get pgplan "$plan_x" \
+            -o jsonpath='{.status.conditions[?(@.type=="Superseded")].reason}')
+          test "$reason" = "SupersededByPromotion" \
+            || { echo "::error::expected SupersededByPromotion on the stranded plan, got '$reason'"; exit 1; }
+          # The decision record itself is untouched: who approved what is
+          # write-once, and retiring a plan must not rewrite it.
+          decided=$(kubectl get pgplan "$plan_x" -o jsonpath='{.status.decidedBy.username}')
+          test "$decided" = "e2e-reviewer" \
+            || { echo "::error::stranding a plan rewrote its decision identity: '$decided'"; exit 1; }
+          assert_role_absent promo_x_user
+
+          echo "--- Test: identical candidates — the approved plan picks the promoted one ---"
+          # dup-cand-a is created FIRST, so lexicographic and creation order
+          # both point at it; only dup-cand-b's plan carries the approval, so
+          # b — not a — must be the candidate recorded Promoted.
+          file_candidate dup-cand-a promo_new_user promo_other_user promo_y_user dup_promo_user
+          wait_for_candidate_phase dup-cand-a Planned
+          file_candidate dup-cand-b promo_new_user promo_other_user promo_y_user dup_promo_user
+          wait_for_candidate_phase dup-cand-b Planned
+          dup_plan_a=$(wait_for_candidate_plan_ref dup-cand-a)
+          dup_plan_b=$(wait_for_candidate_plan_ref dup-cand-b)
+          test "$dup_plan_a" != "$dup_plan_b" \
+            || { echo "::error::identical candidates shared a plan: $dup_plan_a"; exit 1; }
+          dup_digest_a=$(get_candidate_digest dup-cand-a)
+          dup_digest_b=$(get_candidate_digest dup-cand-b)
+          test "$dup_digest_a" = "$dup_digest_b" \
+            || { echo "::error::byte-identical candidates disagree on digest: '$dup_digest_a' vs '$dup_digest_b'"; exit 1; }
+
+          # Approve ONLY b's plan; a's plan stays pending.
+          approve_plan "$dup_plan_b"
+
+          # Merge the identical content into the parent policy; the approved
+          # plan executes it.
+          write_promo_policy promo_new_user promo_other_user promo_y_user dup_promo_user
+          wait_for_plan_phase "$dup_plan_b" Applied
+          assert_role_exists dup_promo_user
+
+          # The candidate whose plan authorized execution is the one promoted.
+          wait_for_candidate_phase dup-cand-b Promoted
+          wait_for_candidate_condition dup-cand-b Promoted True Promoted
+
+          # dup-cand-a listed first, but its plan never carried the approval:
+          # it is superseded, not recorded Promoted.
+          wait_for_candidate_phase dup-cand-a Superseded
+          a_promoted=$(kubectl get pgcand dup-cand-a \
+            -o jsonpath='{.status.conditions[?(@.type=="Promoted")].status}')
+          test "$a_promoted" != "True" \
+            || { echo "::error::dup-cand-a was recorded Promoted on dup-cand-b's approval"; exit 1; }
+          wait_for_plan_phase "$dup_plan_a" Superseded
+          dup_reason=$(kubectl get pgplan "$dup_plan_a" \
+            -o jsonpath='{.status.conditions[?(@.type=="Superseded")].reason}')
+          test "$dup_reason" = "SupersededByPromotion" \
+            || { echo "::error::expected SupersededByPromotion on dup-cand-a's plan, got '$dup_reason'"; exit 1; }
+
+          kubectl delete pgcand dup-cand-a dup-cand-b --wait=true
+
+          echo "--- Test: a base change supersedes a pending candidate plan and its stale approval never promotes ---"
+          # The parent policy currently holds: promo_new_user promo_other_user
+          # promo_y_user dup_promo_user (the duplicate-content promotion).
+          # stale-x is filed against that base and NEVER approved; fresh-y is
+          # approved and merged, moving the base out from under stale-x.
+          file_candidate stale-x promo_new_user promo_other_user promo_y_user dup_promo_user stale_x_user
+          wait_for_candidate_phase stale-x Planned
+          plan_x1=$(wait_for_candidate_plan_ref stale-x)
+
+          file_candidate fresh-y promo_new_user promo_other_user promo_y_user dup_promo_user fresh_y_user
+          wait_for_candidate_phase fresh-y Planned
+          plan_y1=$(wait_for_candidate_plan_ref fresh-y)
+          approve_plan "$plan_y1"
+
+          # Merge fresh-y's content: the base content digest moves to something
+          # that is not stale-x's own content.
+          write_promo_policy promo_new_user promo_other_user promo_y_user dup_promo_user fresh_y_user
+          wait_for_plan_phase "$plan_y1" Applied
+          assert_role_exists fresh_y_user
+          wait_for_candidate_phase fresh-y Promoted
+
+          # stale-x's original plan was pinned to the pre-merge base; the base
+          # change — not a promotion of its content — must retire it. plan_x1
+          # is deliberately unapproved, so promotion-stranding never touches it
+          # and the only valid supersede reason is the base change.
+          wait_for_plan_phase "$plan_x1" Superseded
+          for i in $(seq 1 20); do
+            x1_reason=$(kubectl get pgplan "$plan_x1" \
+              -o jsonpath='{.status.conditions[?(@.type=="Superseded")].reason}' 2>/dev/null || true)
+            if [ "$x1_reason" = "SupersededByBaseChange" ]; then
+              echo "$plan_x1 superseded with reason=SupersededByBaseChange"
+              break
+            fi
+            if [ "$i" -eq 20 ]; then
+              echo "::error::expected SupersededByBaseChange on $plan_x1, got '$x1_reason'"
+              kubectl get pgplan "$plan_x1" -o yaml || true
+              exit 1
+            fi
+            echo "Waiting for $plan_x1 Superseded reason=SupersededByBaseChange (current='$x1_reason')... ($i/20)"
+            sleep 3
+          done
+
+          # stale-x gets a FRESH plan pinned to the new base, needing its own
+          # approval.
+          plan_x2=""
+          for i in $(seq 1 20); do
+            plan_x2=$(kubectl get pgcand stale-x -o jsonpath='{.status.planRef.name}' 2>/dev/null || true)
+            if [ -n "$plan_x2" ] && [ "$plan_x2" != "$plan_x1" ]; then
+              echo "stale-x replanned onto $plan_x2"
+              break
+            fi
+            if [ "$i" -eq 20 ]; then
+              echo "::error::stale-x did not receive a fresh plan pinned to the new base (still '$plan_x2')"
+              kubectl get pgcand stale-x -o yaml || true
+              exit 1
+            fi
+            echo "Waiting for stale-x to replan away from $plan_x1... ($i/20)"
+            sleep 3
+          done
+
+          # The replacement is pinned to the base as it now stands: its
+          # baseContentDigest must be present and differ from the stale pin.
+          base_digest_x1=$(kubectl get pgplan "$plan_x1" -o jsonpath='{.spec.origin.baseContentDigest}')
+          base_digest_x2=$(kubectl get pgplan "$plan_x2" -o jsonpath='{.spec.origin.baseContentDigest}')
+          test -n "$base_digest_x1" \
+            || { echo "::error::superseded plan $plan_x1 has no baseContentDigest"; exit 1; }
+          test -n "$base_digest_x2" \
+            || { echo "::error::fresh plan $plan_x2 has no baseContentDigest"; exit 1; }
+          test "$base_digest_x1" != "$base_digest_x2" \
+            || { echo "::error::fresh plan $plan_x2 is pinned to the stale base '$base_digest_x1'"; exit 1; }
+
+          # Nothing of stale-x ever executed.
+          assert_role_absent stale_x_user
+
+          kubectl delete pgcand stale-x fresh-y --wait=true
+          # Restore the policy content to the set it held before this test.
+          write_promo_policy promo_new_user promo_other_user promo_y_user dup_promo_user
+
+          # Cleanup
+          kubectl delete pgcand --all --wait=true
+          kubectl delete pgr promo-policy --wait=true
+          pg_query "DROP ROLE IF EXISTS stale_x_user;"
+          pg_query "DROP ROLE IF EXISTS fresh_y_user;"
+          for role in promo_base_user promo_new_user promo_other_user promo_y_user dup_promo_user; do
+            pg_query "REASSIGN OWNED BY $role TO postgres; DROP OWNED BY $role; DROP ROLE IF EXISTS $role;"
+          done
+
+      - name: Diagnostics
+        if: failure()
+        run: |
+          kubectl get pgr,pgplan,pgcand,pgeap,pgear -A -o wide || true
+          kubectl get pgr,pgplan,pgcand -A -o yaml || true
+          kubectl -n pgroles-system logs deployment/pgroles-operator --tail=-1 || true
+          kubectl -n pgroles-system logs deployment/pgroles-operator --previous --tail=-1 || true
+          kubectl get events -A --sort-by=.lastTimestamp | tail -100 || true
+
       - name: Cleanup
         if: always()
         run: kind delete cluster --name pgroles-e2e-plans
@@ -1150,6 +1768,14 @@ jobs:
 
       - name: Run ephemeral access lifecycle E2E
         run: scripts/e2e-ephemeral-access.sh "${{ matrix.secure }}"
+
+      # Rides in this job to reuse its Kyverno install: the plan-decision
+      # policy is the sibling of the ephemeral one, and this is the only place
+      # its approve-verb SAR, decidedBy overwrite, and operator exemption run
+      # against a live admission chain.
+      - name: Run plan decision admission E2E
+        if: matrix.secure == 'true'
+        run: scripts/e2e-plan-decision-admission.sh
 
       - name: Diagnostics
         if: failure()

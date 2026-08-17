@@ -18,8 +18,12 @@
 //!   engine's dependency ordering
 //! - the reconciliation mode, since the same desired state converges
 //!   differently under `additive` or `adopt`
-//! - the target database identity, so an approval cannot be reused against a
-//!   different server
+//! - the target database identity, in both of its complementary forms: the
+//!   *physical* identity (`pg_control_system().system_identifier`, the storage
+//!   lineage) and the *logical* identity (the resolved connection fingerprint
+//!   — host, port, database), so an approval cannot be reused against a
+//!   different server, a clone, a branch or a replica
+//! - the Kubernetes reference the connection was resolved from
 //!
 //! What it deliberately excludes:
 //!
@@ -31,7 +35,7 @@
 //! The rendered-SQL hash remains useful as a diagnostic for the preview
 //! artifact; it is simply not the approval identity.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use serde::Serialize;
 use serde_json::Value;
@@ -45,6 +49,14 @@ use crate::diff::{Change, ReconciliationMode};
 /// comparable, so a pending approval computed under an older encoding is
 /// superseded rather than silently accepted.
 pub const APPROVAL_EFFECT_ENCODING_V1: &str = "pgroles.io/approval-effect/v1";
+
+/// Current canonical effect encoding.
+///
+/// v2 adds the resolved target identity — physical (`system_identifier`) and
+/// logical (host/port/database fingerprint) — to the bound inputs. Every
+/// digest changes once when an operator upgrades to this encoding, so every
+/// open plan supersedes exactly once and is re-reviewed.
+pub const APPROVAL_EFFECT_ENCODING_V2: &str = "pgroles.io/approval-effect/v2";
 
 /// Refusal to produce a digest that would not bind what it claims to bind.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -67,12 +79,25 @@ pub struct EffectDigestInputs<'a> {
     /// How the desired state converges. The same effects under a different
     /// mode are a different approval.
     pub reconciliation_mode: ReconciliationMode,
-    /// Identity of the database the effects were computed against.
+    /// Kubernetes-level identity of the connection the effects were computed
+    /// through (namespace-scoped Secret reference or canonical params).
     pub target: &'a str,
+    /// Identity of the database server itself, as observed at planning time.
+    ///
+    /// Bound in addition to `target` because the Kubernetes reference can be
+    /// repointed at a different server without changing.
+    pub target_identity: &'a TargetIdentity,
     /// Stable password source identity per role, keyed by role name — for the
     /// operator this is `secret:key:resourceVersion`. Every role named by a
     /// `SetPassword` change must have an entry.
     pub password_source_versions: &'a BTreeMap<String, String>,
+    /// The roles this plan's owner claims management of. Bound because scope
+    /// is a material control-plane effect the SQL cannot show: dropping a
+    /// role from management produces no SQL at all, yet stops enforcing it.
+    pub owned_roles: &'a [String],
+    /// The schemas this plan's owner claims management of — bound for the
+    /// same reason as `owned_roles`.
+    pub owned_schemas: &'a [String],
 }
 
 #[derive(Serialize)]
@@ -80,7 +105,161 @@ struct CanonicalChangeSet<'a> {
     effect_encoding: &'a str,
     reconciliation_mode: ReconciliationMode,
     target: &'a str,
+    target_physical_identity: Option<&'a str>,
+    target_logical_fingerprint: Option<&'a str>,
+    owned_roles: BTreeSet<&'a str>,
+    owned_schemas: BTreeSet<&'a str>,
     effects: Vec<Value>,
+}
+
+/// The two complementary answers to "is this the same database?".
+///
+/// Neither identity is sufficient alone:
+///
+/// - **Physical** — `pg_control_system().system_identifier`. It answers *same
+///   storage lineage?*: it survives failover to a streaming replica, and it
+///   catches a restore taken from somewhere else. It is a *lineage*
+///   identifier, not an instance one: replicas, PITR and snapshot restores,
+///   Aurora clones and Neon branches all inherit the parent's value, and it
+///   legitimately changes on a major upgrade (`pg_upgrade` runs a fresh
+///   `initdb`) or a blue-green cutover.
+/// - **Logical** — the resolved connection fingerprint (host, port, database).
+///   It answers *same endpoint?*: it catches exactly the clone/branch/replica
+///   confusion the physical identity cannot see, and is in turn fooled by
+///   connection poolers and DNS changes.
+///
+/// Both are therefore bound, and a change in either one fails closed.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TargetIdentity {
+    /// `system_identifier`, when the server exposes `pg_control_system()`.
+    /// `None` on engines that do not implement it (CockroachDB, Spanner's
+    /// PostgreSQL interface, Redshift, Aurora DSQL) or where `EXECUTE` has
+    /// been revoked from `PUBLIC`.
+    pub physical: Option<String>,
+    /// Fingerprint of the resolved host, port and database name. `None` only
+    /// when the connection could not be resolved to a target.
+    pub logical: Option<String>,
+}
+
+impl TargetIdentity {
+    /// A target identity with only the logical half — the ordinary shape on
+    /// engines that do not expose `pg_control_system()`.
+    pub fn logical_only(logical: impl Into<String>) -> Self {
+        Self {
+            physical: None,
+            logical: Some(logical.into()),
+        }
+    }
+
+    /// Whether the physical identity was readable.
+    pub fn has_physical(&self) -> bool {
+        self.physical.is_some()
+    }
+}
+
+/// Why a recorded approval can no longer authorise execution against the
+/// database in front of the operator.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TargetIdentityReason {
+    /// An identity that was bound at approval reads differently now: the plan
+    /// would execute against a different database than the one reviewed.
+    TargetChanged,
+    /// An identity readable at approval is unreadable now. Treated as a
+    /// mismatch rather than "unknown", so revoking `EXECUTE` on
+    /// `pg_control_system()` cannot silently demote an approval's guarantees.
+    TargetIdentityUnavailable,
+    /// An identity that was unavailable at approval is readable now. A
+    /// one-time event (an upgrade, or a permission grant); the approval was
+    /// never bound to it, so it is re-reviewed once.
+    TargetIdentityAppeared,
+    /// `requirePhysicalIdentity` is set and the physical identity is not
+    /// available. No plan may progress.
+    PhysicalIdentityRequired,
+}
+
+impl TargetIdentityReason {
+    /// Condition/event reason string.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            TargetIdentityReason::TargetChanged => "TargetChanged",
+            TargetIdentityReason::TargetIdentityUnavailable => "TargetIdentityUnavailable",
+            TargetIdentityReason::TargetIdentityAppeared => "TargetIdentityAppeared",
+            TargetIdentityReason::PhysicalIdentityRequired => "PhysicalIdentityRequired",
+        }
+    }
+
+    /// Operator-facing explanation.
+    pub fn message(self) -> &'static str {
+        match self {
+            TargetIdentityReason::TargetChanged => {
+                "the database this plan was approved against is not the database it would now \
+                 execute against"
+            }
+            TargetIdentityReason::TargetIdentityUnavailable => {
+                "an identity bound at approval time can no longer be read from the target"
+            }
+            TargetIdentityReason::TargetIdentityAppeared => {
+                "an identity that was unavailable at approval time is now readable, so the \
+                 approval was never bound to it"
+            }
+            TargetIdentityReason::PhysicalIdentityRequired => {
+                "requirePhysicalIdentity is set but pg_control_system().system_identifier could \
+                 not be read from the target"
+            }
+        }
+    }
+}
+
+/// What the observed target identity permits.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TargetIdentityVerdict {
+    /// Both identities still answer as they did at approval.
+    Proceed,
+    /// The target moved. The plan is superseded and re-reviewed; a fresh
+    /// approval is the sanctioned acknowledgement.
+    Superseded(TargetIdentityReason),
+    /// The deployment requires an identity it cannot obtain. Nothing
+    /// progresses until that is fixed — this is a configuration fault, not a
+    /// staleness event.
+    Blocked(TargetIdentityReason),
+}
+
+/// Compare the identity an approval was bound to against the one observed now.
+///
+/// Pure by construction: the whole execution-time gate is this comparison, so
+/// it is exhaustively testable without a database or a cluster.
+pub fn evaluate_target_identity(
+    approved: &TargetIdentity,
+    observed: &TargetIdentity,
+    require_physical_identity: bool,
+) -> TargetIdentityVerdict {
+    if require_physical_identity && (!observed.has_physical() || !approved.has_physical()) {
+        return TargetIdentityVerdict::Blocked(TargetIdentityReason::PhysicalIdentityRequired);
+    }
+
+    for (approved, observed) in [
+        (&approved.physical, &observed.physical),
+        (&approved.logical, &observed.logical),
+    ] {
+        match (approved, observed) {
+            (Some(approved), Some(observed)) if approved != observed => {
+                return TargetIdentityVerdict::Superseded(TargetIdentityReason::TargetChanged);
+            }
+            (Some(_), None) => {
+                return TargetIdentityVerdict::Superseded(
+                    TargetIdentityReason::TargetIdentityUnavailable,
+                );
+            }
+            (None, Some(_)) => {
+                return TargetIdentityVerdict::Superseded(
+                    TargetIdentityReason::TargetIdentityAppeared,
+                );
+            }
+            _ => {}
+        }
+    }
+
+    TargetIdentityVerdict::Proceed
 }
 
 /// Compute the canonical approval-effect digest for a set of changes.
@@ -116,10 +295,21 @@ pub fn canonical_change_set_bytes(
     // of effects are the same approval regardless of emission order.
     effects.sort_by_cached_key(ToString::to_string);
 
+    // Management scope is a set: order is a listing artifact, duplicates say
+    // nothing, and both would make equal scopes hash differently. `BTreeSet`
+    // makes that canonicalisation the type's job rather than a call site's,
+    // and serialises as a sorted JSON array.
+    let owned_roles: BTreeSet<&str> = inputs.owned_roles.iter().map(String::as_str).collect();
+    let owned_schemas: BTreeSet<&str> = inputs.owned_schemas.iter().map(String::as_str).collect();
+
     Ok(serde_json::to_vec(&CanonicalChangeSet {
-        effect_encoding: APPROVAL_EFFECT_ENCODING_V1,
+        effect_encoding: APPROVAL_EFFECT_ENCODING_V2,
         reconciliation_mode: inputs.reconciliation_mode,
         target: inputs.target,
+        target_physical_identity: inputs.target_identity.physical.as_deref(),
+        target_logical_fingerprint: inputs.target_identity.logical.as_deref(),
+        owned_roles,
+        owned_schemas,
         effects,
     })
     .expect("canonical change set is serializable"))
@@ -174,14 +364,61 @@ mod tests {
             .collect()
     }
 
+    /// Shared so the test helper can hand out a `&TargetIdentity` that
+    /// outlives the borrow of the inputs it is embedded in.
+    static TARGET_IDENTITY: std::sync::LazyLock<TargetIdentity> =
+        std::sync::LazyLock::new(|| TargetIdentity {
+            physical: Some("7412330000000000001".to_string()),
+            logical: Some("sha256:fingerprint".to_string()),
+        });
+
     fn inputs<'a>(
         password_source_versions: &'a BTreeMap<String, String>,
     ) -> EffectDigestInputs<'a> {
         EffectDigestInputs {
             reconciliation_mode: ReconciliationMode::Authoritative,
             target: "default/postgres-credentials:url",
+            target_identity: &TARGET_IDENTITY,
             password_source_versions,
+            owned_roles: &[],
+            owned_schemas: &[],
         }
+    }
+
+    /// The lost-management review scenario: dropping a role from management
+    /// produces no SQL at all, so scope must be bound for the digest — and
+    /// therefore the approval — to notice.
+    #[test]
+    fn a_management_scope_change_changes_the_digest_with_identical_effects() {
+        let changes = [create_role("reader")];
+        let versions = BTreeMap::new();
+        let narrow = ["app_reader".to_string()];
+        let wide = ["app_reader".to_string(), "team_y_user".to_string()];
+        let mut inputs_narrow = inputs(&versions);
+        inputs_narrow.owned_roles = &narrow;
+        let mut inputs_wide = inputs(&versions);
+        inputs_wide.owned_roles = &wide;
+        assert_ne!(
+            compute_change_digest(&changes, &inputs_narrow).expect("digest"),
+            compute_change_digest(&changes, &inputs_wide).expect("digest"),
+        );
+    }
+
+    /// Scope is a set: listing order and duplicates are canonicalised away.
+    #[test]
+    fn management_scope_order_and_duplicates_do_not_change_the_digest() {
+        let changes = [create_role("reader")];
+        let versions = BTreeMap::new();
+        let forward = ["a".to_string(), "b".to_string()];
+        let shuffled = ["b".to_string(), "a".to_string(), "b".to_string()];
+        let mut inputs_forward = inputs(&versions);
+        inputs_forward.owned_roles = &forward;
+        let mut inputs_shuffled = inputs(&versions);
+        inputs_shuffled.owned_roles = &shuffled;
+        assert_eq!(
+            compute_change_digest(&changes, &inputs_forward).expect("digest"),
+            compute_change_digest(&changes, &inputs_shuffled).expect("digest"),
+        );
     }
 
     fn set_password(name: &str, verifier: &str) -> Change {
@@ -319,6 +556,192 @@ mod tests {
     }
 
     #[test]
+    fn effects_are_bound_to_both_halves_of_the_target_identity() {
+        let versions = BTreeMap::new();
+        let changes = [grant("reporting")];
+
+        let baseline = compute_change_digest(&changes, &inputs(&versions)).expect("digest");
+
+        // A clone or a branch: same storage lineage, different endpoint.
+        let cloned = TargetIdentity {
+            logical: Some("sha256:other-endpoint".to_string()),
+            ..TARGET_IDENTITY.clone()
+        };
+        // A restore from elsewhere behind an unchanged endpoint.
+        let restored = TargetIdentity {
+            physical: Some("7412330000000000002".to_string()),
+            ..TARGET_IDENTITY.clone()
+        };
+        // Physical identity no longer readable — a downgrade, not a match.
+        let downgraded = TargetIdentity {
+            physical: None,
+            ..TARGET_IDENTITY.clone()
+        };
+
+        for moved in [cloned, restored, downgraded] {
+            assert_ne!(
+                baseline,
+                compute_change_digest(
+                    &changes,
+                    &EffectDigestInputs {
+                        target_identity: &moved,
+                        ..inputs(&versions)
+                    },
+                )
+                .expect("digest"),
+                "an approval must not carry over to a different target identity"
+            );
+        }
+    }
+
+    #[test]
+    fn an_unchanged_target_identity_keeps_the_digest() {
+        let versions = BTreeMap::new();
+        let changes = [grant("reporting")];
+        let same = TARGET_IDENTITY.clone();
+
+        assert_eq!(
+            compute_change_digest(&changes, &inputs(&versions)).expect("digest"),
+            compute_change_digest(
+                &changes,
+                &EffectDigestInputs {
+                    target_identity: &same,
+                    ..inputs(&versions)
+                },
+            )
+            .expect("digest"),
+        );
+    }
+
+    fn identity(physical: Option<&str>, logical: Option<&str>) -> TargetIdentity {
+        TargetIdentity {
+            physical: physical.map(str::to_string),
+            logical: logical.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn an_unchanged_identity_proceeds() {
+        let approved = identity(Some("id-1"), Some("fp-1"));
+        assert_eq!(
+            evaluate_target_identity(&approved, &approved.clone(), false),
+            TargetIdentityVerdict::Proceed
+        );
+        assert_eq!(
+            evaluate_target_identity(&approved, &approved, true),
+            TargetIdentityVerdict::Proceed
+        );
+    }
+
+    /// The ordinary shape on engines without `pg_control_system()`: no
+    /// physical identity at either end is not an anomaly.
+    #[test]
+    fn consistent_physical_unavailability_proceeds() {
+        let logical_only = identity(None, Some("fp-1"));
+        assert_eq!(
+            evaluate_target_identity(&logical_only, &logical_only.clone(), false),
+            TargetIdentityVerdict::Proceed
+        );
+    }
+
+    #[test]
+    fn a_changed_physical_identity_supersedes() {
+        assert_eq!(
+            evaluate_target_identity(
+                &identity(Some("id-1"), Some("fp-1")),
+                &identity(Some("id-2"), Some("fp-1")),
+                false,
+            ),
+            TargetIdentityVerdict::Superseded(TargetIdentityReason::TargetChanged)
+        );
+    }
+
+    #[test]
+    fn a_changed_logical_fingerprint_supersedes() {
+        assert_eq!(
+            evaluate_target_identity(
+                &identity(Some("id-1"), Some("fp-1")),
+                &identity(Some("id-1"), Some("fp-2")),
+                false,
+            ),
+            TargetIdentityVerdict::Superseded(TargetIdentityReason::TargetChanged)
+        );
+    }
+
+    /// Revoking `EXECUTE` between approval and execution must not buy a silent
+    /// demotion to the logical answer alone.
+    #[test]
+    fn a_physical_downgrade_supersedes() {
+        assert_eq!(
+            evaluate_target_identity(
+                &identity(Some("id-1"), Some("fp-1")),
+                &identity(None, Some("fp-1")),
+                false,
+            ),
+            TargetIdentityVerdict::Superseded(TargetIdentityReason::TargetIdentityUnavailable)
+        );
+    }
+
+    /// The mirror case: the approval was never bound to an identity that is
+    /// now readable, so it is re-reviewed exactly once.
+    #[test]
+    fn a_physical_upgrade_supersedes_once() {
+        assert_eq!(
+            evaluate_target_identity(
+                &identity(None, Some("fp-1")),
+                &identity(Some("id-1"), Some("fp-1")),
+                false,
+            ),
+            TargetIdentityVerdict::Superseded(TargetIdentityReason::TargetIdentityAppeared)
+        );
+    }
+
+    #[test]
+    fn require_physical_identity_blocks_when_it_is_unavailable() {
+        // Unavailable now.
+        assert_eq!(
+            evaluate_target_identity(
+                &identity(Some("id-1"), Some("fp-1")),
+                &identity(None, Some("fp-1")),
+                true,
+            ),
+            TargetIdentityVerdict::Blocked(TargetIdentityReason::PhysicalIdentityRequired)
+        );
+        // Never bound at approval.
+        assert_eq!(
+            evaluate_target_identity(
+                &identity(None, Some("fp-1")),
+                &identity(Some("id-1"), Some("fp-1")),
+                true,
+            ),
+            TargetIdentityVerdict::Blocked(TargetIdentityReason::PhysicalIdentityRequired)
+        );
+        // Consistently unavailable — ordinary elsewhere, blocked here.
+        assert_eq!(
+            evaluate_target_identity(
+                &identity(None, Some("fp-1")),
+                &identity(None, Some("fp-1")),
+                true,
+            ),
+            TargetIdentityVerdict::Blocked(TargetIdentityReason::PhysicalIdentityRequired)
+        );
+    }
+
+    /// A physical mismatch is reported as a mismatch even under
+    /// `requirePhysicalIdentity`, since both identities are readable.
+    #[test]
+    fn require_physical_identity_still_reports_a_mismatch_as_a_supersede() {
+        assert_eq!(
+            evaluate_target_identity(
+                &identity(Some("id-1"), Some("fp-1")),
+                &identity(Some("id-2"), Some("fp-1")),
+                true,
+            ),
+            TargetIdentityVerdict::Superseded(TargetIdentityReason::TargetChanged)
+        );
+    }
+
+    #[test]
     fn different_effects_produce_different_digests() {
         let versions = BTreeMap::new();
         let inputs = inputs(&versions);
@@ -357,7 +780,7 @@ mod tests {
     /// object keys in declaration order by default, but its `preserve_order`
     /// feature switches to insertion order — and any dependency in the graph
     /// can enable it, silently changing every digest without changing
-    /// `APPROVAL_EFFECT_ENCODING_V1`. Pending approvals would then be
+    /// `APPROVAL_EFFECT_ENCODING_V2`. Pending approvals would then be
     /// superseded across an unrelated dependency bump.
     ///
     /// Note the object keys come out *alphabetically*, not in struct
@@ -379,10 +802,13 @@ mod tests {
         let bytes = canonical_change_set_bytes(&changes, &inputs(&versions)).expect("bytes");
         let encoded = String::from_utf8(bytes).expect("canonical bytes are UTF-8 JSON");
 
+        // The management-scope fields joined this encoding before v2 ever
+        // shipped in a release, so the constant keeps its name; from the
+        // first released v2 onward, any change here means a new constant.
         assert_eq!(
             encoded,
-            r#"{"effect_encoding":"pgroles.io/approval-effect/v1","reconciliation_mode":"Authoritative","target":"default/postgres-credentials:url","effects":[{"Grant":{"name":"orders","object_type":"table","privileges":["SELECT"],"role":"reporting","schema":"inventory"}},{"SetPassword":{"name":"app","password_source":"role-passwords:app:7"}}]}"#,
-            "canonical encoding changed; bump APPROVAL_EFFECT_ENCODING_V1 rather than \
+            r#"{"effect_encoding":"pgroles.io/approval-effect/v2","reconciliation_mode":"Authoritative","target":"default/postgres-credentials:url","target_physical_identity":"7412330000000000001","target_logical_fingerprint":"sha256:fingerprint","owned_roles":[],"owned_schemas":[],"effects":[{"Grant":{"name":"orders","object_type":"table","privileges":["SELECT"],"role":"reporting","schema":"inventory"}},{"SetPassword":{"name":"app","password_source":"role-passwords:app:7"}}]}"#,
+            "canonical encoding changed; bump the encoding constant rather than \
              editing this fixture"
         );
     }

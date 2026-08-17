@@ -1,3 +1,11 @@
+# Chart-less mirror. The canonical copy is
+# charts/pgroles-operator/files/kyverno-plan-decision.yaml, rendered by the
+# Helm chart when `admissionPolicies.enabled=true` — that path generates the
+# operator exemption below from `operator.serviceAccount.name` and the release
+# namespace, so it cannot drift. Prefer it. This file exists for installs that
+# do not use the chart, and is pinned to the default namespace and
+# ServiceAccount name; keep it in sync with the chart copy when either changes.
+#
 # Admission policy for PostgresPolicyPlan decisions.
 #
 # The CRD's CEL rules make a decision terminal, mutually exclusive, and paired
@@ -77,7 +85,7 @@ spec:
           # treated as a reviewer decision, or the operator would need the
           # approve verb and would have its own decidedBy overwritten.
           - key: >-
-              {{ length(request.object.status.conditions[?(type == 'Approved' || type == 'Denied') && status == 'True']) }}
+              {{ length(request.object.status.conditions[?(type == 'Approved' || type == 'Denied') && status == 'True'] || `[]`) }}
             operator: GreaterThan
             value: >-
               {{ length(request.oldObject.status.conditions[?(type == 'Approved' || type == 'Denied') && status == 'True'] || `[]`) }}
@@ -114,7 +122,7 @@ spec:
           # treated as a reviewer decision, or the operator would need the
           # approve verb and would have its own decidedBy overwritten.
           - key: >-
-              {{ length(request.object.status.conditions[?(type == 'Approved' || type == 'Denied') && status == 'True']) }}
+              {{ length(request.object.status.conditions[?(type == 'Approved' || type == 'Denied') && status == 'True'] || `[]`) }}
             operator: GreaterThan
             value: >-
               {{ length(request.oldObject.status.conditions[?(type == 'Approved' || type == 'Denied') && status == 'True'] || `[]`) }}
@@ -176,4 +184,6 @@ rules:
     verbs: [get, list, watch]
   - apiGroups: [pgroles.io]
     resources: [postgrespolicyplans/status]
-    verbs: [patch, update]
+    # get is required in practice: `kubectl patch --subresource=status` reads
+    # the status subresource before writing it.
+    verbs: [get, patch, update]

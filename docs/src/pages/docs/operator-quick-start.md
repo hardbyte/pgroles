@@ -200,12 +200,25 @@ The CRD's validation rules make a decision terminal and force it to carry a
 server cannot check that `decidedBy` names the account that actually wrote it —
 above, you are typing your own username into the field.
 
-Install `k8s/security/plan-decision-kyverno.yaml` to make it verified. It
-overwrites `decidedBy` from the authenticated admission request and requires
-the `approve` verb on the parent `PostgresPolicy`, so patching a plan's status
-is no longer by itself authority to approve a database change. Without it, any
-account that can patch `postgrespolicyplans/status` can approve, under any name
-it chooses.
+Install the plan-decision admission policy to make it verified. It overwrites
+`decidedBy` from the authenticated admission request and requires the `approve`
+verb on the parent `PostgresPolicy`, so patching a plan's status is no longer by
+itself authority to approve a database change. Without it, any account that can
+patch `postgrespolicyplans/status` can approve, under any name it chooses.
+
+With Kyverno 1.18 or later installed in the cluster, enable it through the
+chart. The operator's exemption is generated from the values you installed
+with, so a custom ServiceAccount name or namespace stays correct:
+
+```shell
+helm upgrade pgroles-operator oci://ghcr.io/hardbyte/charts/pgroles-operator \
+  --namespace pgroles-system --reuse-values \
+  --set admissionPolicies.enabled=true
+```
+
+For chart-less installs, `k8s/security/plan-decision-kyverno.yaml` is the same
+policy pinned to the `pgroles-system` namespace and the `pgroles-operator`
+ServiceAccount name; edit the exemption if yours differ.
 {% /callout %}
 
 ## 6. Make a second change
@@ -218,7 +231,7 @@ When you are comfortable with the review loop, choose deliberately between:
 
 - `approval: manual` for a human gate on every change
 - `approval: auto` for continuous convergence without a human gate
-- `mode: plan` for a permanently non-mutating drift preview
+- `mode: observe` for a permanently non-mutating drift preview
 
 Read [plan and approval](/docs/operator-plan-approval) before changing those
 controls. For an existing database, keep additive or follow

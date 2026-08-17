@@ -31,7 +31,7 @@ The important difference is that the operator has to do this continuously, safel
 
 - Secret-based connection lookup
 - reconciliation interval
-- execution mode (`apply` or `plan`) and approval mode (`auto` or `manual`)
+- execution mode (`apply` or `observe`) and approval mode (`auto` or `manual`)
 - reconciliation mode (`authoritative`, `additive`, or `adopt`)
 - suspend/pause behavior
 
@@ -44,7 +44,7 @@ The operator currently reconciles from four event-driven trigger sources, plus t
 - `PostgresPolicy` generation changes
 - `PostgresPolicy` `reconcile.pgroles.io/requestedAt` annotation changes
 - Secret `resourceVersion` changes for referenced database credentials
-- `PostgresPolicyPlan` changes, mapped back to the owning policy by controller-owner UID — this is what makes an approval or rejection annotation take effect immediately rather than at the next interval
+- `PostgresPolicyPlan` changes, mapped back to the owning policy by controller-owner UID — this is what makes an approval or rejection recorded on a plan's status take effect immediately rather than at the next interval
 
 Generation and annotation filtering matter. The controller intentionally ignores status-only `PostgresPolicy` updates and unrelated annotation changes as reconcile triggers, otherwise successful status patches and GitOps tracking metadata can create hot loops that starve other policies targeting the same database.
 
@@ -174,7 +174,7 @@ request, approval, expiry, and session contracts, and
 [securing ephemeral access](/docs/ephemeral-access-security) for the deployment
 trust and audit boundaries.
 
-For object-local debugging, the controller also emits transition-based Kubernetes Events for notable status changes such as conflicts, suspend/resume, plan-mode drift detection, recovery, secret failures, database connectivity failures, and insufficient privileges. The intended split is:
+For object-local debugging, the controller also emits transition-based Kubernetes Events for notable status changes such as conflicts, suspend/resume, observe-mode drift detection, recovery, secret failures, database connectivity failures, and insufficient privileges. The intended split is:
 
 - status: current state of the policy
 - Events: notable transitions visible in `kubectl describe`

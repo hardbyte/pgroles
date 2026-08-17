@@ -84,7 +84,10 @@ already use Kyverno:
   `approve`, and `manage` roles.
 - `k8s/security/ephemeral-access-kyverno.yaml` authenticates actor fields,
   performs `SubjectAccessReview` checks, and protects lifecycle status and
-  finalizers.
+  finalizers. The Helm chart renders the same policies from
+  `admissionPolicies.enabled`.
+- `k8s/security/plan-decision-kyverno.yaml` does the equivalent for
+  `PostgresPolicyPlan` approvals.
 
 The reference profile is tested in CI with Kyverno 1.18.2. Other Kyverno
 versions are not currently verified by pgroles. Install Kyverno using the
@@ -92,7 +95,29 @@ supported method for your cluster, then apply the pgroles manifests:
 
 ```shell
 kubectl apply -f k8s/security/ephemeral-access-rbac.yaml
+helm upgrade pgroles-operator oci://ghcr.io/hardbyte/charts/pgroles-operator \
+  --namespace pgroles-system --reuse-values \
+  --set admissionPolicies.enabled=true
+```
+
+Prefer the chart for the admission policies. `admissionPolicies.enabled`
+defaults to `false` — the policies are Kyverno custom resources, so enabling
+them without Kyverno present fails the install — but leaving it off means
+decisions are unattributed and `approval.mode: Required` is not an approval
+boundary. Turn it on as soon as Kyverno is in the cluster. The chart generates
+the operator's exemption from `operator.serviceAccount.name` and the release
+namespace, so a non-default install cannot silently stall plans on a mismatched
+identity. Per-policy flags `admissionPolicies.planDecision.enabled` and
+`admissionPolicies.ephemeralAccess.enabled` are on by default under it.
+
+If you are not using the chart, apply the mirrored manifests instead. They are
+pinned to the `pgroles-system` namespace and the `pgroles-operator`
+ServiceAccount name, and the exemption in `plan-decision-kyverno.yaml` must be
+edited to match your install:
+
+```shell
 kubectl apply -f k8s/security/ephemeral-access-kyverno.yaml
+kubectl apply -f k8s/security/plan-decision-kyverno.yaml
 ```
 
 Bind the requester and approver ClusterRoles to deployment-specific users,

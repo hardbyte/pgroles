@@ -27,10 +27,41 @@ for what the operator does and
 [RBAC and security](https://hardbyte.github.io/pgroles/docs/operator-security/)
 for the permissions it needs.
 
+## Admission policies
+
+Reviewer decisions on a `PostgresPolicyPlan` or an `EphemeralAccessRequest` are
+only authenticated when the Kyverno admission policies are installed. Without
+them `decidedBy` is whatever the client wrote, and anyone able to patch
+`.../status` can approve — `approval.mode: Required` is not an approval
+boundary. See
+[securing ephemeral access](https://hardbyte.github.io/pgroles/docs/ephemeral-access-security/).
+
+The chart renders them, with the operator's own exemption generated from
+`operator.serviceAccount.name` and the release namespace so it cannot drift:
+
+```shell
+helm install pgroles-operator oci://ghcr.io/hardbyte/charts/pgroles-operator \
+  --namespace pgroles-system --create-namespace \
+  --set admissionPolicies.enabled=true
+```
+
+`admissionPolicies.enabled` defaults to **false** because the policies are
+Kyverno custom resources: enabling it in a cluster without Kyverno installed
+fails the install. Install Kyverno 1.18 or later first, then turn it on. The
+rendered resources are cluster-scoped with fixed names, so enable them from a
+single release per cluster.
+
+For chart-less installs, `k8s/security/*-kyverno.yaml` in the repository mirror
+these policies, pinned to the `pgroles-system` namespace and the
+`pgroles-operator` ServiceAccount name — edit the exemption if yours differ.
+
 ## Values
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
+| admissionPolicies.enabled | bool | `false` | Render the Kyverno admission policies. Requires Kyverno (v1.18+, for both `kyverno.io/v1` ClusterPolicy and `policies.kyverno.io/v1` ValidatingPolicy) to be installed in the cluster. |
+| admissionPolicies.ephemeralAccess.enabled | bool | `true` | Render the EphemeralAccessRequest decision and lifecycle policies. Only applies when `admissionPolicies.enabled` is true. |
+| admissionPolicies.planDecision.enabled | bool | `true` | Render the PostgresPolicyPlan decision policy, plus the `pgroles-plan-approver` ClusterRole. Only applies when `admissionPolicies.enabled` is true. |
 | fullnameOverride | string | `""` | Replaces the full generated name in resource names. |
 | nameOverride | string | `""` | Replaces the generated name in resource names, keeping the release prefix. |
 | operator.affinity | object | `{}` | Affinity rules for operator pod scheduling. |

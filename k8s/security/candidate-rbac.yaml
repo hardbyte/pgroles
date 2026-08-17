@@ -1,0 +1,24 @@
+# Reference RBAC for PostgresPolicyCandidate.
+#
+# Bind these to deployment-specific identities. The point of the split is what
+# is *absent*: an author may propose content and read the resulting plan, has
+# no verb at all on PostgresPolicy — promotion is a separate capability,
+# normally held only by the GitOps controller — and no verb on
+# postgrespolicyplans/status, so an author cannot decide their own proposal.
+# Approving a plan remains the `pgroles-plan-approver` role in
+# k8s/security/plan-decision-kyverno.yaml.
+#
+# See docs/design/adr-001-candidate-api.md, Decision 4.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: pgroles-candidate-author
+  labels:
+    app.kubernetes.io/name: pgroles-operator
+rules:
+  - apiGroups: [pgroles.io]
+    resources: [postgrespolicycandidates]
+    verbs: [create, get, list]
+  - apiGroups: [pgroles.io]
+    resources: [postgrespolicyplans]
+    verbs: [get, list, watch]

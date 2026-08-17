@@ -60,7 +60,7 @@ export function WorkspaceDataFlowDiagram() {
               tone="amber"
               items={[
                 'CLI diff / apply / generate',
-                'Operator apply or plan mode',
+                'Operator apply or observe mode',
                 'SQL script, status, metrics, and Events',
             ]}
           />

@@ -22,7 +22,7 @@ pgroles already provides:
 - safety preflight for destructive role retirement workflows
 - PostgreSQL-version-aware SQL generation (PostgreSQL 16+ tested in CI; PG 14–15 legacy fallback syntax is best-effort and untested)
 - a production-focused Kubernetes operator with:
-  - plan mode
+  - observe mode (non-mutating drift preview)
   - per-database serialization
   - advisory locking
   - failure-aware retry behavior
@@ -53,7 +53,7 @@ pgroles already provides:
 
 The following landed recently and shape the next release line:
 
-- **Operator plan mode** — `spec.mode: plan` computes drift and publishes planned SQL without mutating PostgreSQL.
+- **Operator observe mode** — `spec.mode: observe` (formerly `plan`) computes drift and publishes planned SQL without mutating PostgreSQL.
 - **Reconciliation modes** — `authoritative`, `additive`, and `adopt` are now available in the CLI and operator.
 - **Password support** — login roles can declare a password source and optional `password_valid_until` timestamp.
 - **`generate --output`** — brownfield export can write manifests directly to a file.
@@ -82,6 +82,7 @@ The following landed recently and shape the next release line:
 
 - Carry the current controller semantics into the next CRD revision instead of leaving them as implementation-only conventions.
 - Promote beyond `v1alpha1` only once compatibility, upgrade, and rollback expectations are explicit.
+- `PostgresPolicyCandidate` API mechanics (schema bounds, defaults, ownership, RBAC) are settled in [ADR-001](docs/design/adr-001-candidate-api.md).
 - Keep status, Events, and OTLP metrics aligned as the CRD evolves.
 
 ### 4. Compatibility and validation

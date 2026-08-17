@@ -17,8 +17,8 @@ use tracing_subscriber::prelude::*;
 
 use pgroles_operator::context::OperatorContext;
 use pgroles_operator::crd::{
-    EphemeralAccessPolicy, EphemeralAccessRequest, PostgresPolicy, PostgresPolicyPlan,
-    REQUESTED_RECONCILE_ANNOTATION,
+    EphemeralAccessPolicy, EphemeralAccessRequest, PostgresPolicy, PostgresPolicyCandidate,
+    PostgresPolicyPlan, REQUESTED_RECONCILE_ANNOTATION,
 };
 use pgroles_operator::ephemeral::{
     access_policy_error_policy, access_request_error_policy, reconcile_access_policy,
@@ -46,6 +46,25 @@ fn plan_decision_hash(plan: &PostgresPolicyPlan) -> Option<u64> {
         }
         format!("{}", status.phase).hash(&mut hasher);
     }
+    Some(hasher.finish())
+}
+
+/// Hash identifying a candidate's *spec* state.
+///
+/// Deliberately not the resource version: the operator writes candidate status
+/// on every reconcile, and waking the parent on our own status write would
+/// spin. A candidate spec is immutable, so in practice this fires on creation
+/// and deletion — which is exactly when the parent has new work.
+fn candidate_trigger_hash(candidate: &PostgresPolicyCandidate) -> Option<u64> {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    candidate.meta().uid.hash(&mut hasher);
+    candidate.meta().generation.hash(&mut hasher);
+    candidate
+        .meta()
+        .deletion_timestamp
+        .as_ref()
+        .map(|timestamp| timestamp.0.to_string())
+        .hash(&mut hasher);
     Some(hasher.finish())
 }
 
@@ -186,13 +205,20 @@ async fn main() -> anyhow::Result<()> {
         .filter_map(|plan| async move { plan.ok() })
         .flat_map(move |plan| {
             let policy_store = plan_policy_store.clone();
-            // Map the plan back to its parent by controller-owner UID.
+            // Map the plan back to its parent by UID, never by name.
             //
             // This used to compare the plan's `pgroles.io/policy` label against
             // `metadata.name`, but that label is truncated at the 63-character label
             // limit while a policy name may be up to 253. For any longer name the
             // comparison never matched, so plan status changes silently stopped
             // waking the policy reconciler. The UID is exact at any name length.
+            //
+            // A candidate-origin plan is controller-owned by its *candidate*,
+            // not the policy, so the owner UID maps to nothing — yet the
+            // decision recorded on it is the parent's work: promotion runs in
+            // the parent's reconcile. Those plans carry the policy's UID in
+            // `spec.origin.policyUid`; without this fallback a candidate-plan
+            // approval sat inert until the policy's periodic interval.
             let parent_policy_uid = plan
                 .metadata
                 .owner_references
@@ -200,17 +226,61 @@ async fn main() -> anyhow::Result<()> {
                 .unwrap_or_default()
                 .iter()
                 .find(|owner| owner.controller.unwrap_or(false))
-                .map(|owner| owner.uid.clone());
+                .map(|owner| owner.uid.clone())
+                .filter(|uid| !uid.is_empty());
+            let origin_policy_uid = plan
+                .spec
+                .origin
+                .as_ref()
+                .and_then(|origin| origin.policy_uid.clone())
+                .filter(|uid| !uid.is_empty());
 
-            let refs: Vec<ObjectRef<PostgresPolicy>> = match parent_policy_uid {
-                Some(uid) if !uid.is_empty() => policy_store
-                    .state()
-                    .into_iter()
-                    .filter(|policy| policy.metadata.uid.as_deref() == Some(uid.as_str()))
-                    .map(|policy| ObjectRef::from_obj(policy.as_ref()))
-                    .collect(),
-                _ => Vec::new(),
+            let refs: Vec<ObjectRef<PostgresPolicy>> = policy_store
+                .state()
+                .into_iter()
+                .filter(|policy| {
+                    let uid = policy.metadata.uid.as_deref();
+                    parent_policy_uid.as_deref().is_some_and(|p| Some(p) == uid)
+                        || origin_policy_uid.as_deref().is_some_and(|o| Some(o) == uid)
+                })
+                .map(|policy| ObjectRef::from_obj(policy.as_ref()))
+                .collect();
+            stream::iter(refs)
+        });
+
+    // Watch PostgresPolicyCandidate resources and enqueue the *parent policy*.
+    // Candidates have no reconciler of their own: they are planned inside the
+    // parent's reconcile, under its lock and in its execution context, so the
+    // parent is the only correct unit of work.
+    let candidate_policy_store = reader.clone();
+    let candidates: Api<PostgresPolicyCandidate> = match &watch_namespace {
+        Some(namespace) => Api::namespaced(client.clone(), namespace),
+        None => Api::all(client.clone()),
+    };
+    let candidate_triggers = watcher(candidates, watcher::Config::default())
+        .default_backoff()
+        .touched_objects()
+        .predicate_filter(candidate_trigger_hash, Default::default())
+        .filter_map(|candidate| async move { candidate.ok() })
+        .flat_map(move |candidate| {
+            let policy_store = candidate_policy_store.clone();
+            let Some(namespace) = candidate.namespace() else {
+                return stream::iter(Vec::<ObjectRef<PostgresPolicy>>::new());
             };
+            // Resolved by `spec.policyRef` rather than by owner reference: the
+            // controller stamps the owner reference on first touch, so a brand
+            // new candidate — the case that most needs to wake the parent —
+            // does not have one yet.
+            let policy_name = candidate.spec.policy_ref.name.clone();
+            let refs = policy_store
+                .state()
+                .into_iter()
+                .filter(|policy| {
+                    policy.namespace().as_deref() == Some(namespace.as_str())
+                        && policy.name_any() == policy_name
+                })
+                .map(|policy| ObjectRef::from_obj(policy.as_ref()))
+                .collect::<Vec<_>>();
             stream::iter(refs)
         });
 
@@ -220,6 +290,7 @@ async fn main() -> anyhow::Result<()> {
     let policy_controller = Controller::for_stream(policy_stream, reader)
         .reconcile_on(secret_triggers)
         .reconcile_on(plan_triggers)
+        .reconcile_on(candidate_triggers)
         .shutdown_on_signal()
         .run(reconcile, error_policy, ctx.clone())
         .for_each(|result| async move {
@@ -376,6 +447,7 @@ mod tests {
                 }),
                 secret_key: Some("DATABASE_URL".to_string()),
                 params: None,
+                require_physical_identity: None,
             },
             interval: "5m".to_string(),
             suspend: false,

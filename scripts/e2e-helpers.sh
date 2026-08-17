@@ -275,6 +275,44 @@ assert_secret_has_keys() {
   echo "Secret $name contains expected keys: $*"
 }
 
+assert_secret_absent() {
+  local name="$1"
+  local err
+  if err="$(kubectl get secret "$name" -o name 2>&1 >/dev/null)"; then
+    echo "::error::Secret $name exists but should not"
+    return 1
+  fi
+  # Only NotFound proves absence; any other failure (API outage, RBAC, typo in
+  # the resource kind) must not be mistaken for the Secret not existing.
+  if ! printf '%s' "$err" | grep -q "NotFound"; then
+    echo "::error::could not query Secret $name: $err"
+    return 1
+  fi
+  echo "Secret $name is absent as expected"
+}
+
+# A generated Secret must stay absent for as long as its plan is unapproved,
+# not merely be absent at one instant — the operator reconciles on an interval,
+# so a single check could simply have run before the first reconcile.
+assert_secret_absent_stable() {
+  local name="$1"
+  local err
+  for i in $(seq 1 6); do
+    sleep 5
+    if err="$(kubectl get secret "$name" -o name 2>&1 >/dev/null)"; then
+      echo "::error::Secret $name appeared while its plan was still unapproved"
+      return 1
+    fi
+    # Only NotFound proves absence; any other failure must not be mistaken for
+    # the Secret not existing.
+    if ! printf '%s' "$err" | grep -q "NotFound"; then
+      echo "::error::could not query Secret $name: $err"
+      return 1
+    fi
+    echo "Secret $name still absent (attempt $i/6)"
+  done
+}
+
 upsert_secret() {
   local name="$1"; shift
   local args=()
@@ -355,11 +393,19 @@ conditions.append({
 })
 print(json.dumps({'status': {
     'conditions': conditions,
-    'decidedBy': {'username': 'e2e-reviewer'},
+    'decidedBy': {'username': '${DECIDE_BY:-e2e-reviewer}'},
 }}))
 ")" || return 1
 
-  kubectl patch pgplan "$plan" --subresource=status --type=merge -p "$merged"
+  # DECIDE_AS impersonates the writer (the read above stays cluster-admin so
+  # a low-privilege identity can still be tested against a readable plan);
+  # DECIDE_BY forges the claimed decider, for asserting that an admission
+  # layer replaces it with the authenticated identity.
+  if [ -n "${DECIDE_AS:-}" ]; then
+    kubectl --as="$DECIDE_AS" patch pgplan "$plan" --subresource=status --type=merge -p "$merged"
+  else
+    kubectl patch pgplan "$plan" --subresource=status --type=merge -p "$merged"
+  fi
 }
 
 approve_plan() {
@@ -445,7 +491,140 @@ wait_for_current_plan_ref() {
   return 1
 }
 
+# Print the names of plans controller-owned by this policy, one per line.
+#
+# The label narrows server-side, but it is truncated at 63 characters and
+# candidate-owned plans carry it too, so the controller-owner UID is the
+# exact filter — the same discipline the operator itself uses.
+plans_owned_by_policy() {
+  local policy="$1"
+  local policy_uid
+  policy_uid="$(kubectl get pgr "$policy" -o jsonpath='{.metadata.uid}' 2>/dev/null || true)"
+  if [ -z "$policy_uid" ]; then
+    return 0
+  fi
+  kubectl get pgplan -l "pgroles.io/policy=$policy" -o json 2>/dev/null |
+    POLICY_UID="$policy_uid" python3 -c '
+import json, os, sys
+uid = os.environ["POLICY_UID"]
+for item in json.load(sys.stdin).get("items", []):
+    owners = item.get("metadata", {}).get("ownerReferences") or []
+    if any(o.get("controller") and o.get("uid") == uid for o in owners):
+        phase = (item.get("status") or {}).get("phase", "")
+        print(item["metadata"]["name"], phase)
+'
+}
+
+# Assert the policy is not sitting on a plan awaiting a decision, and stays
+# that way. A password change planned from a stale source version shows up
+# exactly here: a second Pending plan for work that already applied.
+assert_no_pending_plan_stable() {
+  local policy="$1"
+  for i in $(seq 1 6); do
+    sleep 5
+    local pending
+    pending="$(plans_owned_by_policy "$policy" | awk '$2 == "Pending" { print $1 }')"
+    if [ -n "$pending" ]; then
+      echo "::error::$policy has a pending plan it should not: $pending"
+      return 1
+    fi
+    echo "No pending plan for $policy (attempt $i/6)"
+  done
+}
+
 get_plan_count() {
   local policy="$1"
-  kubectl get pgplan -l "pgroles.io/policy=$policy" --no-headers 2>/dev/null | wc -l | tr -d ' '
+  plans_owned_by_policy "$policy" | wc -l | tr -d ' '
+}
+
+# -- Candidate helpers --------------------------------------------------------
+
+wait_for_candidate_phase() {
+  local candidate="$1" expected_phase="$2"
+  local phase
+  for i in $(seq 1 30); do
+    phase="$(kubectl get pgcand "$candidate" -o jsonpath='{.status.phase}' 2>/dev/null || true)"
+    if [ "$phase" = "$expected_phase" ]; then
+      echo "$candidate reached phase=$expected_phase"
+      return 0
+    fi
+    echo "Waiting for $candidate phase=$expected_phase (current=$phase)... ($i/30)"
+    sleep 3
+  done
+  echo "::error::$candidate did not reach phase=$expected_phase within timeout"
+  kubectl get pgcand "$candidate" -o yaml || true
+  return 1
+}
+
+# Wait for a condition on a candidate to hold a given status and reason.
+# Conditions are the source of truth; phase is only a printable summary.
+wait_for_candidate_condition() {
+  local candidate="$1" ctype="$2" expected_status="$3" expected_reason="$4"
+  for i in $(seq 1 30); do
+    local status reason
+    status="$(kubectl get pgcand "$candidate" \
+      -o jsonpath="{.status.conditions[?(@.type==\"$ctype\")].status}" 2>/dev/null || true)"
+    reason="$(kubectl get pgcand "$candidate" \
+      -o jsonpath="{.status.conditions[?(@.type==\"$ctype\")].reason}" 2>/dev/null || true)"
+    if [ "$status" = "$expected_status" ] && [ "$reason" = "$expected_reason" ]; then
+      echo "$candidate has $ctype=$expected_status reason=$expected_reason"
+      return 0
+    fi
+    echo "Waiting for $candidate $ctype=$expected_status/$expected_reason (current=$status/$reason)... ($i/30)"
+    sleep 3
+  done
+  echo "::error::$candidate did not reach $ctype=$expected_status/$expected_reason within timeout"
+  kubectl get pgcand "$candidate" -o yaml || true
+  return 1
+}
+
+# The plan the operator published for a candidate. Progress goes to stderr:
+# callers capture stdout as the plan name.
+wait_for_candidate_plan_ref() {
+  local candidate="$1"
+  for i in $(seq 1 30); do
+    local plan_name
+    plan_name="$(kubectl get pgcand "$candidate" -o jsonpath='{.status.planRef.name}' 2>/dev/null || true)"
+    if [ -n "$plan_name" ]; then
+      echo "$plan_name"
+      return 0
+    fi
+    echo "Waiting for $candidate planRef... ($i/30)" >&2
+    sleep 3
+  done
+  echo "::error::$candidate did not get a planRef within timeout" >&2
+  kubectl get pgcand "$candidate" -o yaml >&2 || true
+  return 1
+}
+
+get_candidate_digest() {
+  kubectl get pgcand "$1" -o jsonpath='{.status.contentDigest}'
+}
+
+get_policy_content_digest() {
+  kubectl get pgr "$1" -o jsonpath='{.status.content_digest}'
+}
+
+# The policy's current plan, once it names a plan that is actually awaiting a
+# decision. `wait_for_current_plan_ref` can return a reference to the plan that
+# just applied, which a caller about to approve something must not mistake for
+# the fresh one.
+wait_for_pending_plan_ref() {
+  local policy="$1"
+  for i in $(seq 1 30); do
+    local plan_name phase
+    plan_name="$(kubectl get pgr "$policy" -o jsonpath='{.status.current_plan_ref.name}' 2>/dev/null || true)"
+    if [ -n "$plan_name" ]; then
+      phase="$(kubectl get pgplan "$plan_name" -o jsonpath='{.status.phase}' 2>/dev/null || true)"
+      if [ "$phase" = "Pending" ]; then
+        echo "$plan_name"
+        return 0
+      fi
+    fi
+    echo "Waiting for $policy to hold a Pending plan... ($i/30)" >&2
+    sleep 3
+  done
+  echo "::error::$policy did not hold a Pending plan within timeout" >&2
+  kubectl get pgplan -l "pgroles.io/policy=$policy" -o wide >&2 || true
+  return 1
 }

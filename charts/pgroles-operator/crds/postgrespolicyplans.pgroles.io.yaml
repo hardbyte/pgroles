@@ -59,6 +59,12 @@
             "type": "string"
           },
           {
+            "jsonPath": ".status.changeDigest",
+            "name": "Digest",
+            "priority": 1,
+            "type": "string"
+          },
+          {
             "jsonPath": ".status.sqlHash",
             "name": "Hash",
             "priority": 1,
@@ -86,13 +92,40 @@
                     "description": "Origin of this plan. Omitted for ordinary durable reconciliation plans.",
                     "nullable": true,
                     "properties": {
+                      "baseContentDigest": {
+                        "description": "Canonical content digest of the *policy* content this candidate plan\nwas computed against — the applied base. A candidate is a complete\ndesired-state snapshot, so an approval is only meaningful against the\nbase it was reviewed on: identical SQL effects do not prove the\nsnapshot still preserves everything the base has come to manage since.\nPromotion refuses to adopt a plan whose base pin no longer matches the\ncontent the policy carried before the merge, and planning supersedes\nthe plan as soon as the base moves. Absent for non-candidate origins.",
+                        "maxLength": 128,
+                        "nullable": true,
+                        "type": "string"
+                      },
+                      "contentDigest": {
+                        "description": "Canonical content digest of the originating candidate, and the encoding\nit was computed under.\n\nThis is what binds the reviewed plan to the content that will later be\npromoted. It lives on the origin rather than in an annotation because a\npromotion check that can be edited by anyone holding `patch` is not a\nbinding at all. Both fields are absent for non-candidate origins.",
+                        "maxLength": 128,
+                        "nullable": true,
+                        "type": "string"
+                      },
+                      "contentDigestEncoding": {
+                        "description": "Version tag of the encoding `contentDigest` was computed under.\nDigests from different encodings are never comparable, so promotion\nrecognition only matches digests carrying the same tag. Absent for\nnon-candidate origins.",
+                        "maxLength": 64,
+                        "nullable": true,
+                        "type": "string"
+                      },
                       "kind": {
+                        "maxLength": 63,
                         "type": "string"
                       },
                       "name": {
+                        "maxLength": 253,
+                        "type": "string"
+                      },
+                      "policyUid": {
+                        "description": "UID of the `PostgresPolicy` the candidate proposes content for. The\nplan's `spec.policyRef` names it; the UID is what survives a\ndelete-and-recreate of the same name.",
+                        "maxLength": 63,
+                        "nullable": true,
                         "type": "string"
                       },
                       "uid": {
+                        "maxLength": 63,
                         "type": "string"
                       }
                     },
@@ -177,7 +210,13 @@
                   "policyRef",
                   "reconciliationMode"
                 ],
-                "type": "object"
+                "type": "object",
+                "x-kubernetes-validations": [
+                  {
+                    "message": "plan origin is immutable once set",
+                    "rule": "!has(oldSelf.origin) || (has(self.origin) && self.origin == oldSelf.origin)"
+                  }
+                ]
               },
               "status": {
                 "description": "Status of a `PostgresPolicyPlan` resource.\n\nThe decision rules below are the same grammar `EphemeralAccessRequest`\nuses: a decision is terminal, `Approved` and `Denied` cannot both be true,\nand the deciding identity is recorded in the same admitted write. What CEL\ncannot do is check *who* is writing — see [`DecisionActor`].",
@@ -378,6 +417,11 @@
                     ],
                     "type": "string"
                   },
+                  "physicalIdentityAvailable": {
+                    "description": "Whether the physical identity was readable when this plan was computed.\n\nRecorded explicitly rather than inferred from\n`target_physical_identity` being set, so that \"the identifier could not\nbe read\" is distinguishable from \"this plan predates the field\". The\ndifference matters at execution: a plan that had the identifier and now\ndoes not is a downgrade and fails closed.",
+                    "nullable": true,
+                    "type": "boolean"
+                  },
                   "redactedSqlHash": {
                     "description": "SHA-256 hash of the redacted SQL preview bytes. This is for storage\nintegrity only; approval and deduplication use `change_digest`.",
                     "nullable": true,
@@ -389,7 +433,7 @@
                     "type": "string"
                   },
                   "revalidatedGeneration": {
-                    "description": "The policy generation this plan was most recently confirmed current\nagainst.\n\nA pending plan is revalidated on every reconcile. When the policy\nchanges but the resulting effects do not, the plan — and any decision\nrecorded on it — is retained and this advances to the new generation.\nIt is provenance, never approval identity: `change_digest` is what a\ndecision binds.",
+                    "description": "The owning object's `.metadata.generation` this plan was most recently\nconfirmed current against — the policy's for an ordinary plan, the\ncandidate's for a candidate-origin plan.\n\nA pending policy plan is revalidated on every reconcile. When the policy\nchanges but the resulting effects do not, the plan — and any decision\nrecorded on it — is retained and this advances to the new generation.\nA candidate's spec is immutable, so a candidate plan's provenance is\nstamped once at creation; its ongoing revalidation is the digest\ndeduplication itself. It is provenance, never approval identity:\n`change_digest` is what a decision binds.",
                     "format": "int64",
                     "nullable": true,
                     "type": "integer"
@@ -452,6 +496,16 @@
                     "default": false,
                     "description": "True when the SQL preview was truncated because the full redacted SQL\ncould not be persisted within Kubernetes object limits.",
                     "type": "boolean"
+                  },
+                  "targetLogicalFingerprint": {
+                    "description": "Fingerprint of the resolved connection endpoint (host, port, database)\nthis plan was computed against.",
+                    "nullable": true,
+                    "type": "string"
+                  },
+                  "targetPhysicalIdentity": {
+                    "description": "`pg_control_system().system_identifier` as read from the target when\nthis plan was computed — the storage lineage the approval is bound to.\nAbsent on engines that do not expose it.",
+                    "nullable": true,
+                    "type": "string"
                   }
                 },
                 "type": "object",
@@ -471,6 +525,26 @@
                   {
                     "message": "a terminal plan decision and decidedBy identity must be recorded together",
                     "rule": "self.conditions.exists(c, (c.type == 'Approved' || c.type == 'Denied') && c.status == 'True') == has(self.decidedBy)"
+                  },
+                  {
+                    "message": "changeDigest is write-once",
+                    "rule": "!has(oldSelf.changeDigest) || (has(self.changeDigest) && self.changeDigest == oldSelf.changeDigest)"
+                  },
+                  {
+                    "message": "changeDigestEncoding is write-once",
+                    "rule": "!has(oldSelf.changeDigestEncoding) || (has(self.changeDigestEncoding) && self.changeDigestEncoding == oldSelf.changeDigestEncoding)"
+                  },
+                  {
+                    "message": "targetPhysicalIdentity is write-once",
+                    "rule": "!has(oldSelf.targetPhysicalIdentity) || (has(self.targetPhysicalIdentity) && self.targetPhysicalIdentity == oldSelf.targetPhysicalIdentity)"
+                  },
+                  {
+                    "message": "targetLogicalFingerprint is write-once",
+                    "rule": "!has(oldSelf.targetLogicalFingerprint) || (has(self.targetLogicalFingerprint) && self.targetLogicalFingerprint == oldSelf.targetLogicalFingerprint)"
+                  },
+                  {
+                    "message": "physicalIdentityAvailable is write-once",
+                    "rule": "!has(oldSelf.physicalIdentityAvailable) || (has(self.physicalIdentityAvailable) && self.physicalIdentityAvailable == oldSelf.physicalIdentityAvailable)"
                   }
                 ]
               }

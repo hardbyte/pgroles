@@ -30,6 +30,35 @@ EXTENDS FiniteSets, Naturals
                                        liveness violation: an endless
                                        approve/supersede cycle.
 
+  The constants `DeferSecretMaterialization` and `RecordMaterializedVersion`
+  model issue #181, which lives one layer below the approval gate: where a
+  *generated password Secret* is created, and which source version the policy
+  records once it has been.
+
+  A generated password has a "source version" derived from the Secret holding
+  it. When no Secret exists the operator uses a `<secret>:<key>:missing`
+  sentinel, modeled here as `Missing`; a real Secret yields `Real`. A password
+  change is planned whenever the recorded version differs from the current one.
+
+    - DeferSecretMaterialization = FALSE — the Secret is written while the plan
+      is merely *pending*, so a plan that is never approved still leaves a live
+      credential behind. This is the behavior #181 removes.
+    - DeferSecretMaterialization = TRUE  — the Secret is written at execution,
+      after the decision. The plan is then created against `Missing` and the
+      Secret becomes `Real` as it applies.
+    - RecordMaterializedVersion = FALSE  — the naive deferral: the policy
+      records the planning-time sentinel it started from. The next reconcile
+      sees `Real /= Missing`, plans another password change, and asks for a
+      second human approval. `ApprovalsBounded` catches exactly this.
+    - RecordMaterializedVersion = TRUE   — the shipped fix: the version the
+      Secret actually reported is threaded back out of execution and recorded,
+      so the next reconcile is quiet.
+
+  `SecretBeforeSql` justifies the ordering of the two writes execution makes.
+  With a crash between them, writing the Secret first leaves an inert Secret
+  that the next reconcile adopts; writing the SQL first commits a password to
+  the database that exists nowhere else, which `PasswordRecoverable` reports.
+
   What is NOT modeled:
     - the encoding of the digest itself (see pgroles_core::approval)
     - operator crashes and lock contention (covered by PlanLifecycle.tla)
@@ -41,8 +70,16 @@ CONSTANTS
     LockDuringApply,     \* TRUE models verification and execution happening
                          \* under one lock hold with no unlock window
     HasPasswordChange,   \* TRUE when the change set contains a SetPassword
-    MaxDrifts            \* Bound on external database drift, so the system
+    MaxDrifts,           \* Bound on external database drift, so the system
                          \* eventually quiesces and liveness is meaningful
+    DeferSecretMaterialization, \* TRUE writes the generated Secret at
+                                \* execution rather than at planning (#181)
+    RecordMaterializedVersion,  \* TRUE records the post-materialization
+                                \* source version rather than the sentinel
+    SecretBeforeSql,     \* TRUE writes the Secret before the SQL transaction
+    MaxCrashes,          \* Bound on crashes between the two writes
+    MaxApprovals         \* Saturation cap on the approval counter, purely to
+                         \* keep the state space finite
 
 \* Plan phases relevant to approval. Rejection and crash recovery are
 \* PlanLifecycle.tla's business.
@@ -65,6 +102,15 @@ VARIABLES
     dbEffects,        \* Effects the policy would produce against the live database
     driftsLeft,       \* Remaining external database changes
     appliedEffects,   \* Effects that actually executed (for safety checking)
+    planVersion,      \* Password source version snapshotted when the plan was
+                      \* computed — what the reviewer's decision was bound to
+    secretExists,     \* Whether the generated password Secret exists
+    recordedVersion,  \* status.appliedPasswordSourceVersions for this role
+    dbPasswordSet,    \* Whether the database holds the generated password
+    secretMadeUnapproved, \* A Secret was created by a reconcile that had no
+                          \* approved plan to execute — the #181 defect
+    crashesLeft,      \* Remaining crashes between the Secret and SQL writes
+    approvalsUsed,    \* How many human decisions the workflow has consumed
     appliedInSync     \* Whether, *at the moment of execution*, the executed
                       \* effects still matched the live database. Recorded as a
                       \* witness because the database may legitimately drift
@@ -73,7 +119,24 @@ VARIABLES
                       \* post-apply drift instead of on a stale execution.
 
 vars == <<planPhase, planEffects, planRenderStale, approved, dbEffects,
-          driftsLeft, appliedEffects, appliedInSync>>
+          driftsLeft, appliedEffects, appliedInSync, planVersion, secretExists,
+          recordedVersion, dbPasswordSet, secretMadeUnapproved, crashesLeft,
+          approvalsUsed>>
+
+\* Password source versions. `Missing` is the `<secret>:<key>:missing`
+\* sentinel the operator uses while no Secret exists; `Real` stands for any
+\* version derived from a live Secret. `NoVersion` is "nothing recorded yet".
+NoVersion == "none"
+Missing == "missing"
+Real == "real"
+Versions == {NoVersion, Missing, Real}
+
+\* The source version the operator would resolve right now.
+CurrentVersion == IF secretExists THEN Real ELSE Missing
+
+\* A password change is planned exactly when the recorded version differs from
+\* the one resolution produces — `select_password_changes` in the operator.
+SetPasswordNeeded == HasPasswordChange /\ recordedVersion /= CurrentVersion
 
 TypeOK ==
     /\ planPhase \in {NoPlan, Pending, Applying, Applied}
@@ -84,6 +147,13 @@ TypeOK ==
     /\ driftsLeft \in 0..MaxDrifts
     /\ appliedEffects \in Effects \cup {NoEffects}
     /\ appliedInSync \in BOOLEAN
+    /\ planVersion \in Versions
+    /\ secretExists \in BOOLEAN
+    /\ recordedVersion \in Versions
+    /\ dbPasswordSet \in BOOLEAN
+    /\ secretMadeUnapproved \in BOOLEAN
+    /\ crashesLeft \in 0..MaxCrashes
+    /\ approvalsUsed \in 0..MaxApprovals
 
 \* --- The approval gate ---
 
@@ -96,6 +166,9 @@ TypeOK ==
 GatePasses ==
     /\ planEffects = dbEffects
     /\ (SqlHashApproval => ~planRenderStale)
+    \* The password source must still be the one the plan was computed
+    \* against. A Secret that appeared or vanished since is a different plan.
+    /\ planVersion = CurrentVersion
 
 \* --- Safety invariants ---
 
@@ -118,6 +191,25 @@ ExecutedWhatWasApproved ==
 NoStaleExecution ==
     (planPhase = Applied /\ appliedEffects /= NoEffects) => appliedInSync
 
+\* No generated Secret is ever created by a reconcile that is not executing an
+\* approved plan. A plan that is rejected, or never approved, leaves no
+\* credential behind. This is the #181 property, and it is stated over the
+\* *creation* rather than over `secretExists`: once a plan has legitimately
+\* applied, the Secret rightly outlives it and coexists with later plans.
+\* DeferSecretMaterialization = FALSE violates it.
+NoSecretBeforeApproval == ~secretMadeUnapproved
+
+\* Every password the database holds is readable from a Secret. Violated when
+\* the SQL transaction commits before the Secret is written and the operator
+\* crashes in between — the password then exists nowhere a client can read it.
+PasswordRecoverable == dbPasswordSet => secretExists
+
+\* The workflow spends at most one human decision on a settled policy. The
+\* naive deferral — materialize at execution but record the planning-time
+\* sentinel — needs two: the first applies the password, and the second
+\* approves a plan that exists only because the recorded version went stale.
+ApprovalsBounded == approvalsUsed <= 1
+
 \* --- Liveness ---
 
 \* The workflow converges: once drift stops, a plan is eventually applied.
@@ -133,6 +225,13 @@ Init ==
     /\ driftsLeft = MaxDrifts
     /\ appliedEffects = NoEffects
     /\ appliedInSync = TRUE
+    /\ planVersion = NoVersion
+    /\ secretExists = FALSE
+    /\ recordedVersion = NoVersion
+    /\ dbPasswordSet = FALSE
+    /\ secretMadeUnapproved = FALSE
+    /\ crashesLeft = MaxCrashes
+    /\ approvalsUsed = 0
 
 \* --- Actions ---
 
@@ -150,24 +249,46 @@ DatabaseDrifts ==
         /\ dbEffects' = e
     /\ driftsLeft' = driftsLeft - 1
     /\ UNCHANGED <<planPhase, planEffects, planRenderStale, approved,
-                    appliedEffects, appliedInSync>>
+                    appliedEffects, appliedInSync, planVersion, secretExists,
+                    recordedVersion, dbPasswordSet,
+                    secretMadeUnapproved, crashesLeft, approvalsUsed>>
 
 \* The operator computes a plan for the current effects.
+\*
+\* A plan is computed only when there is something to do: the effects moved, or
+\* the password source version the policy recorded no longer matches what
+\* resolution produces.
 OperatorCreatesPlan ==
     /\ planPhase = NoPlan
+    /\ (planEffects /= dbEffects \/ SetPasswordNeeded \/ appliedEffects = NoEffects)
     /\ planPhase' = Pending
     /\ planEffects' = dbEffects
     /\ planRenderStale' = FALSE   \* Freshly rendered and stored together
     /\ approved' = FALSE
-    /\ UNCHANGED <<dbEffects, driftsLeft, appliedEffects, appliedInSync>>
+    \* Pre-#181, resolving a generated password created the Secret right here,
+    \* while the plan was still only pending.
+    /\ secretExists' = (secretExists \/ (HasPasswordChange /\ ~DeferSecretMaterialization))
+    /\ secretMadeUnapproved' = (secretMadeUnapproved
+                                 \/ (secretExists' /= secretExists))
+    \* The decision is bound to the source version resolution just produced.
+    /\ planVersion' = (IF secretExists' THEN Real ELSE Missing)
+    /\ UNCHANGED <<dbEffects, driftsLeft, appliedEffects, appliedInSync,
+                    recordedVersion, dbPasswordSet, crashesLeft, approvalsUsed>>
 
 \* A reviewer approves the pending plan.
 UserApproves ==
     /\ planPhase = Pending
     /\ ~approved
     /\ approved' = TRUE
+    \* Saturating, so the counter bounds the state space without ever
+    \* disabling the action and making liveness vacuous.
+    /\ approvalsUsed' = (IF approvalsUsed < MaxApprovals
+                         THEN approvalsUsed + 1
+                         ELSE approvalsUsed)
     /\ UNCHANGED <<planPhase, planEffects, planRenderStale, dbEffects,
-                    driftsLeft, appliedEffects, appliedInSync>>
+                    driftsLeft, appliedEffects, appliedInSync, planVersion,
+                    secretExists, recordedVersion, dbPasswordSet,
+                    secretMadeUnapproved, crashesLeft>>
 
 \* Before executing, the operator recomputes the diff and re-renders the SQL.
 \*
@@ -181,7 +302,9 @@ OperatorRevalidates ==
     /\ HasPasswordChange
     /\ planRenderStale' = TRUE
     /\ UNCHANGED <<planPhase, planEffects, approved, dbEffects, driftsLeft,
-                    appliedEffects, appliedInSync>>
+                    appliedEffects, appliedInSync, planVersion, secretExists,
+                    recordedVersion, dbPasswordSet,
+                    secretMadeUnapproved, crashesLeft, approvalsUsed>>
 
 \* The gate passes: execute the reviewed effects.
 OperatorExecutes ==
@@ -191,7 +314,9 @@ OperatorExecutes ==
     /\ GatePasses
     /\ planPhase' = Applying
     /\ UNCHANGED <<planEffects, planRenderStale, approved, dbEffects,
-                    driftsLeft, appliedEffects, appliedInSync>>
+                    driftsLeft, appliedEffects, appliedInSync, planVersion,
+                    secretExists, recordedVersion, dbPasswordSet,
+                    secretMadeUnapproved, crashesLeft, approvalsUsed>>
 
 \* The gate fails: supersede the reviewed plan and start a fresh one.
 \*
@@ -207,8 +332,15 @@ OperatorSupersedes ==
     /\ planEffects' = dbEffects
     /\ planRenderStale' = FALSE
     /\ approved' = FALSE          \* The replacement needs its own decision
-    /\ UNCHANGED <<dbEffects, driftsLeft, appliedEffects, appliedInSync>>
+    /\ secretExists' = (secretExists \/ (HasPasswordChange /\ ~DeferSecretMaterialization))
+    /\ secretMadeUnapproved' = (secretMadeUnapproved
+                                 \/ (secretExists' /= secretExists))
+    /\ planVersion' = (IF secretExists' THEN Real ELSE Missing)
+    /\ UNCHANGED <<dbEffects, driftsLeft, appliedEffects, appliedInSync,
+                    recordedVersion, dbPasswordSet, crashesLeft, approvalsUsed>>
 
+\* Execution: materialize any deferred Secret, then run the SQL, then record
+\* the source version the database was actually set from.
 ApplySucceeds ==
     /\ planPhase = Applying
     /\ planPhase' = Applied
@@ -216,8 +348,53 @@ ApplySucceeds ==
     \* The witness: did the database still hold the verified state when the
     \* statements ran? Under a single lock hold it must have.
     /\ appliedInSync' = (planEffects = dbEffects)
+    \* The deferred Secret is written here, after the decision.
+    /\ secretExists' = (secretExists \/ HasPasswordChange)
+    /\ dbPasswordSet' = (dbPasswordSet \/ HasPasswordChange)
+    \* Which version the policy records is the whole of the #181 fix: the
+    \* sentinel the plan started from, or the one the Secret reported.
+    /\ recordedVersion' =
+        IF ~HasPasswordChange THEN recordedVersion
+        ELSE IF RecordMaterializedVersion THEN Real
+        ELSE planVersion
     /\ UNCHANGED <<planEffects, planRenderStale, approved, dbEffects,
-                    driftsLeft>>
+                    driftsLeft, planVersion, secretMadeUnapproved, crashesLeft,
+                    approvalsUsed>>
+
+\* The operator crashes between execution's two writes. Which write survives is
+\* the ordering question `SecretBeforeSql` settles.
+ApplyCrashes ==
+    /\ planPhase = Applying
+    /\ crashesLeft > 0
+    /\ crashesLeft' = crashesLeft - 1
+    /\ HasPasswordChange
+    /\ IF SecretBeforeSql
+       THEN \* The Secret landed; the transaction did not. An inert Secret.
+            /\ secretExists' = TRUE
+            /\ UNCHANGED dbPasswordSet
+       ELSE \* The transaction committed; the Secret was never written. The
+            \* database now holds a password nothing can read.
+            /\ dbPasswordSet' = TRUE
+            /\ UNCHANGED secretExists
+    \* Recovery re-plans from scratch; the interrupted decision is spent.
+    /\ planPhase' = NoPlan
+    /\ approved' = FALSE
+    /\ UNCHANGED <<planEffects, planRenderStale, dbEffects, driftsLeft,
+                    appliedEffects, appliedInSync, planVersion,
+                    recordedVersion, secretMadeUnapproved, approvalsUsed>>
+
+\* The operator reconciles again after an apply. Without this the model stops
+\* at the first Applied state and can never show a *second* plan being demanded
+\* for work the first one already did.
+OperatorRequeues ==
+    /\ planPhase = Applied
+    /\ (planEffects /= dbEffects \/ SetPasswordNeeded)
+    /\ planPhase' = NoPlan
+    /\ approved' = FALSE
+    /\ UNCHANGED <<planEffects, planRenderStale, dbEffects, driftsLeft,
+                    appliedEffects, appliedInSync, planVersion, secretExists,
+                    recordedVersion, dbPasswordSet,
+                    secretMadeUnapproved, crashesLeft, approvalsUsed>>
 
 Next ==
     \/ DatabaseDrifts
@@ -227,6 +404,8 @@ Next ==
     \/ OperatorExecutes
     \/ OperatorSupersedes
     \/ ApplySucceeds
+    \/ ApplyCrashes
+    \/ OperatorRequeues
 
 \* Weak fairness on every progress action: the operator keeps reconciling and
 \* the reviewer keeps reviewing. Drift is deliberately *not* fair — it is
@@ -239,6 +418,7 @@ Fairness ==
     /\ WF_vars(OperatorExecutes)
     /\ WF_vars(OperatorSupersedes)
     /\ WF_vars(ApplySucceeds)
+    /\ WF_vars(OperatorRequeues)
 
 Spec == Init /\ [][Next]_vars /\ Fairness
 

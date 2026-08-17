@@ -5,6 +5,35 @@ nameOverride: ""
 # -- Replaces the full generated name in resource names.
 fullnameOverride: ""
 
+# Kyverno admission policies that authenticate reviewer decisions. Without
+# them, `decidedBy` on a plan or an ephemeral request is a client-supplied
+# assertion and anyone with patch on `.../status` can approve: decisions are
+# unattributed and `approval.mode: Required` is not a real approval boundary.
+# See https://hardbyte.github.io/pgroles/docs/ephemeral-access-security/
+#
+# Default off because the resources need Kyverno's CRDs to exist in the
+# cluster; enabling this without Kyverno installed fails the install. Turn it
+# on once Kyverno is present, or apply the chart-less mirrors in `k8s/security/`.
+#
+# The rendered resources are cluster-scoped and use fixed names, so enable
+# them from one release per cluster. The operator exemption inside the
+# plan-decision policy is generated from `operator.serviceAccount.name` and
+# the release namespace, so it never has to be edited by hand.
+admissionPolicies:
+  # -- Render the Kyverno admission policies. Requires Kyverno (v1.18+, for
+  # both `kyverno.io/v1` ClusterPolicy and `policies.kyverno.io/v1`
+  # ValidatingPolicy) to be installed in the cluster.
+  enabled: false
+  planDecision:
+    # -- Render the PostgresPolicyPlan decision policy, plus the
+    # `pgroles-plan-approver` ClusterRole. Only applies when
+    # `admissionPolicies.enabled` is true.
+    enabled: true
+  ephemeralAccess:
+    # -- Render the EphemeralAccessRequest decision and lifecycle policies.
+    # Only applies when `admissionPolicies.enabled` is true.
+    enabled: true
+
 operator:
   # -- Restrict every operator watch/list and its RBAC to one namespace. Empty
   # means cluster-wide reconciliation.

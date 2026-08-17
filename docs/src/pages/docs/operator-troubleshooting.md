@@ -207,7 +207,7 @@ use a retirement with `reassign_owned_to` and/or `drop_owned` as appropriate.
 If active sessions are the issue, a retirement can terminate them when the
 executor has the required privilege.
 
-Review the generated SQL in plan mode before approving destructive retirement
+Review the generated SQL in observe mode before approving destructive retirement
 steps. Do not remove the safety blocker merely to make the policy green.
 
 ## A plan does not execute
@@ -220,11 +220,12 @@ kubectl get pgr "$POLICY" --namespace "$NAMESPACE" \
 ```
 
 - `suspend: true` stops reconciliation entirely
-- `mode: plan` computes plans but never executes mutating SQL
-- `mode: apply` with `approval: manual` waits for the current plan annotation
+- `mode: observe` computes plans but never executes mutating SQL
+- `mode: apply` with `approval: manual` waits for a terminal `Approved`
+  decision on the current plan's status
 - `mode: apply` with `approval: auto` applies without a human gate
 
-Follow the current plan and inspect its phase and annotations:
+Follow the current plan and inspect its phase and conditions:
 
 ```bash
 PLAN="$(kubectl get pgr "$POLICY" --namespace "$NAMESPACE" \
@@ -232,7 +233,7 @@ PLAN="$(kubectl get pgr "$POLICY" --namespace "$NAMESPACE" \
 kubectl get pgplan "$PLAN" --namespace "$NAMESPACE" -o yaml
 ```
 
-An approval annotation on a plan-mode policy produces `ApprovalIgnored`; switch
+A decision recorded on an observe-mode policy's plan produces `ApprovalIgnored`; switch
 the policy to `mode: apply` if you intend SQL to execute. `ApprovalUnset` means
 the operator inferred an approval mode from `spec.mode`; set `approval`
 explicitly because that inference is deprecated.
@@ -240,8 +241,16 @@ explicitly because that inference is deprecated.
 If policy or database state changed after review, the approved plan may become
 `Superseded`. Review and approve the newly referenced plan. If a plan was
 rejected, its replacement is created on the next reconcile rather than in the
-same cycle. See [plan and approval](/docs/operator-plan-approval) for the full
-lifecycle.
+same cycle. Reject a plan by writing a terminal `Denied` condition and
+`decidedBy` to its status subresource; see [plan and
+approval](/docs/operator-plan-approval#deciding-a-plan) for the exact command
+and the full lifecycle.
+
+A superseded plan names its cause in the `Superseded=True` condition message —
+effects changed, effects cleared, replaced by a newer plan, the policy stopped
+referencing it, another candidate's content was promoted and applied (reason
+`SupersededByPromotion`), or the target moved (reason `TargetChanged`,
+`TargetIdentityUnavailable`, or `TargetIdentityAppeared`).
 
 ## Transient and infrastructure failures
 

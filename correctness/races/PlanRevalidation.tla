@@ -34,13 +34,21 @@ EXTENDS FiniteSets, Naturals
                      did not move but *vanished*, the replacement holds nothing
                      and still blocks on a decision. Violates property 3.
 
+  Database drift — the effects moving with no policy edit behind them — is a
+  first-class action here. It is what separates the two strategies that both
+  keep the summary and the plan paired under policy edits alone: "semantic"
+  compares effects and still holds, while "generational" has nothing to trigger
+  on and reports a summary the plan does not match. See
+  PlanRevalidation_drift.cfg.
+
   What is NOT modeled: approval mechanics and execution (PlanApproval.tla),
   crashes and locking (PlanLifecycle.tla).
 *)
 
 CONSTANTS
-    RevalidationMode,  \* "semantic" | "frozen" | "generational"
-    MaxEdits           \* Bound on policy edits, so the state space is finite
+    RevalidationMode,  \* "semantic" | "frozen" | "generational" | "replace"
+    MaxEdits,          \* Bound on policy edits, so the state space is finite
+    MaxDrifts          \* Bound on database drift, likewise
 
 NoPlan == "none"
 Pending == "Pending"
@@ -61,11 +69,12 @@ VARIABLES
     dbEffects,       \* Effects the policy would produce right now
     policyGen,       \* Current policy generation
     editsLeft,       \* Remaining policy edits
+    driftsLeft,      \* Remaining database drifts
     lostApproval     \* Witness: an approval was discarded even though the
                      \* effects under review had not changed
 
 vars == <<planPhase, planEffects, planGen, summaryEffects, approved,
-          dbEffects, policyGen, editsLeft, lostApproval>>
+          dbEffects, policyGen, editsLeft, driftsLeft, lostApproval>>
 
 TypeOK ==
     /\ planPhase \in {NoPlan, Pending}
@@ -76,6 +85,7 @@ TypeOK ==
     /\ dbEffects \in MaybeEffects
     /\ policyGen \in 0..MaxEdits
     /\ editsLeft \in 0..MaxEdits
+    /\ driftsLeft \in 0..MaxDrifts
     /\ lostApproval \in BOOLEAN
 
 \* --- Properties ---
@@ -110,6 +120,7 @@ Init ==
     /\ dbEffects = "e1"
     /\ policyGen = 0
     /\ editsLeft = MaxEdits
+    /\ driftsLeft = MaxDrifts
     /\ lostApproval = FALSE
 
 \* --- Actions ---
@@ -124,7 +135,7 @@ OperatorCreatesPlan ==
     /\ summaryEffects' = dbEffects
     /\ planGen' = policyGen
     /\ approved' = FALSE
-    /\ UNCHANGED <<dbEffects, policyGen, editsLeft, lostApproval>>
+    /\ UNCHANGED <<dbEffects, policyGen, editsLeft, driftsLeft, lostApproval>>
 
 \* A policy edit the diff engine collapses to nothing: the generation moves,
 \* the effects do not. Comment changes, reordering, redundant declarations.
@@ -133,7 +144,7 @@ PolicyEditEffectNeutral ==
     /\ policyGen' = policyGen + 1
     /\ editsLeft' = editsLeft - 1
     /\ UNCHANGED <<planPhase, planEffects, planGen, summaryEffects, approved,
-                    dbEffects, lostApproval>>
+                    dbEffects, driftsLeft, lostApproval>>
 
 \* A policy edit that genuinely changes what would be executed — including one
 \* that removes the drift altogether, leaving nothing to do.
@@ -145,14 +156,29 @@ PolicyEditEffective ==
     /\ policyGen' = policyGen + 1
     /\ editsLeft' = editsLeft - 1
     /\ UNCHANGED <<planPhase, planEffects, planGen, summaryEffects, approved,
-                    lostApproval>>
+                    driftsLeft, lostApproval>>
+
+\* The database moves underneath a pending plan with no policy edit behind it:
+\* someone runs the DDL by hand, another tool converges part of it, or a role is
+\* dropped out of band. `policyGen` does not move, which is the whole point — a
+\* strategy keyed on the generation cannot see this happen, and will keep
+\* reporting a summary computed from the new database beside a plan holding the
+\* old effects.
+DatabaseDrift ==
+    /\ driftsLeft > 0
+    /\ \E e \in MaybeEffects:
+        /\ e /= dbEffects
+        /\ dbEffects' = e
+    /\ driftsLeft' = driftsLeft - 1
+    /\ UNCHANGED <<planPhase, planEffects, planGen, summaryEffects, approved,
+                    policyGen, editsLeft, lostApproval>>
 
 UserApproves ==
     /\ planPhase = Pending
     /\ ~approved
     /\ approved' = TRUE
     /\ UNCHANGED <<planPhase, planEffects, planGen, summaryEffects, dbEffects,
-                    policyGen, editsLeft, lostApproval>>
+                    policyGen, editsLeft, driftsLeft, lostApproval>>
 
 \* Replace the pending plan with one describing the current effects.
 SupersedeAndReplace ==
@@ -163,7 +189,7 @@ SupersedeAndReplace ==
     \* Record the cost if a decision was discarded while the effects under
     \* review were in fact unchanged.
     /\ lostApproval' = (lostApproval \/ (approved /\ planEffects = dbEffects))
-    /\ UNCHANGED <<planPhase, dbEffects, policyGen, editsLeft>>
+    /\ UNCHANGED <<planPhase, dbEffects, policyGen, editsLeft, driftsLeft>>
 
 \* Drop the pending plan without opening another: there is nothing left to
 \* execute, so there is nothing to review.
@@ -173,14 +199,14 @@ ClearPlan ==
     /\ summaryEffects' = NoEffects
     /\ planGen' = policyGen
     /\ approved' = FALSE
-    /\ UNCHANGED <<dbEffects, policyGen, editsLeft, lostApproval>>
+    /\ UNCHANGED <<dbEffects, policyGen, editsLeft, driftsLeft, lostApproval>>
 
 \* Keep the plan and its decision; only the provenance advances.
 RetainPlan ==
     /\ summaryEffects' = dbEffects
     /\ planGen' = policyGen
     /\ UNCHANGED <<planPhase, planEffects, approved, dbEffects, policyGen,
-                    editsLeft, lostApproval>>
+                    editsLeft, driftsLeft, lostApproval>>
 
 \* One reconcile while a plan is pending.
 ReconcilePending ==
@@ -207,7 +233,7 @@ ReconcilePending ==
           \* untouched however far the effects have moved.
           /\ summaryEffects' = dbEffects
           /\ UNCHANGED <<planPhase, planEffects, planGen, approved, dbEffects,
-                          policyGen, editsLeft, lostApproval>>
+                          policyGen, editsLeft, driftsLeft, lostApproval>>
        \/ /\ RevalidationMode = "generational"
           \* Supersede whenever the generation moved, without asking whether
           \* the effects did.
@@ -220,6 +246,7 @@ Next ==
     \/ OperatorCreatesPlan
     \/ PolicyEditEffectNeutral
     \/ PolicyEditEffective
+    \/ DatabaseDrift
     \/ UserApproves
     \/ ReconcilePending
 

@@ -1,0 +1,24 @@
+{{/*
+Kyverno admission policies for the reviewer-decision boundary.
+
+These are rendered from files/kyverno-*.yaml rather than written inline
+because the policy bodies are full of Kyverno's own `{{ ... }}` JMESPath
+expressions, which Helm would otherwise try to evaluate. `.Files.Get` returns
+them verbatim; the only substitution is the operator's ServiceAccount
+username, which comes from the same helper the Deployment uses for
+`serviceAccountName` plus `.Release.Namespace`.
+
+The resources are cluster-scoped and use fixed names, so enable them from a
+single release per cluster.
+*/}}
+{{- if .Values.admissionPolicies.enabled }}
+{{- $subject := printf "system:serviceaccount:%s:%s" .Release.Namespace (include "pgroles-operator.serviceAccountName" .) }}
+{{- if .Values.admissionPolicies.planDecision.enabled }}
+---
+{{ required "files/kyverno-plan-decision.yaml is missing from the packaged chart" (.Files.Get "files/kyverno-plan-decision.yaml") | replace "__PGROLES_OPERATOR_SUBJECT__" $subject }}
+{{- end }}
+{{- if .Values.admissionPolicies.ephemeralAccess.enabled }}
+---
+{{ required "files/kyverno-ephemeral-access.yaml is missing from the packaged chart" (.Files.Get "files/kyverno-ephemeral-access.yaml") }}
+{{- end }}
+{{- end }}

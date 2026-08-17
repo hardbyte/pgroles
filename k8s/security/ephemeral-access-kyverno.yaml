@@ -1,3 +1,8 @@
+# Chart-less mirror. The canonical copy is
+# charts/pgroles-operator/files/kyverno-ephemeral-access.yaml, rendered by the
+# Helm chart when `admissionPolicies.enabled=true`. Prefer it. This file exists
+# for installs that do not use the chart; keep it in sync with the chart copy.
+#
 # Allow Kyverno's reports controller to resolve the CRDs referenced by the
 # admission policies. Aggregation keeps this separate from Kyverno's managed
 # installation roles.
@@ -13,6 +18,28 @@ rules:
       - ephemeralaccesspolicies
       - ephemeralaccessrequests
       - ephemeralaccessrequests/status
+    verbs: [get, list, watch]
+---
+# The `use`/`approve`/`manage` verb checks below post SubjectAccessReviews
+# using the Kyverno admission controller's own credentials, and the delete
+# rule looks up the request's namespace to detect namespace teardown. Without
+# this role it cannot, and because the policy is enforcing, a failed context
+# lookup blocks every matched write.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: pgroles-ephemeral-access-kyverno-sar
+  labels:
+    rbac.kyverno.io/aggregate-to-admission-controller: "true"
+rules:
+  - apiGroups: [authorization.k8s.io]
+    resources: [subjectaccessreviews]
+    verbs: [create]
+  - apiGroups: [""]
+    resources: [namespaces]
+    verbs: [get, list, watch]
+  - apiGroups: [pgroles.io]
+    resources: [ephemeralaccesspolicies, ephemeralaccessrequests]
     verbs: [get, list, watch]
 ---
 # Kyverno's CEL ValidatingPolicy environment does not expose Kubernetes'

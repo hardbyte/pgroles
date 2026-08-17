@@ -1,7 +1,7 @@
 apiVersion: pgroles.io/v1alpha1
 kind: PostgresPolicy
 metadata:
-  name: plan-policy
+  name: observe-policy
   namespace: default
 spec:
   connection:
@@ -9,15 +9,15 @@ spec:
       name: postgres-credentials
   approval: manual
   interval: "5m"
-  mode: plan
+  mode: observe
 
   roles:
-    - name: plan-preview-user
+    - name: observe-preview-user
       login: true
       comment: "Preview-only role"
 
   grants:
-    - role: plan-preview-user
+    - role: observe-preview-user
       privileges: [CONNECT]
       object:
         type: database

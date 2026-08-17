@@ -48,8 +48,9 @@ reconciles that keep happening underneath it:
 | `PlanRevalidation_frozen.cfg` | `frozen` | `SummaryMatchesPlan` violated |
 | `PlanRevalidation_generational.cfg` | `generational` | `ApprovalSurvivesEffectNeutralEdits` violated |
 | `PlanRevalidation_replace.cfg` | `replace` | `NoEmptyPendingPlan` violated |
+| `PlanRevalidation_drift.cfg` | `generational`, drift allowed | `SummaryMatchesPlan` violated |
 
-The three failing configurations bracket the design. `frozen` is the behaviour
+The four failing configurations bracket the design. `frozen` is the behaviour
 before this work: the Pending arm returned early without revalidating, so the
 status summary advanced while the plan stood still. `generational` is the
 plausible wrong fix — superseding whenever the policy generation moves — which
@@ -64,6 +65,20 @@ policy reports `Drifted=False` beside it. Superseding a pending plan and
 opening a new one are separate decisions, and only the first applies when there
 is nothing left to execute.
 
+`drift` is the same `generational` strategy with the database allowed to move
+underneath the plan with no policy edit behind it — someone runs the DDL by
+hand, or another actor converges part of it. Under policy edits alone
+`generational` keeps the summary and the plan paired, which is what makes it
+look adequate; drift carries no generation bump, so it has nothing to trigger
+on. It refreshes the reported summary from the new database state and retains a
+plan holding the old effects — a reviewer reads one and approves the other. The
+shipped `semantic` strategy compares the effects themselves and passes the same
+configuration, which is the whole argument for keying revalidation on the change
+digest rather than the generation. The configuration checks `SummaryMatchesPlan`
+alone: `generational` also leaves an empty plan behind when the effects vanish,
+and checking both would leave which violation TLC reports first an accident of
+exploration order.
+
 ### `races/PlanApproval.tla`
 
 Verifies what an approval actually binds, by separating two things
@@ -73,6 +88,10 @@ Verifies what an approval actually binds, by separating two things
 - Nothing executes without a recorded approval of the plan being executed
 - What executed is what was reviewed, never a different set of effects
 - An approval never carries across a change in effects
+- No generated password Secret is created by a reconcile that is not executing
+  an approved plan
+- Every password the database holds is readable from a Secret
+- A settled policy costs at most one human decision
 - **Liveness**: once drift stops, a plan is eventually applied
 
 The constant `SqlHashApproval` selects the approval gate:
@@ -81,15 +100,73 @@ The constant `SqlHashApproval` selects the approval gate:
 ./run-tlc.sh races/PlanApproval.tla races/PlanApproval.cfg           # passes
 ./run-tlc.sh races/PlanApproval.tla races/PlanApproval_buggy.cfg     # liveness violated (#174)
 ./run-tlc.sh races/PlanApproval.tla races/PlanApproval_unlocked.cfg  # NoStaleExecution violated
+./run-tlc.sh races/PlanApproval.tla races/PlanApproval_no_password.cfg # passes
+```
+
+The same model also covers where a *generated password Secret* is created, and
+which source version the policy records once it has been — issue #181. A
+generated password's source version is derived from the Secret holding it, with
+a `<secret>:<key>:missing` sentinel standing in while no Secret exists.
+
+```sh
+./run-tlc.sh races/PlanApproval.tla races/PlanApproval_secret_deferral.cfg    # passes
+./run-tlc.sh races/PlanApproval.tla races/PlanApproval_secret_eager.cfg       # NoSecretBeforeApproval violated (#181)
+./run-tlc.sh races/PlanApproval.tla races/PlanApproval_secret_sentinel.cfg    # ApprovalsBounded violated
+./run-tlc.sh races/PlanApproval.tla races/PlanApproval_secret_first_crash.cfg # passes
+./run-tlc.sh races/PlanApproval.tla races/PlanApproval_sql_first_crash.cfg    # PasswordRecoverable violated
 ```
 
 Each configuration demonstrates a distinct requirement:
 
-| Config | `SqlHashApproval` | `LockDuringApply` | Result |
-| --- | --- | --- | --- |
-| `PlanApproval.cfg` | FALSE | TRUE | passes |
-| `PlanApproval_buggy.cfg` | TRUE | TRUE | `EventuallyApplies` violated |
-| `PlanApproval_unlocked.cfg` | FALSE | FALSE | `NoStaleExecution` violated |
+| Config | `SqlHashApproval` | `LockDuringApply` | `HasPasswordChange` | Result |
+| --- | --- | --- | --- | --- |
+| `PlanApproval.cfg` | FALSE | TRUE | TRUE | passes |
+| `PlanApproval_buggy.cfg` | TRUE | TRUE | TRUE | `EventuallyApplies` violated |
+| `PlanApproval_unlocked.cfg` | FALSE | FALSE | TRUE | `NoStaleExecution` violated |
+| `PlanApproval_no_password.cfg` | FALSE | TRUE | FALSE | passes |
+
+All five run with `DeferSecretMaterialization = TRUE`,
+`RecordMaterializedVersion = TRUE` and `SecretBeforeSql = TRUE` — the shipped
+design — and no crashes. The Secret configurations vary those instead:
+
+| Config | `Defer…` | `Record…` | `SecretBeforeSql` | `MaxCrashes` | Result |
+| --- | --- | --- | --- | --- | --- |
+| `PlanApproval_secret_deferral.cfg` | TRUE | TRUE | TRUE | 0 | passes |
+| `PlanApproval_secret_eager.cfg` | FALSE | TRUE | TRUE | 0 | `NoSecretBeforeApproval` violated |
+| `PlanApproval_secret_sentinel.cfg` | TRUE | FALSE | TRUE | 0 | `ApprovalsBounded` violated |
+| `PlanApproval_secret_first_crash.cfg` | TRUE | TRUE | TRUE | 1 | passes |
+| `PlanApproval_sql_first_crash.cfg` | TRUE | TRUE | FALSE | 1 | `PasswordRecoverable` violated |
+
+`secret_eager` is pgroles before #181: resolving a `password.generate` role
+created the Secret during reconciliation, so the credential existed while the
+plan was still pending and outlived a plan that was rejected or never approved.
+
+`secret_sentinel` is the deferral done naively — materialize at execution, but
+record the planning-time sentinel as the applied source version. It is not a
+loop and nothing unsafe executes; it costs exactly one extra human approval,
+because the next reconcile compares a recorded `missing` against a now-real
+version and plans a password change for work already done. Only
+`ApprovalsBounded`, checked with `MaxDrifts = 0` so that a second decision can
+have no legitimate cause, can see the difference. Threading the
+post-materialization version back out of execution is the fix.
+
+The two crash configurations settle the *order* of execution's two writes. With
+the Secret written first, a crash leaves an inert Secret that the next reconcile
+adopts. With the SQL written first, the transaction commits a password that was
+never stored anywhere readable — `PasswordRecoverable` violated, and
+unrecoverable in production. `ApprovalsBounded` is deliberately not checked in
+either: a crash costs a re-approval by design.
+
+`PlanApproval_no_password.cfg` passes, like the shipped configuration — it earns
+its place by what it catches when the model is *wrong*. Under
+`HasPasswordChange = TRUE`, `OperatorExecutes` also requires `planRenderStale`,
+which only `OperatorRevalidates` sets and which itself requires `approved`. The
+approval gate therefore stands transitively, and deleting the `approved`
+conjunct from `OperatorExecutes` leaves all three password-bearing
+configurations passing their safety invariants: the mutation is invisible. A
+change set with no password has no second path, so the same deletion is reported
+immediately as `NoUnreviewedExecution` violated. Every model needs at least one
+configuration in which its central invariant is load-bearing.
 
 `PlanApproval_unlocked.cfg` shows why verification and execution must share one
 lock hold: with drift permitted while a plan is `Applying`, what executes no

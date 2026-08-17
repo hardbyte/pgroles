@@ -19,7 +19,7 @@ use crate::crd::{
     EphemeralAccessPolicy, EphemeralAccessPolicyStatus, EphemeralAccessRequest,
     EphemeralAccessRequestPhase, EphemeralAccessRequestStatus, EphemeralApprovalMode,
     LABEL_ACCESS_POLICY_UID, LABEL_POLICY, LABEL_TARGET_POLICY_UID, PlanOrigin, PlanPhase,
-    PlanScope, PolicyCondition, PolicyMode, PolicyPlanRef, PostgresPolicy, PostgresPolicyPlan,
+    PlanScope, PolicyCondition, PolicyPlanRef, PostgresPolicy, PostgresPolicyPlan,
     PostgresPolicyPlanSpec, PostgresPolicyPlanStatus, ResolvedEphemeralAccess,
     ResolvedEphemeralMembership, ScopedPlanOperation,
 };
@@ -218,7 +218,7 @@ async fn reconcile_access_policy_apply(
         }
         Err(error) => return Err(error.into()),
     };
-    if target.spec.mode != PolicyMode::Apply {
+    if target.spec.mode.never_executes() {
         return update_access_policy_failure(
             policy,
             ctx,
@@ -1042,7 +1042,7 @@ async fn resolve_request(
     let target = target_api
         .get(&policy.spec.postgres_policy_ref.name)
         .await?;
-    if target.spec.mode != PolicyMode::Apply {
+    if target.spec.mode.never_executes() {
         return Err(EphemeralError::Invalid(
             "target PostgresPolicy must be in apply mode".to_string(),
         ));
@@ -2085,6 +2085,10 @@ async fn create_scoped_plan(
                 kind: "EphemeralAccessRequest".to_string(),
                 name: request.name_any(),
                 uid: request.uid().unwrap_or_default(),
+                content_digest: None,
+                content_digest_encoding: None,
+                policy_uid: None,
+                base_content_digest: None,
             }),
             scope: Some(PlanScope {
                 kind: "MembershipBundle".to_string(),
@@ -2420,6 +2424,10 @@ mod tests {
                     kind: "EphemeralAccessRequest".into(),
                     name: "request".into(),
                     uid: "request-uid".into(),
+                    content_digest: None,
+                    content_digest_encoding: None,
+                    policy_uid: None,
+                    base_content_digest: None,
                 }),
                 scope: Some(PlanScope {
                     kind: "MembershipBundle".into(),

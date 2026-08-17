@@ -48,13 +48,13 @@ and rollback implications.
 
 Two independent controls determine behavior:
 
-- `spec.mode: plan` computes and publishes a filtered plan without executing
+- `spec.mode: observe` computes and publishes a filtered plan without executing
   PostgreSQL SQL.
 - `spec.mode: apply` may execute the filtered plan, subject to `spec.approval`.
 - `spec.reconciliation_mode` selects `additive`, `adopt`, or `authoritative`
   filtering. See the policy skill before changing it.
 
-Treat `plan` to `apply`, approval changes, and stronger reconciliation modes as
+Treat `observe` to `apply`, approval changes, and stronger reconciliation modes as
 operational database migrations. Review generated SQL and replacement access
 before enabling execution.
 
@@ -75,7 +75,7 @@ Use the same canonical connection reference for policies intended to share a
 database. Different Secrets can point to the same database without being
 recognized as the same identity.
 
-Plan-only policies retain claims. A suspended policy returns before checking
+Observe-only policies retain claims. A suspended policy returns before checking
 peers, but an active peer can still detect overlap with its claims.
 
 ## Rollout Workflow
@@ -83,7 +83,7 @@ peers, but an active peer can still detect overlap with its claims.
 1. Verify the target chart version, CRDs, connection Secret, executor privileges,
    and provider/IaC prerequisites.
 2. Render the actual Kubernetes overlay or Helm release.
-3. Start in `mode: plan` for brownfield or high-impact changes.
+3. Start in `mode: observe` for brownfield or high-impact changes.
 4. Inspect the `PostgresPolicyPlan`, SQL, change summary, revocations, role
    retirements, and transitive memberships.
 5. Move to `mode: apply` with the smallest safe reconciliation mode and approval
@@ -141,20 +141,99 @@ Before approving a plan:
 - verify external identities and referenced schemas exist
 - inspect revocations, membership removals, ownership changes, and retirements
 - reject or allow supersession rather than approving a stale plan
+- check `status.targetPhysicalIdentity` and `status.targetLogicalFingerprint`
+  name the database you intend. Both are bound into the approval, so a plan
+  whose target moved — a repointed connection Secret, a restore, a major
+  version upgrade, a blue-green cutover — is superseded instead of executing,
+  and needs a fresh approval. Set
+  `spec.connection.requirePhysicalIdentity: true` to refuse to proceed at all
+  when `pg_control_system().system_identifier` cannot be read.
 
 Approve or reject the current plan explicitly:
 
+A decision is a write to the plan's status subresource: one terminal `Approved`
+or `Denied` condition plus the deciding identity, in the same write. There are
+no approval annotations — setting `pgroles.io/approved` does nothing.
+
 ```bash
-kubectl -n <namespace> annotate pgplan <plan-name> \
-  pgroles.io/approved=true --overwrite
-kubectl -n <namespace> annotate pgplan <plan-name> \
-  pgroles.io/rejected=true --overwrite
+kubectl -n <namespace> patch pgplan <plan-name> \
+  --subresource=status --type=merge -p '{
+    "status": {
+      "conditions": [{
+        "type": "Approved", "status": "True",
+        "reason": "ApprovedByReviewer",
+        "message": "reviewed change summary",
+        "lastTransitionTime": "'"$(date -u +%Y-%m-%dT%H:%M:%SZ)"'"
+      }],
+      "decidedBy": {"username": "'"$(kubectl auth whoami -o jsonpath='{.status.userInfo.username}')"'"}
+    }
+  }'
 ```
+
+Reject by writing `Denied` with reason `DeniedByReviewer` in place of
+`Approved`. A merge patch replaces the whole `conditions` array — never append a
+second `Approved` entry alongside the `Approved=False` a plan is created with,
+or the CRD's terminality rule wedges the plan. A decision is terminal and
+write-once; iterating means a new plan, not an edited decision.
 
 After approval, wait for `Applied` and then verify the parent policy's convergence
 conditions. A plan object supports review and recent history, but is not
 independent proof of current database state and may be removed by terminal-plan
 retention.
+
+## Preview A Change Beside An Enforcing Policy
+
+To see what a proposed change would do while the live policy keeps enforcing,
+file a `PostgresPolicyCandidate` — do not flip the policy to `mode: observe`,
+which stops enforcement for everything, and do not edit the live spec to read
+the diff.
+
+```yaml
+apiVersion: pgroles.io/v1alpha1
+kind: PostgresPolicyCandidate
+metadata:
+  name: <policy>-add-reporting-x7k2p
+  namespace: <namespace>
+spec:
+  policyRef:
+    name: <policy>
+  # The full proposed policy content — what spec would become, not a delta.
+  content:
+    roles:
+      - name: reporting_reader
+        login: false
+    grants:
+      - role: reporting_reader
+        object: { type: database }
+        privileges: [CONNECT]
+```
+
+The operator plans the candidate inside the parent's reconcile, with the same
+credentials and locks, against post-enforcement state. Read the result from the
+candidate's own plan:
+
+```bash
+kubectl -n <namespace> get pgcand <candidate>
+PLAN="$(kubectl -n <namespace> get pgcand <candidate> -o jsonpath='{.status.planRef.name}')"
+kubectl -n <namespace> get pgplan "$PLAN" -o jsonpath='{.status.sqlInline}'
+```
+
+Interpretation:
+
+- `content` is the whole desired state; the plan is the diff from current
+  reality, so an unchanged section produces no SQL.
+- `Ready=False, reason=BlockedByActivePolicy` means the parent is failing or
+  has its own plan awaiting a decision; the candidate is planned once the
+  parent settles.
+- The spec is immutable. Revise by filing a successor that names this
+  candidate in `spec.replaces`.
+- Approving the candidate's plan executes nothing by itself. Execution happens
+  only when the same content is merged into the policy spec, at which point the
+  operator recognises the promotion and runs the plan that was reviewed —
+  still digest-checked against fresh effects.
+- `spec.target.connectionRef` previews the content against a different
+  database; such a plan is a preview only and can never be promoted onto the
+  parent's target.
 
 ## Ephemeral Access
 

@@ -25,6 +25,20 @@ rules:
   - apiGroups: ["pgroles.io"]
     resources: ["postgrespolicyplans/status"]
     verbs: ["get", "patch", "update"]
+  # Watch and manage PostgresPolicyCandidate CRDs. The operator reads
+  # candidates and owns their status; it never writes their spec, which the
+  # API server holds immutable anyway. `patch` is for adoption — stamping the
+  # parent policy's ownerReference onto the candidate — and `delete` for
+  # pruning terminal candidates beyond the retention bound.
+  - apiGroups: ["pgroles.io"]
+    resources: ["postgrespolicycandidates"]
+    verbs: ["get", "list", "watch", "patch", "delete"]
+  - apiGroups: ["pgroles.io"]
+    resources: ["postgrespolicycandidates/status"]
+    verbs: ["get", "patch", "update"]
+  - apiGroups: ["pgroles.io"]
+    resources: ["postgrespolicycandidates/finalizers"]
+    verbs: ["update"]
   # Reconcile ephemeral access definitions and runtime requests. Approval is
   # intentionally absent: secure deployments authorize decision-condition
   # mutations through admission policy, not this controller role.

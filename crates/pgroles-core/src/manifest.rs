@@ -1,5 +1,7 @@
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
+
+use crate::bounds::*;
 use std::collections::{BTreeMap, HashSet};
 use thiserror::Error;
 
@@ -55,6 +57,21 @@ pub enum ManifestError {
         "role \"{role}\" sets config `role: {target}` but declares no membership in \"{target}\" — the setting would fail at login; add \"{role}\" to the members of \"{target}\""
     )]
     SetRoleWithoutMembership { role: String, target: String },
+
+    #[error("{collection} has {actual} entries, which exceeds the limit of {limit}")]
+    TooManyEntries {
+        collection: String,
+        actual: usize,
+        limit: u32,
+    },
+
+    #[error("{context} \"{value}\" is {actual} characters, which exceeds the limit of {limit}")]
+    ValueTooLong {
+        context: String,
+        value: String,
+        actual: usize,
+        limit: u32,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -274,20 +291,27 @@ pub struct ProfileObjectTarget {
 }
 
 /// A schema binding — associates a schema with one or more profiles.
+///
+/// Field bounds come from [`crate::bounds`]; see that module for why they
+/// exist and where else they are enforced.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct SchemaBinding {
+    #[schemars(length(min = 1, max = MAX_IDENTIFIER))]
     pub name: String,
 
     #[serde(default)]
+    #[schemars(length(max = MAX_SCHEMA_PROFILES), inner(length(min = 1, max = MAX_IDENTIFIER)))]
     pub profiles: Vec<String>,
 
     /// Role naming pattern. Supports `{schema}` and `{profile}` placeholders.
     /// Defaults to `"{schema}-{profile}"`.
     #[serde(default = "default_role_pattern")]
+    #[schemars(length(min = 1, max = MAX_ROLE_PATTERN))]
     pub role_pattern: String,
 
     /// Override default_owner for this schema's default privileges.
     #[serde(default)]
+    #[schemars(length(min = 1, max = MAX_IDENTIFIER))]
     pub owner: Option<String>,
 }
 
@@ -392,7 +416,7 @@ pub struct RoleDefinition {
 /// `kubectl`. PostgreSQL coerces the string to the parameter's type.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, JsonSchema)]
 #[serde(transparent)]
-pub struct ConfigValue(pub String);
+pub struct ConfigValue(#[schemars(length(max = MAX_CONFIG_VALUE))] pub String);
 
 impl<'de> Deserialize<'de> for ConfigValue {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
@@ -471,7 +495,9 @@ pub struct PasswordSource {
 /// A concrete grant on a specific object or wildcard.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct Grant {
+    #[schemars(length(min = 1, max = MAX_IDENTIFIER))]
     pub role: String,
+    #[schemars(length(min = 1, max = MAX_PRIVILEGES))]
     pub privileges: Vec<Privilege>,
     #[serde(alias = "on")]
     pub object: ObjectTarget,
@@ -485,10 +511,12 @@ pub struct ObjectTarget {
 
     /// Schema name. Required for most object types except database.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(length(min = 1, max = MAX_IDENTIFIER))]
     pub schema: Option<String>,
 
     /// Object name, or "*" for all objects. Omit for schema-level grants.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(length(min = 1, max = MAX_OBJECT_NAME))]
     pub name: Option<String>,
 }
 
@@ -497,10 +525,13 @@ pub struct ObjectTarget {
 pub struct DefaultPrivilege {
     /// The role that owns newly created objects. If omitted, uses manifest's default_owner.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(length(min = 1, max = MAX_IDENTIFIER))]
     pub owner: Option<String>,
 
+    #[schemars(length(min = 1, max = MAX_IDENTIFIER))]
     pub schema: String,
 
+    #[schemars(length(max = MAX_DEFAULT_PRIVILEGE_GRANTS))]
     pub grant: Vec<DefaultPrivilegeGrant>,
 }
 
@@ -510,8 +541,10 @@ pub struct DefaultPrivilegeGrant {
     /// The role receiving the default privilege. Only used in top-level default_privileges
     /// (in profiles, the role is determined by expansion).
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(length(min = 1, max = MAX_IDENTIFIER))]
     pub role: Option<String>,
 
+    #[schemars(length(min = 1, max = MAX_PRIVILEGES))]
     pub privileges: Vec<Privilege>,
     pub on_type: ObjectType,
 }
@@ -519,7 +552,9 @@ pub struct DefaultPrivilegeGrant {
 /// A membership declaration — which members belong to a role.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct Membership {
+    #[schemars(length(min = 1, max = MAX_IDENTIFIER))]
     pub role: String,
+    #[schemars(length(max = MAX_MEMBERS))]
     pub members: Vec<MemberSpec>,
 }
 
@@ -532,6 +567,7 @@ pub struct Membership {
 /// perpetual diffs in GitOps tools like ArgoCD.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct MemberSpec {
+    #[schemars(length(min = 1, max = MAX_IDENTIFIER))]
     pub name: String,
 
     /// Whether the member inherits the role's privileges. Defaults to `true`.
@@ -559,10 +595,12 @@ impl MemberSpec {
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct RoleRetirement {
     /// The role to retire and ultimately drop.
+    #[schemars(length(min = 1, max = MAX_IDENTIFIER))]
     pub role: String,
 
     /// Optional successor role for `REASSIGN OWNED BY ... TO ...`.
     #[serde(default)]
+    #[schemars(length(min = 1, max = MAX_IDENTIFIER))]
     pub reassign_owned_to: Option<String>,
 
     /// Whether to run `DROP OWNED BY` before dropping the role.
@@ -572,6 +610,232 @@ pub struct RoleRetirement {
     /// Whether to terminate other active sessions for the role before drop.
     #[serde(default)]
     pub terminate_sessions: bool,
+}
+
+// ---------------------------------------------------------------------------
+// Content bounds
+// ---------------------------------------------------------------------------
+
+/// Reject content that exceeds the bounds in [`crate::bounds`].
+///
+/// The CRD schemas carry these same limits as `maxLength` / `maxItems` /
+/// `maxProperties`, so a manifest the API server would refuse must be refused
+/// here too: a user who validates with the CLI and applies with `kubectl`
+/// should never learn about a limit from the second command.
+///
+/// Lengths are counted in characters, matching OpenAPI `maxLength` (and
+/// therefore the API server) — except that identifier-bounded values are
+/// additionally held to PostgreSQL's byte-counted `NAMEDATALEN - 1 = 63`,
+/// which the schema cannot express: a 63-character multibyte name would pass
+/// admission and then be silently truncated by the server. Expanded role
+/// names (`role_pattern` output) get the same byte check at expansion time.
+///
+/// One bound has no schema counterpart and is enforced only here: `config`
+/// keys are held to [`MAX_IDENTIFIER`], because Kubernetes structural schemas
+/// have no way to express `propertyNames`.
+pub fn validate_bounds(manifest: &PolicyManifest) -> Result<(), ManifestError> {
+    fn entries(collection: &str, actual: usize, limit: u32) -> Result<(), ManifestError> {
+        if actual > limit as usize {
+            return Err(ManifestError::TooManyEntries {
+                collection: collection.to_string(),
+                actual,
+                limit,
+            });
+        }
+        Ok(())
+    }
+
+    fn text(context: &str, value: &str, limit: u32) -> Result<(), ManifestError> {
+        let actual = value.chars().count();
+        if actual > limit as usize {
+            return Err(ManifestError::ValueTooLong {
+                context: context.to_string(),
+                value: value.to_string(),
+                actual,
+                limit,
+            });
+        }
+        // PostgreSQL's NAMEDATALEN limit is 63 *bytes*, not characters: a
+        // 63-character multibyte identifier passes the schema (OpenAPI
+        // `maxLength` counts characters) but the server silently truncates it,
+        // which is precisely the surprise these bounds exist to prevent. For
+        // identifier-bounded values, enforce the byte form too.
+        if limit == MAX_IDENTIFIER && value.len() > limit as usize {
+            return Err(ManifestError::ValueTooLong {
+                context: format!(
+                    "{context} (bytes; PostgreSQL identifiers are limited to 63 bytes)"
+                ),
+                value: value.to_string(),
+                actual: value.len(),
+                limit,
+            });
+        }
+        Ok(())
+    }
+
+    fn config(context: &str, config: &BTreeMap<String, ConfigValue>) -> Result<(), ManifestError> {
+        entries(
+            &format!("{context}.config"),
+            config.len(),
+            MAX_CONFIG_ENTRIES,
+        )?;
+        for (key, value) in config {
+            text(&format!("{context}.config key"), key, MAX_IDENTIFIER)?;
+            text(
+                &format!("{context}.config[{key}]"),
+                &value.0,
+                MAX_CONFIG_VALUE,
+            )?;
+        }
+        Ok(())
+    }
+
+    entries("profiles", manifest.profiles.len(), MAX_PROFILES)?;
+    for (name, profile) in &manifest.profiles {
+        text("profile name", name, MAX_IDENTIFIER)?;
+        entries(
+            &format!("profiles.{name}.grants"),
+            profile.grants.len(),
+            MAX_PROFILE_GRANTS,
+        )?;
+        for grant in &profile.grants {
+            entries(
+                &format!("profiles.{name}.grants[].privileges"),
+                grant.privileges.len(),
+                MAX_PRIVILEGES,
+            )?;
+            if let Some(object_name) = &grant.object.name {
+                text("grant object name", object_name, MAX_OBJECT_NAME)?;
+            }
+        }
+        entries(
+            &format!("profiles.{name}.default_privileges"),
+            profile.default_privileges.len(),
+            MAX_PROFILE_DEFAULT_PRIVILEGES,
+        )?;
+        for grant in &profile.default_privileges {
+            entries(
+                &format!("profiles.{name}.default_privileges[].privileges"),
+                grant.privileges.len(),
+                MAX_PRIVILEGES,
+            )?;
+            if let Some(role) = &grant.role {
+                text("default privilege role", role, MAX_IDENTIFIER)?;
+            }
+        }
+        config(&format!("profiles.{name}"), &profile.config)?;
+    }
+
+    entries("schemas", manifest.schemas.len(), MAX_SCHEMAS)?;
+    for binding in &manifest.schemas {
+        text("schema name", &binding.name, MAX_IDENTIFIER)?;
+        entries(
+            &format!("schemas.{}.profiles", binding.name),
+            binding.profiles.len(),
+            MAX_SCHEMA_PROFILES,
+        )?;
+        for profile in &binding.profiles {
+            text("profile reference", profile, MAX_IDENTIFIER)?;
+        }
+        text("role_pattern", &binding.role_pattern, MAX_ROLE_PATTERN)?;
+        if let Some(owner) = &binding.owner {
+            text("schema owner", owner, MAX_IDENTIFIER)?;
+        }
+    }
+
+    if let Some(owner) = &manifest.default_owner {
+        text("default_owner", owner, MAX_IDENTIFIER)?;
+    }
+
+    entries("roles", manifest.roles.len(), MAX_ROLES)?;
+    for role in &manifest.roles {
+        text("role name", &role.name, MAX_IDENTIFIER)?;
+        if let Some(comment) = &role.comment {
+            text(
+                &format!("roles.{}.comment", role.name),
+                comment,
+                MAX_OBJECT_NAME,
+            )?;
+        }
+        if let Some(valid_until) = &role.password_valid_until {
+            text(
+                &format!("roles.{}.password_valid_until", role.name),
+                valid_until,
+                MAX_TIMESTAMP,
+            )?;
+        }
+        config(&format!("roles.{}", role.name), &role.config)?;
+    }
+
+    entries("grants", manifest.grants.len(), MAX_GRANTS)?;
+    for grant in &manifest.grants {
+        text("grant role", &grant.role, MAX_IDENTIFIER)?;
+        entries(
+            "grants[].privileges",
+            grant.privileges.len(),
+            MAX_PRIVILEGES,
+        )?;
+        if let Some(schema) = &grant.object.schema {
+            text("grant object schema", schema, MAX_IDENTIFIER)?;
+        }
+        if let Some(name) = &grant.object.name {
+            text("grant object name", name, MAX_OBJECT_NAME)?;
+        }
+    }
+
+    entries(
+        "default_privileges",
+        manifest.default_privileges.len(),
+        MAX_DEFAULT_PRIVILEGES,
+    )?;
+    for default_privilege in &manifest.default_privileges {
+        text(
+            "default privilege schema",
+            &default_privilege.schema,
+            MAX_IDENTIFIER,
+        )?;
+        if let Some(owner) = &default_privilege.owner {
+            text("default privilege owner", owner, MAX_IDENTIFIER)?;
+        }
+        entries(
+            "default_privileges[].grant",
+            default_privilege.grant.len(),
+            MAX_DEFAULT_PRIVILEGE_GRANTS,
+        )?;
+        for grant in &default_privilege.grant {
+            entries(
+                "default_privileges[].grant[].privileges",
+                grant.privileges.len(),
+                MAX_PRIVILEGES,
+            )?;
+            if let Some(role) = &grant.role {
+                text("default privilege role", role, MAX_IDENTIFIER)?;
+            }
+        }
+    }
+
+    entries("memberships", manifest.memberships.len(), MAX_MEMBERSHIPS)?;
+    for membership in &manifest.memberships {
+        text("membership role", &membership.role, MAX_IDENTIFIER)?;
+        entries(
+            &format!("memberships.{}.members", membership.role),
+            membership.members.len(),
+            MAX_MEMBERS,
+        )?;
+        for member in &membership.members {
+            text("member name", &member.name, MAX_IDENTIFIER)?;
+        }
+    }
+
+    entries("retirements", manifest.retirements.len(), MAX_RETIREMENTS)?;
+    for retirement in &manifest.retirements {
+        text("retirement role", &retirement.role, MAX_IDENTIFIER)?;
+        if let Some(successor) = &retirement.reassign_owned_to {
+            text("reassign_owned_to", successor, MAX_IDENTIFIER)?;
+        }
+    }
+
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -626,6 +890,8 @@ pub fn parse_manifest(yaml: &str) -> Result<PolicyManifest, ManifestError> {
 /// roles, grants, and default privileges. Merges with one-off definitions.
 /// Validates no duplicate role names.
 pub fn expand_manifest(manifest: &PolicyManifest) -> Result<ExpandedManifest, ManifestError> {
+    validate_bounds(manifest)?;
+
     let mut seen_schemas: HashSet<String> = HashSet::new();
     for schema_binding in &manifest.schemas {
         if !seen_schemas.insert(schema_binding.name.clone()) {
@@ -667,6 +933,23 @@ pub fn expand_manifest(manifest: &PolicyManifest) -> Result<ExpandedManifest, Ma
                 .role_pattern
                 .replace("{schema}", &schema_binding.name)
                 .replace("{profile}", profile_name);
+
+            // The inputs are bounded, but their *composition* is only checked
+            // here: a pattern, schema and profile that each fit can expand to
+            // a name PostgreSQL would silently truncate at 63 bytes — and a
+            // truncated name is a different role than the one reviewed.
+            if role_name.len() > 63 {
+                return Err(ManifestError::ValueTooLong {
+                    context: format!(
+                        "role name expanded from role_pattern \"{}\" for schema \"{}\" (bytes; \
+                         PostgreSQL identifiers are limited to 63 bytes)",
+                        schema_binding.role_pattern, schema_binding.name
+                    ),
+                    value: role_name.clone(),
+                    actual: role_name.len(),
+                    limit: 63,
+                });
+            }
 
             // Expand profile config — substitute {schema}/{profile} in VALUES
             // only. Keys are literal PostgreSQL parameter names; a `{schema}`
@@ -974,6 +1257,66 @@ fn is_valid_iso8601_timestamp(value: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The CLI must reject exactly what the CRD schema rejects, so a user
+    /// never learns about a limit for the first time from `kubectl`.
+    #[test]
+    fn bounds_reject_an_over_long_identifier() {
+        let yaml = format!("roles:\n  - name: {}\n", "r".repeat(64));
+        let manifest = parse_manifest(&yaml).expect("manifest parses");
+        assert!(matches!(
+            expand_manifest(&manifest),
+            Err(ManifestError::ValueTooLong { limit, actual, .. }) if limit == 63 && actual == 64
+        ));
+    }
+
+    #[test]
+    fn bounds_accept_an_identifier_at_the_limit() {
+        let yaml = format!("roles:\n  - name: {}\n", "r".repeat(63));
+        let manifest = parse_manifest(&yaml).expect("manifest parses");
+        assert!(expand_manifest(&manifest).is_ok());
+    }
+
+    /// PostgreSQL truncates identifiers at 63 *bytes*. A 32-character name of
+    /// two-byte characters passes the schema's character count and must still
+    /// be rejected here, or the server would silently create a different role
+    /// than the one reviewed.
+    #[test]
+    fn bounds_reject_an_identifier_over_63_bytes_even_under_63_characters() {
+        let name = "é".repeat(32); // 32 chars, 64 bytes
+        let yaml = format!("roles:\n  - name: {name}\n");
+        let manifest = parse_manifest(&yaml).expect("manifest parses");
+        assert!(matches!(
+            expand_manifest(&manifest),
+            Err(ManifestError::ValueTooLong { actual, limit, .. }) if actual == 64 && limit == 63
+        ));
+    }
+
+    /// Each input fits, the composition does not: the expanded role name is
+    /// what PostgreSQL sees, so it is what the byte limit is checked against.
+    #[test]
+    fn bounds_reject_an_expanded_role_name_over_63_bytes() {
+        let schema = "s".repeat(40);
+        let yaml = format!(
+            "profiles:\n  editor:\n    grants: []\nschemas:\n  - name: {schema}\n    profiles: [editor]\n    role_pattern: '{{schema}}-very-long-suffix-{{profile}}'\n"
+        );
+        let manifest = parse_manifest(&yaml).expect("manifest parses");
+        assert!(matches!(
+            expand_manifest(&manifest),
+            Err(ManifestError::ValueTooLong { limit, .. }) if limit == 63
+        ));
+    }
+
+    #[test]
+    fn bounds_reject_an_over_long_collection() {
+        let roles: String = (0..1025).map(|i| format!("  - name: role{i}\n")).collect();
+        let manifest = parse_manifest(&format!("roles:\n{roles}")).expect("manifest parses");
+        assert!(matches!(
+            expand_manifest(&manifest),
+            Err(ManifestError::TooManyEntries { collection, limit, .. })
+                if collection == "roles" && limit == 1024
+        ));
+    }
 
     #[test]
     fn parse_minimal_role() {
@@ -1822,7 +2165,7 @@ spec:
     secretRef:
       name: pgroles-db-credentials
   interval: "5m"
-  mode: plan
+  mode: observe
   roles:
     - name: app_analytics
       login: true

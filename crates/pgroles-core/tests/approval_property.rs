@@ -22,7 +22,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use pgroles_core::approval::{
-    EffectDigestInputs, canonical_change_set_bytes, compute_change_digest,
+    EffectDigestInputs, TargetIdentity, canonical_change_set_bytes, compute_change_digest,
 };
 use pgroles_core::diff::{Change, ReconciliationMode};
 use pgroles_core::manifest::{ObjectType, Privilege};
@@ -218,13 +218,24 @@ fn all_password_versions(tag: &str) -> BTreeMap<String, String> {
         .collect()
 }
 
+/// The identity the operator would observe against a fixed target.
+fn target_identity() -> TargetIdentity {
+    TargetIdentity {
+        physical: Some("7412330000000000001".to_string()),
+        logical: Some("sha256:fingerprint".to_string()),
+    }
+}
+
 fn digest(changes: &[Change], versions: &BTreeMap<String, String>) -> String {
     compute_change_digest(
         changes,
         &EffectDigestInputs {
             reconciliation_mode: ReconciliationMode::Authoritative,
             target: "default/postgres-credentials:url",
+            target_identity: &target_identity(),
             password_source_versions: versions,
+            owned_roles: &[],
+            owned_schemas: &[],
         },
     )
     .expect("every generated role has a password source version")
@@ -366,7 +377,10 @@ fn digest_binds_mode_and_target() {
             &EffectDigestInputs {
                 reconciliation_mode: ReconciliationMode::Additive,
                 target: "default/postgres-credentials:url",
+                target_identity: &target_identity(),
                 password_source_versions: &versions,
+                owned_roles: &[],
+                owned_schemas: &[],
             },
         )
         .expect("digest");
@@ -376,7 +390,42 @@ fn digest_binds_mode_and_target() {
             &EffectDigestInputs {
                 reconciliation_mode: ReconciliationMode::Authoritative,
                 target: "default/other-credentials:url",
+                target_identity: &target_identity(),
                 password_source_versions: &versions,
+                owned_roles: &[],
+                owned_schemas: &[],
+            },
+        )
+        .expect("digest");
+
+        let moved_physical = compute_change_digest(
+            &changes,
+            &EffectDigestInputs {
+                reconciliation_mode: ReconciliationMode::Authoritative,
+                target: "default/postgres-credentials:url",
+                target_identity: &TargetIdentity {
+                    physical: Some("7412330000000000002".to_string()),
+                    ..target_identity()
+                },
+                password_source_versions: &versions,
+                owned_roles: &[],
+                owned_schemas: &[],
+            },
+        )
+        .expect("digest");
+
+        let moved_logical = compute_change_digest(
+            &changes,
+            &EffectDigestInputs {
+                reconciliation_mode: ReconciliationMode::Authoritative,
+                target: "default/postgres-credentials:url",
+                target_identity: &TargetIdentity {
+                    logical: Some("sha256:other-endpoint".to_string()),
+                    ..target_identity()
+                },
+                password_source_versions: &versions,
+                owned_roles: &[],
+                owned_schemas: &[],
             },
         )
         .expect("digest");
@@ -385,6 +434,14 @@ fn digest_binds_mode_and_target() {
         assert_ne!(
             base, other_target,
             "seed {seed}: target not bound into digest"
+        );
+        assert_ne!(
+            base, moved_physical,
+            "seed {seed}: physical target identity not bound into digest"
+        );
+        assert_ne!(
+            base, moved_logical,
+            "seed {seed}: logical target fingerprint not bound into digest"
         );
     }
 }
@@ -444,7 +501,10 @@ fn password_material_never_reaches_the_hashed_bytes() {
             &EffectDigestInputs {
                 reconciliation_mode: ReconciliationMode::Authoritative,
                 target: "default/postgres-credentials:url",
+                target_identity: &target_identity(),
                 password_source_versions: &versions,
+                owned_roles: &[],
+                owned_schemas: &[],
             },
         )
         .expect("digest inputs");

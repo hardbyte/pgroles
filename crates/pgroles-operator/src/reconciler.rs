@@ -59,6 +59,10 @@ enum ReconcileOutcome {
     Suspended,
     Conflict,
     LockContention,
+    /// The target cannot answer an identity the deployment requires. Nothing
+    /// converges until that is fixed, so this is not a drift or a failure to
+    /// retry into success.
+    TargetIdentityBlocked,
 }
 
 impl ReconcileOutcome {
@@ -68,6 +72,7 @@ impl ReconcileOutcome {
             ReconcileOutcome::Planned => "planned",
             ReconcileOutcome::Suspended => "suspended",
             ReconcileOutcome::Conflict => "conflict",
+            ReconcileOutcome::TargetIdentityBlocked => "blocked",
             ReconcileOutcome::LockContention => "contention",
         }
     }
@@ -78,6 +83,7 @@ impl ReconcileOutcome {
             ReconcileOutcome::Planned => "Planned",
             ReconcileOutcome::Suspended => "Suspended",
             ReconcileOutcome::Conflict => "ConflictingPolicy",
+            ReconcileOutcome::TargetIdentityBlocked => "PhysicalIdentityRequired",
             ReconcileOutcome::LockContention => "LockContention",
         }
     }
@@ -165,12 +171,101 @@ pub enum ReconcileError {
 
     #[error("plan SQL storage error: {0}")]
     PlanSqlStorage(String),
+
+    #[error("Kubernetes API call \"{0}\" did not complete within {1:?}")]
+    ApiStalled(&'static str, Duration),
 }
 
+/// Ceiling on a single Kubernetes API request made from the reconcile path.
+///
+/// kube-rs defaults its client to a 295-second read/write timeout, which is
+/// sized for long-poll watches, not for the handful of point reads and status
+/// patches a reconcile makes. That default is dangerous here for a reason
+/// specific to the controller runtime: kube-rs never schedules two concurrent
+/// reconciles for the same object, so *one* request that stalls holds that
+/// object's only reconcile slot — every requeue, and every trigger a watch
+/// fires at it, queues behind the stalled call and is silently deferred. A
+/// stalled request must therefore become an ordinary transient error that the
+/// error policy requeues, not a wedge.
+///
+/// Only calls made *before* either reconciliation lock is taken are bounded
+/// this way: cancelling one of those is side-effect-free, whereas cancelling
+/// work under the locks would abandon an in-flight DDL phase.
+const K8S_CALL_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Run one pre-lock Kubernetes API call under [`K8S_CALL_TIMEOUT`].
+///
+/// `call` names the request in the log and in the resulting status condition,
+/// so the next occurrence identifies which request stalled instead of leaving
+/// a silent gap in the log.
+async fn bounded_k8s_call<T, F>(call: &'static str, future: F) -> Result<T, ReconcileError>
+where
+    F: std::future::Future<Output = Result<T, kube::Error>>,
+{
+    match tokio::time::timeout(K8S_CALL_TIMEOUT, future).await {
+        Ok(result) => result.map_err(ReconcileError::Kube),
+        Err(_) => {
+            tracing::error!(
+                call,
+                timeout_secs = K8S_CALL_TIMEOUT.as_secs(),
+                "Kubernetes API call did not complete; failing this reconcile so the controller \
+                 requeues instead of holding the object's only reconcile slot open"
+            );
+            Err(ReconcileError::ApiStalled(call, K8S_CALL_TIMEOUT))
+        }
+    }
+}
+
+/// What the policy's locked phase hands to candidate planning.
+///
+/// Candidates are planned after the policy's own work, in the policy's
+/// execution context, so they need two things the locked phase computed and
+/// nothing else: the target identity it resolved, and the ephemeral membership
+/// overlay it composed. Passing them out rather than recomputing them keeps
+/// candidate planning on exactly the state the policy just enforced against.
+#[derive(Debug, Default)]
+struct ParentHandoff {
+    overlay_edges: Vec<pgroles_core::model::MembershipEdge>,
+    target_identity: Option<pgroles_core::approval::TargetIdentity>,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) struct ResolvedPassword {
+    pub(crate) cleartext: String,
+    pub(crate) source_version: String,
+    /// Set when the password was generated in memory because no Secret exists
+    /// yet. The Secret is deliberately not written during planning — it is
+    /// materialized only once the plan is about to execute, so a plan that is
+    /// never approved leaves no credential behind (#181).
+    pub(crate) pending_materialization: Option<PendingGeneratedSecret>,
+}
+
+// Manual so `{:?}` can never print the password: the derived form would.
+impl std::fmt::Debug for ResolvedPassword {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ResolvedPassword")
+            .field("cleartext", &"[redacted]")
+            .field("source_version", &self.source_version)
+            .field("pending_materialization", &self.pending_materialization)
+            .finish()
+    }
+}
+
+impl ResolvedPassword {
+    fn existing(cleartext: String, source_version: String) -> Self {
+        Self {
+            cleartext,
+            source_version,
+            pending_materialization: None,
+        }
+    }
+}
+
+/// Everything needed to create a generated-password Secret at execution time.
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct ResolvedPassword {
-    cleartext: String,
-    source_version: String,
+pub(crate) struct PendingGeneratedSecret {
+    pub(crate) role: String,
+    pub(crate) spec: crate::crd::GeneratePasswordSpec,
 }
 
 /// Parse a duration string like "5m", "1h", "30s", "2h30m".
@@ -437,6 +532,9 @@ fn retry_class_for_reconcile_error(error: &ReconcileError) -> RetryClass {
             }
         }
         ReconcileError::Kube(_) => RetryClass::Transient,
+        // The API server or the path to it is not answering right now; the
+        // next reconcile is the retry.
+        ReconcileError::ApiStalled(_, _) => RetryClass::Transient,
     }
 }
 
@@ -547,7 +645,7 @@ fn is_system_schema(name: &str) -> bool {
 ///
 /// System schemas (`pg_*`, `information_schema`) are excluded from the check
 /// since they always exist but are filtered out of the inspect query.
-async fn validate_referenced_schemas_exist(
+pub(crate) async fn validate_referenced_schemas_exist(
     pool: &sqlx::PgPool,
     expanded: &pgroles_core::manifest::ExpandedManifest,
 ) -> Result<(), ReconcileError> {
@@ -768,6 +866,15 @@ async fn reconcile_apply_inner(
         );
         ctx.observability.record_deprecated_approval_unset(inferred);
     }
+    if resource.spec.mode.is_deprecated_spelling() {
+        tracing::warn!(
+            name,
+            namespace,
+            "spec.mode is `plan`, the deprecated spelling of `observe`; behaviour is identical, \
+             and a future release removes the value — change the manifest to `mode: observe`"
+        );
+        ctx.observability.record_deprecated_mode_plan();
+    }
 
     // Update status to "Reconciling".
     // Note: do NOT clear last_error here — it should persist until a successful
@@ -782,6 +889,12 @@ async fn reconcile_apply_inner(
     })
     .await?;
 
+    // Breadcrumbs across the pre-lock phase. Every step between here and the
+    // in-process lock is a network call, and without them a stall in any of
+    // them looks identical in the log: "starting reconciliation" and then
+    // nothing.
+    tracing::debug!(name, namespace, "status marked Reconciling");
+
     spec.validate_connection_spec()
         .map_err(|err| ReconcileError::InvalidSpec(err.to_string()))?;
     spec.validate_password_specs(&name)
@@ -794,6 +907,8 @@ async fn reconcile_apply_inner(
         status.owned_schemas = ownership.schemas.iter().cloned().collect();
     })
     .await?;
+
+    tracing::debug!(name, namespace, "ownership claims recorded");
 
     if let Some(conflict_message) =
         detect_policy_conflict(ctx, resource, identity, &ownership).await?
@@ -822,6 +937,8 @@ async fn reconcile_apply_inner(
         ));
     }
 
+    tracing::debug!(name, namespace, "no conflicting policy");
+
     // 1. Convert CRD spec to core manifest.
     let manifest = spec.to_policy_manifest();
 
@@ -846,6 +963,8 @@ async fn reconcile_apply_inner(
         .get_or_create_pool(&namespace, &spec.connection)
         .await
         .map_err(Box::new)?;
+
+    tracing::debug!(name, namespace, "database pool ready");
 
     // 5. Acquire the in-process per-database lock for the DDL phase.
     //
@@ -883,6 +1002,7 @@ async fn reconcile_apply_inner(
     };
 
     // Wrap the remaining work so the advisory lock is released on all paths.
+    let mut handoff = ParentHandoff::default();
     let result = apply_under_lock(
         resource,
         ctx,
@@ -895,8 +1015,51 @@ async fn reconcile_apply_inner(
         &name,
         &namespace,
         identity,
+        &mut handoff,
     )
     .await;
+
+    // Candidates are planned here: after the active policy's own enforcement
+    // or planning has completed, still inside both of its locks, against the
+    // post-enforcement state rather than the drift the policy just removed.
+    // A candidate is a proposal, so nothing it does may break enforcement —
+    // failures are recorded on the candidate and swallowed here.
+    if let Ok((_, outcome)) = &result
+        && let Some(target_identity) = handoff.target_identity.as_ref()
+    {
+        let converged = matches!(
+            outcome,
+            ReconcileOutcome::Reconciled | ReconcileOutcome::Planned
+        );
+        // An API failure here is not "no plan": treating it as one would open
+        // the gate while the parent may in fact hold an actionable plan, and
+        // the candidate would be planned against a state the database is not
+        // in yet. Skip candidate planning for this cycle instead.
+        match crate::plan::get_current_actionable_plan(&ctx.kube_client, resource).await {
+            Ok(actionable) => {
+                let planning = crate::candidate::CandidatePlanning {
+                    pool: &pool,
+                    identity,
+                    target_identity,
+                    overlay_edges: &handoff.overlay_edges,
+                    gate: crate::candidate::parent_gate(converged, actionable.is_some()),
+                };
+                if let Err(err) =
+                    crate::candidate::reconcile_candidates(ctx, resource, &planning).await
+                {
+                    tracing::warn!(name, namespace, %err, "candidate planning failed");
+                }
+            }
+            Err(err) => {
+                tracing::warn!(
+                    name,
+                    namespace,
+                    %err,
+                    "could not read the policy's actionable plan; skipping candidate planning this cycle"
+                );
+            }
+        }
+    }
 
     // Release advisory lock (always, even on error).
     advisory_lock.release().await;
@@ -904,6 +1067,47 @@ async fn reconcile_apply_inner(
     crate::plan::cleanup_old_plans_best_effort(&ctx.kube_client, resource, None).await;
 
     result
+}
+
+/// The membership edges an ephemeral overlay contributed.
+///
+/// Everything the composition added that the policy does not declare. This is
+/// the overlay half of the candidate overlay-overlap rule (ADR-001 Decision 6),
+/// and it is a set difference rather than a second read of the requests so that
+/// the pairs a candidate is compared against are exactly the edges that entered
+/// the graph the policy just enforced.
+fn overlay_edges(
+    declared: &pgroles_core::model::RoleGraph,
+    effective: &pgroles_core::model::RoleGraph,
+) -> Vec<pgroles_core::model::MembershipEdge> {
+    effective
+        .memberships
+        .difference(&declared.memberships)
+        .cloned()
+        .collect()
+}
+
+/// Resolve both halves of the target's identity.
+///
+/// The physical half is read from the connection the reconcile already holds;
+/// the logical half is resolved from the connection Secret, which is exactly
+/// the fingerprint the ephemeral path computes and covers URL-mode
+/// connections whose Kubernetes reference names only a Secret and key.
+async fn resolve_target_identity(
+    ctx: &OperatorContext,
+    pool: &sqlx::PgPool,
+    namespace: &str,
+    resource: &PostgresPolicy,
+) -> Result<pgroles_core::approval::TargetIdentity, ReconcileError> {
+    let physical = pgroles_inspect::detect_system_identifier(pool).await?;
+    let logical = ctx
+        .resolve_database_target_fingerprint(namespace, &resource.spec.connection)
+        .await
+        .map_err(Box::new)?;
+    Ok(pgroles_core::approval::TargetIdentity {
+        physical,
+        logical: Some(logical),
+    })
 }
 
 /// Execute the inspect/diff/apply cycle while both locks are held.
@@ -922,7 +1126,51 @@ async fn apply_under_lock(
     name: &str,
     namespace: &str,
     identity: &DatabaseIdentity,
+    handoff: &mut ParentHandoff,
 ) -> Result<(Action, ReconcileOutcome), ReconcileError> {
+    // 5a. Resolve the identity of the database actually on the other end of
+    // the connection, under the lock and against the same pool everything
+    // else uses. Both halves are bound into the approval digest, so an
+    // approval made against one server cannot execute against another even
+    // though the Kubernetes reference is unchanged.
+    let target_identity = resolve_target_identity(ctx, pool, namespace, resource).await?;
+    handoff.target_identity = Some(target_identity.clone());
+    if resource.spec.connection.requires_physical_identity() && !target_identity.has_physical() {
+        let reason = pgroles_core::approval::TargetIdentityReason::PhysicalIdentityRequired;
+        let message = format!(
+            "{} Reconciliation is blocked until the identifier is readable, or \
+             connection.requirePhysicalIdentity is cleared.",
+            reason.message()
+        );
+        emit_policy_warning(
+            ctx,
+            resource,
+            reason.as_str(),
+            "TargetIdentity",
+            message.clone(),
+        )
+        .await;
+        update_status(ctx, resource, |status| {
+            status.set_condition(ready_condition(false, reason.as_str(), &message));
+            status.set_condition(crate::crd::target_identity_blocked_condition(
+                reason.as_str(),
+                &message,
+            ));
+            status.set_condition(degraded_condition(reason.as_str(), &message));
+            status
+                .conditions
+                .retain(|c| c.condition_type != "Reconciling" && c.condition_type != "Drifted");
+            status.last_attempted_generation = generation;
+            status.last_error = Some(message.clone());
+            status.transient_failure_count = 0;
+        })
+        .await?;
+        return Ok((
+            Action::requeue(requeue_interval),
+            ReconcileOutcome::TargetIdentityBlocked,
+        ));
+    }
+
     // 5b. Recover stuck Applying plans (operator may have crashed mid-apply).
     if let Some(stuck_plan) =
         crate::plan::get_plan_by_phase(&ctx.kube_client, resource, crate::crd::PlanPhase::Applying)
@@ -963,6 +1211,10 @@ async fn apply_under_lock(
     let mut effective_desired = desired.clone();
     let ephemeral_roles =
         crate::ephemeral::compose_effective_graph(ctx, resource, &mut effective_desired).await?;
+    // The overlay itself, as edges: everything the composition added that the
+    // policy does not declare. This is the input to the candidate
+    // overlay-overlap rule (ADR-001 Decision 6).
+    handoff.overlay_edges = overlay_edges(desired, &effective_desired);
 
     // 6. Inspect current state from the database.
     let has_database_grants = expanded
@@ -1019,7 +1271,7 @@ async fn apply_under_lock(
     changes = pgroles_core::diff::filter_external_role_changes(changes, &expanded.roles);
 
     let resolved_passwords = resolve_passwords_from_secrets(ctx, resource, namespace).await?;
-    let (password_changes, applied_password_source_versions) =
+    let (password_changes, mut applied_password_source_versions) =
         select_password_changes(&changes, &resolved_passwords, resource.status.as_ref());
     if !password_changes.is_empty() {
         changes = pgroles_core::diff::inject_password_changes(changes, &password_changes);
@@ -1048,7 +1300,32 @@ async fn apply_under_lock(
 
     let effective_approval = resource.spec.effective_approval();
 
-    if resource.spec.mode == PolicyMode::Plan {
+    // Is this reconcile the promotion of a reviewed candidate? Recognition is
+    // by content digest, computed over exactly the same canonical form a
+    // candidate's digest uses, and it runs here — under both locks, on the
+    // state just inspected — so that the plan it may hand back is checked
+    // against fresh effects.
+    //
+    // A failure to look candidates up degrades to the ordinary flow rather
+    // than failing the reconcile: the ordinary flow can only ever execute a
+    // plan this policy owns and a human approved, so degrading cannot execute
+    // anything unreviewed — while failing closed here would take enforcement
+    // down whenever the candidate CRD is unavailable.
+    let content_digest = resource.spec.content_digest();
+    let promoted_plan = match crate::promotion::recognize(ctx, resource, &content_digest).await {
+        Ok(plan) => plan,
+        Err(err) => {
+            tracing::warn!(
+                name,
+                namespace,
+                %err,
+                "could not evaluate candidate promotion; continuing with the ordinary flow"
+            );
+            None
+        }
+    };
+
+    if resource.spec.mode.never_executes() {
         let drift_detected = !changes.is_empty();
         let ready_message = if drift_detected {
             format!("Plan computed; {} change(s) pending", summary.total)
@@ -1073,6 +1350,13 @@ async fn apply_under_lock(
 
         // Create a PostgresPolicyPlan resource for changes (if any).
         let mut plan_ref_name = None;
+        // Observe mode used to only ever *set* this reference. When drift went
+        // away out of band the pending plan stayed Pending and the reference
+        // stayed pointing at it, while the policy reported InSync beside it.
+        let previous_plan_ref = resource
+            .status
+            .as_ref()
+            .and_then(|status| status.current_plan_ref.clone());
         // Tracks a plan that someone approved even though this policy never
         // executes, so the pointless approval is reported rather than ignored.
         let mut ignored_approval_plan = None;
@@ -1085,8 +1369,10 @@ async fn apply_under_lock(
                 &inspect_config,
                 resource.spec.reconciliation_mode,
                 identity.as_str(),
+                &target_identity,
                 &summary,
                 &applied_password_source_versions,
+                None,
             )
             .await?;
             let plan_name = creation_result.plan_name().to_string();
@@ -1108,7 +1394,7 @@ async fn apply_under_lock(
                 .await;
             }
 
-            // Plan mode returns without ever consulting spec.approval, so an
+            // Observe mode returns without ever consulting spec.approval, so an
             // approval annotation here is inert. Left unreported it looks like
             // the operator is stuck rather than working as designed.
             if matches!(
@@ -1119,7 +1405,7 @@ async fn apply_under_lock(
                     name,
                     namespace,
                     plan = %plan_name,
-                    "plan is approved but spec.mode is `plan`; approval has no effect and no SQL \
+                    "plan is approved but spec.mode is `observe`; approval has no effect and no SQL \
                      will run"
                 );
                 ignored_approval_plan = Some(plan_name.clone());
@@ -1150,21 +1436,33 @@ async fn apply_under_lock(
                     && c.condition_type != "Degraded"
                     && c.condition_type != "Conflict"
                     && c.condition_type != "Paused"
+                    && c.condition_type != crate::crd::CONDITION_TARGET_IDENTITY_BLOCKED
             });
             status.observed_generation = generation;
             status.last_attempted_generation = generation;
             status.last_successful_reconcile_time = Some(crate::crd::now_rfc3339());
             status.change_summary = Some(summary.clone());
-            status.last_reconcile_mode = Some(PolicyMode::Plan);
+            status.last_reconcile_mode = Some(PolicyMode::Observe);
             status.last_error = None;
             status.transient_failure_count = 0;
-            if let Some(ref plan_name) = plan_ref_name {
-                status.current_plan_ref = Some(crate::crd::PlanReference {
-                    name: plan_name.clone(),
-                });
-            }
+            // Cleared, not left alone, when there is no drift: a reference is
+            // a claim that a plan describes outstanding work, and with nothing
+            // outstanding there is no such plan.
+            status.current_plan_ref =
+                plan_ref_name
+                    .as_ref()
+                    .map(|plan_name| crate::crd::PlanReference {
+                        name: plan_name.clone(),
+                    });
         })
         .await?;
+
+        // Retire the plan the cleared reference pointed at. Ordered after the
+        // status write so a crash in between leaves a Pending plan the next
+        // reconcile finds and clears again, never a reference to nothing.
+        if !drift_detected {
+            supersede_referenced_plan_if_pending(ctx, resource, previous_plan_ref.as_ref()).await;
+        }
 
         info!(
             name,
@@ -1190,8 +1488,10 @@ async fn apply_under_lock(
                     &inspect_config,
                     resource.spec.reconciliation_mode,
                     identity.as_str(),
+                    &target_identity,
                     &summary,
                     &applied_password_source_versions,
+                    None,
                 )
                 .await?;
                 let plan_name = creation_result.plan_name().to_string();
@@ -1225,6 +1525,36 @@ async fn apply_under_lock(
                 let plan = plans_api.get(&plan_name).await?;
                 emit_plan_event(ctx, resource, &plan, PlanEventType::Approved).await;
                 emit_plan_event(ctx, resource, &plan, PlanEventType::ApplyStarted).await;
+
+                // Generated Secrets are created here, after approval and before
+                // any SQL runs. A failure aborts the apply with no DDL issued.
+                if let Err(err) = materialize_pending_generated_secrets(
+                    ctx,
+                    resource,
+                    namespace,
+                    &resolved_passwords,
+                    &mut changes,
+                    &mut applied_password_source_versions,
+                )
+                .await
+                {
+                    let message = err.to_string();
+                    if let Err(status_err) =
+                        crate::plan::mark_plan_failed(&ctx.kube_client, &plan, &message).await
+                    {
+                        tracing::warn!(plan = %plan_name, %status_err, "failed to mark plan Failed");
+                    }
+                    emit_plan_event(
+                        ctx,
+                        resource,
+                        &plan,
+                        PlanEventType::ApplyFailed {
+                            error: message.clone(),
+                        },
+                    )
+                    .await;
+                    return Err(err);
+                }
 
                 match crate::plan::execute_plan(&ctx.kube_client, &plan, pool, &sql_ctx, &changes)
                     .await
@@ -1261,6 +1591,13 @@ async fn apply_under_lock(
                 info!(name, namespace, "no changes needed");
             }
 
+            // The database now holds this content, however it got there — an
+            // auto-approved apply, or nothing to do because it was already
+            // converged. Either way a candidate proposing exactly this content
+            // has been promoted. Under `approval: auto` the gate is trivially
+            // satisfied, and this is the whole of promotion's effect.
+            record_promotion(ctx, resource, &content_digest).await;
+
             // Update status to Ready.
             update_status(ctx, resource, |status| {
                 status.set_condition(ready_condition(true, "Reconciled", "All changes applied"));
@@ -1270,6 +1607,7 @@ async fn apply_under_lock(
                         && c.condition_type != "Degraded"
                         && c.condition_type != "Conflict"
                         && c.condition_type != "Paused"
+                        && c.condition_type != crate::crd::CONDITION_TARGET_IDENTITY_BLOCKED
                 });
                 status.observed_generation = generation;
                 status.last_attempted_generation = generation;
@@ -1290,10 +1628,21 @@ async fn apply_under_lock(
         crate::crd::ApprovalMode::Manual => {
             // Manual approval: check for an existing approved plan, or create one.
 
-            // First, check if there is a current pending plan that has been approved.
-            if let Some(current_plan) =
-                crate::plan::get_current_actionable_plan(&ctx.kube_client, resource).await?
-            {
+            // First, check if there is a current pending plan that has been
+            // approved — or, when this reconcile is the promotion of an
+            // approved candidate, that candidate's plan, which *is* this
+            // policy's plan for this transition. Adopting it rather than
+            // minting an approval on a fresh plan is what keeps promotion from
+            // adding a trusted step: the plan below carries the human decision,
+            // the `decidedBy`, the approved change digest and the bound target
+            // identity, and it goes through the identical verification.
+            let current_plan = match promoted_plan.clone() {
+                Some(plan) => Some(plan),
+                None => {
+                    crate::plan::get_current_actionable_plan(&ctx.kube_client, resource).await?
+                }
+            };
+            if let Some(current_plan) = current_plan {
                 let approval_state = crate::plan::check_plan_approval(&current_plan);
 
                 match approval_state {
@@ -1307,15 +1656,85 @@ async fn apply_under_lock(
                             &changes,
                             resource.spec.reconciliation_mode,
                             identity.as_str(),
+                            &target_identity,
                             &applied_password_source_versions,
+                            &inspect_config.managed_roles,
+                            &inspect_config.managed_schemas,
                         )?;
-                        let decision = crate::plan::decide_approved_plan(
+                        // Before anything else, ask whether this is even the
+                        // database the reviewer approved against. The identity
+                        // is bound into the digest, so a moved target already
+                        // fails the comparison below — this seam exists to say
+                        // *why*, with a reason a human can act on, rather than
+                        // reporting a target change as an effects change.
+                        let approved_identity = current_plan
+                            .status
+                            .as_ref()
+                            .map(crate::plan::plan_target_identity)
+                            .unwrap_or_default();
+                        let verdict = pgroles_core::approval::evaluate_target_identity(
+                            &approved_identity,
+                            &target_identity,
+                            resource.spec.connection.requires_physical_identity(),
+                        );
+                        if let pgroles_core::approval::TargetIdentityVerdict::Superseded(reason)
+                        | pgroles_core::approval::TargetIdentityVerdict::Blocked(reason) =
+                            verdict
+                        {
+                            tracing::warn!(
+                                plan = %current_plan.name_any(),
+                                reason = reason.as_str(),
+                                "approved plan will not execute: {}",
+                                reason.message()
+                            );
+                            emit_plan_event(
+                                ctx,
+                                resource,
+                                &current_plan,
+                                PlanEventType::TargetIdentityChanged {
+                                    reason: reason.as_str().to_string(),
+                                    detail: reason.message().to_string(),
+                                },
+                            )
+                            .await;
+                        }
+
+                        let mut decision = crate::plan::decide_approved_plan(
                             current_plan.status.as_ref(),
                             &fresh_digest,
                             !changes.is_empty(),
                         );
+                        // Belt and braces: the digest already binds the
+                        // identity, so this cannot currently disagree — but a
+                        // future encoding that dropped the binding must not
+                        // silently re-enable execution against a moved target.
+                        if verdict != pgroles_core::approval::TargetIdentityVerdict::Proceed
+                            && decision == crate::plan::ApprovedPlanDecision::Execute
+                        {
+                            decision = crate::plan::ApprovedPlanDecision::Replace;
+                        }
 
                         if decision != crate::plan::ApprovedPlanDecision::Execute {
+                            // Name the actual cause on the condition. A moved
+                            // target reads as an effects change through the
+                            // digest alone, and telling a reviewer their
+                            // effects changed when the database moved sends
+                            // them to inspect the wrong thing.
+                            let supersede_cause = match verdict {
+                                pgroles_core::approval::TargetIdentityVerdict::Superseded(
+                                    reason,
+                                )
+                                | pgroles_core::approval::TargetIdentityVerdict::Blocked(reason) => {
+                                    crate::plan::SupersedeCause::TargetChanged(reason)
+                                }
+                                pgroles_core::approval::TargetIdentityVerdict::Proceed => {
+                                    if decision == crate::plan::ApprovedPlanDecision::Clear {
+                                        crate::plan::SupersedeCause::EffectsCleared
+                                    } else {
+                                        crate::plan::SupersedeCause::EffectsChanged
+                                    }
+                                }
+                            };
                             // The approved effects are no longer the effects
                             // this policy would produce.
                             let stored_digest = current_plan
@@ -1326,11 +1745,10 @@ async fn apply_under_lock(
                                 plan = %current_plan.name_any(),
                                 stored_digest = ?stored_digest,
                                 fresh_digest = %fresh_digest,
-                                "approved plan superseded: effects changed since approval"
+                                reason = supersede_cause.reason(),
+                                "approved plan superseded: {}",
+                                supersede_cause.message()
                             );
-
-                            crate::plan::mark_plan_superseded(&ctx.kube_client, &current_plan)
-                                .await?;
 
                             // The effects did not just move, they vanished —
                             // someone applied them by hand, or an edit removed
@@ -1343,6 +1761,25 @@ async fn apply_under_lock(
                                     plan = %current_plan.name_any(),
                                     "approved plan superseded with no remaining changes"
                                 );
+
+                                // No replacement is created on this path, so
+                                // this is the one place the supersede has to
+                                // happen here rather than after a create. A
+                                // crash between the two leaves the plan
+                                // Superseded and the reference behind, which
+                                // the next reconcile clears through the same
+                                // helper.
+                                crate::plan::mark_plan_superseded(
+                                    &ctx.kube_client,
+                                    &current_plan,
+                                    supersede_cause,
+                                )
+                                .await?;
+
+                                // The database already holds this content:
+                                // a candidate proposing it has been promoted,
+                                // even though this reconcile executed nothing.
+                                record_promotion(ctx, resource, &content_digest).await;
 
                                 mark_reconciled_no_changes(
                                     ctx,
@@ -1368,8 +1805,10 @@ async fn apply_under_lock(
                                 &inspect_config,
                                 resource.spec.reconciliation_mode,
                                 identity.as_str(),
+                                &target_identity,
                                 &summary,
                                 &applied_password_source_versions,
+                                None,
                             )
                             .await?;
                             let new_plan_name = new_creation_result.plan_name().to_string();
@@ -1396,14 +1835,28 @@ async fn apply_under_lock(
                             )
                             .await?;
 
-                            let msg = format!(
-                                "Plan {} superseded (DB state changed); new plan {} created with {} change(s) awaiting approval",
-                                current_plan.name_any(),
-                                new_plan_name,
-                                summary.total,
-                            );
+                            let report = planned_report(&new_creation_result, summary.total.into());
+                            // The old plan is retired by `create_or_update_plan`
+                            // once the replacement exists — except in the
+                            // failed-backoff case, where nothing replaced it
+                            // and claiming otherwise would misreport it.
+                            let msg = if new_creation_result.is_failed_backoff() {
+                                format!(
+                                    "Plan {} can no longer be executed ({}); {}",
+                                    current_plan.name_any(),
+                                    supersede_cause.message(),
+                                    report.message,
+                                )
+                            } else {
+                                format!(
+                                    "Plan {} superseded ({}); {}",
+                                    current_plan.name_any(),
+                                    supersede_cause.message(),
+                                    report.message,
+                                )
+                            };
                             update_status(ctx, resource, |status| {
-                                status.set_condition(ready_condition(true, "Planned", &msg));
+                                status.set_condition(ready_condition(true, report.reason, &msg));
                                 status.set_condition(drifted_condition(
                                     true,
                                     "DriftDetected",
@@ -1414,6 +1867,8 @@ async fn apply_under_lock(
                                         && c.condition_type != "Degraded"
                                         && c.condition_type != "Conflict"
                                         && c.condition_type != "Paused"
+                                        && c.condition_type
+                                            != crate::crd::CONDITION_TARGET_IDENTITY_BLOCKED
                                 });
                                 status.last_attempted_generation = generation;
                                 status.change_summary = Some(summary.clone());
@@ -1447,8 +1902,11 @@ async fn apply_under_lock(
                         crate::plan::mark_plan_approved(
                             &ctx.kube_client,
                             &current_plan,
+                            // Only reached for a plan with no decision on it,
+                            // which the manual path cannot produce — the
+                            // reviewer's own decision is preserved instead.
                             "ManuallyApproved",
-                            "Plan approved via annotation",
+                            "Plan approved by a reviewer",
                         )
                         .await?;
 
@@ -1457,6 +1915,42 @@ async fn apply_under_lock(
                         let plan = plans_api.get(&current_plan.name_any()).await?;
 
                         emit_plan_event(ctx, resource, &plan, PlanEventType::ApplyStarted).await;
+
+                        // Generated Secrets are created here, after the human
+                        // decision and before any SQL runs. A failure aborts the
+                        // apply with no DDL issued.
+                        if let Err(err) = materialize_pending_generated_secrets(
+                            ctx,
+                            resource,
+                            namespace,
+                            &resolved_passwords,
+                            &mut changes,
+                            &mut applied_password_source_versions,
+                        )
+                        .await
+                        {
+                            let message = err.to_string();
+                            if let Err(status_err) =
+                                crate::plan::mark_plan_failed(&ctx.kube_client, &plan, &message)
+                                    .await
+                            {
+                                tracing::warn!(
+                                    plan = %plan.name_any(),
+                                    %status_err,
+                                    "failed to mark plan Failed"
+                                );
+                            }
+                            emit_plan_event(
+                                ctx,
+                                resource,
+                                &plan,
+                                PlanEventType::ApplyFailed {
+                                    error: message.clone(),
+                                },
+                            )
+                            .await;
+                            return Err(err);
+                        }
 
                         match crate::plan::execute_plan(
                             &ctx.kube_client,
@@ -1491,6 +1985,13 @@ async fn apply_under_lock(
                         }
 
                         ctx.observability.record_apply_result("success");
+
+                        // The approved effects executed. If they were a
+                        // candidate's content, that candidate is now promoted —
+                        // whether the approval came from the candidate's own
+                        // plan (the gate) or from a fresh policy plan approved
+                        // after a `PromotedWithoutApproval` fallback.
+                        record_promotion(ctx, resource, &content_digest).await;
 
                         // Update status to Ready.
                         update_status(ctx, resource, |status| {
@@ -1535,7 +2036,7 @@ async fn apply_under_lock(
                             name,
                             namespace,
                             plan = %current_plan.name_any(),
-                            "plan rejected via annotation"
+                            "plan rejected by a terminal Denied decision"
                         );
 
                         // Update status to reflect rejection, but don't create a new plan
@@ -1569,7 +2070,10 @@ async fn apply_under_lock(
                             &changes,
                             resource.spec.reconciliation_mode,
                             identity.as_str(),
+                            &target_identity,
                             &applied_password_source_versions,
+                            &inspect_config.managed_roles,
+                            &inspect_config.managed_schemas,
                         )?;
                         let plan_status = current_plan.status.as_ref();
                         let decision = crate::plan::decide_pending_plan(
@@ -1590,14 +2094,25 @@ async fn apply_under_lock(
                                 "pending plan superseded while awaiting approval"
                             );
 
-                            crate::plan::mark_plan_superseded(&ctx.kube_client, &current_plan)
-                                .await?;
-
                             // The effects did not just move, they vanished. A
                             // replacement plan here would hold nothing and still
                             // demand a decision, so leave the policy with no
                             // pending plan at all.
                             if decision == crate::plan::PendingPlanDecision::Clear {
+                                // Nothing replaces this plan, so it is retired
+                                // here rather than after a create.
+                                crate::plan::mark_plan_superseded(
+                                    &ctx.kube_client,
+                                    &current_plan,
+                                    crate::plan::SupersedeCause::EffectsCleared,
+                                )
+                                .await?;
+
+                                // The database already holds this content:
+                                // a candidate proposing it has been promoted,
+                                // even though this reconcile executed nothing.
+                                record_promotion(ctx, resource, &content_digest).await;
+
                                 mark_reconciled_no_changes(
                                     ctx,
                                     resource,
@@ -1621,18 +2136,18 @@ async fn apply_under_lock(
                                 &inspect_config,
                                 resource.spec.reconciliation_mode,
                                 identity.as_str(),
+                                &target_identity,
                                 &summary,
                                 &applied_password_source_versions,
+                                None,
                             )
                             .await?;
                             let replacement = creation_result.plan_name().to_string();
+                            let report = planned_report(&creation_result, summary.total.into());
 
                             update_status(ctx, resource, |status| {
-                                let msg = format!(
-                                    "Plan {replacement} awaiting approval; {} change(s) pending",
-                                    summary.total,
-                                );
-                                status.set_condition(ready_condition(true, "Planned", &msg));
+                                let msg = report.message.clone();
+                                status.set_condition(ready_condition(true, report.reason, &msg));
                                 // Replace implies a non-empty change set; the
                                 // empty case returned above as Clear.
                                 status.set_condition(drifted_condition(
@@ -1645,6 +2160,8 @@ async fn apply_under_lock(
                                         && c.condition_type != "Degraded"
                                         && c.condition_type != "Conflict"
                                         && c.condition_type != "Paused"
+                                        && c.condition_type
+                                            != crate::crd::CONDITION_TARGET_IDENTITY_BLOCKED
                                 });
                                 status.last_attempted_generation = generation;
                                 status.change_summary = Some(summary.clone());
@@ -1733,6 +2250,11 @@ async fn apply_under_lock(
                 // previously it left a reference to whatever plan had been
                 // superseded, which outlived the plan itself once retention
                 // pruned it.
+                // Nothing to do because the content is already the
+                // database's state — which promotes a candidate that proposed
+                // exactly this content.
+                record_promotion(ctx, resource, &content_digest).await;
+
                 mark_reconciled_no_changes(
                     ctx,
                     resource,
@@ -1757,8 +2279,10 @@ async fn apply_under_lock(
                 &inspect_config,
                 resource.spec.reconciliation_mode,
                 identity.as_str(),
+                &target_identity,
                 &summary,
                 &applied_password_source_versions,
+                None,
             )
             .await?;
             let plan_name = creation_result.plan_name().to_string();
@@ -1781,12 +2305,10 @@ async fn apply_under_lock(
 
             crate::plan::update_policy_plan_ref(&ctx.kube_client, resource, &plan_name).await?;
 
-            let msg = format!(
-                "Plan {plan_name} created; {} change(s) awaiting approval",
-                summary.total,
-            );
+            let report = planned_report(&creation_result, summary.total.into());
+            let msg = report.message.clone();
             update_status(ctx, resource, |status| {
-                status.set_condition(ready_condition(true, "Planned", &msg));
+                status.set_condition(ready_condition(true, report.reason, &msg));
                 status.set_condition(drifted_condition(
                     true,
                     "DriftDetected",
@@ -1797,6 +2319,7 @@ async fn apply_under_lock(
                         && c.condition_type != "Degraded"
                         && c.condition_type != "Conflict"
                         && c.condition_type != "Paused"
+                        && c.condition_type != crate::crd::CONDITION_TARGET_IDENTITY_BLOCKED
                 });
                 status.last_attempted_generation = generation;
                 status.change_summary = Some(summary.clone());
@@ -1826,9 +2349,11 @@ async fn apply_under_lock(
 ///
 /// For each role that declares a `password`:
 /// - `PasswordSpec::SecretRef`: fetches the password from the referenced Secret.
-/// - `PasswordSpec::Generate`: reads the generated Secret if it exists; in
-///   apply mode it creates the Secret if needed, while in plan mode it keeps
-///   reconciliation non-mutating and synthesizes an in-memory password.
+/// - `PasswordSpec::Generate`: reads the generated Secret if it exists. If it
+///   does not, an in-memory password is synthesized and the entry is marked for
+///   materialization — resolution itself never writes, in any mode. The Secret
+///   is created by [`materialize_pending_generated_secrets`] immediately before
+///   the approved plan executes (#181).
 ///
 /// Returns a map of role name → cleartext password string suitable for
 /// [`pgroles_core::diff::inject_password_changes`] (which computes the
@@ -1837,6 +2362,23 @@ async fn resolve_passwords_from_secrets(
     ctx: &OperatorContext,
     resource: &PostgresPolicy,
     namespace: &str,
+) -> Result<std::collections::BTreeMap<String, ResolvedPassword>, ReconcileError> {
+    resolve_passwords_for_roles(ctx, resource, namespace, &resource.spec.roles, true).await
+}
+
+/// Resolve passwords for an arbitrary role set in the parent policy's context.
+///
+/// Candidate planning uses this with the candidate's own roles: generated
+/// Secret names are derived from the *parent policy* name, because that is
+/// what promotion would produce, and `warn_on_missing` is off — a candidate
+/// has no applied history of its own, so "the Secret disappeared" is not a
+/// statement it can make.
+pub(crate) async fn resolve_passwords_for_roles(
+    ctx: &OperatorContext,
+    resource: &PostgresPolicy,
+    namespace: &str,
+    role_specs: &[crate::crd::RoleSpec],
+    warn_on_missing: bool,
 ) -> Result<std::collections::BTreeMap<String, ResolvedPassword>, ReconcileError> {
     use k8s_openapi::api::core::v1::Secret;
 
@@ -1850,7 +2392,7 @@ async fn resolve_passwords_from_secrets(
     let secrets_api: kube::Api<Secret> = kube::Api::namespaced(ctx.kube_client.clone(), namespace);
 
     // First pass: fetch all referenced Secrets for secretRef roles.
-    for role_spec in &resource.spec.roles {
+    for role_spec in role_specs {
         if role_spec.external {
             continue;
         }
@@ -1872,66 +2414,83 @@ async fn resolve_passwords_from_secrets(
     }
 
     // Second pass: resolve passwords from cache (secretRef) or generate.
-    for role_spec in &resource.spec.roles {
+    for role_spec in role_specs {
         if role_spec.external {
             continue;
         }
         if let Some(pw) = &role_spec.password {
             if let Some(gen_spec) = &pw.generate {
-                let password = if resource.spec.mode == PolicyMode::Plan {
-                    match crate::password::get_generated_secret(
-                        ctx.kube_client.clone(),
-                        namespace,
-                        &resource.name_any(),
-                        &role_spec.name,
-                        gen_spec,
-                    )
-                    .await
-                    .map_err(Box::new)?
-                    {
-                        Some(existing) => existing,
-                        None => {
-                            let secret_name = crate::password::generated_secret_name(
-                                &resource.name_any(),
+                // Resolution never writes: planning must not leave a credential
+                // behind for a plan that is rejected or never approved. An
+                // existing Secret is read; a missing one resolves to an
+                // in-memory password plus the `:missing` sentinel version, and
+                // the Secret is created just before the plan executes.
+                let existing = crate::password::get_generated_secret(
+                    ctx.kube_client.clone(),
+                    namespace,
+                    &resource.name_any(),
+                    &role_spec.name,
+                    gen_spec,
+                )
+                .await
+                .map_err(Box::new)?;
+
+                let entry = match existing {
+                    Some(existing) => {
+                        ResolvedPassword::existing(existing.password, existing.source_version)
+                    }
+                    None => {
+                        let secret_name = crate::password::generated_secret_name(
+                            &resource.name_any(),
+                            &role_spec.name,
+                            gen_spec,
+                        );
+                        let secret_key = crate::password::generated_secret_key(gen_spec);
+                        let sentinel = crate::password::missing_generated_secret_source_version(
+                            &secret_name,
+                            &secret_key,
+                        );
+
+                        // A recorded version that is not the sentinel means a
+                        // real Secret existed and has since been deleted. The
+                        // next plan legitimately rotates the password, but that
+                        // is worth saying out loud.
+                        if warn_on_missing
+                            && recorded_source_version_was_real(
+                                resource,
                                 &role_spec.name,
-                                gen_spec,
-                            );
-                            let secret_key = crate::password::generated_secret_key(gen_spec);
-                            let cleartext = crate::password::generate_password(
+                                &sentinel,
+                            )
+                        {
+                            emit_policy_warning(
+                                ctx,
+                                resource,
+                                "GeneratedSecretMissing",
+                                "PasswordGeneration",
+                                format!(
+                                    "generated Secret \"{secret_name}\" for role \
+                                     \"{}\" disappeared; regenerating and rotating password",
+                                    role_spec.name
+                                ),
+                            )
+                            .await;
+                        }
+
+                        ResolvedPassword {
+                            cleartext: crate::password::generate_password(
                                 gen_spec
                                     .length
                                     .unwrap_or(crate::password::DEFAULT_PASSWORD_LENGTH),
-                            );
-
-                            crate::password::GeneratedPasswordSecret {
-                                password: cleartext,
-                                source_version:
-                                    crate::password::missing_generated_secret_source_version(
-                                        &secret_name,
-                                        &secret_key,
-                                    ),
-                            }
+                            ),
+                            source_version: sentinel,
+                            pending_materialization: Some(PendingGeneratedSecret {
+                                role: role_spec.name.clone(),
+                                spec: gen_spec.clone(),
+                            }),
                         }
                     }
-                } else {
-                    // Apply mode — ensure a Secret exists with a generated password.
-                    crate::password::ensure_generated_secret(
-                        ctx.kube_client.clone(),
-                        namespace,
-                        resource,
-                        &role_spec.name,
-                        gen_spec,
-                    )
-                    .await
-                    .map_err(Box::new)?
                 };
-                resolved.insert(
-                    role_spec.name.clone(),
-                    ResolvedPassword {
-                        cleartext: password.password,
-                        source_version: password.source_version,
-                    },
-                );
+                resolved.insert(role_spec.name.clone(), entry);
             } else if pw.secret_ref.is_some() {
                 // SecretRef mode — read from an existing Secret.
                 let password = resolve_password_from_cache(&role_spec.name, pw, &secret_cache)?;
@@ -1999,10 +2558,89 @@ fn resolve_password_from_cache(
         .resource_version
         .as_deref()
         .unwrap_or("unknown");
-    Ok(ResolvedPassword {
-        cleartext: password,
-        source_version: format!("{secret_name}:{secret_key}:{resource_version}"),
-    })
+    Ok(ResolvedPassword::existing(
+        password,
+        format!("{secret_name}:{secret_key}:{resource_version}"),
+    ))
+}
+
+/// Returns `true` when the policy previously recorded a real (non-sentinel)
+/// source version for this role's generated password.
+fn recorded_source_version_was_real(resource: &PostgresPolicy, role: &str, sentinel: &str) -> bool {
+    resource
+        .status
+        .as_ref()
+        .and_then(|status| status.applied_password_source_versions.get(role))
+        .is_some_and(|recorded| recorded != sentinel)
+}
+
+/// Create the Kubernetes Secrets for generated passwords that planning left
+/// unmaterialized, immediately before the approved plan executes.
+///
+/// Ordering is deliberate: the Secret is written *before* the SQL transaction.
+/// A crash between the two leaves an unused Secret which the next reconcile
+/// adopts and applies; the reverse order could commit a password to the
+/// database that exists nowhere else.
+///
+/// `ensure_generated_secret` is create-or-read, so a Secret written concurrently
+/// by another replica wins. When it does, the plan's `SetPassword` verifier is
+/// rebuilt from the Secret's cleartext so the database matches what the Secret
+/// hands to applications.
+///
+/// The returned source versions replace the planning-time `:missing` sentinels
+/// in `applied_password_source_versions`, so the status records the version the
+/// database was actually set from. Recording the sentinel instead would make
+/// the very next reconcile see a changed source and emit a spurious plan.
+async fn materialize_pending_generated_secrets(
+    ctx: &OperatorContext,
+    resource: &PostgresPolicy,
+    namespace: &str,
+    resolved_passwords: &std::collections::BTreeMap<String, ResolvedPassword>,
+    changes: &mut [pgroles_core::diff::Change],
+    applied_password_source_versions: &mut std::collections::BTreeMap<String, String>,
+) -> Result<(), ReconcileError> {
+    for resolved in resolved_passwords.values() {
+        let Some(pending) = &resolved.pending_materialization else {
+            continue;
+        };
+
+        let materialized = crate::password::ensure_generated_secret(
+            ctx.kube_client.clone(),
+            namespace,
+            resource,
+            &pending.role,
+            &pending.spec,
+        )
+        .await
+        .map_err(Box::new)?;
+
+        applied_password_source_versions
+            .insert(pending.role.clone(), materialized.source_version.clone());
+
+        if materialized.password != resolved.cleartext {
+            // Another writer created the Secret first. The plan's verifier was
+            // computed from the password we generated, which nothing will ever
+            // read — set the database from the Secret's password instead.
+            tracing::info!(
+                role = %pending.role,
+                "generated Secret already existed at execution time; \
+                 rebuilding password change from its contents"
+            );
+            let verifier = pgroles_core::scram::compute_verifier(
+                &materialized.password,
+                pgroles_core::scram::DEFAULT_ITERATIONS,
+            );
+            for change in changes.iter_mut() {
+                if let pgroles_core::diff::Change::SetPassword { name, password } = change
+                    && name == &pending.role
+                {
+                    *password = verifier.clone();
+                }
+            }
+        }
+    }
+
+    Ok(())
 }
 
 /// Resolve passwords from a pre-populated cache (for unit testing without K8s).
@@ -2026,7 +2664,7 @@ fn resolve_passwords_from_cached_secrets(
     Ok(resolved)
 }
 
-fn select_password_changes(
+pub(crate) fn select_password_changes(
     changes: &[pgroles_core::diff::Change],
     resolved_passwords: &std::collections::BTreeMap<String, ResolvedPassword>,
     status: Option<&PostgresPolicyStatus>,
@@ -2051,7 +2689,12 @@ fn select_password_changes(
 
     for (role, resolved) in resolved_passwords {
         current_versions.insert(role.clone(), resolved.source_version.clone());
+        // An unmaterialized generated password always needs applying: the
+        // recorded version could only match the `:missing` sentinel if a
+        // previous run recorded it, and no database ever received that
+        // password.
         if created_roles.contains(role.as_str())
+            || resolved.pending_materialization.is_some()
             || previous_versions.get(role) != Some(&resolved.source_version)
         {
             password_changes.insert(role.clone(), resolved.cleartext.clone());
@@ -2115,7 +2758,7 @@ fn accumulate_summary(summary: &mut ChangeSummary, change: &pgroles_core::diff::
     }
 }
 
-fn summarize_changes(changes: &[pgroles_core::diff::Change]) -> ChangeSummary {
+pub(crate) fn summarize_changes(changes: &[pgroles_core::diff::Change]) -> ChangeSummary {
     let mut summary = ChangeSummary::default();
     for change in changes {
         accumulate_summary(&mut summary, change);
@@ -2185,6 +2828,28 @@ pub(crate) async fn detect_sql_context(
     )
 }
 
+/// Emit a Warning event on the policy, logging failures rather than failing the
+/// reconcile — the event is a notification, not a control-flow step.
+async fn emit_policy_warning(
+    ctx: &OperatorContext,
+    policy: &PostgresPolicy,
+    reason: &str,
+    action: &str,
+    note: String,
+) {
+    tracing::warn!(policy = %policy.name_any(), reason, note = %note, "policy warning");
+    if let Err(error) =
+        crate::events::publish_policy_warning(&ctx.event_recorder, policy, reason, action, note)
+            .await
+    {
+        tracing::warn!(
+            policy = %policy.name_any(),
+            %error,
+            "failed to publish policy warning event"
+        );
+    }
+}
+
 /// Emit a plan lifecycle event on the parent policy, logging warnings on failure.
 async fn emit_plan_event(
     ctx: &OperatorContext,
@@ -2204,6 +2869,22 @@ async fn emit_plan_event(
 }
 
 /// Patch the status sub-resource of a PostgresPolicy.
+/// Promotion bookkeeping after the database converged on the policy's content.
+///
+/// Never fatal. The SQL has already run (or was never needed), so failing the
+/// reconcile here would retry an apply to fix a status write — and the next
+/// reconcile re-recognises the same promotion and writes it anyway, because
+/// recognition is by digest and not by a one-shot transition.
+async fn record_promotion(ctx: &OperatorContext, resource: &PostgresPolicy, content_digest: &str) {
+    if let Err(err) = crate::promotion::record_promotion(ctx, resource, content_digest).await {
+        tracing::warn!(
+            policy = %resource.name_any(),
+            %err,
+            "failed to record candidate promotion; will retry on the next reconcile"
+        );
+    }
+}
+
 /// Record that the policy is in sync with nothing left to do.
 ///
 /// Three paths reach this state under manual approval — no plan and no changes,
@@ -2217,6 +2898,11 @@ async fn mark_reconciled_no_changes(
     summary: crate::crd::ChangeSummary,
     applied_password_source_versions: std::collections::BTreeMap<String, String>,
 ) -> Result<(), ReconcileError> {
+    let previous_plan_ref = resource
+        .status
+        .as_ref()
+        .and_then(|status| status.current_plan_ref.clone());
+
     update_status(ctx, resource, |status| {
         status.set_condition(ready_condition(true, "Reconciled", "No changes needed"));
         status.set_condition(drifted_condition(false, "InSync", "No pending changes"));
@@ -2238,7 +2924,92 @@ async fn mark_reconciled_no_changes(
         status.applied_password_source_versions = applied_password_source_versions;
         status.transient_failure_count = 0;
     })
+    .await?;
+
+    // Only after the reference is gone: a crash here leaves a Pending plan
+    // that the next reconcile still finds, whereas superseding first and
+    // crashing would strand the reference on a plan nobody can act on.
+    supersede_referenced_plan_if_pending(ctx, resource, previous_plan_ref.as_ref()).await;
+
+    Ok(())
+}
+
+/// Retire a plan a just-cleared `current_plan_ref` pointed at, if it is still
+/// Pending.
+///
+/// Best-effort by design: the reference is already gone, so a failure here
+/// costs a stale Pending plan that the next reconcile or plan retention
+/// collects — not a wedged reconcile.
+async fn supersede_referenced_plan_if_pending(
+    ctx: &OperatorContext,
+    resource: &PostgresPolicy,
+    plan_ref: Option<&crate::crd::PlanReference>,
+) {
+    let (Some(plan_ref), Some(namespace)) = (plan_ref, resource.namespace()) else {
+        return;
+    };
+
+    let plans_api: Api<PostgresPolicyPlan> = Api::namespaced(ctx.kube_client.clone(), &namespace);
+    let plan = match plans_api.get_opt(&plan_ref.name).await {
+        Ok(Some(plan)) => plan,
+        Ok(None) => return,
+        Err(err) => {
+            tracing::warn!(
+                plan = %plan_ref.name,
+                error = %err,
+                "could not read the plan a cleared reference pointed at"
+            );
+            return;
+        }
+    };
+
+    if plan.status.as_ref().map(|s| &s.phase) != Some(&crate::crd::PlanPhase::Pending) {
+        return;
+    }
+
+    if let Err(err) = crate::plan::mark_plan_superseded(
+        &ctx.kube_client,
+        &plan,
+        crate::plan::SupersedeCause::PolicyStoppedPlanning,
+    )
     .await
+    {
+        tracing::warn!(
+            plan = %plan_ref.name,
+            error = %err,
+            "could not supersede the plan a cleared reference pointed at"
+        );
+    }
+}
+
+/// Ready-condition wording for a reconcile that just planned changes.
+///
+/// `create_or_update_plan` can answer with a plan that is *not* awaiting a
+/// decision: when an identical change set failed recently, the failed plan is
+/// held in its retry window instead of a new one being opened. Reporting that
+/// as "awaiting approval" sends a reviewer to a Failed plan looking for a
+/// decision to make.
+struct PlannedReport {
+    reason: &'static str,
+    message: String,
+}
+
+fn planned_report(result: &crate::plan::PlanCreationResult, total: i64) -> PlannedReport {
+    let plan_name = result.plan_name();
+    if result.is_failed_backoff() {
+        PlannedReport {
+            reason: "PlanFailedRetryBackoff",
+            message: format!(
+                "Plan {plan_name} holds these exact {total} change(s) and failed recently; \
+                 it is in its retry backoff window and no plan is awaiting approval"
+            ),
+        }
+    } else {
+        PlannedReport {
+            reason: "Planned",
+            message: format!("Plan {plan_name} created; {total} change(s) awaiting approval"),
+        }
+    }
 }
 
 async fn update_status<F>(
@@ -2253,7 +3024,7 @@ where
     let name = resource.name_any();
 
     let api: Api<PostgresPolicy> = Api::namespaced(ctx.kube_client.clone(), &namespace);
-    let latest = api.get(&name).await?;
+    let latest = bounded_k8s_call("get PostgresPolicy", api.get(&name)).await?;
     let old_status = latest.status.clone();
     let mut status = old_status.clone().unwrap_or_default();
 
@@ -2265,16 +3036,20 @@ where
     // was set while this reconcile ran, the snapshot would re-add a condition
     // that no longer applies.
     apply_approval_deprecation_condition(&latest, &mut status);
+    apply_mode_deprecation_condition(&latest, &mut status);
     clear_stale_approval_ignored_condition(&latest, &mut status);
 
     let patch = serde_json::json!({
         "status": status
     });
 
-    api.patch_status(
-        &name,
-        &PatchParams::apply("pgroles-operator"),
-        &Patch::Merge(&patch),
+    bounded_k8s_call(
+        "patch PostgresPolicy status",
+        api.patch_status(
+            &name,
+            &PatchParams::apply("pgroles-operator"),
+            &Patch::Merge(&patch),
+        ),
     )
     .await?;
 
@@ -2306,14 +3081,26 @@ fn apply_approval_deprecation_condition(
     ));
 }
 
-/// Clear `ApprovalIgnored` for any policy that is not in plan mode. The plan
+/// Carry a `ModeValueDeprecated` condition while `spec.mode` is spelled
+/// `plan`; writing `observe` clears it on the next reconcile.
+fn apply_mode_deprecation_condition(resource: &PostgresPolicy, status: &mut PostgresPolicyStatus) {
+    if !resource.spec.mode.is_deprecated_spelling() {
+        status.conditions.retain(|condition| {
+            condition.condition_type != crate::crd::CONDITION_MODE_VALUE_DEPRECATED
+        });
+        return;
+    }
+    status.set_condition(crate::crd::mode_value_deprecated_condition());
+}
+
+/// Clear `ApprovalIgnored` for any policy that is not in observe mode. The observe
 /// path maintains the condition itself; this only stops a stale one surviving a
 /// switch to `mode: apply`, where an approval is no longer ignored.
 fn clear_stale_approval_ignored_condition(
     resource: &PostgresPolicy,
     status: &mut PostgresPolicyStatus,
 ) {
-    if resource.spec.mode != PolicyMode::Plan {
+    if !resource.spec.mode.never_executes() {
         status
             .conditions
             .retain(|condition| condition.condition_type != crate::crd::CONDITION_APPROVAL_IGNORED);
@@ -2330,7 +3117,7 @@ async fn detect_policy_conflict(
         Some(namespace) => Api::namespaced(ctx.kube_client.clone(), namespace),
         None => Api::all(ctx.kube_client.clone()),
     };
-    let policies = api.list(&Default::default()).await?;
+    let policies = bounded_k8s_call("list PostgresPolicy", api.list(&Default::default())).await?;
 
     Ok(detect_policy_conflict_in_list(
         resource,
@@ -2448,6 +3235,7 @@ impl ReconcileError {
             ReconcileError::PasswordGeneration(_) => "SecretFetchFailed",
             ReconcileError::PlanSqlStorage(_) => "PlanSqlStorageFailed",
             ReconcileError::Kube(_) => "KubernetesApiError",
+            ReconcileError::ApiStalled(_, _) => "KubernetesApiStalled",
             ReconcileError::NoNamespace => "InvalidResource",
             ReconcileError::PendingEphemeralAccessCleanup(_) => "EphemeralAccessCleanupPending",
         }
@@ -2473,6 +3261,58 @@ mod tests {
     use std::collections::BTreeMap;
     use std::error::Error as StdError;
     use std::fmt;
+
+    fn edge(role: &str, member: &str) -> pgroles_core::model::MembershipEdge {
+        pgroles_core::model::MembershipEdge {
+            role: role.to_string(),
+            member: member.to_string(),
+            inherit: true,
+            admin: false,
+        }
+    }
+
+    #[test]
+    fn the_overlay_handed_to_candidates_is_only_what_the_overlay_added() {
+        let mut declared = pgroles_core::model::RoleGraph::default();
+        declared.memberships.insert(edge("app_rw", "service"));
+
+        let mut effective = declared.clone();
+        effective.memberships.insert(edge("oncall_admin", "carol"));
+
+        assert_eq!(
+            overlay_edges(&declared, &effective),
+            vec![edge("oncall_admin", "carol")]
+        );
+        // A durable membership the policy declares is not an overlay, even
+        // though an ephemeral request may also want it — attributing it to the
+        // overlay would force fresh review of every candidate that touches it.
+        assert!(overlay_edges(&declared, &declared).is_empty());
+    }
+
+    #[test]
+    fn a_failed_plan_held_in_backoff_is_not_reported_as_awaiting_approval() {
+        // Pointing a reviewer at a Failed plan with "awaiting approval" is the
+        // bug: there is no decision to make, only a retry window to wait out.
+        let backoff = planned_report(
+            &crate::plan::PlanCreationResult::DeduplicatedFailed("plan-old".to_string()),
+            3,
+        );
+        assert_eq!(backoff.reason, "PlanFailedRetryBackoff");
+        assert!(backoff.message.contains("plan-old"));
+        assert!(backoff.message.contains("failed recently"));
+        assert!(backoff.message.contains("retry backoff window"));
+        assert!(!backoff.message.contains("created;"));
+
+        for result in [
+            crate::plan::PlanCreationResult::Created("plan-new".to_string()),
+            crate::plan::PlanCreationResult::Deduplicated("plan-new".to_string()),
+        ] {
+            let report = planned_report(&result, 3);
+            assert_eq!(report.reason, "Planned");
+            assert!(report.message.contains("plan-new"));
+            assert!(report.message.contains("3 change(s) awaiting approval"));
+        }
+    }
 
     #[derive(Debug)]
     struct TestDatabaseError {
@@ -2564,6 +3404,7 @@ mod tests {
                 }),
                 secret_key: Some("DATABASE_URL".to_string()),
                 params: None,
+                require_physical_identity: None,
             },
             interval: interval.to_string(),
             suspend: false,
@@ -2604,6 +3445,7 @@ mod tests {
                     }),
                     secret_key: Some("DATABASE_URL".to_string()),
                     params: None,
+                    require_physical_identity: None,
                 },
                 interval: "5m".to_string(),
                 suspend: false,
@@ -2646,7 +3488,7 @@ mod tests {
 
     #[test]
     fn approval_deprecation_condition_reports_inference_per_mode() {
-        for (mode, expected) in [(PolicyMode::Apply, "auto"), (PolicyMode::Plan, "manual")] {
+        for (mode, expected) in [(PolicyMode::Apply, "auto"), (PolicyMode::Observe, "manual")] {
             let mut policy = valid_role_policy("p", "app", "s");
             policy.spec.mode = mode;
             policy.spec.approval = None;
@@ -2704,20 +3546,20 @@ mod tests {
     }
 
     #[test]
-    fn stale_approval_ignored_condition_cleared_when_leaving_plan_mode() {
+    fn stale_approval_ignored_condition_cleared_when_leaving_observe_mode() {
         let mut policy = valid_role_policy("p", "app", "s");
-        policy.spec.mode = PolicyMode::Plan;
+        policy.spec.mode = PolicyMode::Observe;
         let mut status = PostgresPolicyStatus::default();
         status.set_condition(crate::crd::approval_ignored_condition("p-plan-1"));
 
-        // Still in plan mode: the plan path owns the condition, leave it alone.
+        // Still in observe mode: the observe path owns the condition, leave it alone.
         clear_stale_approval_ignored_condition(&policy, &mut status);
         assert!(
             status
                 .conditions
                 .iter()
                 .any(|c| c.condition_type == crate::crd::CONDITION_APPROVAL_IGNORED),
-            "plan mode must keep the condition the plan path maintains"
+            "observe mode must keep the condition the observe path maintains"
         );
 
         // Switched to apply: an approval is honoured now, so the warning is wrong.
@@ -2728,7 +3570,7 @@ mod tests {
                 .conditions
                 .iter()
                 .any(|c| c.condition_type == crate::crd::CONDITION_APPROVAL_IGNORED),
-            "leaving plan mode must clear the stale warning"
+            "leaving observe mode must clear the stale warning"
         );
     }
 
@@ -2760,6 +3602,7 @@ mod tests {
                     }),
                     secret_key: Some("DATABASE_URL".to_string()),
                     params: None,
+                    require_physical_identity: None,
                 },
                 interval: "5m".to_string(),
                 suspend: false,
@@ -2793,6 +3636,7 @@ mod tests {
                     }),
                     secret_key: Some("DATABASE_URL".to_string()),
                     params: None,
+                    require_physical_identity: None,
                 },
                 interval: "5m".to_string(),
                 suspend: false,
@@ -3708,6 +4552,32 @@ mod tests {
         assert_eq!(retry_class(&error), RetryClass::LockContention);
     }
 
+    /// A stalled API call must requeue rather than wedge: kube-rs runs at most
+    /// one reconcile per object, so an unbounded call holds that object's only
+    /// slot and every later trigger — including a plan approval — queues behind
+    /// it forever.
+    #[test]
+    fn a_stalled_api_call_is_a_transient_retry_with_its_own_reason() {
+        let error = ReconcileError::ApiStalled("get PostgresPolicy", K8S_CALL_TIMEOUT);
+        assert_eq!(error.reason(), "KubernetesApiStalled");
+        assert_eq!(
+            retry_class(&finalizer::Error::ApplyFailed(error)),
+            RetryClass::Transient
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn bounded_k8s_call_gives_up_instead_of_waiting_out_the_client_timeout() {
+        let stalled = bounded_k8s_call::<(), _>("get PostgresPolicy", async {
+            std::future::pending::<Result<(), kube::Error>>().await
+        })
+        .await;
+        assert!(matches!(
+            stalled,
+            Err(ReconcileError::ApiStalled("get PostgresPolicy", _))
+        ));
+    }
+
     #[test]
     fn retry_classifies_invalid_spec_as_slow() {
         let error = finalizer::Error::ApplyFailed(ReconcileError::InvalidInterval(
@@ -4253,10 +5123,10 @@ mod tests {
     fn select_password_changes_skips_unchanged_password_sources() {
         let resolved = BTreeMap::from([(
             "app".to_string(),
-            ResolvedPassword {
-                cleartext: "app-secret".to_string(),
-                source_version: "role-passwords:app:7".to_string(),
-            },
+            ResolvedPassword::existing(
+                "app-secret".to_string(),
+                "role-passwords:app:7".to_string(),
+            ),
         )]);
         let status = PostgresPolicyStatus {
             applied_password_source_versions: BTreeMap::from([(
@@ -4280,10 +5150,10 @@ mod tests {
     fn select_password_changes_applies_on_source_version_change() {
         let resolved = BTreeMap::from([(
             "app".to_string(),
-            ResolvedPassword {
-                cleartext: "new-secret".to_string(),
-                source_version: "role-passwords:app:8".to_string(),
-            },
+            ResolvedPassword::existing(
+                "new-secret".to_string(),
+                "role-passwords:app:8".to_string(),
+            ),
         )]);
         let status = PostgresPolicyStatus {
             applied_password_source_versions: BTreeMap::from([(
@@ -4308,10 +5178,10 @@ mod tests {
 
         let resolved = BTreeMap::from([(
             "app".to_string(),
-            ResolvedPassword {
-                cleartext: "new-secret".to_string(),
-                source_version: "role-passwords:app:7".to_string(),
-            },
+            ResolvedPassword::existing(
+                "new-secret".to_string(),
+                "role-passwords:app:7".to_string(),
+            ),
         )]);
         let status = PostgresPolicyStatus {
             applied_password_source_versions: BTreeMap::from([(
@@ -4343,17 +5213,17 @@ mod tests {
         let resolved = BTreeMap::from([
             (
                 "app".to_string(),
-                ResolvedPassword {
-                    cleartext: "secret-a".to_string(),
-                    source_version: "role-passwords:app:1".to_string(),
-                },
+                ResolvedPassword::existing(
+                    "secret-a".to_string(),
+                    "role-passwords:app:1".to_string(),
+                ),
             ),
             (
                 "reporter".to_string(),
-                ResolvedPassword {
-                    cleartext: "secret-b".to_string(),
-                    source_version: "role-passwords:reporter:1".to_string(),
-                },
+                ResolvedPassword::existing(
+                    "secret-b".to_string(),
+                    "role-passwords:reporter:1".to_string(),
+                ),
             ),
         ]);
         let changes: Vec<pgroles_core::diff::Change> = vec![];
@@ -4374,6 +5244,118 @@ mod tests {
             Some("secret-b")
         );
         assert_eq!(versions.len(), 2, "all source versions should be tracked");
+    }
+
+    fn pending_generated(cleartext: &str, secret: &str) -> ResolvedPassword {
+        ResolvedPassword {
+            cleartext: cleartext.to_string(),
+            source_version: crate::password::missing_generated_secret_source_version(
+                secret, "password",
+            ),
+            pending_materialization: Some(PendingGeneratedSecret {
+                role: "app".to_string(),
+                spec: crate::crd::GeneratePasswordSpec {
+                    length: None,
+                    secret_name: Some(secret.to_string()),
+                    secret_key: None,
+                },
+            }),
+        }
+    }
+
+    #[test]
+    fn select_password_changes_always_applies_unmaterialized_generated_passwords() {
+        // Deferred materialization records a `:missing` sentinel while the plan
+        // is pending. If a sentinel ever survives into status, the password it
+        // stood for was never written to any database, so re-seeing the same
+        // sentinel must still apply — not be treated as "unchanged".
+        let resolved = BTreeMap::from([(
+            "app".to_string(),
+            pending_generated("in-memory", "policy-pgr-app"),
+        )]);
+        let status = PostgresPolicyStatus {
+            applied_password_source_versions: BTreeMap::from([(
+                "app".to_string(),
+                crate::password::missing_generated_secret_source_version(
+                    "policy-pgr-app",
+                    "password",
+                ),
+            )]),
+            ..Default::default()
+        };
+
+        let (password_changes, _) = select_password_changes(&[], &resolved, Some(&status));
+
+        assert_eq!(
+            password_changes.get("app").map(String::as_str),
+            Some("in-memory"),
+            "an unmaterialized generated password must always be applied"
+        );
+    }
+
+    #[test]
+    fn materialized_source_version_suppresses_the_next_password_change() {
+        // The regression this guards: planning records the `:missing` sentinel,
+        // execution creates the Secret. If status kept the sentinel, the next
+        // reconcile would see a different (now real) source version, emit a
+        // spurious SetPassword, and demand a second approval. Recording the
+        // post-materialization version instead makes the next reconcile quiet.
+        let mut versions = BTreeMap::from([(
+            "app".to_string(),
+            crate::password::missing_generated_secret_source_version("policy-pgr-app", "password"),
+        )]);
+        // Stand-in for `materialize_pending_generated_secrets` overwriting the
+        // sentinel with what the created Secret reported.
+        versions.insert("app".to_string(), "policy-pgr-app:password:512".to_string());
+
+        let status = PostgresPolicyStatus {
+            applied_password_source_versions: versions,
+            ..Default::default()
+        };
+        // Next reconcile: the Secret now exists, so resolution reads it.
+        let resolved = BTreeMap::from([(
+            "app".to_string(),
+            ResolvedPassword::existing(
+                "from-secret".to_string(),
+                "policy-pgr-app:password:512".to_string(),
+            ),
+        )]);
+
+        let (password_changes, _) = select_password_changes(&[], &resolved, Some(&status));
+
+        assert!(
+            password_changes.is_empty(),
+            "recording the materialized version must not re-emit SetPassword"
+        );
+    }
+
+    #[test]
+    fn recorded_real_source_version_is_detected_for_disappeared_secret() {
+        let mut resource = valid_role_policy("policy", "app", "shared-db-secret");
+        let sentinel =
+            crate::password::missing_generated_secret_source_version("policy-pgr-app", "password");
+        resource.status = Some(PostgresPolicyStatus {
+            applied_password_source_versions: BTreeMap::from([(
+                "app".to_string(),
+                "policy-pgr-app:password:41".to_string(),
+            )]),
+            ..Default::default()
+        });
+        assert!(
+            recorded_source_version_was_real(&resource, "app", &sentinel),
+            "a real recorded version plus a missing Secret means the Secret disappeared"
+        );
+
+        resource
+            .status
+            .as_mut()
+            .unwrap()
+            .applied_password_source_versions
+            .insert("app".to_string(), sentinel.clone());
+        assert!(
+            !recorded_source_version_was_real(&resource, "app", &sentinel),
+            "a recorded sentinel is not a disappeared Secret"
+        );
     }
 
     #[test]

@@ -1,10 +1,13 @@
 pub mod approval;
+pub mod bounds;
+pub mod candidate;
 pub mod composition;
 pub mod diff;
 pub mod export;
 pub mod guc;
 pub mod manifest;
 pub mod model;
+pub mod overlap;
 pub mod ownership;
 pub mod report;
 pub mod scram;

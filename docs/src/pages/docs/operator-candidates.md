@@ -7,11 +7,11 @@ Review what a change would do to production before it becomes the desired state.
 
 ---
 
-{% callout type="warning" title="Design preview" %}
-This page documents the target design from
-[#173](https://github.com/hardbyte/pgroles/issues/173) ahead of implementation.
-It is written as end-state documentation so the design can be reviewed in the
-form users will meet it. Nothing on this page is released yet.
+{% callout type="note" title="What is not built" %}
+The kind, the content digest, the planning lifecycle and **promotion** — the
+subject of this page — are implemented. Two things named below are not: the
+`pgroles candidate` and `pgroles plan` CLI subcommands (use `kubectl`; the
+recipes here do), and `spec.contentRef` for content too large to embed.
 {% /callout %}
 
 ## What a candidate is
@@ -46,9 +46,10 @@ The intended workflow, end to end:
 3. A reviewer approves or rejects the **plan** — this is the single
    operator-checked approval.
 4. The pull request merges, promoting the same content into
-   `PostgresPolicy.spec`. The merge is *promotion*, not a second approval:
-   `pgroles candidate verify` runs in CI to confirm the PR content digest
-   matches the approved candidate before merge.
+   `PostgresPolicy.spec`. The merge is *promotion*, not a second approval —
+   CI confirms before merge that the PR's content is the content that was
+   reviewed (see [Verifying before the
+   merge](#verifying-before-the-merge)).
 5. The operator executes only when the promoted content digest matches the
    approved candidate and the recomputed effects match the approved change
    digest, verified under the database lock.
@@ -85,8 +86,20 @@ approval always come from the parent policy; the connection does too, unless
 migration](#previewing-a-connection-migration)). The whole spec is immutable
 (`self == oldSelf`); to revise a proposal, create a successor:
 
-```bash
-pgroles candidate create --policy orders -f revised.yaml --replaces orders-change-x7k2p
+```yaml
+apiVersion: pgroles.io/v1alpha1
+kind: PostgresPolicyCandidate
+metadata:
+  generateName: orders-change-
+spec:
+  policyRef:
+    name: orders
+  replaces: orders-change-x7k2p
+  content:
+    roles:
+      - name: reporting-reader
+        login: true
+        connection_limit: 4
 ```
 
 `spec.replaces` marks the named earlier draft superseded. Supersession is
@@ -133,9 +146,14 @@ write-once decision recorded on the plan status with an admission-stamped
 decision mechanics and their trust model.
 
 ```bash
-pgroles candidate show orders-change-x7k2p     # plan summary, effects, digests
-pgroles plan approve orders-change-x7k2p-plan-9f21c4
+kubectl get pgcand orders-change-x7k2p -o wide          # phase, plan, digest
+kubectl get pgplan orders-change-x7k2p-plan-9f21c4 -o yaml
 ```
+
+There are no `pgroles candidate` or `pgroles plan` subcommands: everything here
+is `kubectl`. Deciding a plan is a write to its status subresource — see
+[Deciding a plan](/docs/operator-plan-approval#deciding-a-plan) for the exact
+patch, which is identical for a candidate's plan and a policy's.
 
 Rejection lands on the plan, not the candidate: the plan records
 `Denied=True` (phase `Rejected`) and is terminal. The candidate is terminal
@@ -149,32 +167,102 @@ GitOps write: the PR carrying the same content merges, the GitOps controller
 updates `PostgresPolicy.spec`, and the operator recognises the update as the
 approved candidate by digest.
 
-Run `pgroles candidate verify` in CI before merge:
+Recognition is exact. The digest is computed over the same canonical form for
+both kinds — `PostgresPolicy.spec`'s content fields project into the candidate
+content type and are digested through the identical function — so promoting a
+candidate's content verbatim yields a byte-identical digest, and anything else
+yields a different one. The policy publishes what it recognised in
+`status.content_digest`, beside the candidate's `status.contentDigest`.
+
+### The gate
+
+When the promoted content is a candidate whose plan is **approved**, that plan
+becomes the policy's plan for this transition. Nothing about execution is
+special-cased: the operator takes the reviewed plan — the one carrying the
+human decision, the `decidedBy`, the approved change digest and the bound
+target identity — and runs it through the ordinary approved-plan path, which
+under the database lock re-inspects, recomputes the canonical effects, and
+executes only if the recomputed digest equals the approved one.
+
+The property this buys, stated plainly:
+
+> The statements executed are exactly the approved canonical effects,
+> recomputed under the lock.
+
+The operator never mints an approval of its own to make a promotion execute.
+Adopting the candidate's plan is what makes that possible: transferring an
+approval onto a freshly created policy plan would mean writing a decision no
+human made, with a `decidedBy` the operator invented.
+
+On success the candidate becomes `Promoted=True` (terminal), its plan reaches
+phase `Applied`, and any *other* candidate that was sitting on an approved plan
+has that plan retired — phase `Superseded`, condition `Superseded=True` with
+reason `SupersededByPromotion` — because its approval was made against a base
+this promotion replaced. The decision record on that plan is left exactly as
+the reviewer wrote it; retiring a plan never rewrites who decided what.
+
+### Verifying before the merge
+
+There is no `pgroles candidate verify`. The dependable pre-merge check is
+equality of the content itself, which is what the digest measures:
 
 ```bash
-pgroles candidate verify orders-change-x7k2p --against path/to/policy.yaml
+# In CI, on the PR branch: the candidate you filed and the policy you are about
+# to merge must carry identical content.
+diff <(yq -P '.spec.content' candidate.yaml) \
+     <(yq -P 'del(.spec.connection, .spec.interval, .spec.mode, .spec.suspend, .spec.approval) | .spec' policy.yaml)
 ```
 
-It fails when the PR's rendered content digest differs from the candidate's —
-catching edited-after-approval content *before* the merge, when it is cheap,
-instead of at promotion, when the spec has already changed.
+Filing the candidate from the very same file the PR promotes makes this
+structural rather than checked. After the merge, the cluster answers directly:
 
-The edge cases are defined, not implied:
+```bash
+kubectl get pgcand orders-change-x7k2p -o jsonpath='{.status.contentDigest}'
+kubectl get pgr    orders             -o jsonpath='{.status.content_digest}'
+```
+
+A CLI subcommand is deliberately absent rather than pending: a faithful digest
+has to be computed over the operator's typed content model, and a second
+implementation in the CLI would be a second definition of the thing the digest
+exists to make unambiguous.
+
+### Edge cases
+
+Defined, not implied — each row is a unit test, and the first three are covered
+end to end in the kind E2E:
 
 | What happens | Result |
 | --- | --- |
-| Promoted content matches the approved candidate, base unchanged | Executes under the lock after fresh verification |
-| Promoted content was edited after approval (digest mismatch) | Nothing executes; the policy falls back to the normal manual-plan flow with an explicit condition |
-| Promotion with no approved plan at all | Normal manual-plan flow |
-| Plan X approved, candidate Y merged | Y plans fresh; X goes stale |
+| Promoted content matches the approved candidate | Its plan is adopted and executes under the lock after fresh verification; candidate → `Promoted=True` |
+| Promoted content matches a candidate whose plan is *not* approved | Nothing executes on it. The policy falls back to its ordinary manual-plan flow, and the candidate reports `Promoted=False, reason=PromotedWithoutApproval`. It becomes `Promoted=True` once that fresh plan is approved and applied — the content did reach the database, just on a different approval |
+| Promoted content was edited after approval (digest mismatch) | Nothing executes. The policy falls back to the manual-plan flow, and the approved candidate reports `Promoted=False, reason=PromotionDigestMismatch` naming the enforcement gap below |
+| Promoted content matches no candidate at all | The ordinary policy flow. Nothing is reported, because nothing unusual happened |
+| Plan X approved, candidate Y merged | Y promotes and executes; X's plan is retired with `SupersededByPromotion` and X is replanned against the new base |
 
-One honest cost to know: after a mismatched promotion, nothing has executed
-and the database is unchanged — but the merged spec is now the desired state
-and is not being converged, so drift against *either* state goes unreconciled
-until a fresh plan is approved. That is the same suspension `apply + manual`
-has always had, surfaced by condition and Event and bounded by the plan
-retention TTL. Continued enforcement of the *previous* state through a failed
-promotion is what a future Revision model would add.
+Two execution modes make the gate moot rather than absent:
+
+- **`approval: auto`** — the policy approves and executes its own plan on every
+  reconcile, so there is no approval to gate and the candidate's plan is not
+  adopted. Promotion executes immediately, and the bookkeeping still happens:
+  the candidate reaches `Promoted=True` once the content is applied.
+- **`mode: observe`** — the policy never executes anything, so a promoted
+  candidate cannot reach `Promoted`. It reports `Promoted=False,
+  reason=PromotionNotExecuted` and stays open; it becomes `Promoted=True` if
+  and when the policy is switched to `mode: apply` and the content applies.
+
+Promotion is recognised by digest and not by a one-shot transition, so it
+survives an interrupted reconcile: if the SQL executed and the operator
+restarted before writing `Promoted=True`, the next reconcile recognises the
+same promotion and records it, with nothing to replay because the effects are
+already gone.
+
+One honest cost to know: after a mismatched promotion under `apply` +
+`manual`, nothing has executed and the database is unchanged — but the merged
+spec is now the desired state and is not being converged, so drift against
+*either* state goes unreconciled until a fresh plan is approved. That is the
+same suspension `apply + manual` has always had; the condition and Event on the
+candidate say so in those words. Continued enforcement of the *previous* state
+through a failed promotion is what a future Revision model would add.
 
 ## Staleness and revalidation
 
@@ -223,9 +311,13 @@ explicit about it:
 
 - **Credentials and connection settings come from the override**, not the
   parent. The referenced Secret must carry credentials for the destination.
-- **Locking follows the target.** Advisory and in-process locks are keyed by
-  database identity, so planning against the override acquires that
-  database's locks — it cannot share the parent's lock state, and it does not
+- **Locking follows the target.** The advisory lock key is derived
+  server-side from the connected database itself (`current_database()`), so
+  differently-named Secrets or aliases of the same database contend on the
+  same lock. An override that merely aliases the parent's own database is
+  detected and shares the parent's lock hold; a genuinely different database
+  gets its own advisory and in-process locks — it cannot share the parent's
+  lock state, and it does not
   block the parent's reconcile. The enforce-then-plan ordering still applies
   to the parent (it is reconciled first on its own target); the override is
   then inspected separately within the same reconcile.
@@ -256,19 +348,43 @@ approval is not an indefinite authorisation.
 | Condition | Meaning |
 | --- | --- |
 | `Ready=True, reason=Planned` | A current plan exists for this candidate |
+| `Ready=True, reason=NoEffects` | The content is already the database's state, so there is nothing to review. Not terminal — the content may diverge again |
 | `Ready=False, reason=BlockedByActivePolicy` | Parent is failing or awaiting its own approval; will re-plan |
 | `Ready=False, reason=OverlayOverlap` | An ephemeral grant overlaps this candidate's effects; fresh review required |
+| `Ready=False, reason=PlanningFailed` | The candidate could not be planned at all; the message carries the error |
 | `Superseded=True, reason=Replaced` | A successor candidate named this one in `spec.replaces` |
 | `Superseded=True, reason=EffectsChanged` | Replanning produced a different change digest; the fresh plan awaits its own decision |
 | `Superseded=True, reason=PlanDenied` | The candidate's plan was rejected (terminal) |
-| `Promoted=True` | This candidate's content was promoted and executed |
+| `Promoted=True, reason=Promoted` | This candidate's content was promoted and executed (terminal) |
+| `Promoted=False, reason=PromotedWithoutApproval` | The content was promoted while this candidate's plan held no approval |
+| `Promoted=False, reason=PromotionDigestMismatch` | The policy's content changed into something that is not this approved candidate |
+| `Promoted=False, reason=PromotionNotExecuted` | The content was promoted into a policy in `mode: observe`, which never executes |
+| `Promoted=False, reason=SupersededByPromotion` | Another candidate was promoted; this candidate carries this condition, while its retired plan records the same reason on its own `Superseded=True` condition |
 
 Rejection is recorded on the plan (`Denied=True`, phase `Rejected`); the
 candidate reflects it as `Superseded=True, reason=PlanDenied`. Both are
 terminal.
 
+`Promoted` is a separate condition from `Ready` deliberately. `Ready` belongs to
+the planning lifecycle and is rewritten on every cycle — including with
+`BlockedByActivePolicy` the moment a fallen-back promotion opens a plan of its
+own, which is exactly when a reviewer needs to read why the promotion did not
+execute.
+
 ## Limits
 
-`spec.content` collections carry explicit size bounds (required by the
-whole-spec immutability rule's CEL cost budget). Policies too large to embed
-can pass content by reference; the digest binding is identical either way.
+`spec.content` collections carry explicit size bounds — 1024 roles, 4096
+grants, 63-character identifiers and the rest of the table in the [manifest
+reference](/docs/manifest-reference#size-limits). They are required by the
+whole-spec immutability rule's CEL cost budget, and they apply to
+`PostgresPolicy` too. Content too large to embed has no supported form today;
+`spec.contentRef` is planned for that case (see the callout at the top of this
+page), with the same digest binding.
+
+`spec.content` also emits no OpenAPI defaults, unlike `PostgresPolicy.spec`.
+An API-server default is written into the stored object, so if a default value
+ever changed, a stored candidate would keep the old value while the identical
+source YAML would now mean the new one — and the stored object's content
+digest would no longer match the digest CI computed from that YAML. Omitted
+content fields are resolved by the operator instead, identically for policies
+and candidates.
