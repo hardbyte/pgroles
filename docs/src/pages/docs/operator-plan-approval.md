@@ -259,6 +259,11 @@ For `password.generate` roles the operator synthesizes material in memory while
 planning and creates the Kubernetes Secret only during post-approval execution
 — see [Passwords and planning](#passwords-and-planning).
 
+Terminal plans are not kept forever: per-phase bounds prune the oldest, with
+`Applied` plans kept the longest. See [what plan retention
+keeps](/docs/operator-candidates#what-plan-retention-keeps) for the bounds,
+how to configure them, and the `pgroles.io/keep=true` exemption.
+
 ### Who may decide
 
 The trust model has two layers, and both matter:

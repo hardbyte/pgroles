@@ -451,7 +451,7 @@ fn set_condition(
     conditions.push(condition);
 }
 
-fn parse_duration(value: &str) -> Result<Duration, EphemeralError> {
+pub(crate) fn parse_duration(value: &str) -> Result<Duration, EphemeralError> {
     let value = value.trim();
     if value.is_empty() {
         return Err(EphemeralError::Invalid(

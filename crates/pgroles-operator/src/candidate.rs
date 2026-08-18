@@ -69,7 +69,11 @@ use crate::reconciler::{ReconcileError, ResolvedPassword};
 
 /// Maximum terminal candidates retained per policy before the oldest are
 /// pruned. Deleting a candidate cascades to the plan it owns and to that
-/// plan's SQL ConfigMap.
+/// plan's SQL ConfigMap — which is why this flat bound governs only
+/// candidates whose plans never executed. A candidate owning an `Applied`
+/// plan is held to [`crate::plan::PlanRetention`]'s applied bounds instead,
+/// so proposal churn cannot delete execution history through the owner
+/// object (see [`terminal_candidates_to_prune`]).
 const DEFAULT_MAX_TERMINAL_CANDIDATES: usize = 10;
 
 /// Maximum *open* candidates per policy that are planned in one pass.
@@ -742,6 +746,7 @@ async fn plan_against_target(
         target.target_identity(),
         &summary,
         &password_source_versions,
+        ctx.plan_retention,
         Some(CandidatePlanBinding {
             candidate,
             content_digest: &content_digest,
@@ -1434,39 +1439,132 @@ async fn supersede_candidate_plan(
     Ok(())
 }
 
-/// Prune terminal candidates beyond the retention bound.
+/// Prune terminal candidates beyond the retention bounds.
 ///
 /// Plans cascade: each is owned by its candidate, so deleting the candidate
-/// takes the plan and its SQL ConfigMap with it. `pgroles.io/keep=true` exempts
-/// a candidate, and this is best-effort — retention must never block planning.
+/// takes the plan and its SQL ConfigMap with it. That cascade is why pruning
+/// reads the plans first — see [`terminal_candidates_to_prune`] for the
+/// decision. Best-effort throughout: retention must never block planning, and
+/// when the plans cannot be read this pass prunes nothing rather than prune
+/// blind and cascade away an `Applied` plan retention promises to keep.
 async fn cleanup_terminal_candidates(
     ctx: &OperatorContext,
     namespace: &str,
     candidates: &[PostgresPolicyCandidate],
 ) {
-    let mut terminal: Vec<&PostgresPolicyCandidate> = candidates
+    let terminal: Vec<&PostgresPolicyCandidate> = candidates
         .iter()
         .filter(|candidate| candidate_phase(candidate).is_terminal())
-        .filter(|candidate| !is_retention_exempt(*candidate))
         .collect();
-    if terminal.len() <= DEFAULT_MAX_TERMINAL_CANDIDATES {
+    let retention = ctx.plan_retention;
+    // The buckets below partition the terminal set, so when the whole set
+    // fits inside every count bound nothing can be pruned — skip the plan
+    // read on that common path.
+    if terminal.len() <= DEFAULT_MAX_TERMINAL_CANDIDATES && terminal.len() <= retention.applied {
         return;
     }
-    terminal.sort_by(|a, b| {
-        a.metadata
-            .creation_timestamp
-            .cmp(&b.metadata.creation_timestamp)
-    });
+
+    let plans: Vec<PostgresPolicyPlan> =
+        match Api::<PostgresPolicyPlan>::namespaced(ctx.kube_client.clone(), namespace)
+            .list(&ListParams::default())
+            .await
+        {
+            Ok(list) => list.items,
+            Err(err) => {
+                tracing::warn!(%err, "could not read plans; skipping terminal-candidate pruning");
+                return;
+            }
+        };
+    let records: Vec<(&PostgresPolicyCandidate, Vec<&PostgresPolicyPlan>)> = terminal
+        .into_iter()
+        .map(|candidate| {
+            let uid = candidate.metadata.uid.clone().unwrap_or_default();
+            let owned: Vec<&PostgresPolicyPlan> = plans
+                .iter()
+                .filter(|plan| !uid.is_empty() && crate::plan::is_owned_by_uid(*plan, &uid))
+                .collect();
+            (candidate, owned)
+        })
+        .collect();
 
     let api: Api<PostgresPolicyCandidate> = Api::namespaced(ctx.kube_client.clone(), namespace);
-    let excess = terminal.len() - DEFAULT_MAX_TERMINAL_CANDIDATES;
-    for candidate in terminal.into_iter().take(excess) {
+    let now_ts = Timestamp::now().as_second();
+    for candidate in terminal_candidates_to_prune(&records, retention, now_ts) {
         let name = candidate.name_any();
         info!(candidate = %name, "pruning terminal candidate");
         if let Err(err) = api.delete(&name, &DeleteParams::default()).await {
             tracing::warn!(candidate = %name, %err, "failed to prune terminal candidate");
         }
     }
+}
+
+/// Which terminal candidates to prune, given the plans each one owns.
+///
+/// Deleting a candidate cascades to every plan it owns, so the decision is
+/// made per candidate-and-plans pair:
+///
+/// - `pgroles.io/keep=true` on the candidate **or on any plan it owns**
+///   exempts the pair. The cascade cannot honour a keep on the child if the
+///   parent goes, so a kept child must protect its parent.
+/// - A candidate owning an `Applied` plan is the provenance of an execution
+///   record, so it is held to the [`crate::plan::PlanRetention`] bounds for
+///   `Applied` plans — same count, age floor and ceiling, ordered by when the plan
+///   applied — not to the flat terminal bound, which proposal churn would
+///   otherwise use to delete fresh execution history through the owner
+///   object.
+/// - Every other terminal candidate is proposal churn — nothing it owns ever
+///   ran — bounded by [`DEFAULT_MAX_TERMINAL_CANDIDATES`], oldest first by
+///   creation.
+fn terminal_candidates_to_prune<'a>(
+    records: &[(&'a PostgresPolicyCandidate, Vec<&'a PostgresPolicyPlan>)],
+    retention: crate::plan::PlanRetention,
+    now_ts: i64,
+) -> Vec<&'a PostgresPolicyCandidate> {
+    let mut churn: Vec<&PostgresPolicyCandidate> = Vec::new();
+    let mut applied: Vec<(&PostgresPolicyCandidate, &PostgresPolicyPlan)> = Vec::new();
+    for (candidate, plans) in records {
+        if is_retention_exempt(*candidate) || plans.iter().any(|plan| is_retention_exempt(*plan)) {
+            continue;
+        }
+        let applied_plan = plans.iter().find(|plan| {
+            plan.status
+                .as_ref()
+                .is_some_and(|status| status.phase == PlanPhase::Applied)
+        });
+        match applied_plan {
+            Some(plan) => applied.push((candidate, plan)),
+            None => churn.push(candidate),
+        }
+    }
+
+    let mut prune: Vec<&PostgresPolicyCandidate> = Vec::new();
+    if churn.len() > DEFAULT_MAX_TERMINAL_CANDIDATES {
+        churn.sort_by(|a, b| {
+            a.metadata
+                .creation_timestamp
+                .cmp(&b.metadata.creation_timestamp)
+        });
+        let excess = churn.len() - DEFAULT_MAX_TERMINAL_CANDIDATES;
+        prune.extend(churn.into_iter().take(excess));
+    }
+
+    // Plan names are unique within the namespace, so they key the way back
+    // from an evicted plan to the candidate that owns it.
+    let evicted_plans: BTreeSet<String> = crate::plan::applied_plans_to_evict(
+        applied.iter().map(|(_, plan)| *plan).collect(),
+        retention,
+        now_ts,
+    )
+    .into_iter()
+    .map(|plan| plan.name_any())
+    .collect();
+    prune.extend(
+        applied
+            .into_iter()
+            .filter(|(_, plan)| evicted_plans.contains(&plan.name_any()))
+            .map(|(candidate, _)| candidate),
+    );
+    prune
 }
 
 /// Read the `Ready` condition reason from a candidate status, for tests and
@@ -1534,6 +1632,172 @@ mod tests {
 
     /// The TTL in hours, so fixtures can sit either side of it precisely.
     const TTL_HOURS: i64 = DEFAULT_OPEN_CANDIDATE_TTL.as_hours();
+
+    // -----------------------------------------------------------------
+    // Terminal-candidate pruning
+    // -----------------------------------------------------------------
+
+    /// A terminal candidate created `age_secs` ago.
+    fn terminal_candidate(
+        name: &str,
+        phase: CandidatePhase,
+        age_secs: i64,
+        now_ts: i64,
+    ) -> PostgresPolicyCandidate {
+        let mut candidate = candidate(name, PolicyContent::default());
+        candidate.metadata.uid = Some(format!("{name}-uid"));
+        candidate.metadata.creation_timestamp =
+            Some(k8s_openapi::apimachinery::pkg::apis::meta::v1::Time(
+                jiff::Timestamp::from_second(now_ts - age_secs).expect("epoch second in range"),
+            ));
+        candidate.status = Some(PostgresPolicyCandidateStatus {
+            phase,
+            ..Default::default()
+        });
+        candidate
+    }
+
+    /// An `Applied` plan that executed `applied_age_secs` ago.
+    fn applied_plan(name: &str, applied_age_secs: i64, now_ts: i64) -> PostgresPolicyPlan {
+        let spec = crate::crd::PostgresPolicyPlanSpec {
+            policy_ref: crate::crd::PolicyPlanRef {
+                name: "orders".to_string(),
+            },
+            policy_generation: 1,
+            reconciliation_mode: crate::crd::CrdReconciliationMode::Authoritative,
+            owned_roles: Vec::new(),
+            owned_schemas: Vec::new(),
+            managed_database_identity: "default/db/DATABASE_URL".to_string(),
+            origin: None,
+            scope: None,
+        };
+        let mut plan = PostgresPolicyPlan::new(name, spec);
+        plan.status = Some(crate::crd::PostgresPolicyPlanStatus {
+            phase: PlanPhase::Applied,
+            applied_at: Some(
+                jiff::Timestamp::from_second(now_ts - applied_age_secs)
+                    .expect("epoch second in range")
+                    .to_string(),
+            ),
+            ..Default::default()
+        });
+        plan
+    }
+
+    fn keep_plan(mut plan: PostgresPolicyPlan) -> PostgresPolicyPlan {
+        plan.metadata
+            .labels
+            .get_or_insert_with(Default::default)
+            .insert("pgroles.io/keep".to_string(), "true".to_string());
+        plan
+    }
+
+    fn pruned_names(
+        records: &[(&PostgresPolicyCandidate, Vec<&PostgresPolicyPlan>)],
+        retention: crate::plan::PlanRetention,
+        now_ts: i64,
+    ) -> Vec<String> {
+        let mut names: Vec<String> = terminal_candidates_to_prune(records, retention, now_ts)
+            .into_iter()
+            .map(|candidate| candidate.name_any())
+            .collect();
+        names.sort();
+        names
+    }
+
+    /// The recommended workflow's failure mode: every change lands as a
+    /// candidate, so terminal proposals accumulate fast, and under one flat
+    /// creation-time bound the eleventh proposal deletes the oldest terminal
+    /// candidate — cascading to the Applied plan it owns, straight through
+    /// the retention promise made for Applied plans.
+    #[test]
+    fn proposal_churn_cannot_prune_a_promoted_candidate_with_a_fresh_applied_plan() {
+        let now = 1_700_000_000;
+        let retention = crate::plan::PlanRetention::default();
+
+        // The promoted candidate is the oldest object in the set by a wide
+        // margin, and its plan applied a minute ago.
+        let promoted = terminal_candidate("promoted", CandidatePhase::Promoted, 100_000, now);
+        let promoted_plan = applied_plan("promoted-plan", 60, now);
+
+        let churn: Vec<PostgresPolicyCandidate> = (0..DEFAULT_MAX_TERMINAL_CANDIDATES + 2)
+            .map(|i| {
+                terminal_candidate(
+                    &format!("churn-{i:03}"),
+                    CandidatePhase::Superseded,
+                    1_000 - i as i64,
+                    now,
+                )
+            })
+            .collect();
+
+        let mut records: Vec<(&PostgresPolicyCandidate, Vec<&PostgresPolicyPlan>)> =
+            vec![(&promoted, vec![&promoted_plan])];
+        records.extend(
+            churn
+                .iter()
+                .map(|candidate| (candidate, Vec::<&PostgresPolicyPlan>::new())),
+        );
+
+        // Guard against a vacuous pass: the promoted candidate must be the
+        // oldest by creation, so a flat creation-time bound over the whole
+        // set — the behaviour this test exists to reject — would prune it
+        // first.
+        assert!(
+            churn
+                .iter()
+                .all(|c| c.metadata.creation_timestamp > promoted.metadata.creation_timestamp),
+            "the fixture must make the promoted candidate the oldest object"
+        );
+
+        let pruned = pruned_names(&records, retention, now);
+        assert_eq!(
+            pruned,
+            vec!["churn-000".to_string(), "churn-001".to_string()],
+            "exactly the excess churn goes, oldest first"
+        );
+        assert!(
+            !pruned.contains(&"promoted".to_string()),
+            "a promoted candidate with a fresh Applied plan is execution history, not churn"
+        );
+    }
+
+    /// Deleting the candidate cascades to its plans, so `pgroles.io/keep=true`
+    /// on the child plan has to protect the pair — a keep the cascade would
+    /// ignore is not a keep.
+    #[test]
+    fn a_keep_label_on_the_child_plan_protects_the_candidate() {
+        let now = 1_700_000_000;
+        // A floor of zero and a bound of one, so the applied bucket must
+        // evict — only exemptions can spare anything here.
+        let retention = crate::plan::PlanRetention {
+            applied: 1,
+            applied_ceiling: 1,
+            applied_min_age_secs: 0,
+            ..Default::default()
+        };
+
+        let oldest = terminal_candidate("p-old", CandidatePhase::Promoted, 900, now);
+        let oldest_plan = keep_plan(applied_plan("p-old-plan", 300, now));
+        let middle = terminal_candidate("p-mid", CandidatePhase::Promoted, 800, now);
+        let middle_plan = applied_plan("p-mid-plan", 200, now);
+        let newest = terminal_candidate("p-new", CandidatePhase::Promoted, 700, now);
+        let newest_plan = applied_plan("p-new-plan", 100, now);
+
+        let records: Vec<(&PostgresPolicyCandidate, Vec<&PostgresPolicyPlan>)> = vec![
+            (&oldest, vec![&oldest_plan]),
+            (&middle, vec![&middle_plan]),
+            (&newest, vec![&newest_plan]),
+        ];
+
+        // p-old's plan is the earliest execution, so without the keep it is
+        // the first eviction; pruning the *younger* p-mid instead is what
+        // proves the child's label protected its parent.
+        assert_eq!(
+            pruned_names(&records, retention, now),
+            vec!["p-mid".to_string()]
+        );
+    }
 
     fn keep(mut candidate: PostgresPolicyCandidate) -> PostgresPolicyCandidate {
         candidate

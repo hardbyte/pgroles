@@ -84,8 +84,205 @@ const ORPHAN_GRACE_SECS: i64 = 60;
 /// Best-effort cleanup should never block a fresh reconcile for long.
 const CLEANUP_TIMEOUT_SECS: u64 = 5;
 
-/// Default maximum number of historical plans to retain per policy.
-const DEFAULT_MAX_PLANS: usize = 10;
+/// How many terminal plans of each kind retention keeps for one policy.
+///
+/// Split by phase rather than pooled, because the phases are not worth the
+/// same and the cheapest one is the one generated fastest. `Superseded` is
+/// churn: every replan supersedes its predecessor, so on an active policy a
+/// single pool fills with records of plans that never ran and evicts the
+/// `Applied` ones, which are the record of what did.
+///
+/// The bounds are operator-level configuration: each field can be overridden
+/// by its `PLAN_RETENTION_*` environment variable (see [`Self::from_env`]).
+/// They are deliberately not per-policy CRD fields — retention caps object
+/// growth in the cluster, it is not policy intent, and the per-object need is
+/// served by the `pgroles.io/keep=true` label.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PlanRetention {
+    /// `Applied` plans kept once they are older than `applied_min_age_secs`.
+    pub applied: usize,
+    /// Hard ceiling on `Applied` plans, age floor notwithstanding. Without it
+    /// a policy applying continuously would grow the count without limit for
+    /// the whole floor period; the floor is a promise about history, not a
+    /// licence to keep everything.
+    pub applied_ceiling: usize,
+    /// An `Applied` plan younger than this is kept whatever `applied` says,
+    /// so the audit trail spans a stated period instead of however long the
+    /// policy's churn rate happens to make it.
+    pub applied_min_age_secs: i64,
+    /// `Failed` and `Rejected` plans. Both are decisions worth reading back —
+    /// why something did not run, and who declined it.
+    pub decided: usize,
+    /// `Superseded` plans. Deliberately small: it is the least informative
+    /// terminal state and the one generating the pressure. A couple is enough
+    /// to see what a replan replaced.
+    pub superseded: usize,
+}
+
+impl Default for PlanRetention {
+    fn default() -> Self {
+        Self {
+            applied: 25,
+            applied_ceiling: 200,
+            applied_min_age_secs: 30 * 24 * 60 * 60,
+            decided: 10,
+            superseded: 3,
+        }
+    }
+}
+
+impl PlanRetention {
+    /// Overrides [`PlanRetention::applied`].
+    pub const ENV_APPLIED: &'static str = "PLAN_RETENTION_APPLIED";
+    /// Overrides [`PlanRetention::applied_ceiling`].
+    pub const ENV_APPLIED_CEILING: &'static str = "PLAN_RETENTION_APPLIED_CEILING";
+    /// Overrides [`PlanRetention::applied_min_age_secs`]. Takes the same
+    /// `s`/`m`/`h` duration syntax as the `EPHEMERAL_ACCESS_*` ceilings.
+    pub const ENV_APPLIED_MIN_AGE: &'static str = "PLAN_RETENTION_APPLIED_MIN_AGE";
+    /// Overrides [`PlanRetention::decided`].
+    pub const ENV_DECIDED: &'static str = "PLAN_RETENTION_DECIDED";
+    /// Overrides [`PlanRetention::superseded`].
+    pub const ENV_SUPERSEDED: &'static str = "PLAN_RETENTION_SUPERSEDED";
+
+    /// Resolve the retention bounds from the process environment.
+    ///
+    /// Unset variables keep their defaults. An invalid value is an error, not
+    /// a fallback: this is meant to be called once at startup, where refusing
+    /// to start is the only failure mode an operator of the operator will
+    /// actually see. Retention that silently ran with different bounds than
+    /// the environment asked for would only be discovered when the plan
+    /// someone wanted was already deleted.
+    pub fn from_env() -> Result<Self, PlanRetentionConfigError> {
+        let mut resolved = std::collections::BTreeMap::new();
+        for variable in [
+            Self::ENV_APPLIED,
+            Self::ENV_APPLIED_CEILING,
+            Self::ENV_APPLIED_MIN_AGE,
+            Self::ENV_DECIDED,
+            Self::ENV_SUPERSEDED,
+        ] {
+            if let Some(value) = env_read(variable, std::env::var(variable))? {
+                resolved.insert(variable, value);
+            }
+        }
+        Self::from_lookup(|variable| resolved.get(variable).cloned())
+    }
+
+    /// [`Self::from_env`] over an arbitrary lookup, so parsing and validation
+    /// are testable without mutating process-global environment state.
+    fn from_lookup(
+        lookup: impl Fn(&str) -> Option<String>,
+    ) -> Result<Self, PlanRetentionConfigError> {
+        let defaults = Self::default();
+        let retention = Self {
+            applied: count_bound(&lookup, Self::ENV_APPLIED, defaults.applied)?,
+            applied_ceiling: count_bound(
+                &lookup,
+                Self::ENV_APPLIED_CEILING,
+                defaults.applied_ceiling,
+            )?,
+            applied_min_age_secs: age_bound(
+                &lookup,
+                Self::ENV_APPLIED_MIN_AGE,
+                defaults.applied_min_age_secs,
+            )?,
+            decided: count_bound(&lookup, Self::ENV_DECIDED, defaults.decided)?,
+            superseded: count_bound(&lookup, Self::ENV_SUPERSEDED, defaults.superseded)?,
+        };
+        // A ceiling below the count bound could never take effect — eviction
+        // already stops at the count — so the configuration says one thing
+        // and the operator would do another. Reject it instead.
+        if retention.applied_ceiling < retention.applied {
+            return Err(PlanRetentionConfigError::CeilingBelowCount {
+                ceiling: retention.applied_ceiling,
+                count: retention.applied,
+            });
+        }
+        Ok(retention)
+    }
+}
+
+/// Classify one raw environment read: present, absent, or refused.
+///
+/// `NotUnicode` is the one `VarError` that must not degrade to "unset": a
+/// variable someone set, however malformed, silently taking the default is
+/// exactly the failure mode this configuration's startup validation exists
+/// to prevent.
+fn env_read(
+    variable: &'static str,
+    read: Result<String, std::env::VarError>,
+) -> Result<Option<String>, PlanRetentionConfigError> {
+    match read {
+        Ok(value) => Ok(Some(value)),
+        Err(std::env::VarError::NotPresent) => Ok(None),
+        Err(std::env::VarError::NotUnicode(_)) => {
+            Err(PlanRetentionConfigError::NotUnicode { variable })
+        }
+    }
+}
+
+/// A count bound from `lookup`, or `default` when the variable is unset.
+fn count_bound(
+    lookup: impl Fn(&str) -> Option<String>,
+    variable: &'static str,
+    default: usize,
+) -> Result<usize, PlanRetentionConfigError> {
+    match lookup(variable) {
+        None => Ok(default),
+        Some(value) => value
+            .trim()
+            .parse()
+            .map_err(|_| PlanRetentionConfigError::InvalidCount { variable, value }),
+    }
+}
+
+/// An age bound in seconds from `lookup`, or `default` when the variable is
+/// unset. The value uses the same duration syntax as the `EPHEMERAL_ACCESS_*`
+/// variables.
+fn age_bound(
+    lookup: impl Fn(&str) -> Option<String>,
+    variable: &'static str,
+    default: i64,
+) -> Result<i64, PlanRetentionConfigError> {
+    let Some(value) = lookup(variable) else {
+        return Ok(default);
+    };
+    let invalid = |detail: String| PlanRetentionConfigError::InvalidDuration {
+        variable,
+        value: value.clone(),
+        detail,
+    };
+    let duration = crate::ephemeral::parse_duration(&value).map_err(|error| {
+        invalid(match error {
+            crate::ephemeral::EphemeralError::Invalid(detail) => detail,
+            other => other.to_string(),
+        })
+    })?;
+    i64::try_from(duration.as_secs()).map_err(|_| invalid("duration is too large".to_string()))
+}
+
+/// Why [`PlanRetention::from_env`] refused the environment's values.
+#[derive(Debug, thiserror::Error)]
+pub enum PlanRetentionConfigError {
+    #[error("{variable} must be a non-negative integer, got {value:?}")]
+    InvalidCount {
+        variable: &'static str,
+        value: String,
+    },
+    #[error("{variable} is not a valid duration ({detail}), got {value:?}")]
+    InvalidDuration {
+        variable: &'static str,
+        value: String,
+        detail: String,
+    },
+    #[error(
+        "PLAN_RETENTION_APPLIED_CEILING ({ceiling}) is below PLAN_RETENTION_APPLIED ({count}); \
+         a ceiling under the count bound can never take effect"
+    )]
+    CeilingBelowCount { ceiling: usize, count: usize },
+    #[error("{variable} is set to a value that is not valid Unicode")]
+    NotUnicode { variable: &'static str },
+}
 
 /// How recently a Failed plan must have been created (in seconds) for the
 /// dedup check to consider it a match. Plans older than this are ignored so
@@ -413,6 +610,7 @@ pub async fn create_or_update_plan(
     target_identity: &TargetIdentity,
     change_summary: &ChangeSummary,
     password_source_versions: &BTreeMap<String, String>,
+    plan_retention: PlanRetention,
     candidate: Option<CandidatePlanBinding<'_>>,
 ) -> Result<PlanCreationResult, ReconcileError> {
     let namespace = policy.namespace().ok_or(ReconcileError::NoNamespace)?;
@@ -469,7 +667,7 @@ pub async fn create_or_update_plan(
     // Candidate plans are pruned by candidate retention (their owner cascades),
     // never by the policy's plan retention, which would not see them anyway.
     if candidate.is_none() {
-        cleanup_old_plans_best_effort(client, policy, None).await;
+        cleanup_old_plans_best_effort(client, policy, plan_retention).await;
     }
 
     let plans_api: Api<PostgresPolicyPlan> = Api::namespaced(client.clone(), &namespace);
@@ -1286,11 +1484,11 @@ pub(crate) async fn execute_changes_in_transaction(
 pub async fn cleanup_old_plans_best_effort(
     client: &Client,
     policy: &PostgresPolicy,
-    max_plans: Option<usize>,
+    retention: PlanRetention,
 ) {
     match tokio::time::timeout(
         Duration::from_secs(CLEANUP_TIMEOUT_SECS),
-        cleanup_old_plans(client, policy, max_plans),
+        cleanup_old_plans(client, policy, retention),
     )
     .await
     {
@@ -1303,19 +1501,19 @@ pub async fn cleanup_old_plans_best_effort(
     }
 }
 
-/// Clean up old plans for a policy, retaining at most `max_plans` terminal plans.
+/// Clean up old plans for a policy under [`PlanRetention`].
 ///
-/// Terminal plans are those in Applied, Failed, Superseded, or Rejected phase;
-/// Pending, Approved, and Applying plans are retained. Status-less plans and
-/// SQL ConfigMaps older than a short grace period are treated as stale orphans.
+/// Terminal plans — Applied, Failed, Superseded, Rejected — are bounded per
+/// phase; Pending, Approved, and Applying plans are never evicted, because
+/// they are still live. Status-less plans and SQL ConfigMaps older than a
+/// short grace period are treated as stale orphans.
 pub async fn cleanup_old_plans(
     client: &Client,
     policy: &PostgresPolicy,
-    max_plans: Option<usize>,
+    retention: PlanRetention,
 ) -> Result<(), ReconcileError> {
     let namespace = policy.namespace().ok_or(ReconcileError::NoNamespace)?;
     let policy_name = policy.name_any();
-    let max_plans = max_plans.unwrap_or(DEFAULT_MAX_PLANS);
 
     let plans_api: Api<PostgresPolicyPlan> = Api::namespaced(client.clone(), &namespace);
     let selector = policy_selector(&policy_name);
@@ -1346,51 +1544,20 @@ pub async fn cleanup_old_plans(
         }
     }
 
-    // Collect terminal plans sorted by creation timestamp (oldest first).
-    // `pgroles.io/keep=true` exempts an object from the bound: retention is a
-    // cap on unbounded growth, not a policy about what an operator may keep.
-    let mut terminal_plans: Vec<&PostgresPolicyPlan> = existing_plans
-        .iter()
-        .filter(|plan| !is_retention_exempt(*plan))
-        .filter(|plan| {
-            plan.status
-                .as_ref()
-                .map(|s| {
-                    matches!(
-                        s.phase,
-                        PlanPhase::Applied
-                            | PlanPhase::Failed
-                            | PlanPhase::Superseded
-                            | PlanPhase::Rejected
-                    )
-                })
-                .unwrap_or(false)
-        })
-        .collect();
-
-    if terminal_plans.len() > max_plans {
-        // Sort by creation timestamp ascending (oldest first).
-        terminal_plans.sort_by(|a, b| {
-            let a_time = a.metadata.creation_timestamp.as_ref();
-            let b_time = b.metadata.creation_timestamp.as_ref();
-            a_time.cmp(&b_time)
-        });
-
-        let plans_to_delete = terminal_plans.len() - max_plans;
-        for plan in terminal_plans.into_iter().take(plans_to_delete) {
-            let plan_name = plan.name_any();
-            info!(
+    for plan in plans_to_evict(&existing_plans, retention, now_ts) {
+        let plan_name = plan.name_any();
+        info!(
+            plan = %plan_name,
+            policy = %policy_name,
+            phase = ?plan.status.as_ref().map(|status| &status.phase),
+            "cleaning up old plan"
+        );
+        if let Err(err) = plans_api.delete(&plan_name, &DeleteParams::default()).await {
+            tracing::warn!(
                 plan = %plan_name,
-                policy = %policy_name,
-                "cleaning up old plan"
+                %err,
+                "failed to delete old plan during cleanup"
             );
-            if let Err(err) = plans_api.delete(&plan_name, &DeleteParams::default()).await {
-                tracing::warn!(
-                    plan = %plan_name,
-                    %err,
-                    "failed to delete old plan during cleanup"
-                );
-            }
         }
     }
 
@@ -1489,6 +1656,135 @@ fn should_patch_existing_plan_status(plan: &PostgresPolicyPlan) -> bool {
         .as_ref()
         .map(|status| status.phase == PlanPhase::Pending)
         .unwrap_or(true)
+}
+
+/// Which terminal plans retention evicts this pass.
+///
+/// Pure and takes `now` as an argument, so the policy is testable without a
+/// cluster — the bounds are the part worth pinning, and they are invisible in
+/// an integration test that would have to create hundreds of objects to reach
+/// them.
+///
+/// `pgroles.io/keep=true` exempts an object from every bound: retention caps
+/// unbounded growth, it is not a policy about what an operator may keep.
+fn plans_to_evict(
+    plans: &[PostgresPolicyPlan],
+    retention: PlanRetention,
+    now_ts: i64,
+) -> Vec<&PostgresPolicyPlan> {
+    let mut applied = Vec::new();
+    let mut decided = Vec::new();
+    let mut superseded = Vec::new();
+
+    for plan in plans.iter().filter(|plan| !is_retention_exempt(*plan)) {
+        let Some(phase) = plan.status.as_ref().map(|status| &status.phase) else {
+            continue;
+        };
+        match phase {
+            PlanPhase::Applied => applied.push(plan),
+            PlanPhase::Failed | PlanPhase::Rejected => decided.push(plan),
+            PlanPhase::Superseded => superseded.push(plan),
+            // Still live. Never evicted, however old.
+            PlanPhase::Pending | PlanPhase::Approved | PlanPhase::Applying => {}
+        }
+    }
+
+    let mut evict = oldest_beyond(&mut decided, retention.decided);
+    evict.extend(oldest_beyond(&mut superseded, retention.superseded));
+    evict.extend(applied_plans_to_evict(applied, retention, now_ts));
+    evict
+}
+
+/// Which `Applied` plans the retention bounds evict from `applied`.
+///
+/// Applied is the audit record of what actually ran, so its count bound
+/// yields to the age floor. Walk oldest first and stop once the count bound
+/// is met; spare anything still inside the floor along the way, unless the
+/// survivors would breach the ceiling. Sparing is what makes the retained
+/// span a promise rather than a function of how often the policy applies.
+///
+/// Both the order and the floor measure from [`applied_epoch_secs`] — one
+/// notion of "when did this apply" drives the whole walk. Ordering by
+/// creation instead would evict a plan created before a long review but
+/// applied moments ago, ahead of older executions whose objects happen to be
+/// newer.
+///
+/// Shared with terminal-candidate pruning: deleting a promoted candidate
+/// cascades to the `Applied` plan it owns, so the candidate is held to these
+/// same bounds (see `candidate::terminal_candidates_to_prune`).
+pub(crate) fn applied_plans_to_evict(
+    mut applied: Vec<&PostgresPolicyPlan>,
+    retention: PlanRetention,
+    now_ts: i64,
+) -> Vec<&PostgresPolicyPlan> {
+    applied.sort_by_key(|plan| applied_epoch_secs(plan));
+    let mut evict = Vec::new();
+    let mut remaining = applied.len();
+    for plan in applied {
+        if remaining <= retention.applied {
+            break;
+        }
+        let inside_floor = applied_age_secs(plan, now_ts) < retention.applied_min_age_secs;
+        if inside_floor && remaining <= retention.applied_ceiling {
+            continue;
+        }
+        evict.push(plan);
+        remaining -= 1;
+    }
+    evict
+}
+
+/// Sort oldest first and return everything past `keep`.
+fn oldest_beyond<'a>(
+    plans: &mut Vec<&'a PostgresPolicyPlan>,
+    keep: usize,
+) -> Vec<&'a PostgresPolicyPlan> {
+    if plans.len() <= keep {
+        return Vec::new();
+    }
+    sort_oldest_first(plans);
+    plans[..plans.len() - keep].to_vec()
+}
+
+fn sort_oldest_first(plans: &mut [&PostgresPolicyPlan]) {
+    plans.sort_by(|a, b| {
+        a.metadata
+            .creation_timestamp
+            .as_ref()
+            .cmp(&b.metadata.creation_timestamp.as_ref())
+    });
+}
+
+/// When an `Applied` plan applied, as epoch seconds: `status.appliedAt`,
+/// falling back to the creation timestamp when it is absent or unparseable so
+/// plans recorded before it was set keep the creation-time behaviour rather
+/// than reading as infinitely old. `None` when neither instant is known.
+///
+/// This is the single notion of "when did this apply" behind both the
+/// retention floor and the eviction order — the floor promises
+/// post-application history, and a plan can sit `Pending` or `Approved` for
+/// arbitrarily long before a reviewer decides it, so measuring from creation
+/// would read a plan approved late as already outside that promise.
+fn applied_epoch_secs(plan: &PostgresPolicyPlan) -> Option<i64> {
+    plan.status
+        .as_ref()
+        .and_then(|status| status.applied_at.as_deref())
+        .and_then(parse_rfc3339_epoch_secs)
+        .or_else(|| {
+            plan.metadata
+                .creation_timestamp
+                .as_ref()
+                .map(|timestamp| timestamp.0.as_second())
+        })
+}
+
+/// Age of an `Applied` plan for the retention floor — see
+/// [`applied_epoch_secs`]. An unknown instant is age 0: brand new is the safe
+/// direction for a deletion decision.
+fn applied_age_secs(plan: &PostgresPolicyPlan, now_ts: i64) -> i64 {
+    applied_epoch_secs(plan)
+        .map(|applied_ts| now_ts.saturating_sub(applied_ts))
+        .unwrap_or(0)
 }
 
 fn is_stale_statusless_plan(plan: &PostgresPolicyPlan, now_ts: i64) -> bool {
@@ -2397,6 +2693,445 @@ mod tests {
     }
 
     /// Build a plan in `phase`, having recorded a failure `age_secs` ago.
+    /// A terminal plan of `phase`, created `age_secs` ago.
+    fn retained_plan(
+        name: &str,
+        phase: PlanPhase,
+        age_secs: i64,
+        now_ts: i64,
+    ) -> PostgresPolicyPlan {
+        let mut plan = PostgresPolicyPlan::new(name, test_plan_spec());
+        plan.metadata.creation_timestamp =
+            Some(k8s_openapi::apimachinery::pkg::apis::meta::v1::Time(
+                jiff::Timestamp::from_second(now_ts - age_secs).expect("epoch second in range"),
+            ));
+        plan.status = Some(PostgresPolicyPlanStatus {
+            phase,
+            ..Default::default()
+        });
+        plan
+    }
+
+    fn evicted_names(
+        plans: &[PostgresPolicyPlan],
+        retention: PlanRetention,
+        now_ts: i64,
+    ) -> Vec<String> {
+        let mut names: Vec<String> = plans_to_evict(plans, retention, now_ts)
+            .into_iter()
+            .map(|plan| plan.name_any())
+            .collect();
+        names.sort();
+        names
+    }
+
+    /// The bug this split exists for: replan churn must not evict the record
+    /// of what actually ran. Under one pooled bound the Superseded plans, being
+    /// newer, kept every slot and the Applied ones were deleted.
+    #[test]
+    fn superseded_churn_does_not_evict_applied_plans() {
+        let now = 1_700_000_000;
+        let retention = PlanRetention::default();
+        let year = 400 * 24 * 60 * 60;
+
+        let mut plans = vec![retained_plan("applied-old", PlanPhase::Applied, year, now)];
+        // Far more superseded plans than any pooled bound would have allowed,
+        // all newer than the applied one.
+        for i in 0..50 {
+            plans.push(retained_plan(
+                &format!("superseded-{i:03}"),
+                PlanPhase::Superseded,
+                1000 - i,
+                now,
+            ));
+        }
+
+        let evicted = evicted_names(&plans, retention, now);
+        assert!(
+            !evicted.contains(&"applied-old".to_string()),
+            "an applied plan must survive any amount of replan churn"
+        );
+        assert_eq!(
+            evicted.len(),
+            50 - retention.superseded,
+            "every superseded plan past the small bound is evicted"
+        );
+    }
+
+    #[test]
+    fn each_terminal_phase_is_bounded_separately() {
+        let now = 1_700_000_000;
+        let retention = PlanRetention::default();
+        let year = 400 * 24 * 60 * 60;
+
+        let mut plans = Vec::new();
+        for (prefix, phase, count) in [
+            ("applied", PlanPhase::Applied, retention.applied + 4),
+            ("failed", PlanPhase::Failed, retention.decided + 4),
+            (
+                "superseded",
+                PlanPhase::Superseded,
+                retention.superseded + 4,
+            ),
+        ] {
+            for i in 0..count {
+                // Older than the age floor, so only the count bounds apply.
+                plans.push(retained_plan(
+                    &format!("{prefix}-{i:03}"),
+                    phase.clone(),
+                    year + count as i64 - i as i64,
+                    now,
+                ));
+            }
+        }
+
+        let evicted = evicted_names(&plans, retention, now);
+        for prefix in ["applied", "failed", "superseded"] {
+            let count = evicted.iter().filter(|n| n.starts_with(prefix)).count();
+            assert_eq!(count, 4, "{prefix} should lose exactly its 4 excess plans");
+        }
+    }
+
+    /// Failed and Rejected share one bound, so a policy that fails repeatedly
+    /// cannot bury the record of a plan a reviewer declined.
+    #[test]
+    fn failed_and_rejected_share_the_decided_bound() {
+        let now = 1_700_000_000;
+        let retention = PlanRetention::default();
+        let year = 400 * 24 * 60 * 60;
+
+        let mut plans = vec![retained_plan(
+            "rejected",
+            PlanPhase::Rejected,
+            year * 2,
+            now,
+        )];
+        for i in 0..retention.decided {
+            plans.push(retained_plan(
+                &format!("failed-{i:03}"),
+                PlanPhase::Failed,
+                year - i as i64,
+                now,
+            ));
+        }
+
+        // One over the shared bound, and the rejected plan is the oldest.
+        assert_eq!(
+            evicted_names(&plans, retention, now),
+            vec!["rejected".to_string()]
+        );
+    }
+
+    /// The age floor is what makes the retained span a promise rather than a
+    /// function of how often the policy applies.
+    #[test]
+    fn the_age_floor_keeps_applied_plans_past_the_count_bound() {
+        let now = 1_700_000_000;
+        let retention = PlanRetention::default();
+
+        let recent: Vec<PostgresPolicyPlan> = (0..retention.applied + 10)
+            .map(|i| {
+                retained_plan(
+                    &format!("applied-{i:03}"),
+                    PlanPhase::Applied,
+                    retention.applied_min_age_secs - 1 - i as i64,
+                    now,
+                )
+            })
+            .collect();
+        assert!(
+            evicted_names(&recent, retention, now).is_empty(),
+            "nothing inside the floor is evicted, even past the count bound"
+        );
+
+        // One second older and the same plan is outside the promise.
+        let stale: Vec<PostgresPolicyPlan> = (0..retention.applied + 10)
+            .map(|i| {
+                retained_plan(
+                    &format!("applied-{i:03}"),
+                    PlanPhase::Applied,
+                    retention.applied_min_age_secs + 1 + i as i64,
+                    now,
+                )
+            })
+            .collect();
+        assert_eq!(evicted_names(&stale, retention, now).len(), 10);
+    }
+
+    /// The floor promises history; it does not license unbounded growth.
+    #[test]
+    fn the_ceiling_overrides_the_age_floor() {
+        let now = 1_700_000_000;
+        let retention = PlanRetention::default();
+
+        let plans: Vec<PostgresPolicyPlan> = (0..retention.applied_ceiling + 40)
+            .map(|i| {
+                retained_plan(
+                    &format!("applied-{i:04}"),
+                    PlanPhase::Applied,
+                    // All well inside the floor.
+                    60 + i as i64,
+                    now,
+                )
+            })
+            .collect();
+
+        assert_eq!(
+            evicted_names(&plans, retention, now).len(),
+            40,
+            "the ceiling trims back to itself, not to the count bound"
+        );
+    }
+
+    #[test]
+    fn live_plans_and_kept_plans_are_never_evicted() {
+        let now = 1_700_000_000;
+        let retention = PlanRetention::default();
+        let year = 400 * 24 * 60 * 60;
+
+        let mut plans = Vec::new();
+        for (i, phase) in [PlanPhase::Pending, PlanPhase::Approved, PlanPhase::Applying]
+            .into_iter()
+            .enumerate()
+        {
+            plans.push(retained_plan(&format!("live-{i}"), phase, year * 2, now));
+        }
+        // Enough superseded plans to blow past the bound many times over.
+        for i in 0..40 {
+            plans.push(retained_plan(
+                &format!("superseded-{i:03}"),
+                PlanPhase::Superseded,
+                year,
+                now,
+            ));
+        }
+        let mut kept = retained_plan("kept", PlanPhase::Superseded, year * 3, now);
+        kept.metadata
+            .labels
+            .get_or_insert_with(Default::default)
+            .insert("pgroles.io/keep".to_string(), "true".to_string());
+        plans.push(kept);
+
+        let evicted = evicted_names(&plans, retention, now);
+        assert!(!evicted.iter().any(|name| name.starts_with("live-")));
+        assert!(!evicted.contains(&"kept".to_string()));
+        assert_eq!(evicted.len(), 40 - retention.superseded);
+    }
+
+    /// [`PlanRetention::from_lookup`] over a fixed variable table.
+    fn retention_from(vars: &[(&str, &str)]) -> Result<PlanRetention, PlanRetentionConfigError> {
+        PlanRetention::from_lookup(|variable| {
+            vars.iter()
+                .find(|(name, _)| *name == variable)
+                .map(|(_, value)| value.to_string())
+        })
+    }
+
+    #[test]
+    fn unset_retention_variables_keep_the_defaults() {
+        assert_eq!(
+            retention_from(&[]).expect("an empty environment is valid"),
+            PlanRetention::default()
+        );
+    }
+
+    #[test]
+    fn each_retention_variable_overrides_its_bound() {
+        let resolved = retention_from(&[
+            (PlanRetention::ENV_APPLIED, "7"),
+            (PlanRetention::ENV_APPLIED_CEILING, "70"),
+            (PlanRetention::ENV_APPLIED_MIN_AGE, "36h"),
+            (PlanRetention::ENV_DECIDED, "4"),
+            (PlanRetention::ENV_SUPERSEDED, "1"),
+        ])
+        .expect("all five values are valid");
+
+        let expected = PlanRetention {
+            applied: 7,
+            applied_ceiling: 70,
+            applied_min_age_secs: 36 * 60 * 60,
+            decided: 4,
+            superseded: 1,
+        };
+        // Guard against this test going vacuous: if the fixture ever equalled
+        // the defaults, a lookup that ignored the environment entirely would
+        // still pass the assertion below.
+        assert_ne!(expected, PlanRetention::default());
+        assert_eq!(resolved, expected);
+    }
+
+    #[test]
+    fn an_invalid_retention_count_is_rejected_naming_the_variable() {
+        let error = retention_from(&[(PlanRetention::ENV_DECIDED, "many")])
+            .expect_err("a non-numeric count must be rejected, not defaulted");
+        assert!(
+            error.to_string().contains(PlanRetention::ENV_DECIDED),
+            "the error must name the variable to fix: {error}"
+        );
+    }
+
+    #[test]
+    fn an_invalid_retention_min_age_is_rejected_naming_the_variable() {
+        // Days are deliberately not a unit — this is the same syntax as the
+        // EPHEMERAL_ACCESS_* durations, and "30d" must fail loudly rather
+        // than resolve to something else.
+        let error = retention_from(&[(PlanRetention::ENV_APPLIED_MIN_AGE, "30d")])
+            .expect_err("an unsupported duration unit must be rejected, not defaulted");
+        assert!(
+            error
+                .to_string()
+                .contains(PlanRetention::ENV_APPLIED_MIN_AGE),
+            "the error must name the variable to fix: {error}"
+        );
+    }
+
+    #[test]
+    fn the_applied_floor_runs_from_when_the_plan_applied_not_when_it_was_created() {
+        // A plan can sit Pending or Approved for longer than the entire floor
+        // before a reviewer decides it. Measured from creation, such a plan is
+        // already outside the floor the moment it executes, and the cleanup
+        // that follows execution deletes it — the exact history the floor
+        // promises to keep.
+        let now = 1_700_000_000;
+        let retention = PlanRetention::default();
+
+        // Created far outside the floor, applied just now. Enough plans to
+        // exceed the count bound, but well under the ceiling, so only the
+        // floor can be what spares them.
+        let excess = 10;
+        assert!(
+            retention.applied + excess <= retention.applied_ceiling,
+            "this test must not lean on the ceiling to pass"
+        );
+        let plans: Vec<PostgresPolicyPlan> = (0..retention.applied + excess)
+            .map(|i| {
+                let mut plan = retained_plan(
+                    &format!("applied-{i:03}"),
+                    PlanPhase::Applied,
+                    retention.applied_min_age_secs * 3 + i as i64,
+                    now,
+                );
+                plan.status
+                    .as_mut()
+                    .expect("retained_plan always sets a status")
+                    .applied_at = Some(
+                    jiff::Timestamp::from_second(now - 60 - i as i64)
+                        .expect("epoch second in range")
+                        .to_string(),
+                );
+                plan
+            })
+            .collect();
+
+        assert!(
+            evicted_names(&plans, retention, now).is_empty(),
+            "a plan applied inside the floor is kept, however old the object is"
+        );
+    }
+
+    #[test]
+    fn above_the_ceiling_eviction_order_follows_when_plans_applied_not_when_created() {
+        // Above the ceiling the floor is overridden and the walk evicts from
+        // the front, so the sort order decides who dies. Ordered by creation,
+        // a plan created before a long review but applied moments ago sorts
+        // first and is deleted by the cleanup right after it executes, while
+        // older executions whose objects happen to be newer survive.
+        let now = 1_700_000_000;
+        let retention = PlanRetention::default();
+        let excess = 5;
+        let count = retention.applied_ceiling + excess;
+
+        // Creation order is the exact reverse of applied order: plan 0 is the
+        // oldest object but the most recent execution. All applied inside the
+        // floor, so only the ceiling forces eviction.
+        let plans: Vec<PostgresPolicyPlan> = (0..count)
+            .map(|i| {
+                let mut plan = retained_plan(
+                    &format!("applied-{i:04}"),
+                    PlanPhase::Applied,
+                    retention.applied_min_age_secs * 3 + (count - i) as i64,
+                    now,
+                );
+                plan.status
+                    .as_mut()
+                    .expect("retained_plan always sets a status")
+                    .applied_at = Some(
+                    jiff::Timestamp::from_second(now - 100 - i as i64)
+                        .expect("epoch second in range")
+                        .to_string(),
+                );
+                plan
+            })
+            .collect();
+
+        let evicted = evicted_names(&plans, retention, now);
+        assert_eq!(
+            evicted.len(),
+            excess,
+            "the ceiling trims exactly the excess"
+        );
+        for i in 0..excess {
+            let earliest_executed = format!("applied-{:04}", count - 1 - i);
+            assert!(
+                evicted.contains(&earliest_executed),
+                "the earliest executions go first, whatever their objects' creation order"
+            );
+        }
+        assert!(
+            !evicted.contains(&"applied-0000".to_string()),
+            "the most recent execution must survive even as the oldest object by creation"
+        );
+    }
+
+    #[test]
+    fn a_non_unicode_environment_value_is_rejected_not_defaulted() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let read = Err(std::env::VarError::NotUnicode(
+            std::ffi::OsString::from_vec(vec![b'2', b'5', 0xff]),
+        ));
+        let error = env_read(PlanRetention::ENV_APPLIED, read)
+            .expect_err("a set-but-non-Unicode value must be rejected, not read as unset");
+        assert!(
+            error.to_string().contains(PlanRetention::ENV_APPLIED),
+            "the error must name the variable to fix: {error}"
+        );
+
+        assert_eq!(
+            env_read(
+                PlanRetention::ENV_APPLIED,
+                Err(std::env::VarError::NotPresent)
+            )
+            .expect("absent is not an error"),
+            None
+        );
+        assert_eq!(
+            env_read(PlanRetention::ENV_APPLIED, Ok("25".to_string()))
+                .expect("a Unicode value is not an error"),
+            Some("25".to_string())
+        );
+    }
+
+    #[test]
+    fn a_ceiling_below_the_applied_count_is_rejected() {
+        // Eviction stops at the count bound before the ceiling is consulted,
+        // so a smaller ceiling could never take effect; accepting it would
+        // mean running with different bounds than the environment states.
+        retention_from(&[
+            (PlanRetention::ENV_APPLIED, "50"),
+            (PlanRetention::ENV_APPLIED_CEILING, "10"),
+        ])
+        .expect_err("a ceiling below the count bound must be rejected");
+
+        // Equal is the degenerate-but-coherent form: the floor never spares
+        // anything, and that is exactly what the configuration says.
+        retention_from(&[
+            (PlanRetention::ENV_APPLIED, "50"),
+            (PlanRetention::ENV_APPLIED_CEILING, "50"),
+        ])
+        .expect("a ceiling equal to the count bound is valid");
+    }
+
     fn plan_failed_at(phase: PlanPhase, age_secs: i64, now_ts: i64) -> PostgresPolicyPlan {
         let mut plan = PostgresPolicyPlan::new("plan", test_plan_spec());
         plan.status = Some(PostgresPolicyPlanStatus {
