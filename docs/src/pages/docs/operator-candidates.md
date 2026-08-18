@@ -8,16 +8,16 @@ Review what a change would do to production before it becomes the desired state.
 ---
 
 {% callout type="note" title="What is not built" %}
-The kind, the content digest, the planning lifecycle, **promotion** — the
-subject of this page — and the `pgroles candidate` CLI subcommands are
+The kind, the content digest, the planning lifecycle, **promotion** (the
+subject of this page), and the `pgroles candidate` CLI subcommands are
 implemented. Two things named below are not: `pgroles plan`, and
 `spec.contentRef` for content too large to embed.
 
 Every recipe on this page is given twice, as `kubectl` and as `pgroles
 candidate`. The `kubectl` form is not a fallback: it is the definition, and it
 is what you use where the CLI is not installed. **Deciding** a plan has only
-the `kubectl` form, on purpose — see [Reviewing and
-deciding](#reviewing-and-deciding).
+the `kubectl` form; this is deliberate (see [Reviewing and
+deciding](#reviewing-and-deciding)).
 {% /callout %}
 
 ## What a candidate is
@@ -115,8 +115,8 @@ CI typically files every team's candidates under one service account.
 ### With the CLI
 
 `pgroles candidate create` files the same object from an ordinary pgroles
-manifest — the file you already run `pgroles validate` and `pgroles diff`
-against — so the proposal and the thing the PR promotes are one file:
+manifest: the file you already run `pgroles validate` and `pgroles diff`
+against. The file you propose is the file the PR merges:
 
 ```shell
 pgroles candidate create --policy orders -f policy.yaml
@@ -126,9 +126,9 @@ pgroles candidate create --policy orders -f policy.yaml --replaces orders-x7k2p
 It accepts a bare manifest, a `PostgresPolicy` CR (whose `connection`,
 `interval`, `mode`, `suspend` and `approval` are dropped, because a candidate
 takes those from its parent), or a `PostgresPolicyCandidate` CR. A manifest key
-with no candidate counterpart — `auth_providers`, say — is rejected rather than
-filed, because a structural CRD schema would prune it server-side and the stored
-content would then mean something other than the file on disk.
+with no candidate counterpart, such as `auth_providers`, is rejected rather
+than filed. A structural CRD schema would prune the key server-side, and the
+stored content would then mean something other than the file on disk.
 
 The content is validated locally first, through the same path as `pgroles
 validate`, so a candidate the API server would reject on [size
@@ -183,7 +183,7 @@ kubectl get pgplan orders-change-x7k2p-plan-9f21c4 -o yaml
 
 ### With the CLI
 
-The same three questions, without hand-rolled jsonpath:
+Three subcommands read the same information without hand-rolled jsonpath:
 
 ```shell
 pgroles candidate list --policy orders
@@ -191,34 +191,36 @@ pgroles candidate status orders-change-x7k2p
 pgroles candidate diff orders-change-x7k2p
 ```
 
-`list` gives one row per candidate for that policy — phase, abbreviated content
+`list` gives one row per candidate for that policy: phase, abbreviated content
 digest, plan name, and the `Ready` / `Superseded` / `Promoted` conditions with
-their reasons, which are the [conditions table](#conditions) below.
+their reasons, as listed in the [conditions table](#conditions) below.
 
 `status` expands one candidate: its phase and full digest, its conditions with
 messages, and then its plan — the plan's phase, its decision and the identity
 that made it, whether it is still current or has been superseded, the applied
-base it is pinned to, and what promotion has to say. A candidate with no plan
-yet says so and says why rather than printing a blank plan section.
+base it is pinned to, and any promotion outcome. A candidate with no plan yet
+reports that, with the reason, rather than printing a blank plan section.
 
 `diff` prints the reviewed plan's SQL on stdout: what approving this candidate
 would execute. It reads `status.sqlInline`, falling back to the gzipped
-ConfigMap in `status.sqlRef` when the plan is too large to inline. A plan whose
-SQL survives only as a truncated preview is an error, not a short diff — a
-fragment shown under "what would this do?" is worse than nothing.
+ConfigMap in `status.sqlRef` when the plan is too large to inline. A plan
+whose SQL survives only as a truncated preview is an error, not a short diff,
+because a partial listing could be read as the full set of statements the
+approval would execute.
 
-Every one of these fails loudly and specifically instead of printing something
+Each subcommand reports missing state as a specific error rather than output
 that could be misread: a policy that does not exist is distinguished from a
-policy with no candidates, a candidate with no plan from a plan with no SQL, and
-`--replaces` naming a candidate of a different policy is refused outright.
+policy with no candidates, a candidate with no plan from a plan with no SQL,
+and `--replaces` naming a candidate of a different policy is refused.
 
 ### Deciding stays `kubectl`-shaped
 
 There is deliberately no `pgroles candidate approve` or `reject`. A decision is
 a write to the plan's status subresource, gated by admission so that `decidedBy`
 records an authenticated identity rather than an assertion by whoever wrote the
-status. Putting that behind a CLI verb would blur who authenticated it — the one
-thing the approval mechanism exists to make unambiguous. See [Deciding a
+status. A CLI verb in front of that write would obscure which identity
+authenticated the decision, and recording that identity unambiguously is the
+point of the approval mechanism. See [Deciding a
 plan](/docs/operator-plan-approval#deciding-a-plan) for the exact patch, which
 is identical for a candidate's plan and a policy's.
 
@@ -412,21 +414,21 @@ approval is not an indefinite authorisation.
 
 Retention prunes what is already finished. Two separate bounds apply to
 proposals that are still open, because planning them is work the parent policy
-does while holding its locks — an unbounded number of open candidates would
+does while holding its locks. An unbounded number of open candidates would
 slow enforcement of the live policy in proportion to how many people are
 proposing changes to it.
 
 **A budget.** At most 32 open candidates per policy are planned in one pass.
 The oldest are kept: the failure this guards against is a CI loop filing a
 candidate per push, and evicting the newest protects proposals already under
-review from being pushed out by the flood. Nothing is deleted — a candidate
+review from being displaced by new filings. Nothing is deleted: a candidate
 over the budget reports `Ready=False, reason=CandidateBudgetExceeded` and is
 planned as soon as enough older proposals are decided or expire.
 
 **A TTL.** An open candidate that nobody decides within 14 days of being filed
 is marked `Superseded=True, reason=Expired`: at that point it is abandoned
 rather than under review, and retention prunes it in the ordinary way. The TTL
-runs from creation and nothing else — consulting each candidate's plan for a
+runs from creation and nothing else. Consulting each candidate's plan for a
 decision would put per-candidate reads back into the parent's critical
 section, which is what these bounds exist to avoid. A proposal that genuinely
 is still in flight after two weeks can be labelled `pgroles.io/keep=true`,

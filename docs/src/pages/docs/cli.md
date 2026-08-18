@@ -314,11 +314,11 @@ Files a `PostgresPolicyCandidate` carrying the content of a local manifest. The 
 | `--replaces` | Name of an earlier candidate this one supersedes; must belong to the same policy |
 | `-n`, `--namespace` | Kubernetes namespace (default: `default`) |
 
-The manifest may be a bare pgroles manifest, a `PostgresPolicy` CR — whose `connection`, `interval`, `mode`, `suspend` and `approval` are dropped, since a candidate takes those from its parent — or a `PostgresPolicyCandidate` CR. A key with no candidate counterpart is rejected rather than silently pruned server-side.
+The manifest may be a bare pgroles manifest, a `PostgresPolicy` CR (whose `connection`, `interval`, `mode`, `suspend` and `approval` are dropped, since a candidate takes those from its parent), or a `PostgresPolicyCandidate` CR. A key with no candidate counterpart is rejected rather than silently pruned server-side.
 
 ### list
 
-One row per candidate filed against the policy: phase, abbreviated content digest, plan name, and the `Ready` / `Superseded` / `Promoted` conditions with their reasons. A policy with no candidates says so; a policy that does not exist is a distinct error.
+One row per candidate filed against the policy: phase, abbreviated content digest, plan name, and the `Ready` / `Superseded` / `Promoted` conditions with their reasons. A policy with no candidates reports that; a policy that does not exist is a distinct error.
 
 ### status
 
