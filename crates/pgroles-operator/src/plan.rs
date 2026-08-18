@@ -1691,13 +1691,34 @@ fn plans_to_evict(
 
     let mut evict = oldest_beyond(&mut decided, retention.decided);
     evict.extend(oldest_beyond(&mut superseded, retention.superseded));
+    evict.extend(applied_plans_to_evict(applied, retention, now_ts));
+    evict
+}
 
-    // Applied is the audit record of what actually ran, so its count bound
-    // yields to the age floor. Walk oldest first and stop once the count bound
-    // is met; spare anything still inside the floor along the way, unless the
-    // survivors would breach the ceiling. Sparing is what makes the retained
-    // span a promise rather than a function of how often the policy applies.
-    sort_oldest_first(&mut applied);
+/// Which `Applied` plans the retention bounds evict from `applied`.
+///
+/// Applied is the audit record of what actually ran, so its count bound
+/// yields to the age floor. Walk oldest first and stop once the count bound
+/// is met; spare anything still inside the floor along the way, unless the
+/// survivors would breach the ceiling. Sparing is what makes the retained
+/// span a promise rather than a function of how often the policy applies.
+///
+/// Both the order and the floor measure from [`applied_epoch_secs`] — one
+/// notion of "when did this apply" drives the whole walk. Ordering by
+/// creation instead would evict a plan created before a long review but
+/// applied moments ago, ahead of older executions whose objects happen to be
+/// newer.
+///
+/// Shared with terminal-candidate pruning: deleting a promoted candidate
+/// cascades to the `Applied` plan it owns, so the candidate is held to these
+/// same bounds (see `candidate::terminal_candidates_to_prune`).
+pub(crate) fn applied_plans_to_evict(
+    mut applied: Vec<&PostgresPolicyPlan>,
+    retention: PlanRetention,
+    now_ts: i64,
+) -> Vec<&PostgresPolicyPlan> {
+    applied.sort_by_key(|plan| applied_epoch_secs(plan));
+    let mut evict = Vec::new();
     let mut remaining = applied.len();
     for plan in applied {
         if remaining <= retention.applied {
@@ -1710,7 +1731,6 @@ fn plans_to_evict(
         evict.push(plan);
         remaining -= 1;
     }
-
     evict
 }
 
@@ -1735,31 +1755,35 @@ fn sort_oldest_first(plans: &mut [&PostgresPolicyPlan]) {
     });
 }
 
-/// Age of an `Applied` plan for the retention floor, measured from
-/// `status.appliedAt`. The floor promises post-application history, and a
-/// plan can sit `Pending` or `Approved` for arbitrarily long before a
-/// reviewer decides it — measured from creation, a plan approved late would
-/// read as already outside the floor and be evicted by the cleanup that runs
-/// right after it executes. Falls back to [`plan_age_secs`] when `appliedAt`
-/// is absent or unparseable, so plans recorded before it was set keep the
-/// creation-time behaviour rather than reading as infinitely old.
-fn applied_age_secs(plan: &PostgresPolicyPlan, now_ts: i64) -> i64 {
+/// When an `Applied` plan applied, as epoch seconds: `status.appliedAt`,
+/// falling back to the creation timestamp when it is absent or unparseable so
+/// plans recorded before it was set keep the creation-time behaviour rather
+/// than reading as infinitely old. `None` when neither instant is known.
+///
+/// This is the single notion of "when did this apply" behind both the
+/// retention floor and the eviction order — the floor promises
+/// post-application history, and a plan can sit `Pending` or `Approved` for
+/// arbitrarily long before a reviewer decides it, so measuring from creation
+/// would read a plan approved late as already outside that promise.
+fn applied_epoch_secs(plan: &PostgresPolicyPlan) -> Option<i64> {
     plan.status
         .as_ref()
         .and_then(|status| status.applied_at.as_deref())
         .and_then(parse_rfc3339_epoch_secs)
-        .map(|applied_ts| now_ts.saturating_sub(applied_ts))
-        .unwrap_or_else(|| plan_age_secs(plan, now_ts))
+        .or_else(|| {
+            plan.metadata
+                .creation_timestamp
+                .as_ref()
+                .map(|timestamp| timestamp.0.as_second())
+        })
 }
 
-/// Age in seconds, or 0 for a plan with no creation timestamp — treating an
-/// unknown age as brand new keeps it, which is the safe direction for a
-/// deletion decision.
-fn plan_age_secs(plan: &PostgresPolicyPlan, now_ts: i64) -> i64 {
-    plan.metadata
-        .creation_timestamp
-        .as_ref()
-        .map(|timestamp| now_ts.saturating_sub(timestamp.0.as_second()))
+/// Age of an `Applied` plan for the retention floor — see
+/// [`applied_epoch_secs`]. An unknown instant is age 0: brand new is the safe
+/// direction for a deletion decision.
+fn applied_age_secs(plan: &PostgresPolicyPlan, now_ts: i64) -> i64 {
+    applied_epoch_secs(plan)
+        .map(|applied_ts| now_ts.saturating_sub(applied_ts))
         .unwrap_or(0)
 }
 
@@ -3002,6 +3026,60 @@ mod tests {
         assert!(
             evicted_names(&plans, retention, now).is_empty(),
             "a plan applied inside the floor is kept, however old the object is"
+        );
+    }
+
+    #[test]
+    fn above_the_ceiling_eviction_order_follows_when_plans_applied_not_when_created() {
+        // Above the ceiling the floor is overridden and the walk evicts from
+        // the front, so the sort order decides who dies. Ordered by creation,
+        // a plan created before a long review but applied moments ago sorts
+        // first and is deleted by the cleanup right after it executes, while
+        // older executions whose objects happen to be newer survive.
+        let now = 1_700_000_000;
+        let retention = PlanRetention::default();
+        let excess = 5;
+        let count = retention.applied_ceiling + excess;
+
+        // Creation order is the exact reverse of applied order: plan 0 is the
+        // oldest object but the most recent execution. All applied inside the
+        // floor, so only the ceiling forces eviction.
+        let plans: Vec<PostgresPolicyPlan> = (0..count)
+            .map(|i| {
+                let mut plan = retained_plan(
+                    &format!("applied-{i:04}"),
+                    PlanPhase::Applied,
+                    retention.applied_min_age_secs * 3 + (count - i) as i64,
+                    now,
+                );
+                plan.status
+                    .as_mut()
+                    .expect("retained_plan always sets a status")
+                    .applied_at = Some(
+                    jiff::Timestamp::from_second(now - 100 - i as i64)
+                        .expect("epoch second in range")
+                        .to_string(),
+                );
+                plan
+            })
+            .collect();
+
+        let evicted = evicted_names(&plans, retention, now);
+        assert_eq!(
+            evicted.len(),
+            excess,
+            "the ceiling trims exactly the excess"
+        );
+        for i in 0..excess {
+            let earliest_executed = format!("applied-{:04}", count - 1 - i);
+            assert!(
+                evicted.contains(&earliest_executed),
+                "the earliest executions go first, whatever their objects' creation order"
+            );
+        }
+        assert!(
+            !evicted.contains(&"applied-0000".to_string()),
+            "the most recent execution must survive even as the oldest object by creation"
         );
     }
 
