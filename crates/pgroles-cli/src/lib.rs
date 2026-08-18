@@ -8,6 +8,8 @@ use std::path::Path;
 
 use anyhow::{Context, Result};
 
+pub mod candidate;
+
 use pgroles_core::composition::{self, ComposedPolicy, PolicyBundle, PolicyDocument};
 use pgroles_core::diff::{self, Change};
 use pgroles_core::manifest::{self, ExpandedManifest, PolicyManifest, RoleRetirement};

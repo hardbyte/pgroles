@@ -25,6 +25,19 @@
 //! override, which is exactly why such a plan can never be promoted onto the
 //! current target.
 //!
+//! **One inspection per target per reconcile.** Planning N candidates used to
+//! cost N full database inspections, all inside the parent's critical section,
+//! so enforcement latency for the *live* policy degraded in proportion to how
+//! many people were proposing changes to it. It now costs one: every
+//! candidate's inspection scope is computed up front (purely, from its content
+//! — see [`candidate_inputs`]), the scopes are unioned, the database is read
+//! once, and each candidate derives its own scoped inspection from that read
+//! in memory. Deriving is *not* reusing the parent's snapshot: a candidate's
+//! scope, wildcard expansion and diagnostics are its own, and
+//! `RawInspection::derive` refuses a scope the read does not cover rather than
+//! answering narrowly. Candidates with a `spec.target` override are a
+//! different database and still inspect for themselves.
+//!
 //! See `docs/src/pages/docs/operator-candidates.md` for the behaviour and
 //! `docs/design/adr-001-candidate-api.md` (Decisions 3 and 6) for the
 //! ownership and overlay-overlap rules.
@@ -32,6 +45,9 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference;
+// Re-exported by k8s-openapi, which is where `creation_timestamp` gets its
+// type from — so comparing against it needs no new dependency.
+use k8s_openapi::jiff::{SignedDuration, Timestamp};
 use kube::api::{Api, DeleteParams, ListParams, Patch, PatchParams};
 use kube::{Resource, ResourceExt};
 use tracing::info;
@@ -55,6 +71,27 @@ use crate::reconciler::{ReconcileError, ResolvedPassword};
 /// pruned. Deleting a candidate cascades to the plan it owns and to that
 /// plan's SQL ConfigMap.
 const DEFAULT_MAX_TERMINAL_CANDIDATES: usize = 10;
+
+/// Maximum *open* candidates per policy that are planned in one pass.
+///
+/// Distinct from [`DEFAULT_MAX_TERMINAL_CANDIDATES`], which prunes what is
+/// already finished. This bounds work that has not happened yet: a CI loop
+/// filing a candidate per push can otherwise unbound the planning the parent
+/// does under its locks. Candidates past the budget are not deleted — they are
+/// somebody's proposal — they are left unplanned with a `Ready=False` reason
+/// that says so.
+const DEFAULT_MAX_OPEN_CANDIDATES: usize = 32;
+
+/// How long an undecided candidate stays open before it is treated as
+/// abandoned rather than under review.
+///
+/// Deliberately measured from creation and nothing else. Consulting each
+/// candidate's plan for a decision would reintroduce per-candidate I/O in the
+/// parent's critical section, which is the cost this whole area exists to
+/// bound. Two weeks is long enough that an approved-but-unmerged proposal has
+/// stopped being in flight; `pgroles.io/keep=true` is the escape hatch for one
+/// that genuinely is.
+const DEFAULT_OPEN_CANDIDATE_TTL: SignedDuration = SignedDuration::from_hours(14 * 24);
 
 // ---------------------------------------------------------------------------
 // The parent gate
@@ -145,6 +182,78 @@ enum CandidateOutcome {
 }
 
 // ---------------------------------------------------------------------------
+// Open-candidate admission: TTL and budget
+// ---------------------------------------------------------------------------
+
+/// Why an open candidate is not being planned this pass.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NotPlanned {
+    /// Undecided past the TTL: abandoned, not under review. Terminal.
+    Expired,
+    /// Past the open-candidate budget. Not terminal: it plans as soon as
+    /// enough of its elders finish.
+    OverBudget,
+}
+
+/// Decide, for every candidate, whether it is planned this pass.
+///
+/// Pure — takes `now` rather than reading the clock — so the policy is
+/// unit-testable without a cluster, and computed before the shared inspection
+/// so that a candidate which will not be planned does not widen the read.
+///
+/// TTL is applied first: expiring an abandoned proposal frees budget for a
+/// live one. The budget then keeps the *oldest* survivors, which is the
+/// deliberate choice — the failure this bounds is a runaway loop filing new
+/// candidates, and evicting the newest protects proposals already under review
+/// from being pushed out by the flood. A candidate labelled
+/// `pgroles.io/keep=true` is exempt from both, and is still counted against
+/// the budget so the exemption cannot be used to enlarge it.
+fn classify_open_candidates(
+    candidates: &[PostgresPolicyCandidate],
+    now: Timestamp,
+) -> BTreeMap<String, NotPlanned> {
+    let mut verdicts = BTreeMap::new();
+    let mut budget_remaining = DEFAULT_MAX_OPEN_CANDIDATES;
+
+    // `candidates` is already sorted oldest-first by the caller, which is what
+    // makes "keep the oldest" a single pass.
+    for candidate in candidates {
+        if candidate_phase(candidate).is_terminal() {
+            continue;
+        }
+        let exempt = is_retention_exempt(candidate);
+
+        let expired = !exempt
+            && candidate
+                .metadata
+                .creation_timestamp
+                .as_ref()
+                .is_some_and(|created| {
+                    // `Timestamp - Timestamp` yields a calendar `Span`;
+                    // `duration_since` is the fixed-length difference, which is
+                    // what a TTL wants.
+                    now.duration_since(created.0) > DEFAULT_OPEN_CANDIDATE_TTL
+                });
+        if expired {
+            verdicts.insert(candidate.name_any(), NotPlanned::Expired);
+            continue;
+        }
+
+        if budget_remaining > 0 {
+            budget_remaining -= 1;
+        } else {
+            // The keep label exempts a candidate from the TTL, not from the
+            // budget. Exempting it here would make the label a way to opt out
+            // of the bound entirely — 40 kept candidates would plan all 40 —
+            // which is the cost this function exists to hold down.
+            verdicts.insert(candidate.name_any(), NotPlanned::OverBudget);
+        }
+    }
+
+    verdicts
+}
+
+// ---------------------------------------------------------------------------
 // Entry point
 // ---------------------------------------------------------------------------
 
@@ -183,6 +292,16 @@ pub async fn reconcile_candidates(
 
     let overlay_pairs = membership_overlay_pairs(planning.overlay_edges);
 
+    // Which candidates are not planned this pass — abandoned past the TTL, or
+    // past the open-candidate budget. Decided before the shared read so an
+    // unplanned candidate does not widen it.
+    let not_planned = classify_open_candidates(&candidates, Timestamp::now());
+
+    // One database read for the whole pass, over the union of every
+    // candidate's scope, taken before the loop so N candidates cost one
+    // inspection instead of N while the parent's locks are held.
+    let shared = shared_inspection(planning, &candidates, &not_planned).await;
+
     for candidate in &mut candidates {
         // First touch: adopt the candidate and stamp the identity everything
         // downstream is compared against, before any planning can fail.
@@ -197,6 +316,30 @@ pub async fn reconcile_candidates(
 
         if candidate_phase(candidate).is_terminal() {
             continue;
+        }
+
+        // Not planned this pass: abandoned, or queued behind its elders.
+        match not_planned.get(&candidate.name_any()) {
+            Some(NotPlanned::Expired) => {
+                mark_superseded(
+                    ctx,
+                    candidate,
+                    candidate_reason::EXPIRED,
+                    &format!(
+                        "no decision within {} days of being filed, so this proposal is \
+                         treated as abandoned; file a successor to revive it, or label \
+                         it pgroles.io/keep=true to exempt it",
+                        DEFAULT_OPEN_CANDIDATE_TTL.as_hours() / 24
+                    ),
+                )
+                .await?;
+                continue;
+            }
+            Some(NotPlanned::OverBudget) => {
+                mark_over_budget(ctx, candidate).await?;
+                continue;
+            }
+            None => {}
         }
 
         // A denied plan is terminal for the candidate too: it has no other
@@ -231,7 +374,12 @@ pub async fn reconcile_candidates(
             continue;
         }
 
-        match plan_candidate(ctx, policy, candidate, planning, &overlay_pairs).await {
+        let planning_started_at = std::time::Instant::now();
+        let outcome =
+            plan_candidate(ctx, policy, candidate, planning, &overlay_pairs, &shared).await;
+        ctx.observability
+            .record_candidate_planning(planning_started_at.elapsed());
+        match outcome {
             Ok(outcome) => {
                 record_outcome(ctx, candidate, outcome).await?;
             }
@@ -263,6 +411,13 @@ pub async fn reconcile_candidates(
         }
     }
 
+    ctx.observability.record_candidate_inspections(
+        shared
+            .inspections
+            .load(std::sync::atomic::Ordering::Relaxed),
+        shared.plannable,
+    );
+
     // Supersession is explicit and only takes effect once the successor has a
     // plan of its own: marking the predecessor earlier would leave a reviewer
     // with neither a live proposal nor a reviewable replacement.
@@ -277,17 +432,23 @@ pub async fn reconcile_candidates(
 // Planning one candidate
 // ---------------------------------------------------------------------------
 
-async fn plan_candidate(
-    ctx: &OperatorContext,
-    policy: &PostgresPolicy,
-    candidate: &PostgresPolicyCandidate,
-    planning: &CandidatePlanning<'_>,
-    overlay_pairs: &BTreeSet<EffectPair>,
-) -> Result<CandidateOutcome, ReconcileError> {
-    let namespace = candidate.namespace().ok_or(ReconcileError::NoNamespace)?;
-    let content = &candidate.spec.content;
+/// Everything planning one candidate derives from its content alone.
+///
+/// Pure: no I/O, no clock, no Kubernetes. That is what lets the candidate pass
+/// compute every candidate's inspection scope up front, union them, and read
+/// the database once — see [`shared_inspection`].
+struct CandidateInputs {
+    manifest: pgroles_core::manifest::PolicyManifest,
+    expanded: pgroles_core::manifest::ExpandedManifest,
+    desired: pgroles_core::model::RoleGraph,
+    inspect_config: pgroles_inspect::InspectConfig,
+}
 
-    let manifest = content.to_policy_manifest();
+fn candidate_inputs(
+    candidate: &PostgresPolicyCandidate,
+    overlay_edges: &[MembershipEdge],
+) -> Result<CandidateInputs, ReconcileError> {
+    let manifest = candidate.spec.content.to_policy_manifest();
     let expanded = pgroles_core::manifest::expand_manifest(&manifest)?;
     let mut desired = pgroles_core::model::RoleGraph::from_expanded(
         &expanded,
@@ -301,7 +462,7 @@ async fn plan_candidate(
     // removing that role, which the pair intersection below reports as an
     // overlap rather than silently planning around.
     let mut overlay_roles: BTreeSet<String> = BTreeSet::new();
-    for edge in planning.overlay_edges {
+    for edge in overlay_edges {
         if !desired.roles.contains_key(&edge.role) || !desired.roles.contains_key(&edge.member) {
             continue;
         }
@@ -317,6 +478,158 @@ async fn plan_candidate(
         desired.memberships.insert(edge.clone());
     }
 
+    // The candidate's own inspection scope: its expanded content, plus the
+    // roles it retires and the overlay roles it inherited. It is deliberately
+    // NOT the policy's scope — a candidate proposing a new role has a role in
+    // scope the policy does not, and the wildcard patterns it carries drive a
+    // different expansion and different diagnostics.
+    let has_database_grants = expanded
+        .grants
+        .iter()
+        .any(|g| g.object.object_type == pgroles_core::manifest::ObjectType::Database);
+    let inspect_config =
+        pgroles_inspect::InspectConfig::from_expanded(&expanded, has_database_grants)
+            .with_additional_roles(
+                manifest
+                    .retirements
+                    .iter()
+                    .map(|retirement| retirement.role.clone()),
+            )
+            .with_additional_roles(overlay_roles);
+
+    Ok(CandidateInputs {
+        manifest,
+        expanded,
+        desired,
+        inspect_config,
+    })
+}
+
+/// The one database read the whole candidate pass shares, plus how many reads
+/// the pass actually performed.
+struct SharedInspection {
+    /// `None` when there was nothing to share (no plannable candidate on the
+    /// parent's own target) or when the shared read failed — in which case
+    /// every candidate falls back to inspecting for itself, exactly as before.
+    raw: Option<pgroles_inspect::RawInspection>,
+    /// Database inspections performed during this pass: the shared read counts
+    /// as one, and each fallback adds another. This is the number the issue
+    /// asks to bound, so it is measured rather than assumed. (The at-most-one
+    /// lazy grantability query a derivation may trigger is part of the shared
+    /// read, not a further inspection.)
+    inspections: std::sync::atomic::AtomicUsize,
+    /// How many candidates the shared read was taken for — the denominator
+    /// that says whether `inspections` is flat in the candidate count.
+    plannable: usize,
+}
+
+impl SharedInspection {
+    fn none() -> Self {
+        Self {
+            raw: None,
+            inspections: std::sync::atomic::AtomicUsize::new(0),
+            plannable: 0,
+        }
+    }
+
+    /// Inspect `config` against `target`: from the shared snapshot when it
+    /// covers the scope and the target is the parent's own connection,
+    /// otherwise with a full inspection of its own.
+    ///
+    /// An override target has a different pool and therefore a different
+    /// database; a scope the snapshot never read would be silently
+    /// under-reported. Both fall back rather than approximate.
+    async fn inspect(
+        &self,
+        target: &CandidateTargetContext<'_>,
+        config: &pgroles_inspect::InspectConfig,
+    ) -> Result<pgroles_inspect::InspectionResult, ReconcileError> {
+        if let CandidateTargetContext::Parent(_) = target
+            && let Some(raw) = self.raw.as_ref()
+            && raw.covers(config)
+        {
+            return Ok(raw.derive(target.pool(), config).await?);
+        }
+
+        self.inspections
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Ok(pgroles_inspect::inspect_with_diagnostics(target.pool(), config).await?)
+    }
+}
+
+/// Read the database once for every candidate that will plan against the
+/// parent's own target.
+///
+/// The union of the candidates' scopes is read in one pass; each candidate
+/// then derives its own scoped inspection from it in memory. Candidates with a
+/// `spec.target` override are excluded: they are a different database, and
+/// resolving which one is itself I/O.
+///
+/// A failure here is not fatal — it degrades to the previous behaviour of one
+/// inspection per candidate, because a shared read is an optimisation and a
+/// proposal must never break enforcement.
+async fn shared_inspection(
+    planning: &CandidatePlanning<'_>,
+    candidates: &[PostgresPolicyCandidate],
+    not_planned: &BTreeMap<String, NotPlanned>,
+) -> SharedInspection {
+    if !matches!(planning.gate, ParentGate::Stable) {
+        return SharedInspection::none();
+    }
+
+    let configs: Vec<pgroles_inspect::InspectConfig> = candidates
+        .iter()
+        .filter(|candidate| {
+            !candidate_phase(candidate).is_terminal()
+                && candidate.spec.target.is_none()
+                // An expired or over-budget candidate is never planned, so
+                // letting its scope into the union would make the read wider
+                // than the work — the opposite of the point of the budget.
+                && !not_planned.contains_key(&candidate.name_any())
+        })
+        .filter_map(|candidate| {
+            candidate_inputs(candidate, planning.overlay_edges)
+                .ok()
+                .map(|inputs| inputs.inspect_config)
+        })
+        .collect();
+    if configs.is_empty() {
+        return SharedInspection::none();
+    }
+
+    let plannable = configs.len();
+    let union = pgroles_inspect::InspectConfig::union_of(configs.iter());
+    match pgroles_inspect::RawInspection::read(planning.pool, &union).await {
+        Ok(raw) => SharedInspection {
+            raw: Some(raw),
+            inspections: std::sync::atomic::AtomicUsize::new(1),
+            plannable,
+        },
+        Err(err) => {
+            tracing::warn!(
+                %err,
+                "shared candidate inspection failed; falling back to one inspection per candidate"
+            );
+            SharedInspection {
+                raw: None,
+                inspections: std::sync::atomic::AtomicUsize::new(0),
+                plannable,
+            }
+        }
+    }
+}
+
+async fn plan_candidate(
+    ctx: &OperatorContext,
+    policy: &PostgresPolicy,
+    candidate: &PostgresPolicyCandidate,
+    planning: &CandidatePlanning<'_>,
+    overlay_pairs: &BTreeSet<EffectPair>,
+    shared: &SharedInspection,
+) -> Result<CandidateOutcome, ReconcileError> {
+    let namespace = candidate.namespace().ok_or(ReconcileError::NoNamespace)?;
+    let inputs = candidate_inputs(candidate, planning.overlay_edges)?;
+
     // Resolve the execution context. Everything after this point runs against
     // `target`, which is the parent's connection unless `spec.target` overrides
     // it — in which case the plan binds that database's identity and can never
@@ -328,11 +641,9 @@ async fn plan_candidate(
         candidate,
         overlay_pairs,
         &target,
-        &manifest,
-        &expanded,
-        &desired,
-        &overlay_roles,
+        &inputs,
         &namespace,
+        shared,
     )
     .await;
     // An override holds its own advisory lock; release it on every path.
@@ -347,28 +658,18 @@ async fn plan_against_target(
     candidate: &PostgresPolicyCandidate,
     overlay_pairs: &BTreeSet<EffectPair>,
     target: &CandidateTargetContext<'_>,
-    manifest: &pgroles_core::manifest::PolicyManifest,
-    expanded: &pgroles_core::manifest::ExpandedManifest,
-    desired: &pgroles_core::model::RoleGraph,
-    overlay_roles: &BTreeSet<String>,
+    inputs: &CandidateInputs,
     namespace: &str,
+    shared: &SharedInspection,
 ) -> Result<CandidateOutcome, ReconcileError> {
     let content = &candidate.spec.content;
-    let has_database_grants = expanded
-        .grants
-        .iter()
-        .any(|g| g.object.object_type == pgroles_core::manifest::ObjectType::Database);
-    let inspect_config =
-        pgroles_inspect::InspectConfig::from_expanded(expanded, has_database_grants)
-            .with_additional_roles(
-                manifest
-                    .retirements
-                    .iter()
-                    .map(|retirement| retirement.role.clone()),
-            )
-            .with_additional_roles(overlay_roles.iter().cloned());
-    let inspection =
-        pgroles_inspect::inspect_with_diagnostics(target.pool(), &inspect_config).await?;
+    let CandidateInputs {
+        manifest,
+        expanded,
+        desired,
+        inspect_config,
+    } = inputs;
+    let inspection = shared.inspect(target, inspect_config).await?;
     if let Some(message) = inspection.diagnostics.blocking_message() {
         return Err(ReconcileError::UnsatisfiableWildcardGrant(message));
     }
@@ -417,7 +718,7 @@ async fn plan_against_target(
     let candidate_pairs = effect_pairs(&changes);
     let overlapping = intersecting_pairs(&candidate_pairs, overlay_pairs);
 
-    let sql_ctx = crate::reconciler::detect_sql_context(target.pool(), &inspect_config).await?;
+    let sql_ctx = crate::reconciler::detect_sql_context(target.pool(), inspect_config).await?;
     let content_digest = content_digest(candidate);
     // The base pin: the policy content this plan is being computed against.
     // Promotion refuses to adopt a plan pinned to any other base, so an
@@ -435,7 +736,7 @@ async fn plan_against_target(
         policy,
         &changes,
         &sql_ctx,
-        &inspect_config,
+        inspect_config,
         content.reconciliation_mode,
         target.identity(),
         target.target_identity(),
@@ -901,6 +1202,48 @@ async fn record_outcome(
     }
 }
 
+/// Report that a candidate is queued behind the open-candidate budget.
+///
+/// Nothing is deleted and the candidate is not terminal: it is planned as soon
+/// as enough older proposals are decided or expire. Like [`block_candidate`],
+/// a candidate can sit here for many cycles, so the Event is published once per
+/// transition rather than once per pass.
+async fn mark_over_budget(
+    ctx: &OperatorContext,
+    candidate: &mut PostgresPolicyCandidate,
+) -> Result<(), ReconcileError> {
+    let message = format!(
+        "this policy already has {DEFAULT_MAX_OPEN_CANDIDATES} open candidates being \
+         planned; this one is planned once older proposals are decided or expire"
+    );
+    let already_over_budget = candidate.status.as_ref().is_some_and(|status| {
+        status.conditions.iter().any(|c| {
+            c.condition_type == "Ready"
+                && c.status == "False"
+                && c.reason.as_deref() == Some(candidate_reason::OVER_BUDGET)
+        })
+    });
+    write_status(ctx, candidate, |status| {
+        set_condition_in(
+            &mut status.conditions,
+            ready_condition(false, candidate_reason::OVER_BUDGET, &message),
+        );
+    })
+    .await?;
+    if !already_over_budget {
+        crate::events::publish_candidate_event(
+            &ctx.event_recorder,
+            candidate,
+            true,
+            candidate_reason::OVER_BUDGET,
+            message,
+        )
+        .await
+        .ok();
+    }
+    Ok(())
+}
+
 async fn block_candidate(
     ctx: &OperatorContext,
     candidate: &mut PostgresPolicyCandidate,
@@ -1174,6 +1517,190 @@ mod tests {
         )
     }
 
+    // -----------------------------------------------------------------
+    // Open-candidate admission: TTL and budget
+    // -----------------------------------------------------------------
+
+    /// An open candidate `age_hours` old, in the order
+    /// `classify_open_candidates` expects (oldest first).
+    fn open_candidate(name: &str, now: Timestamp, age_hours: i64) -> PostgresPolicyCandidate {
+        let mut candidate = candidate(name, PolicyContent::default());
+        candidate.metadata.creation_timestamp =
+            Some(k8s_openapi::apimachinery::pkg::apis::meta::v1::Time(
+                now - SignedDuration::from_hours(age_hours),
+            ));
+        candidate
+    }
+
+    /// The TTL in hours, so fixtures can sit either side of it precisely.
+    const TTL_HOURS: i64 = DEFAULT_OPEN_CANDIDATE_TTL.as_hours();
+
+    fn keep(mut candidate: PostgresPolicyCandidate) -> PostgresPolicyCandidate {
+        candidate
+            .metadata
+            .labels
+            .get_or_insert_with(Default::default)
+            .insert("pgroles.io/keep".to_string(), "true".to_string());
+        candidate
+    }
+
+    #[test]
+    fn an_undecided_candidate_expires_once_it_is_past_the_ttl() {
+        let now = Timestamp::now();
+        let candidates = vec![
+            open_candidate("abandoned", now, TTL_HOURS + 1),
+            // Exactly at the TTL is not yet past it.
+            open_candidate("borderline", now, TTL_HOURS),
+            open_candidate("fresh", now, 1),
+        ];
+
+        let verdicts = classify_open_candidates(&candidates, now);
+        assert_eq!(verdicts.get("abandoned"), Some(&NotPlanned::Expired));
+        assert_eq!(verdicts.get("borderline"), None);
+        assert_eq!(verdicts.get("fresh"), None);
+    }
+
+    #[test]
+    fn the_budget_keeps_the_oldest_and_queues_the_rest() {
+        let now = Timestamp::now();
+        // Oldest first, as the caller sorts them.
+        let candidates: Vec<PostgresPolicyCandidate> = (0..DEFAULT_MAX_OPEN_CANDIDATES + 3)
+            .map(|i| {
+                // All well inside the TTL, so this test isolates the budget.
+                open_candidate(
+                    &format!("candidate-{i:03}"),
+                    now,
+                    (DEFAULT_MAX_OPEN_CANDIDATES + 3 - i) as i64,
+                )
+            })
+            .collect();
+
+        let verdicts = classify_open_candidates(&candidates, now);
+        assert_eq!(verdicts.len(), 3, "exactly the excess is queued");
+        for i in 0..DEFAULT_MAX_OPEN_CANDIDATES {
+            assert_eq!(
+                verdicts.get(&format!("candidate-{i:03}")),
+                None,
+                "the oldest proposals keep planning — a flood of new ones must not \
+                 evict what is already under review"
+            );
+        }
+        for i in DEFAULT_MAX_OPEN_CANDIDATES..DEFAULT_MAX_OPEN_CANDIDATES + 3 {
+            assert_eq!(
+                verdicts.get(&format!("candidate-{i:03}")),
+                Some(&NotPlanned::OverBudget)
+            );
+        }
+    }
+
+    #[test]
+    fn an_expired_candidate_does_not_consume_a_budget_slot() {
+        let now = Timestamp::now();
+        // Every budget slot is filled by an abandoned proposal, with one live
+        // candidate behind them: if expiry still spent a slot, the live one
+        // would be queued behind a wall of proposals nobody is reviewing.
+        //
+        // Note this is *not* a test of TTL-before-budget ordering, which is
+        // unobservable: the caller sorts oldest-first and expiry is by age, so
+        // every expired candidate already precedes every live one.
+        let mut candidates: Vec<PostgresPolicyCandidate> = (0..DEFAULT_MAX_OPEN_CANDIDATES)
+            .map(|i| open_candidate(&format!("stale-{i:03}"), now, TTL_HOURS + 10))
+            .collect();
+        candidates.push(open_candidate("live", now, 1));
+
+        let verdicts = classify_open_candidates(&candidates, now);
+        assert_eq!(
+            verdicts.get("live"),
+            None,
+            "a live candidate must not be queued behind abandoned ones"
+        );
+        assert_eq!(verdicts.get("stale-000"), Some(&NotPlanned::Expired));
+    }
+
+    #[test]
+    fn a_kept_candidate_is_exempt_from_both_but_still_occupies_a_slot() {
+        let now = Timestamp::now();
+        let ancient = keep(open_candidate("ancient", now, TTL_HOURS + 100));
+        assert_eq!(
+            classify_open_candidates(std::slice::from_ref(&ancient), now).get("ancient"),
+            None,
+            "pgroles.io/keep=true exempts a candidate from the TTL"
+        );
+
+        // The exemption must not be a way to enlarge the budget: a kept
+        // candidate still consumes a slot, so the one behind it is queued.
+        let mut candidates: Vec<PostgresPolicyCandidate> = (0..DEFAULT_MAX_OPEN_CANDIDATES - 1)
+            .map(|i| open_candidate(&format!("live-{i:03}"), now, 5))
+            .collect();
+        candidates.push(keep(open_candidate("kept", now, 4)));
+        candidates.push(open_candidate("queued", now, 3));
+
+        let verdicts = classify_open_candidates(&candidates, now);
+        assert_eq!(verdicts.get("kept"), None);
+        assert_eq!(verdicts.get("queued"), Some(&NotPlanned::OverBudget));
+    }
+
+    #[test]
+    fn the_keep_label_cannot_be_used_to_exceed_the_budget() {
+        let now = Timestamp::now();
+        // The case above only shows a kept candidate spending a slot while one
+        // is left. The bound is only real if the label also fails to buy a slot
+        // once they are gone — otherwise labelling every candidate `keep` plans
+        // every candidate, and the budget bounds nothing.
+        let mut candidates: Vec<PostgresPolicyCandidate> = (0..DEFAULT_MAX_OPEN_CANDIDATES)
+            .map(|i| open_candidate(&format!("live-{i:03}"), now, 5))
+            .collect();
+        candidates.push(keep(open_candidate("kept-over", now, 4)));
+
+        let verdicts = classify_open_candidates(&candidates, now);
+        assert_eq!(
+            verdicts.get("kept-over"),
+            Some(&NotPlanned::OverBudget),
+            "keep exempts from the TTL, not from the budget"
+        );
+
+        // The strong form: an entire fleet of kept candidates is still bounded,
+        // and the survivors are the oldest, exactly as for unlabelled ones.
+        let all_kept: Vec<PostgresPolicyCandidate> = (0..DEFAULT_MAX_OPEN_CANDIDATES + 8)
+            .map(|i| keep(open_candidate(&format!("k-{i:03}"), now, 5)))
+            .collect();
+        let verdicts = classify_open_candidates(&all_kept, now);
+        assert_eq!(
+            verdicts.len(),
+            8,
+            "everything past the budget must be queued however it is labelled"
+        );
+        assert_eq!(verdicts.get("k-000"), None);
+        assert_eq!(
+            verdicts.get(&format!("k-{:03}", DEFAULT_MAX_OPEN_CANDIDATES)),
+            Some(&NotPlanned::OverBudget)
+        );
+    }
+
+    #[test]
+    fn terminal_candidates_are_neither_expired_nor_counted_against_the_budget() {
+        let now = Timestamp::now();
+        // Terminal candidates are retention's business, not the budget's;
+        // counting them would let finished work crowd out live proposals.
+        let mut candidates: Vec<PostgresPolicyCandidate> = (0..DEFAULT_MAX_OPEN_CANDIDATES)
+            .map(|i| {
+                let mut c = open_candidate(&format!("done-{i:03}"), now, TTL_HOURS + 5);
+                c.status = Some(PostgresPolicyCandidateStatus {
+                    phase: CandidatePhase::Promoted,
+                    ..Default::default()
+                });
+                c
+            })
+            .collect();
+        candidates.push(open_candidate("live", now, 1));
+
+        let verdicts = classify_open_candidates(&candidates, now);
+        assert!(
+            verdicts.is_empty(),
+            "terminal candidates are invisible to both the TTL and the budget"
+        );
+    }
+
     #[test]
     fn the_gate_blocks_only_a_parent_that_has_not_finished_its_own_work() {
         assert_eq!(parent_gate(true, false), ParentGate::Stable);
@@ -1267,6 +1794,96 @@ mod tests {
                  active policy's own reconcile"
             );
         }
+    }
+
+    /// The inspection scope of a candidate is the candidate's own — its
+    /// content, the roles it retires, and the overlay roles it inherited — and
+    /// nothing of the policy's. This is what makes the shared snapshot a union
+    /// rather than a reuse of the parent's read.
+    #[test]
+    fn a_candidates_inspection_scope_is_its_own_content_plus_retirements_and_overlay() {
+        let content: PolicyContent = serde_json::from_value(serde_json::json!({
+            "roles": [{ "name": "reporting_reader" }, { "name": "app_owner" }],
+            "grants": [{
+                "role": "reporting_reader",
+                "privileges": ["SELECT"],
+                "object": { "type": "table", "schema": "reporting", "name": "*" },
+            }],
+            "retirements": [{ "role": "legacy_reader" }],
+            "memberships": [{ "role": "app_owner", "members": [{ "name": "reporting_reader" }] }],
+        }))
+        .expect("candidate content");
+        let candidate = candidate("orders-change-x7k2p", content);
+
+        // An overlay edge between two roles the candidate declares is composed
+        // in, so both of its roles enter the inspection scope.
+        let overlay = vec![MembershipEdge {
+            role: "app_owner".to_string(),
+            member: "grafana".to_string(),
+            inherit: true,
+            admin: false,
+        }];
+        let inputs = candidate_inputs(&candidate, &overlay).expect("inputs");
+
+        assert!(
+            inputs
+                .inspect_config
+                .managed_roles
+                .contains(&"reporting_reader".to_string())
+        );
+        assert!(
+            inputs
+                .inspect_config
+                .managed_roles
+                .contains(&"legacy_reader".to_string()),
+            "a retired role must stay in scope or its drop cannot be planned"
+        );
+        assert!(
+            !inputs
+                .inspect_config
+                .managed_roles
+                .contains(&"grafana".to_string()),
+            "an overlay edge whose member the candidate does not declare is left out"
+        );
+        assert_eq!(
+            inputs.inspect_config.privilege_schemas,
+            vec!["reporting".to_string()]
+        );
+    }
+
+    /// The union of two candidates' scopes contains both, which is exactly the
+    /// property that lets one read serve both derivations.
+    #[test]
+    fn the_union_of_candidate_scopes_contains_every_candidates_scope() {
+        let make = |role: &str, schema: &str| {
+            let content: PolicyContent = serde_json::from_value(serde_json::json!({
+                "roles": [{ "name": role }],
+                "grants": [{
+                    "role": role,
+                    "privileges": ["SELECT"],
+                    "object": { "type": "table", "schema": schema, "name": "*" },
+                }],
+            }))
+            .expect("candidate content");
+            candidate_inputs(&candidate("orders-change-x7k2p", content), &[])
+                .expect("inputs")
+                .inspect_config
+        };
+
+        let first = make("reporting_reader", "reporting");
+        let second = make("billing_reader", "billing");
+        let union = pgroles_inspect::InspectConfig::union_of([&first, &second]);
+
+        for config in [&first, &second] {
+            for role in &config.managed_roles {
+                assert!(union.managed_roles.contains(role));
+            }
+            for schema in &config.privilege_schemas {
+                assert!(union.privilege_schemas.contains(schema));
+            }
+        }
+        // Wildcard pattern merging itself is covered by the inspect crate's
+        // `union_merges_wildcard_privileges_for_the_same_pattern`.
     }
 
     #[test]

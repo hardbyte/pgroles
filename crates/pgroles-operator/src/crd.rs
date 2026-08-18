@@ -2694,6 +2694,14 @@ pub mod candidate_reason {
     pub const OVERLAY_OVERLAP: &str = "OverlayOverlap";
     /// `Ready=False` — the candidate could not be planned at all.
     pub const PLANNING_FAILED: &str = "PlanningFailed";
+    /// `Ready=False` — the policy already has as many open candidates as it
+    /// plans in one pass, and older ones are ahead of this in the queue. Not
+    /// terminal and nothing is deleted: it plans once its elders finish.
+    pub const OVER_BUDGET: &str = "CandidateBudgetExceeded";
+    /// `Superseded=True` — nobody decided this candidate inside the open-
+    /// candidate TTL, so it is abandoned rather than under review (terminal).
+    /// Label a candidate `pgroles.io/keep=true` to exempt it.
+    pub const EXPIRED: &str = "Expired";
     /// `Superseded=True` — a successor named this candidate in `spec.replaces`.
     pub const REPLACED: &str = "Replaced";
     /// `Superseded=True` — replanning produced a different change digest.

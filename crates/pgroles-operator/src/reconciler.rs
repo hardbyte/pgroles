@@ -140,6 +140,13 @@ pub enum ReconcileError {
     #[error("invalid spec: {0}")]
     InvalidSpec(String),
 
+    /// A plan that failed inside the retry window was not re-executed.
+    ///
+    /// Carries the error the plan recorded, so the policy's condition keeps
+    /// describing the real problem rather than the back-off that deferred it.
+    #[error("plan {0} failed recently and was not retried: {1}")]
+    PlanRetryDeferred(String, String),
+
     #[error("approval digest error: {0}")]
     ApprovalDigest(#[from] pgroles_core::approval::ApprovalDigestError),
 
@@ -391,6 +398,30 @@ fn retry_action(resource: &PostgresPolicy, error: &finalizer::Error<ReconcileErr
 }
 
 /// Compute a requeue delay with jitter for lock contention back-off.
+/// Should this reconcile announce `Reconciling` on the status?
+///
+/// Only when it is a genuinely new attempt. Every exit path strips the
+/// condition again (see `set_failure_status` and the success paths), so on a
+/// retry of a generation already attempted, announcing it would mutate the
+/// status twice per reconcile for no net change. Each mutation is a watch
+/// event that re-triggers the reconcile at once, pre-empting the back-off
+/// `error_policy` returned — which is how a permanently-failing policy came to
+/// spin at ~5 reconciles/second, holding the per-database advisory lock each
+/// time and starving every other policy targeting that database.
+///
+/// A policy with no `Ready` condition has never completed a reconcile, so it
+/// announces regardless of generation: that is the first-attempt signal, and
+/// it is the case where an operator most wants to see progress.
+fn should_announce_reconciling(status: &PostgresPolicyStatus, generation: Option<i64>) -> bool {
+    let attempted_this_generation =
+        generation.is_some() && status.last_attempted_generation == generation;
+    let has_settled_before = status
+        .conditions
+        .iter()
+        .any(|c| c.condition_type == "Ready");
+    !(attempted_this_generation && has_settled_before)
+}
+
 fn requeue_with_jitter() -> Action {
     let delay = jitter_delay();
     tracing::debug!(delay_secs = delay.as_secs(), "requeue with jitter");
@@ -473,7 +504,10 @@ fn retry_class_for_reconcile_error(error: &ReconcileError) -> RetryClass {
         // The watch resyncs on its own, so this clears without operator action.
         ReconcileError::RequestIndexNotReady(_) => RetryClass::Transient,
         ReconcileError::PendingEphemeralAccessCleanup(_) => RetryClass::CleanupPending,
-        ReconcileError::ManifestExpansion(_)
+        // Waiting out the plan's retry window is exactly the normal interval:
+        // requeuing sooner would re-enter the back-off and re-defer.
+        ReconcileError::PlanRetryDeferred(_, _)
+        | ReconcileError::ManifestExpansion(_)
         | ReconcileError::InvalidInterval(_, _)
         | ReconcileError::InvalidSpec(_)
         | ReconcileError::MissingDatabaseObjects(_)
@@ -541,6 +575,9 @@ fn retry_class_for_reconcile_error(error: &ReconcileError) -> RetryClass {
 fn inspect_error_is_non_transient(error: &pgroles_inspect::InspectError) -> bool {
     match error {
         pgroles_inspect::InspectError::Database(error) => sqlx_error_is_non_transient(error),
+        // A scope the shared snapshot never read: a programming error in the
+        // caller, not something a retry can fix.
+        pgroles_inspect::InspectError::ScopeNotCovered(_) => true,
     }
 }
 
@@ -881,7 +918,9 @@ async fn reconcile_apply_inner(
     // reconcile clears it. Clearing on every retry cycle would race with the
     // error handler that sets it.
     update_status(ctx, resource, |status| {
-        status.set_condition(reconciling_condition("Reconciliation in progress"));
+        if should_announce_reconciling(status, generation) {
+            status.set_condition(reconciling_condition("Reconciliation in progress"));
+        }
         status
             .conditions
             .retain(|c| c.condition_type != "Paused" && c.condition_type != "Drifted");
@@ -1495,6 +1534,25 @@ async fn apply_under_lock(
                 )
                 .await?;
                 let plan_name = creation_result.plan_name().to_string();
+
+                // Stop before the first write when the plan handed back is one
+                // that failed moments ago. Deferring inside `execute_plan` is
+                // too late: `mark_plan_approved` and the apply-started event
+                // both write to the plan first, and the controller wakes on
+                // its own plans, so each write schedules the next reconcile.
+                // A back-off that still writes is only a slower spin.
+                if creation_result.is_failed_backoff() {
+                    let recorded =
+                        crate::plan::recorded_plan_failure(&ctx.kube_client, namespace, &plan_name)
+                            .await;
+                    info!(
+                        name,
+                        namespace,
+                        plan = %plan_name,
+                        "plan failed recently, deferring retry to the policy interval"
+                    );
+                    return Err(ReconcileError::PlanRetryDeferred(plan_name, recorded));
+                }
 
                 // Fetch the plan, mark it approved, and execute it.
                 let plans_api: Api<PostgresPolicyPlan> =
@@ -3039,6 +3097,28 @@ where
     apply_mode_deprecation_condition(&latest, &mut status);
     clear_stale_approval_ignored_condition(&latest, &mut status);
 
+    // A status write that changes nothing still bumps `resourceVersion`, and
+    // the resulting watch event re-triggers this controller immediately —
+    // discarding whatever back-off `error_policy` chose. That is not a
+    // theoretical cost: a permanently-failing policy reconciles, writes status,
+    // wakes itself, and spins as fast as it can reconcile (~5/second observed),
+    // taking the per-database advisory lock every time and starving every other
+    // policy pointed at the same database.
+    //
+    // Compared as serialized JSON rather than with `PartialEq`: the question is
+    // whether the PATCH body differs from what is stored, and that is exactly a
+    // JSON question. Serialization failure falls through to writing, which is
+    // the pre-existing behaviour.
+    let status_json = serde_json::to_value(&status).ok();
+    let unchanged = match (&old_status, &status_json) {
+        (Some(old), Some(new)) => serde_json::to_value(old).ok().as_ref() == Some(new),
+        _ => false,
+    };
+    if unchanged {
+        tracing::trace!(name, namespace, "status unchanged, skipping write");
+        return Ok(());
+    }
+
     let patch = serde_json::json!({
         "status": status
     });
@@ -3197,6 +3277,13 @@ impl ReconcileError {
             ReconcileError::ManifestExpansion(_)
             | ReconcileError::InvalidInterval(_, _)
             | ReconcileError::InvalidSpec(_) => "InvalidSpec",
+            // A distinct reason rather than the deferred failure's own: it
+            // transitions once, when the back-off first engages, and then
+            // stays put. Reusing a reason we cannot derive from the recorded
+            // string would flip every pass, which is the write storm this
+            // back-off exists to stop. The underlying cause is not lost — it
+            // is carried verbatim in the message, and so in `last_error`.
+            ReconcileError::PlanRetryDeferred(_, _) => "PlanRetryDeferred",
             ReconcileError::ApprovalDigest(_) => "ApprovalDigestFailed",
             ReconcileError::ConflictingPolicy(_) => "ConflictingPolicy",
             ReconcileError::UnsatisfiableWildcardGrant(_) => "UnsatisfiableWildcardGrant",
@@ -3223,6 +3310,7 @@ impl ReconcileError {
                         SqlErrorKind::Transient => "DatabaseInspectionFailed",
                     }
                 }
+                pgroles_inspect::InspectError::ScopeNotCovered(_) => "DatabaseInspectionFailed",
             },
             ReconcileError::SqlExec(error) => match classify_sqlx_error(error) {
                 SqlErrorKind::InsufficientPrivileges => "InsufficientPrivileges",
@@ -4480,6 +4568,51 @@ mod tests {
             msg.contains("advisory lock"),
             "lock contention error should include reason"
         );
+    }
+
+    /// A settled policy retrying the same generation must not re-announce
+    /// `Reconciling`.
+    ///
+    /// This is the self-wake loop that starved the E2E: the exit paths strip
+    /// the condition, so announcing it on every retry mutates status twice per
+    /// reconcile with no net change, and each mutation is a watch event that
+    /// discards the back-off `error_policy` chose.
+    #[test]
+    fn a_retry_of_a_settled_generation_does_not_re_announce_reconciling() {
+        let mut status = PostgresPolicyStatus {
+            last_attempted_generation: Some(7),
+            ..Default::default()
+        };
+        status.set_condition(ready_condition(
+            false,
+            "InsufficientPrivileges",
+            "permission denied to create role",
+        ));
+
+        assert!(
+            !should_announce_reconciling(&status, Some(7)),
+            "a retry of an already-attempted generation must not churn the status"
+        );
+        assert!(
+            should_announce_reconciling(&status, Some(8)),
+            "a new generation is a new attempt and must announce"
+        );
+    }
+
+    #[test]
+    fn a_policy_that_has_never_settled_always_announces_reconciling() {
+        // No Ready condition: the object has never completed a reconcile, so
+        // the first-attempt signal is exactly what an operator wants to see.
+        let fresh = PostgresPolicyStatus {
+            last_attempted_generation: Some(3),
+            ..Default::default()
+        };
+        assert!(should_announce_reconciling(&fresh, Some(3)));
+
+        // A generation the API server never assigned must not be mistaken for
+        // "already attempted" against a status that also carries none.
+        let unknown_generation = PostgresPolicyStatus::default();
+        assert!(should_announce_reconciling(&unknown_generation, None));
     }
 
     #[test]

@@ -114,6 +114,8 @@ The intended deployment model is operator -> OpenTelemetry Collector -> your met
 | `pgroles.inspect.items` | `kind` | Counts of inspected objects by kind |
 | `pgroles.wildcard.grantability_queries` | - | Wildcard grantability catalog queries issued |
 | `pgroles.wildcard.unsatisfied_grants` | - | Wildcard grants missing privileges before grantability checks |
+| `pgroles.candidate.planning.duration` | - | Milliseconds to plan one candidate, end to end |
+| `pgroles.candidate.inspections` | `candidates` | Database inspections performed by one reconcile's candidate pass, bucketed by how many candidates that pass covered. Expected to stay at 1 however many candidates are open; a value tracking the candidate count means they are falling back to inspecting individually (a `spec.target` override, or a failed shared read) |
 | `pgroles.ephemeral_access.transitions` | `phase`, `reason` | Ephemeral request phase transitions |
 | `pgroles.ephemeral_access.failures` | `reason` | Requests reaching a failed terminal phase — in practice `Denied` and `ApprovalExpired`, since nothing sets `Failed` |
 | `pgroles.ephemeral_access.retained_memberships` | - | Memberships kept at expiry because they became durable |

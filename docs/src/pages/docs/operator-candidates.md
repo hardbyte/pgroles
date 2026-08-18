@@ -8,10 +8,16 @@ Review what a change would do to production before it becomes the desired state.
 ---
 
 {% callout type="note" title="What is not built" %}
-The kind, the content digest, the planning lifecycle and **promotion** — the
-subject of this page — are implemented. Two things named below are not: the
-`pgroles candidate` and `pgroles plan` CLI subcommands (use `kubectl`; the
-recipes here do), and `spec.contentRef` for content too large to embed.
+The kind, the content digest, the planning lifecycle, **promotion** (the
+subject of this page), and the `pgroles candidate` CLI subcommands are
+implemented. Two things named below are not: `pgroles plan`, and
+`spec.contentRef` for content too large to embed.
+
+Every recipe on this page is given twice, as `kubectl` and as `pgroles
+candidate`. The `kubectl` form is not a fallback: it is the definition, and it
+is what you use where the CLI is not installed. **Deciding** a plan has only
+the `kubectl` form; this is deliberate (see [Reviewing and
+deciding](#reviewing-and-deciding)).
 {% /callout %}
 
 ## What a candidate is
@@ -106,6 +112,31 @@ spec:
 always explicit — the operator never infers it from creator identity, because
 CI typically files every team's candidates under one service account.
 
+### With the CLI
+
+`pgroles candidate create` files the same object from an ordinary pgroles
+manifest: the file you already run `pgroles validate` and `pgroles diff`
+against. The file you propose is the file the PR merges:
+
+```shell
+pgroles candidate create --policy orders -f policy.yaml
+pgroles candidate create --policy orders -f policy.yaml --replaces orders-x7k2p
+```
+
+It accepts a bare manifest, a `PostgresPolicy` CR (whose `connection`,
+`interval`, `mode`, `suspend` and `approval` are dropped, because a candidate
+takes those from its parent), or a `PostgresPolicyCandidate` CR. A manifest key
+with no candidate counterpart, such as `auth_providers`, is rejected rather
+than filed. A structural CRD schema would prune the key server-side, and the
+stored content would then mean something other than the file on disk.
+
+The content is validated locally first, through the same path as `pgroles
+validate`, so a candidate the API server would reject on [size
+bounds](#limits) fails on your machine with the same field-level message
+instead of after a round trip. The object is created with `generateName`, so
+two people filing against one policy at the same moment never collide; the
+assigned name is printed.
+
 There is no base pin in the spec. The plan records which applied base it was
 computed against; staleness is decided semantically from there (see
 [Staleness](#staleness-and-revalidation)).
@@ -150,10 +181,48 @@ kubectl get pgcand orders-change-x7k2p -o wide          # phase, plan, digest
 kubectl get pgplan orders-change-x7k2p-plan-9f21c4 -o yaml
 ```
 
-There are no `pgroles candidate` or `pgroles plan` subcommands: everything here
-is `kubectl`. Deciding a plan is a write to its status subresource — see
-[Deciding a plan](/docs/operator-plan-approval#deciding-a-plan) for the exact
-patch, which is identical for a candidate's plan and a policy's.
+### With the CLI
+
+Three subcommands read the same information without hand-rolled jsonpath:
+
+```shell
+pgroles candidate list --policy orders
+pgroles candidate status orders-change-x7k2p
+pgroles candidate diff orders-change-x7k2p
+```
+
+`list` gives one row per candidate for that policy: phase, abbreviated content
+digest, plan name, and the `Ready` / `Superseded` / `Promoted` conditions with
+their reasons, as listed in the [conditions table](#conditions) below.
+
+`status` expands one candidate: its phase and full digest, its conditions with
+messages, and then its plan — the plan's phase, its decision and the identity
+that made it, whether it is still current or has been superseded, the applied
+base it is pinned to, and any promotion outcome. A candidate with no plan yet
+reports that, with the reason, rather than printing a blank plan section.
+
+`diff` prints the reviewed plan's SQL on stdout: what approving this candidate
+would execute. It reads `status.sqlInline`, falling back to the gzipped
+ConfigMap in `status.sqlRef` when the plan is too large to inline. A plan
+whose SQL survives only as a truncated preview is an error, not a short diff,
+because a partial listing could be read as the full set of statements the
+approval would execute.
+
+Each subcommand reports missing state as a specific error rather than output
+that could be misread: a policy that does not exist is distinguished from a
+policy with no candidates, a candidate with no plan from a plan with no SQL,
+and `--replaces` naming a candidate of a different policy is refused.
+
+### Deciding stays `kubectl`-shaped
+
+There is deliberately no `pgroles candidate approve` or `reject`. A decision is
+a write to the plan's status subresource, gated by admission so that `decidedBy`
+records an authenticated identity rather than an assertion by whoever wrote the
+status. A CLI verb in front of that write would obscure which identity
+authenticated the decision, and recording that identity unambiguously is the
+point of the approval mechanism. See [Deciding a
+plan](/docs/operator-plan-approval#deciding-a-plan) for the exact patch, which
+is identical for a candidate's plan and a policy's.
 
 Rejection lands on the plan, not the candidate: the plan records
 `Denied=True` (phase `Rejected`) and is terminal. The candidate is terminal
@@ -341,6 +410,39 @@ are pruned by the same bounded retention loop as plans; label a candidate
 `pgroles.io/keep=true` to exempt it. Plans also expire after a TTL — an
 approval is not an indefinite authorisation.
 
+## Bounding open candidates
+
+Retention prunes what is already finished. Two separate bounds apply to
+proposals that are still open, because planning them is work the parent policy
+does while holding its locks. An unbounded number of open candidates would
+slow enforcement of the live policy in proportion to how many people are
+proposing changes to it.
+
+**A budget.** At most 32 open candidates per policy are planned in one pass.
+The oldest are kept: the failure this guards against is a CI loop filing a
+candidate per push, and evicting the newest protects proposals already under
+review from being displaced by new filings. Nothing is deleted: a candidate
+over the budget reports `Ready=False, reason=CandidateBudgetExceeded` and is
+planned as soon as enough older proposals are decided or expire.
+
+**A TTL.** An open candidate that nobody decides within 14 days of being filed
+is marked `Superseded=True, reason=Expired`: at that point it is abandoned
+rather than under review, and retention prunes it in the ordinary way. The TTL
+runs from creation and nothing else. Consulting each candidate's plan for a
+decision would put per-candidate reads back into the parent's critical
+section, which is what these bounds exist to avoid. A proposal that genuinely
+is still in flight after two weeks can be labelled `pgroles.io/keep=true`,
+which exempts it from the TTL and from retention pruning. It does not exempt
+it from the budget: a kept candidate past the budget reports
+`CandidateBudgetExceeded` like any other, so the label cannot be used to
+enlarge the bound it exists inside.
+
+Planning the candidates that *are* in budget costs one database inspection per
+reconcile, not one per candidate: their inspection scopes are unioned, the
+database is read once, and each candidate's own scoped inspection is derived
+from that read. A candidate with a `spec.target` override is a different
+database and still inspects for itself.
+
 ## Conditions
 
 `status.phase` is a printable summary; conditions are the source of truth.
@@ -352,9 +454,11 @@ approval is not an indefinite authorisation.
 | `Ready=False, reason=BlockedByActivePolicy` | Parent is failing or awaiting its own approval; will re-plan |
 | `Ready=False, reason=OverlayOverlap` | An ephemeral grant overlaps this candidate's effects; fresh review required |
 | `Ready=False, reason=PlanningFailed` | The candidate could not be planned at all; the message carries the error |
+| `Ready=False, reason=CandidateBudgetExceeded` | The policy is at its open-candidate budget and older proposals are ahead in the queue. Not terminal, and nothing is deleted — it plans once they are decided or expire |
 | `Superseded=True, reason=Replaced` | A successor candidate named this one in `spec.replaces` |
 | `Superseded=True, reason=EffectsChanged` | Replanning produced a different change digest; the fresh plan awaits its own decision |
 | `Superseded=True, reason=PlanDenied` | The candidate's plan was rejected (terminal) |
+| `Superseded=True, reason=Expired` | Nobody decided this candidate within the open-candidate TTL, so it is treated as abandoned (terminal). Label it `pgroles.io/keep=true` to exempt it |
 | `Promoted=True, reason=Promoted` | This candidate's content was promoted and executed (terminal) |
 | `Promoted=False, reason=PromotedWithoutApproval` | The content was promoted while this candidate's plan held no approval |
 | `Promoted=False, reason=PromotionDigestMismatch` | The policy's content changed into something that is not this approved candidate |

@@ -402,9 +402,79 @@ jobs:
           wait_for_event_reason missing-secret-policy SecretFetchFailed
 
           kubectl apply -f k8s/samples/insufficient-privileges-policy.yaml
-          wait_for_ready_reason insufficient-privileges-policy InsufficientPrivileges
+          # PlanRetryDeferred, not InsufficientPrivileges: the first attempt
+          # reports the SQL error, then the retry back-off engages and the
+          # reason settles there for the rest of the window. Asserting the
+          # first-attempt reason would be racing a state that lasts
+          # milliseconds. The cause is not lost — the back-off carries the
+          # original error verbatim, which the lastError assertion checks.
+          wait_for_ready_reason insufficient-privileges-policy PlanRetryDeferred
           wait_for_last_error_contains insufficient-privileges-policy "permission denied to create role"
           assert_role_absent insufficient-privileges-user
+
+          # A permanently-failing policy must not spin. This one is never
+          # deleted, so it stays in the cluster for every scenario below, and
+          # it shares a database with them — the advisory lock key is derived
+          # server-side from `current_database()`, so every policy pointed at
+          # this server contends for one lock.
+          #
+          # Any write to a plan wakes the policy that owns it, so a retry that
+          # writes before it backs off schedules its own next attempt. Left
+          # unbounded that is several reconciles a second, each one taking the
+          # shared lock, and the policies sharing this database lose it
+          # repeatedly until their waits time out. Nothing else in this suite
+          # asserts a rate, so nothing else catches it.
+          #
+          # At the policy interval this should be 0 or 1 in a 20s window. The
+          # bound is loose because the point is to catch a storm, not to pin a
+          # cadence: the unbounded retry produced ~190.
+          echo "--- Test: a permanently-failing policy does not spin ---"
+          # Count by differencing two whole-log reads of one pod. Two things
+          # this must not do:
+          #
+          #   `--since` — observed returning nothing on kind for windows that
+          #   covered the pod's entire lifetime, while an unwindowed read of
+          #   the same pod a second later returned ~130 matching lines. A
+          #   silently empty read makes the assertion below pass vacuously.
+          #
+          #   `deployment/...` — resolves to one arbitrary pod, which is
+          #   ambiguous while the previous ReplicaSet's pod still exists.
+          #
+          # Differencing needs neither server-side time filtering nor any
+          # comparison between the runner's clock and the node's.
+          operator_pod="$(kubectl -n pgroles-system get pod \
+            -l app.kubernetes.io/name=pgroles-operator \
+            --field-selector=status.phase=Running \
+            --sort-by=.metadata.creationTimestamp \
+            -o jsonpath='{.items[-1:].metadata.name}')"
+          test -n "$operator_pod" || { echo "::error::could not resolve the operator pod"; exit 1; }
+          count_reconciles() {
+            kubectl -n pgroles-system logs "pod/${operator_pod}" --tail=-1 \
+              | grep -c 'starting reconciliation.*insufficient-privileges-policy' || true
+          }
+          # Guard against a vacuous pass: the policy has already reconciled at
+          # least once (its Ready condition and lastError were asserted just
+          # above), so a zero baseline means the log format drifted or the
+          # wrong pod was read — the spin assertion below would then pass
+          # while measuring nothing.
+          baseline="$(count_reconciles)"
+          if [ "$baseline" -eq 0 ]; then
+            echo "::error::no reconcile log lines matched for insufficient-privileges-policy; the spin assertion below would pass without measuring anything"
+            exit 1
+          fi
+          sleep 20
+          after="$(count_reconciles)"
+          if [ "$after" -lt "$baseline" ]; then
+            echo "::error::reconcile count went backwards (${baseline} -> ${after}); the operator restarted or its log rotated mid-window, so the spin rate cannot be measured"
+            exit 1
+          fi
+          spin_count=$((after - baseline))
+          echo "insufficient-privileges-policy reconciled ${spin_count} times in 20s"
+          if [ "$spin_count" -gt 5 ]; then
+            echo "::error::failing policy reconciled ${spin_count} times in 20s (>5): it is self-waking and will starve other policies on this database"
+            kubectl -n pgroles-system logs "pod/${operator_pod}" --tail=40 || true
+            exit 1
+          fi
 
           # The deprecated `mode: plan` spelling stays accepted — a GitOps
           # controller re-applies existing manifests on every sync, so the
@@ -668,9 +738,9 @@ jobs:
         if: failure()
         run: |
           kubectl get pgr,pgplan,pgcand,pgeap,pgear -A -o wide || true
-          kubectl get pgr,pgplan,pgcand -A -o yaml || true
-          kubectl -n pgroles-system logs deployment/pgroles-operator --tail=-1 || true
-          kubectl -n pgroles-system logs deployment/pgroles-operator --previous --tail=-1 || true
+          kubectl get pgr,pgplan,pgcand -A -o yaml | head -c 200000 || true
+          kubectl -n pgroles-system logs deployment/pgroles-operator --tail=2000 || true
+          kubectl -n pgroles-system logs deployment/pgroles-operator --previous --tail=2000 || true
           kubectl get events -A --sort-by=.lastTimestamp | tail -100 || true
 
       - name: Cleanup
@@ -746,9 +816,9 @@ jobs:
         if: failure()
         run: |
           kubectl get pgr,pgplan,pgcand,pgeap,pgear -A -o wide || true
-          kubectl get pgr,pgplan,pgcand -A -o yaml || true
-          kubectl -n pgroles-system logs deployment/pgroles-operator --tail=-1 || true
-          kubectl -n pgroles-system logs deployment/pgroles-operator --previous --tail=-1 || true
+          kubectl get pgr,pgplan,pgcand -A -o yaml | head -c 200000 || true
+          kubectl -n pgroles-system logs deployment/pgroles-operator --tail=2000 || true
+          kubectl -n pgroles-system logs deployment/pgroles-operator --previous --tail=2000 || true
           kubectl get events -A --sort-by=.lastTimestamp | tail -100 || true
 
       - name: Cleanup
@@ -771,6 +841,20 @@ jobs:
       - uses: ./.github/actions/setup-e2e
         with:
           cluster-name: pgroles-e2e-plans
+
+      # The candidate scenarios below drive the `pgroles` CLI against this live
+      # cluster, so the binary has to exist on the runner. Built from the
+      # Dockerfile's existing `cli` target rather than with a second cargo
+      # toolchain: `setup-e2e` has just built the operator image, so the shared
+      # `base` stage and the cargo registry/target cache mounts are warm and
+      # only the CLI crate itself is compiled.
+      - name: Build the pgroles CLI
+        run: |
+          docker build -f docker/Dockerfile --target cli -t pgroles-cli:e2e .
+          container="$(docker create pgroles-cli:e2e)"
+          trap 'docker rm -f "$container" >/dev/null 2>&1 || true' EXIT
+          docker cp "$container:/usr/local/bin/pgroles" /usr/local/bin/pgroles
+          pgroles --version
 
       - name: Run plan lifecycle scenarios
         run: |
@@ -1410,6 +1494,58 @@ jobs:
           wait_for_plan_phase "$base_plan" Applied
           assert_role_exists promo_base_user
 
+          echo "--- Test: the open-candidate budget queues the excess and plans the rest (#191) ---"
+          # The unit tests pin the classification itself; what only a live
+          # cluster shows is the wiring — that an over-budget candidate is
+          # reported rather than silently dropped, that it is NOT deleted, and
+          # that being over budget does not stop its elders from planning.
+          #
+          # The TTL half deliberately has no E2E: it is fourteen days long, and
+          # a knob to shorten it would exist only for the test. Its
+          # classification is unit-tested and it shares mark_superseded with the
+          # scenarios above.
+          budget=32
+          kubectl delete pgcand --all --wait=true
+
+          # One over the budget, oldest first. Created in order so the API
+          # server's creationTimestamps rank them the way the operator sorts.
+          for i in $(seq 0 "$budget"); do
+            file_candidate "$(printf 'budget-%03d' "$i")" "$(printf 'budget_user_%03d' "$i")"
+          done
+
+          # The newest is the one over budget: the oldest keep their slots, so a
+          # flood of new proposals cannot evict what is already under review.
+          newest="$(printf 'budget-%03d' "$budget")"
+          wait_for_candidate_condition "$newest" Ready False CandidateBudgetExceeded
+
+          # It is queued, not discarded — the object is still there, still not
+          # terminal, and carries no plan.
+          kubectl get pgcand "$newest" >/dev/null \
+            || { echo "::error::an over-budget candidate was deleted"; exit 1; }
+          over_phase="$(kubectl get pgcand "$newest" -o jsonpath='{.status.phase}')"
+          case "$over_phase" in
+            Promoted|Superseded)
+              echo "::error::an over-budget candidate went terminal (phase=$over_phase)"
+              exit 1
+              ;;
+          esac
+          over_plan="$(kubectl get pgcand "$newest" -o jsonpath='{.status.planRef.name}' 2>/dev/null || true)"
+          test -z "$over_plan" \
+            || { echo "::error::an over-budget candidate was planned anyway ($over_plan)"; exit 1; }
+
+          # And the budget did not cost the others their planning.
+          wait_for_candidate_condition budget-000 Ready True Planned
+          wait_for_candidate_condition "$(printf 'budget-%03d' "$((budget - 1))")" Ready True Planned
+
+          # Freeing a slot lets the queued candidate through, which is what
+          # makes CandidateBudgetExceeded a queue rather than a rejection.
+          kubectl delete pgcand budget-000 --wait=true
+          wait_for_candidate_condition "$newest" Ready True Planned
+
+          # No role cleanup needed: candidate planning never executes SQL, so
+          # none of budget_user_* was ever created.
+          kubectl delete pgcand --all --wait=true
+
           echo "--- Test: a candidate is planned and writes nothing ---"
           file_candidate promo-cand-1 promo_new_user
           wait_for_candidate_phase promo-cand-1 Planned
@@ -1661,6 +1797,136 @@ jobs:
           # Restore the policy content to the set it held before this test.
           write_promo_policy promo_new_user promo_other_user promo_y_user dup_promo_user
 
+          echo "--- Test: the pgroles CLI files and reads a candidate (#189) ---"
+          # The CLI is the same workflow through a different door, so it is
+          # exercised against the live cluster and every answer it prints is
+          # checked against what kubectl reports for the same object.
+
+          candidates_before="$(kubectl get pgcand -o name | wc -l)"
+
+          # Rejected before anything is sent: the CLI validates through the same
+          # path as `pgroles validate`, so a candidate the API server would
+          # refuse on the identifier bound fails locally first.
+          cat >/tmp/cli-cand-invalid.yaml <<'MANIFEST'
+          roles:
+            - name: this_role_name_is_far_too_long_for_postgresql_which_truncates_at_63_chars
+              login: true
+          MANIFEST
+          if pgroles candidate create --policy promo-policy \
+              -f /tmp/cli-cand-invalid.yaml >/tmp/cli-invalid.txt 2>&1; then
+            echo "::error::the CLI filed a candidate whose role name exceeds the identifier bound"
+            cat /tmp/cli-invalid.txt
+            exit 1
+          fi
+          cat /tmp/cli-invalid.txt
+          grep -q 'exceeds the limit of 63' /tmp/cli-invalid.txt \
+            || { echo "::error::local validation did not report the field-level bound"; exit 1; }
+          # Nothing reached the cluster.
+          test "$(kubectl get pgcand -o name | wc -l)" -eq "$candidates_before" \
+            || { echo "::error::a rejected candidate was filed anyway"; kubectl get pgcand; exit 1; }
+
+          # A candidate is a complete desired-state snapshot, so the manifest
+          # carries the policy's current roles plus the proposed one.
+          cat >/tmp/cli-cand.yaml <<'MANIFEST'
+          roles:
+            - name: promo_base_user
+              login: true
+            - name: promo_new_user
+              login: true
+            - name: promo_other_user
+              login: true
+            - name: promo_y_user
+              login: true
+            - name: dup_promo_user
+              login: true
+            - name: cli_candidate_user
+              login: true
+          MANIFEST
+          pgroles candidate create --policy promo-policy -f /tmp/cli-cand.yaml \
+            | tee /tmp/cli-create.txt
+          # `generateName` means the CLI, not the caller, learns the name.
+          cli_cand="$(sed -n 's|^Created postgrespolicycandidate/\([^ ]*\) .*|\1|p' /tmp/cli-create.txt)"
+          test -n "$cli_cand" \
+            || { echo "::error::the CLI did not print the generated candidate name"; exit 1; }
+          kubectl get pgcand "$cli_cand" >/dev/null \
+            || { echo "::error::the CLI reported a candidate the cluster does not have"; exit 1; }
+          # The server assigned the name from the policy-derived prefix.
+          case "$cli_cand" in
+            promo-policy-*) ;;
+            *) echo "::error::unexpected generateName prefix on '$cli_cand'"; exit 1 ;;
+          esac
+
+          wait_for_candidate_phase "$cli_cand" Planned
+          cli_plan=$(wait_for_candidate_plan_ref "$cli_cand")
+
+          # list: the CLI's row must agree with kubectl on phase and plan.
+          pgroles candidate list --policy promo-policy | tee /tmp/cli-list.txt
+          cli_row="$(grep "^${cli_cand}[[:space:]]" /tmp/cli-list.txt)"
+          test -n "$cli_row" \
+            || { echo "::error::$cli_cand is missing from the CLI's list output"; exit 1; }
+          kubectl_phase="$(kubectl get pgcand "$cli_cand" -o jsonpath='{.status.phase}')"
+          grep -q "$kubectl_phase" <<<"$cli_row" \
+            || { echo "::error::list phase disagrees with kubectl ($kubectl_phase): $cli_row"; exit 1; }
+          grep -q "$cli_plan" <<<"$cli_row" \
+            || { echo "::error::list plan ref disagrees with kubectl ($cli_plan): $cli_row"; exit 1; }
+
+          # A policy that does not exist must not read as a policy with no
+          # candidates: empty output is never ambiguous.
+          if pgroles candidate list --policy no-such-policy >/tmp/cli-list-missing.txt 2>&1; then
+            echo "::error::listing candidates of a nonexistent policy succeeded"
+            cat /tmp/cli-list-missing.txt
+            exit 1
+          fi
+          cat /tmp/cli-list-missing.txt
+
+          # status: the plan and the full content digest must be kubectl's.
+          pgroles candidate status "$cli_cand" | tee /tmp/cli-status.txt
+          cli_digest="$(get_candidate_digest "$cli_cand")"
+          test -n "$cli_digest" || { echo "::error::candidate has no contentDigest"; exit 1; }
+          grep -q "$cli_digest" /tmp/cli-status.txt \
+            || { echo "::error::status omits the content digest kubectl reports"; exit 1; }
+          grep -q "$cli_plan" /tmp/cli-status.txt \
+            || { echo "::error::status omits the plan kubectl reports"; exit 1; }
+          # Undecided plan, and the CLI says so rather than leaving it blank.
+          grep -q 'Decision:      none recorded' /tmp/cli-status.txt \
+            || { echo "::error::status did not report the plan as undecided"; exit 1; }
+
+          if pgroles candidate status no-such-candidate >/tmp/cli-status-missing.txt 2>&1; then
+            echo "::error::status of a nonexistent candidate succeeded"
+            exit 1
+          fi
+          cat /tmp/cli-status-missing.txt
+
+          # diff: byte-for-byte the SQL the kubectl recipe extracts, whether it
+          # came from sqlInline or the gzipped sqlRef ConfigMap.
+          cli_sql="$(pgroles candidate diff "$cli_cand" 2>/dev/null)"
+          kubectl_sql="$(get_plan_sql "$cli_plan")"
+          test -n "$cli_sql" \
+            || { echo "::error::the CLI printed no SQL for plan $cli_plan"; exit 1; }
+          test "$cli_sql" = "$kubectl_sql" || {
+            echo "::error::CLI diff disagrees with the kubectl recipe for $cli_plan"
+            diff <(echo "$kubectl_sql") <(echo "$cli_sql") || true
+            exit 1
+          }
+          # It is a proposal, not an execution: nothing of it reached PostgreSQL.
+          grep -q 'cli_candidate_user' <<<"$cli_sql" \
+            || { echo "::error::the plan SQL does not mention the proposed role"; exit 1; }
+          assert_role_absent cli_candidate_user
+
+          # A successor must belong to the same policy as the candidate it
+          # replaces; the CLI refuses to file one that does not.
+          if pgroles candidate create --policy basic-policy -f /tmp/cli-cand.yaml \
+              --replaces "$cli_cand" >/tmp/cli-replaces.txt 2>&1; then
+            echo "::error::the CLI filed a successor replacing another policy's candidate"
+            cat /tmp/cli-replaces.txt
+            exit 1
+          fi
+          cat /tmp/cli-replaces.txt
+          grep -q 'not basic-policy' /tmp/cli-replaces.txt \
+            || { echo "::error::the refusal did not name the policy mismatch"; exit 1; }
+
+          kubectl delete pgcand "$cli_cand" --wait=true
+
           # Cleanup
           kubectl delete pgcand --all --wait=true
           kubectl delete pgr promo-policy --wait=true
@@ -1674,9 +1940,9 @@ jobs:
         if: failure()
         run: |
           kubectl get pgr,pgplan,pgcand,pgeap,pgear -A -o wide || true
-          kubectl get pgr,pgplan,pgcand -A -o yaml || true
-          kubectl -n pgroles-system logs deployment/pgroles-operator --tail=-1 || true
-          kubectl -n pgroles-system logs deployment/pgroles-operator --previous --tail=-1 || true
+          kubectl get pgr,pgplan,pgcand -A -o yaml | head -c 200000 || true
+          kubectl -n pgroles-system logs deployment/pgroles-operator --tail=2000 || true
+          kubectl -n pgroles-system logs deployment/pgroles-operator --previous --tail=2000 || true
           kubectl get events -A --sort-by=.lastTimestamp | tail -100 || true
 
       - name: Cleanup

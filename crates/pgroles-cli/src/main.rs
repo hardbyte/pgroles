@@ -14,7 +14,7 @@ use sqlx::{PgPool, Row};
 use tracing::{info, warn};
 
 use pgroles_cli::{
-    PlanSummary, apply_role_retirements, compute_plan, format_bundle_plan_json,
+    PlanSummary, apply_role_retirements, candidate, compute_plan, format_bundle_plan_json,
     format_bundle_validation_result, format_managed_scope_summary, format_plan_json,
     format_plan_sql_with_context, format_rendered_bundle, format_role_graph_summary,
     format_validation_result, inject_password_changes, planned_role_drops, read_manifest_file,
@@ -181,6 +181,18 @@ enum Commands {
         timeout: String,
     },
 
+    /// Work with PostgresPolicyCandidates: propose content, review what the
+    /// operator planned for it, and read the SQL approving it would run.
+    ///
+    /// Deciding a plan is deliberately not here: a decision is a status write
+    /// gated by admission so `decidedBy` records an authenticated identity, and
+    /// a CLI verb would blur who authenticated it. Approve and reject with
+    /// `kubectl` — see the plan-approval docs.
+    Candidate {
+        #[command(subcommand)]
+        command: CandidateCommands,
+    },
+
     /// Visualize the role graph structure.
     ///
     /// Renders roles, memberships, grants, and default privileges as a graph
@@ -214,6 +226,65 @@ enum Commands {
         /// stale checked-in renders).
         #[arg(long, conflicts_with = "output", value_name = "PATH")]
         check: Option<PathBuf>,
+    },
+}
+
+#[derive(Subcommand)]
+enum CandidateCommands {
+    /// File a candidate proposing the content of a local manifest.
+    ///
+    /// The content is validated through the same path as `pgroles validate`
+    /// before anything is sent, so a candidate the API server would reject on
+    /// bounds fails locally first. The object is created with `generateName`,
+    /// so concurrent filings never collide.
+    Create {
+        /// Name of the PostgresPolicy this candidate proposes content for.
+        #[arg(long)]
+        policy: String,
+
+        /// Path to the policy manifest YAML holding the proposed content.
+        #[arg(short, long)]
+        file: PathBuf,
+
+        /// Name of an earlier candidate this one supersedes.
+        #[arg(long)]
+        replaces: Option<String>,
+
+        /// Kubernetes namespace.
+        #[arg(short = 'n', long, default_value = "default")]
+        namespace: String,
+    },
+
+    /// List the candidates filed against a policy.
+    List {
+        /// Name of the PostgresPolicy.
+        #[arg(long)]
+        policy: String,
+
+        /// Kubernetes namespace.
+        #[arg(short = 'n', long, default_value = "default")]
+        namespace: String,
+    },
+
+    /// Show one candidate in detail: its plan, the plan's decision and decider,
+    /// staleness, and any promotion outcome.
+    Status {
+        /// Name of the PostgresPolicyCandidate.
+        name: String,
+
+        /// Kubernetes namespace.
+        #[arg(short = 'n', long, default_value = "default")]
+        namespace: String,
+    },
+
+    /// Show the reviewed plan's SQL — what approving this candidate would mean.
+    Diff {
+        /// Name of the PostgresPolicyCandidate.
+        name: String,
+
+        /// Kubernetes namespace.
+        #[arg(short = 'n', long, default_value = "default")]
+        namespace: String,
     },
 }
 
@@ -416,6 +487,26 @@ async fn run(cli: Cli) -> Result<ExitCode> {
             no_header,
             check,
         } => cmd_render_bundle(&bundle, output.as_deref(), !no_header, check.as_deref()),
+        Commands::Candidate { command } => {
+            match command {
+                CandidateCommands::Create {
+                    policy,
+                    file,
+                    replaces,
+                    namespace,
+                } => candidate::cmd_create(&policy, &file, replaces.as_deref(), &namespace).await?,
+                CandidateCommands::List { policy, namespace } => {
+                    candidate::cmd_list(&policy, &namespace).await?
+                }
+                CandidateCommands::Status { name, namespace } => {
+                    candidate::cmd_status(&name, &namespace).await?
+                }
+                CandidateCommands::Diff { name, namespace } => {
+                    candidate::cmd_diff(&name, &namespace).await?
+                }
+            }
+            Ok(ExitCode::SUCCESS)
+        }
         Commands::Graph { source } => match source {
             GraphSource::Desired {
                 file,

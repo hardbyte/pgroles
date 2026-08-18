@@ -841,6 +841,80 @@ async fn supersede_stale_plans(
 // Plan execution
 // ---------------------------------------------------------------------------
 
+/// Is this plan inside the retry back-off for a failure it already recorded?
+///
+/// The creation path already refuses to mint a second plan with the same
+/// effects inside [`FAILED_PLAN_DEDUP_WINDOW_SECS`], on the grounds that it
+/// would produce the same error. Re-*executing* the plan it kept is the same
+/// bet, and left unbounded it costs far more than a wasted query: every
+/// attempt writes the plan, the policy controller wakes on its own plans
+/// (`reconcile_on(plan_triggers)`), and so each attempt schedules the next.
+/// A permanently-failing policy then reconciles as fast as it can execute —
+/// several times a second — taking the per-database advisory lock each time
+/// and starving every other policy pointed at that database.
+///
+/// Retrying on the policy's own interval instead is the same behaviour the
+/// user already gets after the window expires, minus the storm.
+///
+/// Keyed on the recorded failure, never on `phase`. Under `approval: auto`
+/// the reconciler calls `mark_plan_approved` on the plan before executing it,
+/// so a plan that failed milliseconds ago reads as `Approved` here.
+/// `failed_at` survives that write; `phase` does not.
+fn retry_deferred_until_window_expires(plan: &PostgresPolicyPlan, now_ts: i64) -> bool {
+    let Some(status) = plan.status.as_ref() else {
+        return false;
+    };
+    let failed_ts = status
+        .failed_at
+        .as_deref()
+        .and_then(parse_rfc3339_epoch_secs)
+        .unwrap_or(0);
+    // `failed_ts <= now_ts` is not redundant. A timestamp in the future — a
+    // clock stepped backwards, a status written by a skewed replica, a hand
+    // patched plan — makes the subtraction negative, which is trivially inside
+    // the window. Without the bound the retry is deferred until the wall clock
+    // reaches that timestamp, so a bogus value turns a 120-second back-off into
+    // an unbounded one and the policy never converges. This gate exists to slow
+    // retries down, never to stop them.
+    if !(failed_ts > 0 && failed_ts <= now_ts && now_ts - failed_ts < FAILED_PLAN_DEDUP_WINDOW_SECS)
+    {
+        return false;
+    }
+    // A plan that succeeded after that failure is not in back-off: `failed_at`
+    // is left in place as history when a later attempt applies, so reading it
+    // alone would hold a working plan back for two minutes after it recovered.
+    //
+    // Equal timestamps mean "ordering unknown", not "recovered". Both fields
+    // are written by `now_rfc3339`, which is whole-second, so an apply and a
+    // failure in the same second are indistinguishable here. Ties resolve to
+    // deferring because the two mistakes are not the same size: deferring a
+    // plan that did recover costs one interval, and it has nothing left to
+    // execute anyway, while not deferring one that failed leaves the retry
+    // unbounded — and the tie is sticky, so it would stay unbounded.
+    let applied_ts = status
+        .applied_at
+        .as_deref()
+        .and_then(parse_rfc3339_epoch_secs)
+        .unwrap_or(0);
+    applied_ts <= failed_ts
+}
+
+/// The error a plan recorded when it last failed, for reporting a deferred
+/// retry without losing the cause.
+///
+/// A read, not a write: the point of deferring is to touch nothing the
+/// controller watches. An unreadable plan degrades to a placeholder rather
+/// than failing the reconcile with a second, less useful error.
+pub async fn recorded_plan_failure(client: &Client, namespace: &str, plan_name: &str) -> String {
+    let plans_api: Api<PostgresPolicyPlan> = Api::namespaced(client.clone(), namespace);
+    plans_api
+        .get(plan_name)
+        .await
+        .ok()
+        .and_then(|plan| plan.status.and_then(|status| status.last_error))
+        .unwrap_or_else(|| "no error recorded".to_string())
+}
+
 /// Execute an approved plan against the database.
 ///
 /// Re-renders executable SQL from the reconciler's in-memory changes, executes
@@ -857,6 +931,22 @@ pub async fn execute_plan(
     let namespace = plan.namespace().ok_or(ReconcileError::NoNamespace)?;
     let plan_name = plan.name_any();
     let plans_api: Api<PostgresPolicyPlan> = Api::namespaced(client.clone(), &namespace);
+
+    // Back off before touching anything: the phase write below is itself what
+    // wakes this policy again, so an unbounded retry never reaches the
+    // interval it is supposed to wait for.
+    if retry_deferred_until_window_expires(plan, now_epoch_secs()) {
+        let recorded = plan
+            .status
+            .as_ref()
+            .and_then(|status| status.last_error.clone())
+            .unwrap_or_else(|| "no error recorded".to_string());
+        info!(
+            plan = %plan_name,
+            "plan failed recently, deferring retry to the policy interval"
+        );
+        return Err(ReconcileError::PlanRetryDeferred(plan_name, recorded));
+    }
 
     // Update phase to Applying.
     update_plan_phase(&plans_api, &plan_name, PlanPhase::Applying).await?;
@@ -2304,6 +2394,163 @@ mod tests {
             "true".to_string(),
         )]));
         assert!(crate::crd::is_retention_exempt(&plan));
+    }
+
+    /// Build a plan in `phase`, having recorded a failure `age_secs` ago.
+    fn plan_failed_at(phase: PlanPhase, age_secs: i64, now_ts: i64) -> PostgresPolicyPlan {
+        let mut plan = PostgresPolicyPlan::new("plan", test_plan_spec());
+        plan.status = Some(PostgresPolicyPlanStatus {
+            phase,
+            last_error: Some("permission denied to create role".to_string()),
+            failed_at: Some(
+                jiff::Timestamp::from_second(now_ts - age_secs)
+                    .expect("epoch second in range")
+                    .to_string(),
+            ),
+            ..Default::default()
+        });
+        plan
+    }
+
+    /// Re-executing a plan that just failed is what made a permanently-failing
+    /// policy reconcile ~9 times a second: each attempt moves the plan
+    /// `Failed -> Applying -> Failed`, and the controller wakes on its own
+    /// plans, so every attempt schedules the next one.
+    #[test]
+    fn a_plan_that_just_failed_is_not_retried_until_the_window_expires() {
+        let now = 1_700_000_000;
+
+        assert!(
+            retry_deferred_until_window_expires(&plan_failed_at(PlanPhase::Failed, 1, now), now),
+            "a failure one second old must not be retried immediately"
+        );
+        assert!(
+            retry_deferred_until_window_expires(
+                &plan_failed_at(PlanPhase::Failed, FAILED_PLAN_DEDUP_WINDOW_SECS - 1, now),
+                now
+            ),
+            "still inside the window"
+        );
+        assert!(
+            !retry_deferred_until_window_expires(
+                &plan_failed_at(PlanPhase::Failed, FAILED_PLAN_DEDUP_WINDOW_SECS, now),
+                now
+            ),
+            "the window must expire so a fixed environment recovers"
+        );
+    }
+
+    /// A `failed_at` in the future must not defer the retry.
+    ///
+    /// The subtraction goes negative, which is inside the window by
+    /// arithmetic, so without an explicit bound the plan would wait for the
+    /// wall clock to reach that timestamp — turning a 120-second back-off into
+    /// an unbounded one. The back-off may slow a retry down; it may never
+    /// prevent one.
+    #[test]
+    fn a_failure_timestamp_in_the_future_does_not_defer_the_retry() {
+        let now = 1_700_000_000;
+
+        for skew in [1, 60, FAILED_PLAN_DEDUP_WINDOW_SECS, 86_400] {
+            assert!(
+                !retry_deferred_until_window_expires(
+                    &plan_failed_at(PlanPhase::Failed, -skew, now),
+                    now
+                ),
+                "a failure {skew}s in the future must not block execution"
+            );
+        }
+
+        // The boundary the other direction still defers: now is inside it.
+        assert!(retry_deferred_until_window_expires(
+            &plan_failed_at(PlanPhase::Failed, 0, now),
+            now
+        ));
+    }
+
+    /// The back-off holds whatever the phase says.
+    ///
+    /// `mark_plan_approved` runs between the failure and the next execution
+    /// attempt on the `approval: auto` path, so the phase reads Approved on a
+    /// plan that failed milliseconds ago. Gating on `phase == Failed` would
+    /// therefore never fire on the path that spins.
+    #[test]
+    fn the_backoff_survives_the_phase_being_rewritten() {
+        let now = 1_700_000_000;
+
+        for phase in [
+            PlanPhase::Pending,
+            PlanPhase::Approved,
+            PlanPhase::Applying,
+            PlanPhase::Failed,
+        ] {
+            assert!(
+                retry_deferred_until_window_expires(&plan_failed_at(phase.clone(), 1, now), now),
+                "{phase:?} with a one-second-old failure must still defer"
+            );
+        }
+    }
+
+    /// A plan that applied after its failure is not in back-off.
+    ///
+    /// `failed_at` is kept as history when a later attempt succeeds, so the
+    /// gate has to compare the two timestamps rather than read the failure
+    /// alone — otherwise recovering from a transient error would wedge the
+    /// plan for the rest of the window.
+    #[test]
+    fn a_plan_that_applied_after_failing_is_not_deferred() {
+        let now = 1_700_000_000;
+
+        let mut recovered = plan_failed_at(PlanPhase::Applied, 30, now);
+        recovered.status.as_mut().unwrap().applied_at =
+            Some(jiff::Timestamp::from_second(now - 10).unwrap().to_string());
+        assert!(!retry_deferred_until_window_expires(&recovered, now));
+
+        // Applied *before* the failure is stale history and must not excuse
+        // the failure that came after it.
+        let mut failed_again = plan_failed_at(PlanPhase::Failed, 10, now);
+        failed_again.status.as_mut().unwrap().applied_at =
+            Some(jiff::Timestamp::from_second(now - 30).unwrap().to_string());
+        assert!(retry_deferred_until_window_expires(&failed_again, now));
+    }
+
+    /// An apply and a failure in the same second still defer.
+    ///
+    /// `now_rfc3339` records whole seconds, so a plan that applied and then
+    /// failed inside one second writes the same string to both fields and the
+    /// ordering is not recoverable. Reading that as "recovered" would leave
+    /// the retry unbounded, and because neither timestamp moves afterwards it
+    /// would stay unbounded rather than self-correcting on the next pass.
+    #[test]
+    fn an_apply_and_a_failure_in_the_same_second_still_defer() {
+        let now = 1_700_000_000;
+        let same_second = jiff::Timestamp::from_second(now - 5).unwrap().to_string();
+
+        let mut plan = plan_failed_at(PlanPhase::Failed, 5, now);
+        let status = plan.status.as_mut().unwrap();
+        status.applied_at = Some(same_second.clone());
+        assert_eq!(status.failed_at.as_deref(), Some(same_second.as_str()));
+
+        assert!(
+            retry_deferred_until_window_expires(&plan, now),
+            "an unorderable pair must resolve to the bounded side"
+        );
+    }
+
+    #[test]
+    fn a_plan_with_no_recorded_failure_runs() {
+        let now = 1_700_000_000;
+
+        // No status at all, and no recorded failure time, are both "run it".
+        let bare = PostgresPolicyPlan::new("plan", test_plan_spec());
+        assert!(!retry_deferred_until_window_expires(&bare, now));
+
+        let mut no_timestamp = PostgresPolicyPlan::new("plan", test_plan_spec());
+        no_timestamp.status = Some(PostgresPolicyPlanStatus {
+            phase: PlanPhase::Failed,
+            ..Default::default()
+        });
+        assert!(!retry_deferred_until_window_expires(&no_timestamp, now));
     }
 
     /// A minimal spec — the ownership tests only care about metadata.
