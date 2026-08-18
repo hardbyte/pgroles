@@ -261,7 +261,7 @@ bounds rather than the bug.
 
 The counterexample is the production trace in miniature:
 
-```
+```text
 BBackoffExpires -> AAcquire -> BAttempt (loses) -> AFailAndRelease -> ...
 Back to state 17: <AAcquire>
 ```

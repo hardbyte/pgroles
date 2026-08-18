@@ -868,7 +868,14 @@ fn retry_deferred_until_window_expires(plan: &PostgresPolicyPlan, now_ts: i64) -
         .as_deref()
         .and_then(parse_rfc3339_epoch_secs)
         .unwrap_or(0);
-    failed_ts > 0 && now_ts - failed_ts < FAILED_PLAN_DEDUP_WINDOW_SECS
+    // `failed_ts <= now_ts` is not redundant. A timestamp in the future — a
+    // clock stepped backwards, a status written by a skewed replica, a hand
+    // patched plan — makes the subtraction negative, which is trivially inside
+    // the window. Without the bound the retry is deferred until the wall clock
+    // reaches that timestamp, so a bogus value turns a 120-second back-off into
+    // an unbounded one and the policy never converges. This gate exists to slow
+    // retries down, never to stop them.
+    failed_ts > 0 && failed_ts <= now_ts && now_ts - failed_ts < FAILED_PLAN_DEDUP_WINDOW_SECS
 }
 
 /// Execute an approved plan against the database.
@@ -2394,6 +2401,34 @@ mod tests {
             ),
             "the window must expire so a fixed environment recovers"
         );
+    }
+
+    /// A `failed_at` in the future must not defer the retry.
+    ///
+    /// The subtraction goes negative, which is inside the window by
+    /// arithmetic, so without an explicit bound the plan would wait for the
+    /// wall clock to reach that timestamp — turning a 120-second back-off into
+    /// an unbounded one. The back-off may slow a retry down; it may never
+    /// prevent one.
+    #[test]
+    fn a_failure_timestamp_in_the_future_does_not_defer_the_retry() {
+        let now = 1_700_000_000;
+
+        for skew in [1, 60, FAILED_PLAN_DEDUP_WINDOW_SECS, 86_400] {
+            assert!(
+                !retry_deferred_until_window_expires(
+                    &plan_failed_at(PlanPhase::Failed, -skew, now),
+                    now
+                ),
+                "a failure {skew}s in the future must not block execution"
+            );
+        }
+
+        // The boundary the other direction still defers: now is inside it.
+        assert!(retry_deferred_until_window_expires(
+            &plan_failed_at(PlanPhase::Failed, 0, now),
+            now
+        ));
     }
 
     #[test]
