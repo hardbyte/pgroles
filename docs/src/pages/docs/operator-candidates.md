@@ -410,6 +410,32 @@ are pruned by the same bounded retention loop as plans; label a candidate
 `pgroles.io/keep=true` to exempt it. Plans also expire after a TTL — an
 approval is not an indefinite authorisation.
 
+### What plan retention keeps
+
+Terminal plans are bounded per phase, not as one pool, because the phases are
+not worth the same and the cheapest one is generated fastest. Every replan
+supersedes its predecessor, so under a single bound `Superseded` records — of
+plans that never ran — would evict the `Applied` ones that record what did.
+
+| Phase | Retained | Notes |
+| --- | --- | --- |
+| `Applied` | 25, and never fewer than 30 days' worth | Hard ceiling of 200 |
+| `Failed`, `Rejected` | 10, shared | Why something did not run, and who declined it |
+| `Superseded` | 3 | Enough to see what a replan replaced |
+| `Pending`, `Approved`, `Applying` | all | Still live; never evicted |
+
+The oldest go first within each bucket. `Applied` additionally has an age
+floor: a plan inside it is kept even once the count is exceeded, so the audit
+trail spans a stated period instead of however long the policy's churn rate
+happens to make it. The ceiling overrides the floor — the floor is a promise
+about history, not a licence to keep everything — and a policy applying hard
+enough to reach 200 within the floor period will start losing its oldest.
+
+`pgroles.io/keep=true` exempts a plan from every one of these bounds.
+
+These values are not yet configurable; see
+[#194](https://github.com/hardbyte/pgroles/issues/194).
+
 ## Bounding open candidates
 
 Retention prunes what is already finished. Two separate bounds apply to
