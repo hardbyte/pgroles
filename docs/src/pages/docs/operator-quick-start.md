@@ -207,8 +207,9 @@ itself authority to approve a database change. Without it, any account that can
 patch `postgrespolicyplans/status` can approve, under any name it chooses.
 
 With Kyverno 1.18 or later installed in the cluster, enable it through the
-chart. The operator's exemption is generated from the values you installed
-with, so a custom ServiceAccount name or namespace stays correct:
+chart. The policy recognises the operator's own writes by the logical `manage`
+verb its role grants, not by ServiceAccount name, so a custom name or namespace
+stays correct:
 
 ```shell
 helm upgrade pgroles-operator oci://ghcr.io/hardbyte/charts/pgroles-operator \
@@ -217,13 +218,10 @@ helm upgrade pgroles-operator oci://ghcr.io/hardbyte/charts/pgroles-operator \
 ```
 
 For chart-less installs, `k8s/security/plan-decision-kyverno.yaml` is the same
-policy with the operator exemption left as a placeholder. Render it for the
-namespace and ServiceAccount the operator runs as:
+policy and applies as-is:
 
 ```shell
-scripts/render-kyverno-policies.sh \
-  --namespace pgroles-system --service-account pgroles-operator \
-  | kubectl apply -f -
+kubectl apply -f k8s/security/plan-decision-kyverno.yaml
 ```
 {% /callout %}
 

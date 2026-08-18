@@ -273,30 +273,38 @@ The trust model has two layers, and both matter:
   status can approve, under any name.
 
 Install it through the chart (`admissionPolicies.enabled=true`, Kyverno 1.18 or
-later), which generates the operator's own exemption from the values you
-installed with. For chart-less installs,
-`k8s/security/plan-decision-kyverno.yaml` is the same policy with that
-exemption left as a placeholder; render it with
-`scripts/render-kyverno-policies.sh --namespace … --service-account …` before
-applying. Bind the `pgroles-plan-approver` ClusterRole to the humans or groups
-permitted to authorise changes.
+later), or apply `k8s/security/plan-decision-kyverno.yaml` — the same policy,
+carrying nothing install-specific. Bind the `pgroles-plan-approver` ClusterRole
+to the humans or groups permitted to authorise changes.
 
 ### The exemption is part of the boundary
 
-The policy has to let the operator write plan status without holding the
-`approve` verb, so it exempts one authenticated ServiceAccount username. That
-subject is install-specific and pgroles will not guess it:
+The operator writes plan status too — it opens plans with `Approved=False`,
+records a rejection it observed, and auto-approves under `approval: auto` — so
+the policy has to let those writes through without the `approve` verb. It
+recognises them by asking a `SubjectAccessReview` whether the writer holds the
+logical `manage` verb on the parent `PostgresPolicy`. That is the same shape
+the ephemeral-access policy uses for controller-owned lifecycle writes.
 
-- name an account the operator does not run as and the operator's own decision
-  writes are judged as reviewer decisions, so plans stall behind an admission
-  denial rather than anything the plan status reports;
-- name an account that exists but belongs to someone else — a stale default in
-  a cluster that installs the operator elsewhere — and holding that account is
-  a complete bypass of the approve-verb check.
+Keying the exemption on an authorization rather than on a ServiceAccount name
+is what makes it safe to ship one policy for every install:
 
-Both paths generate the subject from the same namespace and ServiceAccount the
-operator is deployed with, which is why neither the chart nor the render script
-accepts an install where the two could disagree.
+- **it cannot go stale.** A name-based exemption is wrong the moment the
+  operator runs under a different name or namespace, and wrong silently: the
+  operator's writes are judged as reviewer decisions and plans stall behind an
+  admission denial that appears nowhere in the plan's status.
+- **a name is not a credential.** An exemption naming an account this cluster
+  does not actually run the operator as is a standing bypass of the approve
+  check for anyone able to create or impersonate it. A grant cannot be claimed
+  by minting an account.
+- **it composes.** Several operators, in different namespaces and under
+  different names, are all exempt under the one policy.
+
+The corollary is that `manage` on `postgrespolicies` is a controller-level
+permission. Grant it in the operator's role and nowhere else — the shipped
+`pgroles-plan-approver` role deliberately does not carry it, because a reviewer
+holding it would be exempt from the very check that role exists to be subject
+to.
 
 Approval RBAC is per-kind: granting a team create on policies grants nothing on
 plan status. Execution settings (`approval`, managed scope) are

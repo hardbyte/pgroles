@@ -4,35 +4,18 @@ Kyverno admission policies for the reviewer-decision boundary.
 These are rendered from files/kyverno-*.yaml rather than written inline
 because the policy bodies are full of Kyverno's own `{{ ... }}` JMESPath
 expressions, which Helm would otherwise try to evaluate. `.Files.Get` returns
-them verbatim; the only substitution is the operator's ServiceAccount
-username, which comes from the same helper the Deployment uses for
-`serviceAccountName` plus `.Release.Namespace`.
-
-The plan-decision policy exempts that username from the reviewer rules, so a
-substitution that silently did not happen would either exempt nobody (plans
-stall) or, if a literal default were left in place, exempt an account this
-install does not own. Both halves of the subject are therefore checked before
-rendering, and the result is checked for a surviving placeholder.
+them verbatim, and nothing in them is install-specific: the plan-decision
+policy tells the operator's writes from a reviewer's by SubjectAccessReview on
+the logical `manage` verb, which templates/clusterrole.yaml grants, so no
+ServiceAccount identity is substituted here.
 
 The resources are cluster-scoped and use fixed names, so enable them from a
 single release per cluster.
 */}}
 {{- if .Values.admissionPolicies.enabled }}
-{{- $serviceAccount := include "pgroles-operator.serviceAccountName" . }}
-{{- if not $serviceAccount }}
-{{- fail "admissionPolicies.enabled requires a resolvable operator ServiceAccount name; set operator.serviceAccount.name" }}
-{{- end }}
-{{- if not .Release.Namespace }}
-{{- fail "admissionPolicies.enabled requires a release namespace to build the operator exemption subject" }}
-{{- end }}
-{{- $subject := printf "system:serviceaccount:%s:%s" .Release.Namespace $serviceAccount }}
 {{- if .Values.admissionPolicies.planDecision.enabled }}
-{{- $planDecision := required "files/kyverno-plan-decision.yaml is missing from the packaged chart" (.Files.Get "files/kyverno-plan-decision.yaml") | replace "__PGROLES_OPERATOR_SUBJECT__" $subject }}
-{{- if contains "__PGROLES_OPERATOR_SUBJECT__" $planDecision }}
-{{- fail "files/kyverno-plan-decision.yaml still contains __PGROLES_OPERATOR_SUBJECT__ after substitution" }}
-{{- end }}
 ---
-{{ $planDecision }}
+{{ required "files/kyverno-plan-decision.yaml is missing from the packaged chart" (.Files.Get "files/kyverno-plan-decision.yaml") }}
 {{- end }}
 {{- if .Values.admissionPolicies.ephemeralAccess.enabled }}
 ---

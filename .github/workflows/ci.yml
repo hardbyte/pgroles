@@ -128,8 +128,8 @@ jobs:
 
       - uses: azure/setup-helm@v5
 
-      - name: Kyverno operator exemption render check
-        run: scripts/check-kyverno-render.sh
+      - name: Kyverno operator exemption check
+        run: scripts/check-kyverno-operator-exemption.sh
 
       - uses: astral-sh/setup-uv@v9.0.0
 

@@ -104,25 +104,26 @@ Prefer the chart for the admission policies. `admissionPolicies.enabled`
 defaults to `false` — the policies are Kyverno custom resources, so enabling
 them without Kyverno present fails the install — but leaving it off means
 decisions are unattributed and `approval.mode: Required` is not an approval
-boundary. Turn it on as soon as Kyverno is in the cluster. The chart generates
-the operator's exemption from `operator.serviceAccount.name` and the release
-namespace, so a non-default install cannot silently stall plans on a mismatched
-identity. Per-policy flags `admissionPolicies.planDecision.enabled` and
+boundary. Turn it on as soon as Kyverno is in the cluster. Both policies
+recognise the operator's own writes by authorization rather than by
+ServiceAccount name, so a non-default `operator.serviceAccount.name` or
+namespace needs no adjustment. Per-policy flags
+`admissionPolicies.planDecision.enabled` and
 `admissionPolicies.ephemeralAccess.enabled` are on by default under it.
 
-If you are not using the chart, render the mirrored manifests for your install
-and apply those. `plan-decision-kyverno.yaml` ships with the operator exemption
-as a placeholder rather than a default, so it is not applyable as-is:
+If you are not using the chart, apply the mirrored manifests. They carry
+nothing install-specific:
 
 ```shell
-scripts/render-kyverno-policies.sh \
-  --namespace pgroles-system --service-account pgroles-operator \
-  | kubectl apply -f -
+kubectl apply -f k8s/security/ephemeral-access-kyverno.yaml
+kubectl apply -f k8s/security/plan-decision-kyverno.yaml
 ```
 
-Pass the namespace and ServiceAccount the operator actually runs as. The script
-refuses to emit a manifest whose exemption is still a placeholder, or names a
-subject the API server could never issue a token for.
+Whichever path you use, the operator's own role must grant the logical `manage`
+verb — on `ephemeralaccesspolicies` for the ephemeral policies and on
+`postgrespolicies` for plan decisions. Both shipped operator roles do. Grant it
+to controllers only: on `postgrespolicies` it exempts the holder from the
+approve-verb check on plan decisions.
 
 Bind the requester and approver ClusterRoles to deployment-specific users,
 groups, or brokers. Prefer namespace-scoped `RoleBinding` objects so access to

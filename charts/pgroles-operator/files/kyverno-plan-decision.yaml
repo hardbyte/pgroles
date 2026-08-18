@@ -1,12 +1,9 @@
 # Admission policy for PostgresPolicyPlan decisions, rendered by the
 # pgroles-operator Helm chart when `admissionPolicies.enabled` is true.
 #
-# This file is the canonical copy. It is read verbatim by
-# templates/admission-policies.yaml, which substitutes the placeholder token
-# below with the operator's ServiceAccount username, so it is not valid
-# Kubernetes YAML on its own — apply it through the chart.
-# `k8s/security/plan-decision-kyverno.yaml` is a chart-less mirror of this
-# file, rendered by scripts/render-kyverno-policies.sh.
+# This file is the canonical copy, read verbatim by
+# templates/admission-policies.yaml.
+# `k8s/security/plan-decision-kyverno.yaml` is a chart-less mirror of it.
 #
 # The CRD's CEL rules make a decision terminal, mutually exclusive, and paired
 # with a `decidedBy` identity — but CEL cannot see `request.userInfo`, so the
@@ -18,6 +15,17 @@
 #   2. it requires the logical `approve` verb on the parent PostgresPolicy, so
 #      being able to patch a plan's status is not by itself authority to
 #      approve database changes.
+#
+# The operator writes plan status too — opening a plan with Approved=False,
+# recording a rejection it observed, auto-approving under `approval: auto` —
+# so both rules exempt callers holding the logical `manage` verb on the parent
+# PostgresPolicy, checked with a SubjectAccessReview. That verb is granted by
+# the operator's controller role and by nothing else pgroles ships, so the
+# exemption follows the authorization an install actually granted rather than a
+# ServiceAccount name: however many operators an install runs, under whatever
+# names and namespaces, all are covered, and creating or impersonating an
+# account named like the operator buys nothing without the grant. A caller
+# holding neither `approve` nor `manage` is denied.
 #
 # Without this policy installed, `decidedBy` is an assertion, and anyone with
 # patch on plans/status can approve. Deployments that need separation of duties
@@ -40,9 +48,10 @@ rules:
       - postgrespolicyplans/status
     verbs: [get, list, watch]
 ---
-# The `approve`-verb check below posts a SubjectAccessReview using the Kyverno
-# admission controller's own credentials. Without this it cannot, and because
-# the policy is enforcing, a failed context lookup blocks every decision write.
+# The `approve` and `manage` checks below post SubjectAccessReviews using the
+# Kyverno admission controller's own credentials. Without this it cannot, and
+# because the policy is enforcing, a failed context lookup blocks every
+# decision write.
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
@@ -77,25 +86,50 @@ spec:
           - resources:
               kinds: [pgroles.io/v1alpha1/PostgresPolicyPlan/status]
               operations: [UPDATE]
+      context:
+        # Kyverno resolves context before preconditions, so this review is
+        # available to the operator exemption in the preconditions. It asks
+        # whether the writer holds the logical `manage` verb on the parent
+        # PostgresPolicy — the verb the operator's controller role grants.
+        - name: managereview
+          apiCall:
+            urlPath: /apis/authorization.k8s.io/v1/subjectaccessreviews
+            method: POST
+            data:
+              - key: kind
+                value: SubjectAccessReview
+              - key: apiVersion
+                value: authorization.k8s.io/v1
+              - key: spec
+                value:
+                  resourceAttributes:
+                    group: pgroles.io
+                    resource: postgrespolicies
+                    namespace: "{{ request.namespace }}"
+                    name: "{{ request.object.spec.policyRef.name }}"
+                    verb: manage
+                  user: "{{ request.userInfo.username }}"
+                  groups: "{{ request.userInfo.groups }}"
       preconditions:
         all:
-          # Only a *newly true* decision counts. The operator's own writes —
-          # creating a plan with Approved=False, recording a rejection it
-          # observed, auto-approving under `approval: auto` — must not be
-          # treated as a reviewer decision, or the operator would need the
-          # approve verb and would have its own decidedBy overwritten.
+          # Only a *newly true* decision counts, and only one made by a caller
+          # without controller authority. The operator's own writes — creating
+          # a plan with Approved=False, recording a rejection it observed,
+          # auto-approving under `approval: auto` — must not be treated as
+          # reviewer decisions, or the operator would need the approve verb and
+          # would have its own decidedBy overwritten.
           - key: >-
               {{ length(request.object.status.conditions[?(type == 'Approved' || type == 'Denied') && status == 'True'] || `[]`) }}
             operator: GreaterThan
             value: >-
               {{ length(request.oldObject.status.conditions[?(type == 'Approved' || type == 'Denied') && status == 'True'] || `[]`) }}
-          # The operator's own identity, substituted by the chart from the
-          # same helper the Deployment uses for `serviceAccountName` and from
-          # `.Release.Namespace`. Do not edit by hand: change
-          # `operator.serviceAccount.name` or the install namespace instead.
-          - key: "{{ request.userInfo.username }}"
+          # A controller write, not a reviewer decision. The exemption is the
+          # `manage` grant itself, so it covers every operator an install runs
+          # regardless of ServiceAccount name or namespace, and holding a
+          # particular name without the grant buys nothing.
+          - key: "{{ managereview.status.allowed }}"
             operator: NotEquals
-            value: "__PGROLES_OPERATOR_SUBJECT__"
+            value: true
       mutate:
         patchStrategicMerge:
           status:
@@ -113,26 +147,30 @@ spec:
           - resources:
               kinds: [pgroles.io/v1alpha1/PostgresPolicyPlan/status]
               operations: [UPDATE]
-      preconditions:
-        all:
-          # Only a *newly true* decision counts. The operator's own writes —
-          # creating a plan with Approved=False, recording a rejection it
-          # observed, auto-approving under `approval: auto` — must not be
-          # treated as a reviewer decision, or the operator would need the
-          # approve verb and would have its own decidedBy overwritten.
-          - key: >-
-              {{ length(request.object.status.conditions[?(type == 'Approved' || type == 'Denied') && status == 'True'] || `[]`) }}
-            operator: GreaterThan
-            value: >-
-              {{ length(request.oldObject.status.conditions[?(type == 'Approved' || type == 'Denied') && status == 'True'] || `[]`) }}
-          # The operator's own identity, substituted by the chart from the
-          # same helper the Deployment uses for `serviceAccountName` and from
-          # `.Release.Namespace`. Do not edit by hand: change
-          # `operator.serviceAccount.name` or the install namespace instead.
-          - key: "{{ request.userInfo.username }}"
-            operator: NotEquals
-            value: "__PGROLES_OPERATOR_SUBJECT__"
       context:
+        # Kyverno resolves context before preconditions, so this review is
+        # available to the operator exemption in the preconditions. It asks
+        # whether the writer holds the logical `manage` verb on the parent
+        # PostgresPolicy — the verb the operator's controller role grants.
+        - name: managereview
+          apiCall:
+            urlPath: /apis/authorization.k8s.io/v1/subjectaccessreviews
+            method: POST
+            data:
+              - key: kind
+                value: SubjectAccessReview
+              - key: apiVersion
+                value: authorization.k8s.io/v1
+              - key: spec
+                value:
+                  resourceAttributes:
+                    group: pgroles.io
+                    resource: postgrespolicies
+                    namespace: "{{ request.namespace }}"
+                    name: "{{ request.object.spec.policyRef.name }}"
+                    verb: manage
+                  user: "{{ request.userInfo.username }}"
+                  groups: "{{ request.userInfo.groups }}"
         - name: subjectaccessreview
           apiCall:
             urlPath: /apis/authorization.k8s.io/v1/subjectaccessreviews
@@ -152,6 +190,26 @@ spec:
                     verb: approve
                   user: "{{ request.userInfo.username }}"
                   groups: "{{ request.userInfo.groups }}"
+      preconditions:
+        all:
+          # Only a *newly true* decision counts, and only one made by a caller
+          # without controller authority. The operator's own writes — creating
+          # a plan with Approved=False, recording a rejection it observed,
+          # auto-approving under `approval: auto` — must not be treated as
+          # reviewer decisions, or the operator would need the approve verb and
+          # would have its own decidedBy overwritten.
+          - key: >-
+              {{ length(request.object.status.conditions[?(type == 'Approved' || type == 'Denied') && status == 'True'] || `[]`) }}
+            operator: GreaterThan
+            value: >-
+              {{ length(request.oldObject.status.conditions[?(type == 'Approved' || type == 'Denied') && status == 'True'] || `[]`) }}
+          # A controller write, not a reviewer decision. The exemption is the
+          # `manage` grant itself, so it covers every operator an install runs
+          # regardless of ServiceAccount name or namespace, and holding a
+          # particular name without the grant buys nothing.
+          - key: "{{ managereview.status.allowed }}"
+            operator: NotEquals
+            value: true
       validate:
         message: >-
           changing Approved or Denied requires the approve verb on the parent

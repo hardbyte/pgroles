@@ -4,11 +4,16 @@
 # raw patch on plans/status *without* it — the caller the Kyverno policy
 # exists to stop.
 #
-# `pgroles-alt/pgroles-operator-alt` stands in for an operator installed under
-# a non-default namespace and ServiceAccount name. It deliberately holds the
-# same approve-less status access as plan-status-writer, so when the policy is
-# rendered for it the only thing that can admit its decision is the operator
-# exemption tracking the configured identity.
+# The `pgroles-alt` namespace holds the two identities that pin down what the
+# operator exemption is keyed on. Both would be exempt under a policy that
+# recognised the operator by ServiceAccount name; under the shipped policy only
+# the one granted the logical `manage` verb is:
+#
+#   pgroles-operator-alt — a second controller, differently named and in a
+#     different namespace from the default install, with the `manage` grant;
+#   pgroles-operator — the *default* operator name, in a namespace that does
+#     not run the operator, with no `manage` grant. An account anyone with
+#     namespace-create rights could mint.
 apiVersion: v1
 kind: Namespace
 metadata:
@@ -18,6 +23,12 @@ apiVersion: v1
 kind: ServiceAccount
 metadata:
   name: pgroles-operator-alt
+  namespace: pgroles-alt
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: pgroles-operator
   namespace: pgroles-alt
 ---
 apiVersion: v1
@@ -49,6 +60,18 @@ rules:
     resources: [postgrespolicies]
     verbs: [get]
 ---
+# What makes a second controller a controller: the same logical `manage` verb
+# the shipped operator role grants. Deliberately no `approve`, so a decision it
+# records is admitted by the exemption alone.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: pgroles-plan-manager-e2e
+rules:
+  - apiGroups: [pgroles.io]
+    resources: [postgrespolicies]
+    verbs: [manage]
+---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
 metadata:
@@ -73,7 +96,23 @@ subjects:
   - kind: ServiceAccount
     name: pgroles-operator-alt
     namespace: pgroles-alt
+  - kind: ServiceAccount
+    name: pgroles-operator
+    namespace: pgroles-alt
 roleRef:
   apiGroup: rbac.authorization.k8s.io
   kind: ClusterRole
   name: pgroles-plan-status-writer-e2e
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: pgroles-plan-manager-e2e
+subjects:
+  - kind: ServiceAccount
+    name: pgroles-operator-alt
+    namespace: pgroles-alt
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: pgroles-plan-manager-e2e
