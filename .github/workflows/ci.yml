@@ -406,6 +406,42 @@ jobs:
           wait_for_last_error_contains insufficient-privileges-policy "permission denied to create role"
           assert_role_absent insufficient-privileges-user
 
+          # A permanently-failing policy must not spin. This one is never
+          # deleted, so it stays in the cluster for every scenario below, and
+          # it shares a database with them — the advisory lock key is derived
+          # server-side from `current_database()`, so every policy pointed at
+          # this server contends for one lock.
+          #
+          # Executing a failed plan used to write it twice (Applying, then
+          # Failed with a fresh timestamp), and the controller wakes on its own
+          # plans, so each attempt scheduled the next: ~9 reconciles a second,
+          # each taking that shared lock. Other policies then lost the lock
+          # repeatedly and their waits timed out — an intermittent failure that
+          # took two wrong fixes to pin down, because nothing asserted the rate.
+          #
+          # At the policy interval this should be 0 or 1 in a 20s window. The
+          # bound is loose because the point is to catch a storm, not to pin a
+          # cadence: the regression produced ~190.
+          echo "--- Test: a permanently-failing policy does not spin ---"
+          sleep 20
+          # Guard against a vacuous pass: if the log format drifts, the counter
+          # below reads 0 and the assertion "succeeds" while measuring nothing.
+          # This window covers the policy's creation and first failures, so it
+          # must match.
+          if ! kubectl -n pgroles-system logs deployment/pgroles-operator --since=120s \
+            | grep -q 'starting reconciliation.*insufficient-privileges-policy'; then
+            echo "::error::no reconcile log lines matched for insufficient-privileges-policy; the spin assertion below would pass without measuring anything"
+            exit 1
+          fi
+          spin_count="$(kubectl -n pgroles-system logs deployment/pgroles-operator --since=20s \
+            | grep -c 'starting reconciliation.*insufficient-privileges-policy' || true)"
+          echo "insufficient-privileges-policy reconciled ${spin_count} times in 20s"
+          if [ "$spin_count" -gt 5 ]; then
+            echo "::error::failing policy reconciled ${spin_count} times in 20s (>5): it is self-waking and will starve other policies on this database"
+            kubectl -n pgroles-system logs deployment/pgroles-operator --since=20s --tail=40 || true
+            exit 1
+          fi
+
           # The deprecated `mode: plan` spelling stays accepted — a GitOps
           # controller re-applies existing manifests on every sync, so the
           # rename must not reject them — behaves exactly as observe, and
