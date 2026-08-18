@@ -5,8 +5,8 @@
 # templates/admission-policies.yaml, which substitutes the placeholder token
 # below with the operator's ServiceAccount username, so it is not valid
 # Kubernetes YAML on its own — apply it through the chart.
-# `k8s/security/plan-decision-kyverno.yaml` is a chart-less mirror of this file
-# pinned to the default namespace and ServiceAccount name.
+# `k8s/security/plan-decision-kyverno.yaml` is a chart-less mirror of this
+# file, rendered by scripts/render-kyverno-policies.sh.
 #
 # The CRD's CEL rules make a decision terminal, mutually exclusive, and paired
 # with a `decidedBy` identity — but CEL cannot see `request.userInfo`, so the

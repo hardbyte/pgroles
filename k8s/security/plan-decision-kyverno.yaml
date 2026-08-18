@@ -1,10 +1,23 @@
-# Chart-less mirror. The canonical copy is
-# charts/pgroles-operator/files/kyverno-plan-decision.yaml, rendered by the
-# Helm chart when `admissionPolicies.enabled=true` — that path generates the
-# operator exemption below from `operator.serviceAccount.name` and the release
-# namespace, so it cannot drift. Prefer it. This file exists for installs that
-# do not use the chart, and is pinned to the default namespace and
-# ServiceAccount name; keep it in sync with the chart copy when either changes.
+# Chart-less mirror of the PostgresPolicyPlan decision policy. The canonical
+# copy is charts/pgroles-operator/files/kyverno-plan-decision.yaml.
+#
+# This file is a template, not an applyable manifest. Render it first:
+#
+#   scripts/render-kyverno-policies.sh \
+#     --namespace pgroles-system --service-account pgroles-operator \
+#     | kubectl apply -f -
+#
+# The operator exemption below is keyed on an authenticated ServiceAccount
+# username, which is install-specific, so it ships as a placeholder rather than
+# a default. A default would name the operator of some *other* install:
+# exempting a ServiceAccount this cluster does not actually run the operator as
+# grants the approve-verb bypass to anyone who can create that account. Leaving
+# the placeholder unrendered exempts nobody, which stalls plans rather than
+# admitting unauthorised decisions.
+#
+# Installs that use the Helm chart should set `admissionPolicies.enabled=true`
+# instead; the chart substitutes the same placeholder from
+# `operator.serviceAccount.name` and the release namespace.
 #
 # Admission policy for PostgresPolicyPlan decisions.
 #
@@ -89,14 +102,12 @@ spec:
             operator: GreaterThan
             value: >-
               {{ length(request.oldObject.status.conditions[?(type == 'Approved' || type == 'Denied') && status == 'True'] || `[]`) }}
-          # EDIT THIS if you install the operator under a different namespace
-          # or ServiceAccount name (Helm: `operator.serviceAccount.name`,
-          # `--namespace`). Kyverno cannot resolve it for you, and getting it
-          # wrong means the operator's own status writes are treated as
-          # reviewer decisions and rejected.
+          # The operator's own identity. Substituted at render time from the
+          # namespace and ServiceAccount the operator actually runs as; see
+          # the header. Do not pin a literal username here.
           - key: "{{ request.userInfo.username }}"
             operator: NotEquals
-            value: "system:serviceaccount:pgroles-system:pgroles-operator"
+            value: "__PGROLES_OPERATOR_SUBJECT__"
       mutate:
         patchStrategicMerge:
           status:
@@ -126,14 +137,12 @@ spec:
             operator: GreaterThan
             value: >-
               {{ length(request.oldObject.status.conditions[?(type == 'Approved' || type == 'Denied') && status == 'True'] || `[]`) }}
-          # EDIT THIS if you install the operator under a different namespace
-          # or ServiceAccount name (Helm: `operator.serviceAccount.name`,
-          # `--namespace`). Kyverno cannot resolve it for you, and getting it
-          # wrong means the operator's own status writes are treated as
-          # reviewer decisions and rejected.
+          # The operator's own identity. Substituted at render time from the
+          # namespace and ServiceAccount the operator actually runs as; see
+          # the header. Do not pin a literal username here.
           - key: "{{ request.userInfo.username }}"
             operator: NotEquals
-            value: "system:serviceaccount:pgroles-system:pgroles-operator"
+            value: "__PGROLES_OPERATOR_SUBJECT__"
       context:
         - name: subjectaccessreview
           apiCall:

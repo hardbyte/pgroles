@@ -3,6 +3,23 @@
 # verb through the shipped pgroles-plan-approver ClusterRole, and one holds
 # raw patch on plans/status *without* it — the caller the Kyverno policy
 # exists to stop.
+#
+# `pgroles-alt/pgroles-operator-alt` stands in for an operator installed under
+# a non-default namespace and ServiceAccount name. It deliberately holds the
+# same approve-less status access as plan-status-writer, so when the policy is
+# rendered for it the only thing that can admit its decision is the operator
+# exemption tracking the configured identity.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: pgroles-alt
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: pgroles-operator-alt
+  namespace: pgroles-alt
+---
 apiVersion: v1
 kind: ServiceAccount
 metadata:
@@ -53,6 +70,9 @@ subjects:
   - kind: ServiceAccount
     name: plan-status-writer
     namespace: default
+  - kind: ServiceAccount
+    name: pgroles-operator-alt
+    namespace: pgroles-alt
 roleRef:
   apiGroup: rbac.authorization.k8s.io
   kind: ClusterRole

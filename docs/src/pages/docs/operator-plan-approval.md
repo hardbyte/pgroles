@@ -274,10 +274,29 @@ The trust model has two layers, and both matter:
 
 Install it through the chart (`admissionPolicies.enabled=true`, Kyverno 1.18 or
 later), which generates the operator's own exemption from the values you
-installed with; `k8s/security/plan-decision-kyverno.yaml` is the same policy for
-chart-less installs, pinned to the `pgroles-system` namespace and the
-`pgroles-operator` ServiceAccount. Bind the `pgroles-plan-approver` ClusterRole
-to the humans or groups permitted to authorise changes.
+installed with. For chart-less installs,
+`k8s/security/plan-decision-kyverno.yaml` is the same policy with that
+exemption left as a placeholder; render it with
+`scripts/render-kyverno-policies.sh --namespace … --service-account …` before
+applying. Bind the `pgroles-plan-approver` ClusterRole to the humans or groups
+permitted to authorise changes.
+
+### The exemption is part of the boundary
+
+The policy has to let the operator write plan status without holding the
+`approve` verb, so it exempts one authenticated ServiceAccount username. That
+subject is install-specific and pgroles will not guess it:
+
+- name an account the operator does not run as and the operator's own decision
+  writes are judged as reviewer decisions, so plans stall behind an admission
+  denial rather than anything the plan status reports;
+- name an account that exists but belongs to someone else — a stale default in
+  a cluster that installs the operator elsewhere — and holding that account is
+  a complete bypass of the approve-verb check.
+
+Both paths generate the subject from the same namespace and ServiceAccount the
+operator is deployed with, which is why neither the chart nor the render script
+accepts an install where the two could disagree.
 
 Approval RBAC is per-kind: granting a team create on policies grants nothing on
 plan status. Execution settings (`approval`, managed scope) are

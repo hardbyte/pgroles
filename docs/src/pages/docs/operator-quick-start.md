@@ -217,8 +217,14 @@ helm upgrade pgroles-operator oci://ghcr.io/hardbyte/charts/pgroles-operator \
 ```
 
 For chart-less installs, `k8s/security/plan-decision-kyverno.yaml` is the same
-policy pinned to the `pgroles-system` namespace and the `pgroles-operator`
-ServiceAccount name; edit the exemption if yours differ.
+policy with the operator exemption left as a placeholder. Render it for the
+namespace and ServiceAccount the operator runs as:
+
+```shell
+scripts/render-kyverno-policies.sh \
+  --namespace pgroles-system --service-account pgroles-operator \
+  | kubectl apply -f -
+```
 {% /callout %}
 
 ## 6. Make a second change

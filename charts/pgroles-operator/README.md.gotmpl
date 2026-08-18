@@ -50,9 +50,21 @@ fails the install. Install Kyverno 1.18 or later first, then turn it on. The
 rendered resources are cluster-scoped with fixed names, so enable them from a
 single release per cluster.
 
+The plan-decision policy exempts the operator's own plan-status writes from the
+reviewer rules, keyed on its authenticated ServiceAccount username. The chart
+builds that username from `operator.serviceAccount.name` and the release
+namespace — the same values the Deployment uses — so a non-default install
+stays correct without editing anything.
+
 For chart-less installs, `k8s/security/*-kyverno.yaml` in the repository mirror
-these policies, pinned to the `pgroles-system` namespace and the
-`pgroles-operator` ServiceAccount name — edit the exemption if yours differ.
+these policies with the exemption left as a placeholder. Render them for your
+install rather than applying them directly:
+
+```shell
+scripts/render-kyverno-policies.sh \
+  --namespace pgroles-system --service-account pgroles-operator \
+  | kubectl apply -f -
+```
 
 {{ template "chart.valuesSection" . }}
 

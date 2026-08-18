@@ -110,15 +110,19 @@ namespace, so a non-default install cannot silently stall plans on a mismatched
 identity. Per-policy flags `admissionPolicies.planDecision.enabled` and
 `admissionPolicies.ephemeralAccess.enabled` are on by default under it.
 
-If you are not using the chart, apply the mirrored manifests instead. They are
-pinned to the `pgroles-system` namespace and the `pgroles-operator`
-ServiceAccount name, and the exemption in `plan-decision-kyverno.yaml` must be
-edited to match your install:
+If you are not using the chart, render the mirrored manifests for your install
+and apply those. `plan-decision-kyverno.yaml` ships with the operator exemption
+as a placeholder rather than a default, so it is not applyable as-is:
 
 ```shell
-kubectl apply -f k8s/security/ephemeral-access-kyverno.yaml
-kubectl apply -f k8s/security/plan-decision-kyverno.yaml
+scripts/render-kyverno-policies.sh \
+  --namespace pgroles-system --service-account pgroles-operator \
+  | kubectl apply -f -
 ```
+
+Pass the namespace and ServiceAccount the operator actually runs as. The script
+refuses to emit a manifest whose exemption is still a placeholder or names an
+empty subject.
 
 Bind the requester and approver ClusterRoles to deployment-specific users,
 groups, or brokers. Prefer namespace-scoped `RoleBinding` objects so access to
