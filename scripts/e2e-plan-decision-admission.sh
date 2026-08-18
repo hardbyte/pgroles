@@ -11,14 +11,17 @@
 #            cannot record a decision;
 #   allow  — a bound approver can, and the decidedBy it *claims* is replaced
 #            with the identity the API server authenticated;
-#   exempt — a controller holding the logical `manage` verb writes decisions
-#            untouched, and two differently named controllers in different
-#            namespaces are exempt at the same time;
+#   exempt — a controller holding the logical `manage` verb decides without the
+#            approve verb, two differently named controllers in different
+#            namespaces are exempt at the same time, and the decidedBy it
+#            claims is replaced all the same;
 #   named  — an account named like the default operator, without the `manage`
 #            grant, is not exempt.
 #
 # The last two are what distinguish an exemption keyed on authorization from
-# one keyed on a ServiceAccount identity.
+# one keyed on a ServiceAccount identity. Every identity expected to be refused
+# is first asserted able to patch plan status, so a refusal is attributable to
+# admission and not to ordinary RBAC.
 set -euo pipefail
 source scripts/e2e-helpers.sh
 
@@ -34,13 +37,13 @@ kubectl wait --for=condition=Ready "clusterpolicy/${policy_name}" --timeout=120s
 
 # Guard against a vacuous pass: if the policy that ended up served is not the
 # one under test, every "was this admitted?" check below measures the wrong
-# thing. Both decision rules must exempt on the manage review, and neither may
-# key on an identity.
+# thing. Exactly one rule — the approve check — may exempt on the manage
+# review, and no rule may key on an identity.
 echo "Guard: the served policy exempts by authorization, not by identity"
 live="$(kubectl get "clusterpolicy/${policy_name}" -o json)"
 manage_reviews="$(grep -c '"verb": "manage"' <<<"$live" || true)"
-if [ "$manage_reviews" -ne 2 ]; then
-  echo "::error::${policy_name} performs ${manage_reviews} manage reviews, expected 2"
+if [ "$manage_reviews" -ne 1 ]; then
+  echo "::error::${policy_name} performs ${manage_reviews} manage reviews, expected exactly 1"
   exit 1
 fi
 if grep -q 'system:serviceaccount:' <<<"$live"; then
@@ -52,6 +55,20 @@ fi
 echo "RBAC shape: approve and manage sit exactly where they should"
 can_i() {
   kubectl auth can-i "$1" postgrespolicies.pgroles.io --as="$2" -n default
+}
+
+# Every identity that must be *refused* below has to be able to reach the
+# admission chain first. Without this, an ordinary RBAC rejection of the status
+# patch reads exactly like a Kyverno denial, and the denial legs would pass
+# against a policy with no preconditions at all.
+assert_can_patch_status() {
+  local subject="$1" allowed
+  allowed="$(kubectl auth can-i patch postgrespolicyplans.pgroles.io/status \
+    --as="$subject" -n default)"
+  if [ "$allowed" != "yes" ]; then
+    echo "::error::${subject} cannot patch postgrespolicyplans/status, so a refused decision would prove nothing about admission"
+    exit 1
+  fi
 }
 test "$(can_i approve system:serviceaccount:default:plan-approver)" = "yes"
 test "$(can_i manage system:serviceaccount:default:plan-approver)" = "no"
@@ -65,6 +82,10 @@ test "$(can_i manage "$manager_subject")" = "yes"
 # Same name as the default operator, no controller grant.
 test "$(can_i approve "$namesake_subject")" = "no"
 test "$(can_i manage "$namesake_subject")" = "no"
+
+assert_can_patch_status system:serviceaccount:default:plan-status-writer
+assert_can_patch_status "$namesake_subject"
+assert_can_patch_status "$manager_subject"
 
 # A plan under a manual-approval policy, opened while the ClusterPolicy is
 # enforcing. Prints the plan name.
@@ -99,17 +120,27 @@ echo "A manual-approval policy opens a plan under the enforcing admission policy
 plan_name="$(open_plan admission-gate-policy admission_gate_user)"
 assert_role_absent admission_gate_user
 
+# A refusal only means something if it came from the admission policy. The
+# caller was asserted able to patch plan status above; this also requires the
+# refusal to name the policy, so an unrelated rejection cannot stand in for it.
+assert_admission_denied() {
+  local label="$1" subject="$2" plan="$3" decide="$4" output
+  if output="$(DECIDE_AS="$subject" "$decide" "$plan" 2>&1)"; then
+    echo "::error::${label}: ${subject} recorded a decision"
+    exit 1
+  fi
+  if ! grep -q "$policy_name" <<<"$output"; then
+    echo "::error::${label}: ${subject} was refused, but not by ${policy_name}; the refusal says nothing about admission"
+    printf '%s\n' "$output"
+    exit 1
+  fi
+}
+
 echo "Deny: status patch access without approve or manage records nothing"
-if DECIDE_AS=system:serviceaccount:default:plan-status-writer \
-  approve_plan "$plan_name"; then
-  echo "::error::a caller without the approve verb recorded an approval"
-  exit 1
-fi
-if DECIDE_AS=system:serviceaccount:default:plan-status-writer \
-  reject_plan "$plan_name"; then
-  echo "::error::a caller without the approve verb recorded a denial"
-  exit 1
-fi
+assert_admission_denied "approval without the approve verb" \
+  system:serviceaccount:default:plan-status-writer "$plan_name" approve_plan
+assert_admission_denied "denial without the approve verb" \
+  system:serviceaccount:default:plan-status-writer "$plan_name" reject_plan
 assert_role_absent admission_gate_user
 
 echo "Allow: a bound approver approves, and the forged decider is replaced"
@@ -141,11 +172,12 @@ manager_plan="$(open_plan admission-manager-policy admission_manager_user)"
 DECIDE_AS="$manager_subject" DECIDE_BY=controller-claimed-identity \
   approve_plan "$manager_plan"
 
-# An exempt writer skips the mutate rule too, so the claimed decider stands.
-# A reviewer's would have been replaced with its authenticated username.
+# Admitted without the approve verb, so the exemption applied. The stamp is not
+# exempt from anything: the claimed decider is replaced here exactly as it is
+# for a reviewer, so `manage` never buys the ability to name someone else.
 manager_decided="$(kubectl get pgplan "$manager_plan" -o jsonpath='{.status.decidedBy.username}')"
-test "$manager_decided" = "controller-claimed-identity" || {
-  echo "::error::decidedBy holds '$manager_decided'; the second controller was treated as a reviewer"
+test "$manager_decided" = "$manager_subject" || {
+  echo "::error::decidedBy holds '$manager_decided', not the authenticated controller; a manage holder can name its own decider"
   exit 1
 }
 
@@ -159,10 +191,9 @@ assert_role_exists admission_manager_user
 
 echo "An account named like the operator, without the manage grant, is refused"
 namesake_plan="$(open_plan admission-namesake-policy admission_namesake_user)"
-if DECIDE_AS="$namesake_subject" approve_plan "$namesake_plan"; then
-  echo "::error::'${namesake_subject}' recorded a decision holding neither approve nor manage; the exemption is keyed on a name, not on authorization"
-  exit 1
-fi
+assert_admission_denied \
+  "an account carrying the default operator's name, with no manage grant" \
+  "$namesake_subject" "$namesake_plan" approve_plan
 assert_role_absent admission_namesake_user
 
 echo "Cleanup"

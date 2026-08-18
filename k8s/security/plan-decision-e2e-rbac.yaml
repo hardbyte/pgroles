@@ -1,5 +1,8 @@
-# Test identities for the plan-decision admission E2E. Mirrors
-# ephemeral-access-e2e-rbac.yaml: one identity holds the logical `approve`
+# Test identities for the plan-decision admission E2E. Not for installation:
+# pgroles-plan-manager-e2e below grants the logical `manage` verb, which
+# exempts its holder from the approve-verb check on plan decisions.
+#
+# Mirrors ephemeral-access-e2e-rbac.yaml: one identity holds the logical `approve`
 # verb through the shipped pgroles-plan-approver ClusterRole, and one holds
 # raw patch on plans/status *without* it — the caller the Kyverno policy
 # exists to stop.

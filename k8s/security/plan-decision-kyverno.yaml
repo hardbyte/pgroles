@@ -20,14 +20,21 @@
 #
 # The operator writes plan status too — opening a plan with Approved=False,
 # recording a rejection it observed, auto-approving under `approval: auto` —
-# so both rules exempt callers holding the logical `manage` verb on the parent
-# PostgresPolicy, checked with a SubjectAccessReview. That verb is granted by
-# the operator's controller role and by nothing else pgroles ships, so the
-# exemption follows the authorization an install actually granted rather than a
-# ServiceAccount name: however many operators an install runs, under whatever
-# names and namespaces, all are covered, and creating or impersonating an
-# account named like the operator buys nothing without the grant. A caller
+# and requiring a reviewer's `approve` verb for that would be wrong. So the
+# approve check, and only the approve check, exempts callers holding the
+# logical `manage` verb on the parent PostgresPolicy, checked with a
+# SubjectAccessReview. That verb is granted by the operator's controller role,
+# so the exemption follows the authorization an install actually granted rather
+# than a ServiceAccount name: however many operators an install runs, under
+# whatever names and namespaces, all are covered, and creating or impersonating
+# an account named like the operator buys nothing without the grant. A caller
 # holding neither `approve` nor `manage` is denied.
+#
+# Nothing is exempt from the `decidedBy` stamp. Under `approval: auto` the
+# operator's own ServiceAccount is recorded as the decider; the condition's
+# `AutoApproved` reason carries the mechanism, so the two facts stay separate
+# and `decidedBy` means one thing everywhere — the identity the API server
+# authenticated for the write that recorded the decision.
 #
 # Without this policy installed, `decidedBy` is an assertion, and anyone with
 # patch on plans/status can approve. Deployments that need separation of duties
@@ -88,50 +95,22 @@ spec:
           - resources:
               kinds: [pgroles.io/v1alpha1/PostgresPolicyPlan/status]
               operations: [UPDATE]
-      context:
-        # Kyverno resolves context before preconditions, so this review is
-        # available to the operator exemption in the preconditions. It asks
-        # whether the writer holds the logical `manage` verb on the parent
-        # PostgresPolicy — the verb the operator's controller role grants.
-        - name: managereview
-          apiCall:
-            urlPath: /apis/authorization.k8s.io/v1/subjectaccessreviews
-            method: POST
-            data:
-              - key: kind
-                value: SubjectAccessReview
-              - key: apiVersion
-                value: authorization.k8s.io/v1
-              - key: spec
-                value:
-                  resourceAttributes:
-                    group: pgroles.io
-                    resource: postgrespolicies
-                    namespace: "{{ request.namespace }}"
-                    name: "{{ request.object.spec.policyRef.name }}"
-                    verb: manage
-                  user: "{{ request.userInfo.username }}"
-                  groups: "{{ request.userInfo.groups }}"
       preconditions:
         all:
-          # Only a *newly true* decision counts, and only one made by a caller
-          # without controller authority. The operator's own writes — creating
-          # a plan with Approved=False, recording a rejection it observed,
-          # auto-approving under `approval: auto` — must not be treated as
-          # reviewer decisions, or the operator would need the approve verb and
-          # would have its own decidedBy overwritten.
+          # Only a *newly true* decision counts, and every one of them is
+          # stamped — controllers included. `decidedBy` is the only record of
+          # who decided, and it is trustworthy exactly because admission always
+          # writes it from authenticated userInfo. Exempting anyone here would
+          # let that caller name a decider of its choosing.
+          #
+          # Restricting the rule to a newly true decision is also what keeps
+          # the CRD's write-once `decidedBy` satisfiable: later status writes
+          # do not re-stamp, so they carry the recorded identity forward.
           - key: >-
               {{ length(request.object.status.conditions[?(type == 'Approved' || type == 'Denied') && status == 'True'] || `[]`) }}
             operator: GreaterThan
             value: >-
               {{ length(request.oldObject.status.conditions[?(type == 'Approved' || type == 'Denied') && status == 'True'] || `[]`) }}
-          # A controller write, not a reviewer decision. The exemption is the
-          # `manage` grant itself, so it covers every operator an install runs
-          # regardless of ServiceAccount name or namespace, and holding a
-          # particular name without the grant buys nothing.
-          - key: "{{ managereview.status.allowed }}"
-            operator: NotEquals
-            value: true
       mutate:
         patchStrategicMerge:
           status:
@@ -197,9 +176,8 @@ spec:
           # Only a *newly true* decision counts, and only one made by a caller
           # without controller authority. The operator's own writes — creating
           # a plan with Approved=False, recording a rejection it observed,
-          # auto-approving under `approval: auto` — must not be treated as
-          # reviewer decisions, or the operator would need the approve verb and
-          # would have its own decidedBy overwritten.
+          # auto-approving under `approval: auto` — must not require the
+          # approve verb, which is a reviewer's permission, not a controller's.
           - key: >-
               {{ length(request.object.status.conditions[?(type == 'Approved' || type == 'Denied') && status == 'True'] || `[]`) }}
             operator: GreaterThan

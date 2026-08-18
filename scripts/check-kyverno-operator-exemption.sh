@@ -29,11 +29,21 @@ trap 'rm -rf "$tmpdir"' EXIT
 failed=0
 
 # Reads a manifest stream on stdin and exits 0 when the named Role or
-# ClusterRole grants `manage` on postgrespolicies.
+# ClusterRole authorizes `manage` on postgrespolicies.
+#
+# RBAC's `*` matches every value in its list, so a rule carrying it confers
+# `manage` just as a literal does. The negative assertion below is the one that
+# matters here — a reviewer role with a wildcard would be exempt from the
+# approve check while a literal-only match reported it clean.
 grants_manage="$tmpdir/grants_manage.py"
 cat >"$grants_manage" <<'PY'
 import sys
 import yaml
+
+
+def covers(values, wanted):
+    return "*" in (values or []) or wanted in (values or [])
+
 
 role = sys.argv[1]
 for doc in yaml.safe_load_all(sys.stdin):
@@ -42,9 +52,9 @@ for doc in yaml.safe_load_all(sys.stdin):
     if doc["metadata"]["name"] != role:
         continue
     for rule in doc.get("rules") or []:
-        if ("pgroles.io" in (rule.get("apiGroups") or [])
-                and "postgrespolicies" in (rule.get("resources") or [])
-                and "manage" in (rule.get("verbs") or [])):
+        if (covers(rule.get("apiGroups"), "pgroles.io")
+                and covers(rule.get("resources"), "postgrespolicies")
+                and covers(rule.get("verbs"), "manage")):
             sys.exit(0)
 sys.exit(1)
 PY
@@ -106,11 +116,35 @@ if grep -q 'system:serviceaccount:' <<<"$default_render"; then
   failed=1
 fi
 
-# ...and the replacement must actually be present. Both decision rules carry
-# the review, so the expected count is 2.
+# ...and the replacement must actually be present. Exactly one rule carries the
+# review: the approve check. The `decidedBy` stamp must not, or a controller
+# could name a decider of its choosing, so a second review here is a
+# regression, not an improvement.
 manage_reviews="$(grep -c 'verb: manage' <<<"$default_render" || true)"
-if [ "$manage_reviews" -ne 2 ]; then
-  echo "::error::the rendered plan-decision policy performs ${manage_reviews} manage reviews, expected 2"
+if [ "$manage_reviews" -ne 1 ]; then
+  echo "::error::the rendered plan-decision policy performs ${manage_reviews} manage reviews, expected exactly 1 (the approve check)"
+  failed=1
+fi
+
+# The stamp applies to every newly terminal decision. Its rule may gate on the
+# decision becoming true — that is what keeps write-once `decidedBy`
+# satisfiable — but never on the writer's authorization.
+if ! python3 - "$policy_file" <<'PY'
+import sys
+import yaml
+
+policy = [doc for doc in yaml.safe_load_all(open(sys.argv[1]))
+          if doc and doc["kind"] == "ClusterPolicy"][0]
+rule = [r for r in policy["spec"]["rules"]
+        if r["name"] == "record-authenticated-decision-maker"][0]
+if rule.get("context"):
+    sys.exit(1)
+if "managereview" in yaml.safe_dump(rule):
+    sys.exit(1)
+sys.exit(0)
+PY
+then
+  echo "::error::record-authenticated-decision-maker gates the decidedBy stamp on an authorization review; the stamp must apply to every newly terminal decision"
   failed=1
 fi
 

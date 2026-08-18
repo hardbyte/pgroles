@@ -104,9 +104,13 @@ order. Only the last one is about human review:
 observe-mode plan is accepted and does nothing, and the policy reports an `ApprovalIgnored`
 condition so this is distinguishable from a stalled operator.
 
-Under `approval: auto` the operator approves its own plan and records
-`status.decidedBy.username` as `system:pgroles-operator(auto-approval)`, so an
-audit trail never shows an unattributed approval.
+Under `approval: auto` the operator approves its own plan, so an audit trail
+never shows an unattributed approval. The `Approved` condition's reason is
+`AutoApproved` either way; `status.decidedBy.username` reads
+`system:pgroles-operator(auto-approval)` on its own, and the operator's
+authenticated ServiceAccount once the admission policy below is installed and
+stamping the identity. The mechanism and the identity are separate facts and
+each field carries its own.
 
 ## Approval identity: the change digest
 
@@ -300,11 +304,18 @@ is what makes it safe to ship one policy for every install:
 - **it composes.** Several operators, in different namespaces and under
   different names, are all exempt under the one policy.
 
+The exemption is narrow on purpose: it covers the **approve check only**. The
+`decidedBy` stamp has no exemption at all, so every newly terminal decision
+records the identity the API server authenticated for that write, controllers
+included. Holding `manage` lets you decide without a reviewer's permission; it
+never lets you name someone else as the decider.
+
 The corollary is that `manage` on `postgrespolicies` is a controller-level
 permission. Grant it in the operator's role and nowhere else — the shipped
 `pgroles-plan-approver` role deliberately does not carry it, because a reviewer
 holding it would be exempt from the very check that role exists to be subject
-to.
+to. A wildcard rule (`verbs: ["*"]` on `pgroles.io`) confers it too, so avoid
+those on roles bound to people.
 
 Approval RBAC is per-kind: granting a team create on policies grants nothing on
 plan status. Execution settings (`approval`, managed scope) are

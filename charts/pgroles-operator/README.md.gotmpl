@@ -59,7 +59,9 @@ or namespace needs no adjustment, several operators can share one policy, and
 an account merely *named* like the operator is not exempt without the grant.
 
 Grant `manage` on `postgrespolicies` to controllers only — holding it exempts
-the caller from the approve-verb check on decisions.
+the caller from the approve-verb check on decisions. It does not exempt anyone
+from the `decidedBy` stamp: every newly terminal decision records the identity
+the API server authenticated, controllers included.
 
 For chart-less installs, `k8s/security/*-kyverno.yaml` in the repository mirror
 these policies and apply as-is:
