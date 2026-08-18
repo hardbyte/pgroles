@@ -425,9 +425,11 @@ plans that never ran — would evict the `Applied` ones that record what did.
 | `Pending`, `Approved`, `Applying` | all | Still live; never evicted |
 
 The oldest go first within each bucket. `Applied` additionally has an age
-floor: a plan inside it is kept even once the count is exceeded, so the audit
-trail spans a stated period instead of however long the policy's churn rate
-happens to make it. The ceiling overrides the floor — the floor is a promise
+floor, measured from `status.appliedAt` — not from creation, since a plan can
+wait on a reviewer for arbitrarily long before it executes: a plan applied
+inside the floor is kept even once the count is exceeded, so the audit trail
+spans a stated period instead of however long the policy's churn rate happens
+to make it. The ceiling overrides the floor — the floor is a promise
 about history, not a licence to keep everything — and a policy applying hard
 enough to reach 200 within the floor period will start losing its oldest.
 

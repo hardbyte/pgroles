@@ -153,7 +153,19 @@ impl PlanRetention {
     /// the environment asked for would only be discovered when the plan
     /// someone wanted was already deleted.
     pub fn from_env() -> Result<Self, PlanRetentionConfigError> {
-        Self::from_lookup(|variable| std::env::var(variable).ok())
+        let mut resolved = std::collections::BTreeMap::new();
+        for variable in [
+            Self::ENV_APPLIED,
+            Self::ENV_APPLIED_CEILING,
+            Self::ENV_APPLIED_MIN_AGE,
+            Self::ENV_DECIDED,
+            Self::ENV_SUPERSEDED,
+        ] {
+            if let Some(value) = env_read(variable, std::env::var(variable))? {
+                resolved.insert(variable, value);
+            }
+        }
+        Self::from_lookup(|variable| resolved.get(variable).cloned())
     }
 
     /// [`Self::from_env`] over an arbitrary lookup, so parsing and validation
@@ -187,6 +199,25 @@ impl PlanRetention {
             });
         }
         Ok(retention)
+    }
+}
+
+/// Classify one raw environment read: present, absent, or refused.
+///
+/// `NotUnicode` is the one `VarError` that must not degrade to "unset": a
+/// variable someone set, however malformed, silently taking the default is
+/// exactly the failure mode this configuration's startup validation exists
+/// to prevent.
+fn env_read(
+    variable: &'static str,
+    read: Result<String, std::env::VarError>,
+) -> Result<Option<String>, PlanRetentionConfigError> {
+    match read {
+        Ok(value) => Ok(Some(value)),
+        Err(std::env::VarError::NotPresent) => Ok(None),
+        Err(std::env::VarError::NotUnicode(_)) => {
+            Err(PlanRetentionConfigError::NotUnicode { variable })
+        }
     }
 }
 
@@ -249,6 +280,8 @@ pub enum PlanRetentionConfigError {
          a ceiling under the count bound can never take effect"
     )]
     CeilingBelowCount { ceiling: usize, count: usize },
+    #[error("{variable} is set to a value that is not valid Unicode")]
+    NotUnicode { variable: &'static str },
 }
 
 /// How recently a Failed plan must have been created (in seconds) for the
@@ -1670,7 +1703,7 @@ fn plans_to_evict(
         if remaining <= retention.applied {
             break;
         }
-        let inside_floor = plan_age_secs(plan, now_ts) < retention.applied_min_age_secs;
+        let inside_floor = applied_age_secs(plan, now_ts) < retention.applied_min_age_secs;
         if inside_floor && remaining <= retention.applied_ceiling {
             continue;
         }
@@ -1700,6 +1733,23 @@ fn sort_oldest_first(plans: &mut [&PostgresPolicyPlan]) {
             .as_ref()
             .cmp(&b.metadata.creation_timestamp.as_ref())
     });
+}
+
+/// Age of an `Applied` plan for the retention floor, measured from
+/// `status.appliedAt`. The floor promises post-application history, and a
+/// plan can sit `Pending` or `Approved` for arbitrarily long before a
+/// reviewer decides it — measured from creation, a plan approved late would
+/// read as already outside the floor and be evicted by the cleanup that runs
+/// right after it executes. Falls back to [`plan_age_secs`] when `appliedAt`
+/// is absent or unparseable, so plans recorded before it was set keep the
+/// creation-time behaviour rather than reading as infinitely old.
+fn applied_age_secs(plan: &PostgresPolicyPlan, now_ts: i64) -> i64 {
+    plan.status
+        .as_ref()
+        .and_then(|status| status.applied_at.as_deref())
+        .and_then(parse_rfc3339_epoch_secs)
+        .map(|applied_ts| now_ts.saturating_sub(applied_ts))
+        .unwrap_or_else(|| plan_age_secs(plan, now_ts))
 }
 
 /// Age in seconds, or 0 for a plan with no creation timestamp — treating an
@@ -2908,6 +2958,79 @@ mod tests {
                 .to_string()
                 .contains(PlanRetention::ENV_APPLIED_MIN_AGE),
             "the error must name the variable to fix: {error}"
+        );
+    }
+
+    #[test]
+    fn the_applied_floor_runs_from_when_the_plan_applied_not_when_it_was_created() {
+        // A plan can sit Pending or Approved for longer than the entire floor
+        // before a reviewer decides it. Measured from creation, such a plan is
+        // already outside the floor the moment it executes, and the cleanup
+        // that follows execution deletes it — the exact history the floor
+        // promises to keep.
+        let now = 1_700_000_000;
+        let retention = PlanRetention::default();
+
+        // Created far outside the floor, applied just now. Enough plans to
+        // exceed the count bound, but well under the ceiling, so only the
+        // floor can be what spares them.
+        let excess = 10;
+        assert!(
+            retention.applied + excess <= retention.applied_ceiling,
+            "this test must not lean on the ceiling to pass"
+        );
+        let plans: Vec<PostgresPolicyPlan> = (0..retention.applied + excess)
+            .map(|i| {
+                let mut plan = retained_plan(
+                    &format!("applied-{i:03}"),
+                    PlanPhase::Applied,
+                    retention.applied_min_age_secs * 3 + i as i64,
+                    now,
+                );
+                plan.status
+                    .as_mut()
+                    .expect("retained_plan always sets a status")
+                    .applied_at = Some(
+                    jiff::Timestamp::from_second(now - 60 - i as i64)
+                        .expect("epoch second in range")
+                        .to_string(),
+                );
+                plan
+            })
+            .collect();
+
+        assert!(
+            evicted_names(&plans, retention, now).is_empty(),
+            "a plan applied inside the floor is kept, however old the object is"
+        );
+    }
+
+    #[test]
+    fn a_non_unicode_environment_value_is_rejected_not_defaulted() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let read = Err(std::env::VarError::NotUnicode(
+            std::ffi::OsString::from_vec(vec![b'2', b'5', 0xff]),
+        ));
+        let error = env_read(PlanRetention::ENV_APPLIED, read)
+            .expect_err("a set-but-non-Unicode value must be rejected, not read as unset");
+        assert!(
+            error.to_string().contains(PlanRetention::ENV_APPLIED),
+            "the error must name the variable to fix: {error}"
+        );
+
+        assert_eq!(
+            env_read(
+                PlanRetention::ENV_APPLIED,
+                Err(std::env::VarError::NotPresent)
+            )
+            .expect("absent is not an error"),
+            None
+        );
+        assert_eq!(
+            env_read(PlanRetention::ENV_APPLIED, Ok("25".to_string()))
+                .expect("a Unicode value is not an error"),
+            Some("25".to_string())
         );
     }
 
