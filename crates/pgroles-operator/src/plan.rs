@@ -841,6 +841,36 @@ async fn supersede_stale_plans(
 // Plan execution
 // ---------------------------------------------------------------------------
 
+/// Is this plan inside the retry back-off for a failure it already recorded?
+///
+/// The creation path already refuses to mint a second plan with the same
+/// effects inside [`FAILED_PLAN_DEDUP_WINDOW_SECS`], on the grounds that it
+/// would produce the same error. Re-*executing* the plan it kept is the same
+/// bet, and left unbounded it is much worse than a wasted query:
+/// [`execute_plan`] moves the plan `Failed -> Applying -> Failed` on every
+/// attempt, and the policy controller wakes on its own plans
+/// (`reconcile_on(plan_triggers)`). Each attempt therefore schedules the next
+/// one, so a permanently-failing policy reconciles as fast as it can execute
+/// — ~9 times a second in CI — and takes the per-database advisory lock every
+/// time, starving every other policy pointed at that database.
+///
+/// Retrying on the policy's own interval instead is the same behaviour the
+/// user already gets after the window expires, minus the storm.
+fn retry_deferred_until_window_expires(plan: &PostgresPolicyPlan, now_ts: i64) -> bool {
+    let Some(status) = plan.status.as_ref() else {
+        return false;
+    };
+    if status.phase != PlanPhase::Failed {
+        return false;
+    }
+    let failed_ts = status
+        .failed_at
+        .as_deref()
+        .and_then(parse_rfc3339_epoch_secs)
+        .unwrap_or(0);
+    failed_ts > 0 && now_ts - failed_ts < FAILED_PLAN_DEDUP_WINDOW_SECS
+}
+
 /// Execute an approved plan against the database.
 ///
 /// Re-renders executable SQL from the reconciler's in-memory changes, executes
@@ -857,6 +887,22 @@ pub async fn execute_plan(
     let namespace = plan.namespace().ok_or(ReconcileError::NoNamespace)?;
     let plan_name = plan.name_any();
     let plans_api: Api<PostgresPolicyPlan> = Api::namespaced(client.clone(), &namespace);
+
+    // Back off before touching anything: the phase write below is itself what
+    // wakes this policy again, so an unbounded retry never reaches the
+    // interval it is supposed to wait for.
+    if retry_deferred_until_window_expires(plan, now_epoch_secs()) {
+        let recorded = plan
+            .status
+            .as_ref()
+            .and_then(|status| status.last_error.clone())
+            .unwrap_or_else(|| "no error recorded".to_string());
+        info!(
+            plan = %plan_name,
+            "plan failed recently, deferring retry to the policy interval"
+        );
+        return Err(ReconcileError::PlanRetryDeferred(plan_name, recorded));
+    }
 
     // Update phase to Applying.
     update_plan_phase(&plans_api, &plan_name, PlanPhase::Applying).await?;
@@ -2304,6 +2350,80 @@ mod tests {
             "true".to_string(),
         )]));
         assert!(crate::crd::is_retention_exempt(&plan));
+    }
+
+    /// Build a plan in `phase`, having recorded a failure `age_secs` ago.
+    fn plan_failed_at(phase: PlanPhase, age_secs: i64, now_ts: i64) -> PostgresPolicyPlan {
+        let mut plan = PostgresPolicyPlan::new("plan", test_plan_spec());
+        plan.status = Some(PostgresPolicyPlanStatus {
+            phase,
+            last_error: Some("permission denied to create role".to_string()),
+            failed_at: Some(
+                jiff::Timestamp::from_second(now_ts - age_secs)
+                    .expect("epoch second in range")
+                    .to_string(),
+            ),
+            ..Default::default()
+        });
+        plan
+    }
+
+    /// Re-executing a plan that just failed is what made a permanently-failing
+    /// policy reconcile ~9 times a second: each attempt moves the plan
+    /// `Failed -> Applying -> Failed`, and the controller wakes on its own
+    /// plans, so every attempt schedules the next one.
+    #[test]
+    fn a_plan_that_just_failed_is_not_retried_until_the_window_expires() {
+        let now = 1_700_000_000;
+
+        assert!(
+            retry_deferred_until_window_expires(&plan_failed_at(PlanPhase::Failed, 1, now), now),
+            "a failure one second old must not be retried immediately"
+        );
+        assert!(
+            retry_deferred_until_window_expires(
+                &plan_failed_at(PlanPhase::Failed, FAILED_PLAN_DEDUP_WINDOW_SECS - 1, now),
+                now
+            ),
+            "still inside the window"
+        );
+        assert!(
+            !retry_deferred_until_window_expires(
+                &plan_failed_at(PlanPhase::Failed, FAILED_PLAN_DEDUP_WINDOW_SECS, now),
+                now
+            ),
+            "the window must expire so a fixed environment recovers"
+        );
+    }
+
+    #[test]
+    fn only_a_failed_plan_defers_its_retry() {
+        let now = 1_700_000_000;
+
+        // An approved plan that has never run carries no failure to wait out;
+        // deferring it would stall the whole apply path.
+        for phase in [
+            PlanPhase::Pending,
+            PlanPhase::Approved,
+            PlanPhase::Applied,
+            PlanPhase::Applying,
+        ] {
+            assert!(
+                !retry_deferred_until_window_expires(&plan_failed_at(phase.clone(), 1, now), now),
+                "{phase:?} must not be treated as a recent failure"
+            );
+        }
+
+        // No status at all, and no recorded failure time, are both "run it".
+        let bare = PostgresPolicyPlan::new("plan", test_plan_spec());
+        assert!(!retry_deferred_until_window_expires(&bare, now));
+
+        let mut no_timestamp = PostgresPolicyPlan::new("plan", test_plan_spec());
+        no_timestamp.status = Some(PostgresPolicyPlanStatus {
+            phase: PlanPhase::Failed,
+            ..Default::default()
+        });
+        assert!(!retry_deferred_until_window_expires(&no_timestamp, now));
     }
 
     /// A minimal spec — the ownership tests only care about metadata.

@@ -668,7 +668,7 @@ jobs:
         if: failure()
         run: |
           kubectl get pgr,pgplan,pgcand,pgeap,pgear -A -o wide || true
-          kubectl get pgr,pgplan,pgcand -A -o yaml || true
+          kubectl get pgr,pgplan,pgcand -A -o yaml | head -c 200000 || true
           kubectl -n pgroles-system logs deployment/pgroles-operator --tail=2000 || true
           kubectl -n pgroles-system logs deployment/pgroles-operator --previous --tail=2000 || true
           kubectl get events -A --sort-by=.lastTimestamp | tail -100 || true
@@ -746,7 +746,7 @@ jobs:
         if: failure()
         run: |
           kubectl get pgr,pgplan,pgcand,pgeap,pgear -A -o wide || true
-          kubectl get pgr,pgplan,pgcand -A -o yaml || true
+          kubectl get pgr,pgplan,pgcand -A -o yaml | head -c 200000 || true
           kubectl -n pgroles-system logs deployment/pgroles-operator --tail=2000 || true
           kubectl -n pgroles-system logs deployment/pgroles-operator --previous --tail=2000 || true
           kubectl get events -A --sort-by=.lastTimestamp | tail -100 || true
@@ -1870,7 +1870,7 @@ jobs:
         if: failure()
         run: |
           kubectl get pgr,pgplan,pgcand,pgeap,pgear -A -o wide || true
-          kubectl get pgr,pgplan,pgcand -A -o yaml || true
+          kubectl get pgr,pgplan,pgcand -A -o yaml | head -c 200000 || true
           kubectl -n pgroles-system logs deployment/pgroles-operator --tail=2000 || true
           kubectl -n pgroles-system logs deployment/pgroles-operator --previous --tail=2000 || true
           kubectl get events -A --sort-by=.lastTimestamp | tail -100 || true

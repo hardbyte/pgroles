@@ -140,6 +140,13 @@ pub enum ReconcileError {
     #[error("invalid spec: {0}")]
     InvalidSpec(String),
 
+    /// A plan that failed inside the retry window was not re-executed.
+    ///
+    /// Carries the error the plan recorded, so the policy's condition keeps
+    /// describing the real problem rather than the back-off that deferred it.
+    #[error("plan {0} failed recently and was not retried: {1}")]
+    PlanRetryDeferred(String, String),
+
     #[error("approval digest error: {0}")]
     ApprovalDigest(#[from] pgroles_core::approval::ApprovalDigestError),
 
@@ -497,7 +504,10 @@ fn retry_class_for_reconcile_error(error: &ReconcileError) -> RetryClass {
         // The watch resyncs on its own, so this clears without operator action.
         ReconcileError::RequestIndexNotReady(_) => RetryClass::Transient,
         ReconcileError::PendingEphemeralAccessCleanup(_) => RetryClass::CleanupPending,
-        ReconcileError::ManifestExpansion(_)
+        // Waiting out the plan's retry window is exactly the normal interval:
+        // requeuing sooner would re-enter the back-off and re-defer.
+        ReconcileError::PlanRetryDeferred(_, _)
+        | ReconcileError::ManifestExpansion(_)
         | ReconcileError::InvalidInterval(_, _)
         | ReconcileError::InvalidSpec(_)
         | ReconcileError::MissingDatabaseObjects(_)
@@ -3248,6 +3258,13 @@ impl ReconcileError {
             ReconcileError::ManifestExpansion(_)
             | ReconcileError::InvalidInterval(_, _)
             | ReconcileError::InvalidSpec(_) => "InvalidSpec",
+            // A distinct reason rather than the deferred failure's own: it
+            // transitions once, when the back-off first engages, and then
+            // stays put. Reusing a reason we cannot derive from the recorded
+            // string would flip every pass, which is the write storm this
+            // back-off exists to stop. The underlying cause is not lost — it
+            // is carried verbatim in the message, and so in `last_error`.
+            ReconcileError::PlanRetryDeferred(_, _) => "PlanRetryDeferred",
             ReconcileError::ApprovalDigest(_) => "ApprovalDigestFailed",
             ReconcileError::ConflictingPolicy(_) => "ConflictingPolicy",
             ReconcileError::UnsatisfiableWildcardGrant(_) => "UnsatisfiableWildcardGrant",
