@@ -883,12 +883,20 @@ fn retry_deferred_until_window_expires(plan: &PostgresPolicyPlan, now_ts: i64) -
     // A plan that succeeded after that failure is not in back-off: `failed_at`
     // is left in place as history when a later attempt applies, so reading it
     // alone would hold a working plan back for two minutes after it recovered.
+    //
+    // Equal timestamps mean "ordering unknown", not "recovered". Both fields
+    // are written by `now_rfc3339`, which is whole-second, so an apply and a
+    // failure in the same second are indistinguishable here. Ties resolve to
+    // deferring because the two mistakes are not the same size: deferring a
+    // plan that did recover costs one interval, and it has nothing left to
+    // execute anyway, while not deferring one that failed leaves the retry
+    // unbounded — and the tie is sticky, so it would stay unbounded.
     let applied_ts = status
         .applied_at
         .as_deref()
         .and_then(parse_rfc3339_epoch_secs)
         .unwrap_or(0);
-    applied_ts < failed_ts
+    applied_ts <= failed_ts
 }
 
 /// The error a plan recorded when it last failed, for reporting a deferred
@@ -2504,6 +2512,29 @@ mod tests {
         failed_again.status.as_mut().unwrap().applied_at =
             Some(jiff::Timestamp::from_second(now - 30).unwrap().to_string());
         assert!(retry_deferred_until_window_expires(&failed_again, now));
+    }
+
+    /// An apply and a failure in the same second still defer.
+    ///
+    /// `now_rfc3339` records whole seconds, so a plan that applied and then
+    /// failed inside one second writes the same string to both fields and the
+    /// ordering is not recoverable. Reading that as "recovered" would leave
+    /// the retry unbounded, and because neither timestamp moves afterwards it
+    /// would stay unbounded rather than self-correcting on the next pass.
+    #[test]
+    fn an_apply_and_a_failure_in_the_same_second_still_defer() {
+        let now = 1_700_000_000;
+        let same_second = jiff::Timestamp::from_second(now - 5).unwrap().to_string();
+
+        let mut plan = plan_failed_at(PlanPhase::Failed, 5, now);
+        let status = plan.status.as_mut().unwrap();
+        status.applied_at = Some(same_second.clone());
+        assert_eq!(status.failed_at.as_deref(), Some(same_second.as_str()));
+
+        assert!(
+            retry_deferred_until_window_expires(&plan, now),
+            "an unorderable pair must resolve to the bounded side"
+        );
     }
 
     #[test]
