@@ -1535,6 +1535,25 @@ async fn apply_under_lock(
                 .await?;
                 let plan_name = creation_result.plan_name().to_string();
 
+                // Stop before the first write when the plan handed back is one
+                // that failed moments ago. Deferring inside `execute_plan` is
+                // too late: `mark_plan_approved` and the apply-started event
+                // both write to the plan first, and the controller wakes on
+                // its own plans, so each write schedules the next reconcile.
+                // A back-off that still writes is only a slower spin.
+                if creation_result.is_failed_backoff() {
+                    let recorded =
+                        crate::plan::recorded_plan_failure(&ctx.kube_client, namespace, &plan_name)
+                            .await;
+                    info!(
+                        name,
+                        namespace,
+                        plan = %plan_name,
+                        "plan failed recently, deferring retry to the policy interval"
+                    );
+                    return Err(ReconcileError::PlanRetryDeferred(plan_name, recorded));
+                }
+
                 // Fetch the plan, mark it approved, and execute it.
                 let plans_api: Api<PostgresPolicyPlan> =
                     Api::namespaced(ctx.kube_client.clone(), namespace);

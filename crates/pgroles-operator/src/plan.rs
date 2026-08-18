@@ -846,23 +846,24 @@ async fn supersede_stale_plans(
 /// The creation path already refuses to mint a second plan with the same
 /// effects inside [`FAILED_PLAN_DEDUP_WINDOW_SECS`], on the grounds that it
 /// would produce the same error. Re-*executing* the plan it kept is the same
-/// bet, and left unbounded it is much worse than a wasted query:
-/// [`execute_plan`] moves the plan `Failed -> Applying -> Failed` on every
-/// attempt, and the policy controller wakes on its own plans
-/// (`reconcile_on(plan_triggers)`). Each attempt therefore schedules the next
-/// one, so a permanently-failing policy reconciles as fast as it can execute
-/// — ~9 times a second in CI — and takes the per-database advisory lock every
-/// time, starving every other policy pointed at that database.
+/// bet, and left unbounded it costs far more than a wasted query: every
+/// attempt writes the plan, the policy controller wakes on its own plans
+/// (`reconcile_on(plan_triggers)`), and so each attempt schedules the next.
+/// A permanently-failing policy then reconciles as fast as it can execute —
+/// several times a second — taking the per-database advisory lock each time
+/// and starving every other policy pointed at that database.
 ///
 /// Retrying on the policy's own interval instead is the same behaviour the
 /// user already gets after the window expires, minus the storm.
+///
+/// Keyed on the recorded failure, never on `phase`. Under `approval: auto`
+/// the reconciler calls `mark_plan_approved` on the plan before executing it,
+/// so a plan that failed milliseconds ago reads as `Approved` here.
+/// `failed_at` survives that write; `phase` does not.
 fn retry_deferred_until_window_expires(plan: &PostgresPolicyPlan, now_ts: i64) -> bool {
     let Some(status) = plan.status.as_ref() else {
         return false;
     };
-    if status.phase != PlanPhase::Failed {
-        return false;
-    }
     let failed_ts = status
         .failed_at
         .as_deref()
@@ -875,7 +876,35 @@ fn retry_deferred_until_window_expires(plan: &PostgresPolicyPlan, now_ts: i64) -
     // reaches that timestamp, so a bogus value turns a 120-second back-off into
     // an unbounded one and the policy never converges. This gate exists to slow
     // retries down, never to stop them.
-    failed_ts > 0 && failed_ts <= now_ts && now_ts - failed_ts < FAILED_PLAN_DEDUP_WINDOW_SECS
+    if !(failed_ts > 0 && failed_ts <= now_ts && now_ts - failed_ts < FAILED_PLAN_DEDUP_WINDOW_SECS)
+    {
+        return false;
+    }
+    // A plan that succeeded after that failure is not in back-off: `failed_at`
+    // is left in place as history when a later attempt applies, so reading it
+    // alone would hold a working plan back for two minutes after it recovered.
+    let applied_ts = status
+        .applied_at
+        .as_deref()
+        .and_then(parse_rfc3339_epoch_secs)
+        .unwrap_or(0);
+    applied_ts < failed_ts
+}
+
+/// The error a plan recorded when it last failed, for reporting a deferred
+/// retry without losing the cause.
+///
+/// A read, not a write: the point of deferring is to touch nothing the
+/// controller watches. An unreadable plan degrades to a placeholder rather
+/// than failing the reconcile with a second, less useful error.
+pub async fn recorded_plan_failure(client: &Client, namespace: &str, plan_name: &str) -> String {
+    let plans_api: Api<PostgresPolicyPlan> = Api::namespaced(client.clone(), namespace);
+    plans_api
+        .get(plan_name)
+        .await
+        .ok()
+        .and_then(|plan| plan.status.and_then(|status| status.last_error))
+        .unwrap_or_else(|| "no error recorded".to_string())
 }
 
 /// Execute an approved plan against the database.
@@ -2431,23 +2460,55 @@ mod tests {
         ));
     }
 
+    /// The back-off holds whatever the phase says.
+    ///
+    /// `mark_plan_approved` runs between the failure and the next execution
+    /// attempt on the `approval: auto` path, so the phase reads Approved on a
+    /// plan that failed milliseconds ago. Gating on `phase == Failed` would
+    /// therefore never fire on the path that spins.
     #[test]
-    fn only_a_failed_plan_defers_its_retry() {
+    fn the_backoff_survives_the_phase_being_rewritten() {
         let now = 1_700_000_000;
 
-        // An approved plan that has never run carries no failure to wait out;
-        // deferring it would stall the whole apply path.
         for phase in [
             PlanPhase::Pending,
             PlanPhase::Approved,
-            PlanPhase::Applied,
             PlanPhase::Applying,
+            PlanPhase::Failed,
         ] {
             assert!(
-                !retry_deferred_until_window_expires(&plan_failed_at(phase.clone(), 1, now), now),
-                "{phase:?} must not be treated as a recent failure"
+                retry_deferred_until_window_expires(&plan_failed_at(phase.clone(), 1, now), now),
+                "{phase:?} with a one-second-old failure must still defer"
             );
         }
+    }
+
+    /// A plan that applied after its failure is not in back-off.
+    ///
+    /// `failed_at` is kept as history when a later attempt succeeds, so the
+    /// gate has to compare the two timestamps rather than read the failure
+    /// alone — otherwise recovering from a transient error would wedge the
+    /// plan for the rest of the window.
+    #[test]
+    fn a_plan_that_applied_after_failing_is_not_deferred() {
+        let now = 1_700_000_000;
+
+        let mut recovered = plan_failed_at(PlanPhase::Applied, 30, now);
+        recovered.status.as_mut().unwrap().applied_at =
+            Some(jiff::Timestamp::from_second(now - 10).unwrap().to_string());
+        assert!(!retry_deferred_until_window_expires(&recovered, now));
+
+        // Applied *before* the failure is stale history and must not excuse
+        // the failure that came after it.
+        let mut failed_again = plan_failed_at(PlanPhase::Failed, 10, now);
+        failed_again.status.as_mut().unwrap().applied_at =
+            Some(jiff::Timestamp::from_second(now - 30).unwrap().to_string());
+        assert!(retry_deferred_until_window_expires(&failed_again, now));
+    }
+
+    #[test]
+    fn a_plan_with_no_recorded_failure_runs() {
+        let now = 1_700_000_000;
 
         // No status at all, and no recorded failure time, are both "run it".
         let bare = PostgresPolicyPlan::new("plan", test_plan_spec());
