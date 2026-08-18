@@ -226,6 +226,67 @@ semantics are switchable via the `UseFixedDiff` constant:
 ./correctness/run-tlc.sh races/Convergence.tla races/Convergence_buggy.cfg
 ```
 
+### `races/LockStarvation.tla`
+
+Verifies that a policy which can never succeed does not deny the database's
+advisory lock to every other policy pointed at it.
+
+The lock key is computed server-side from `current_database()`, so all policies
+on one server share one lock — deliberately, since two policies converging the
+same database concurrently is the thing it prevents. The hazard is a policy
+whose apply fails permanently: it still holds an approved plan, so every
+reconcile re-executes it, and executing writes the plan twice (`Applying`, then
+`Failed`). The controller wakes on its own plans, so each attempt schedules the
+next. The failing policy reconciles as fast as it can execute — ~9 times a
+second in CI — and takes the shared lock every time.
+
+- **Liveness**: another policy on the same database eventually gets the lock
+
+```sh
+./run-tlc.sh races/LockStarvation.tla races/LockStarvation.cfg                   # passes
+./run-tlc.sh races/LockStarvation.tla races/LockStarvation_spin.cfg              # EventuallyRecovers violated
+./run-tlc.sh races/LockStarvation.tla races/LockStarvation_plan_writes_only.cfg  # EventuallyRecovers violated
+```
+
+| Config | `SelfWakeOnPolicyStatus` | `SelfWakeOnPlanStatus` | Result |
+| --- | --- | --- | --- |
+| `LockStarvation.cfg` | FALSE | FALSE | passes |
+| `LockStarvation_spin.cfg` | TRUE | TRUE | `EventuallyRecovers` violated |
+| `LockStarvation_plan_writes_only.cfg` | FALSE | TRUE | `EventuallyRecovers` violated |
+
+All three run with `MaxTicks = 2` and `MaxAttempts = 4`. `MaxAttempts` must
+exceed `MaxTicks`, or the starving policy could lose to the other one's
+*legitimate* interval reconciles and the violation would be an artefact of the
+bounds rather than the bug.
+
+The counterexample is the production trace in miniature:
+
+```
+BBackoffExpires -> AAcquire -> BAttempt (loses) -> AFailAndRelease -> ...
+Back to state 17: <AAcquire>
+```
+
+The waiting policy's back-off expires, the failing one takes the lock first, the
+waiter loses an attempt, the lock is released, and round again — until the
+waiter's caller gives up and the cycle continues without it forever.
+
+`spin` is the behaviour before the fix. `plan_writes_only` is why the model
+exists: it is the *first attempt* at the fix, which suppressed the policy-status
+write and left the plan-status write alone. That self-wake loop was real, so the
+change looked principled, but either write regenerates the wake on its own and
+the storm continued — the observed reconcile rate went *up*, because each cycle
+had one less API write to make. A fix addressing one of two sufficient causes is
+not a fix, and no test in the tree said otherwise. The shipped behaviour makes
+both writes disappear by declining to re-execute a plan that failed inside the
+retry window, so a failing policy takes the lock once per interval.
+
+As in `PlanApproval.tla`, every safety property holds in both failing
+configurations. `LockHeldOnlyWhileRunning` and `BNeverProgressesWhileLocked` are
+checked in all three and never violated: mutual exclusion is respected
+throughout, nothing executes unreviewed, no state is corrupted. The system
+simply stops making progress. That is why a safety-focused suite — unit tests,
+integration tests, and a full green E2E run — reported nothing wrong twice.
+
 ## Running
 
 ```bash
