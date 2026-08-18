@@ -4,41 +4,121 @@
 # The plan CRD's CEL rules make a decision terminal and paired with a
 # decidedBy, but CEL cannot see request.userInfo — the Kyverno policy in
 # k8s/security/plan-decision-kyverno.yaml is what makes the identity real and
-# the approve verb load-bearing. This script tests that boundary in both
-# directions on a live API server:
+# the approve verb load-bearing. This script tests that boundary on a live API
+# server:
 #
-#   deny  — patch access to plans/status without the logical approve verb
-#           cannot record a decision;
-#   allow — a bound approver can, and the decidedBy it *claims* is replaced
-#           with the identity the API server authenticated;
-#   exempt — the operator's own status writes pass the policy untouched,
-#           proven end to end by the approved plan actually executing.
+#   deny   — patch access to plans/status without the logical approve verb
+#            cannot record a decision;
+#   allow  — a bound approver can, and the decidedBy it *claims* is replaced
+#            with the identity the API server authenticated;
+#   exempt — a controller holding the logical `manage` verb decides without the
+#            approve verb, two differently named controllers in different
+#            namespaces are exempt at the same time, and the decidedBy it
+#            claims is replaced all the same;
+#   named  — an account named like the default operator, without the `manage`
+#            grant, is not exempt.
+#
+# The last two are what distinguish an exemption keyed on authorization from
+# one keyed on a ServiceAccount identity. Every identity expected to be refused
+# is first asserted able to patch plan status, so a refusal is attributable to
+# admission and not to ordinary RBAC.
 set -euo pipefail
 source scripts/e2e-helpers.sh
 
+policy_name=pgroles-plan-decision-authorization
+operator_subject=system:serviceaccount:pgroles-system:pgroles-operator
+manager_subject=system:serviceaccount:pgroles-alt:pgroles-operator-alt
+namesake_subject=system:serviceaccount:pgroles-alt:pgroles-operator
+
 echo "Install the plan-decision admission policy and test identities"
-kubectl apply -f k8s/security/plan-decision-kyverno.yaml
 kubectl apply -f k8s/security/plan-decision-e2e-rbac.yaml
-kubectl wait --for=condition=Ready \
-  clusterpolicy/pgroles-plan-decision-authorization --timeout=120s
+kubectl apply -f k8s/security/plan-decision-kyverno.yaml
+kubectl wait --for=condition=Ready "clusterpolicy/${policy_name}" --timeout=120s
 
-echo "RBAC shape: the approve verb sits exactly where it should"
-test "$(kubectl auth can-i approve postgrespolicies.pgroles.io \
-  --as=system:serviceaccount:default:plan-approver -n default)" = "yes"
-test "$(kubectl auth can-i approve postgrespolicies.pgroles.io \
-  --as=system:serviceaccount:default:plan-status-writer -n default)" = "no"
-test "$(kubectl auth can-i approve postgrespolicies.pgroles.io \
-  --as=system:serviceaccount:pgroles-system:pgroles-operator -n default)" = "no"
+# Guard against a vacuous pass: if the policy that ended up served is not the
+# one under test, every "was this admitted?" check below measures the wrong
+# thing. Exactly one rule — the approve check — may exempt on the manage
+# review, and no rule may key on an identity.
+echo "Guard: the served policy exempts by authorization, not by identity"
+live="$(kubectl get "clusterpolicy/${policy_name}" -o json)" || {
+  echo "::error::could not read ${policy_name}; the assertions below would be measuring nothing"
+  exit 1
+}
+manage_reviews="$(grep -c '"verb": "manage"' <<<"$live" || true)"
+if [ "$manage_reviews" -ne 1 ]; then
+  echo "::error::${policy_name} performs ${manage_reviews} manage reviews, expected exactly 1"
+  exit 1
+fi
+if grep -q 'system:serviceaccount:' <<<"$live"; then
+  echo "::error::${policy_name} names a ServiceAccount subject"
+  grep -n 'system:serviceaccount:' <<<"$live" || true
+  exit 1
+fi
 
-echo "A manual-approval policy opens a plan under the enforcing admission policy"
-# The operator writes this plan's entire status while the ClusterPolicy is
-# enforcing: creation (Approved=False), revalidation, and later execution.
-# The plan existing at all is the first half of the operator-exemption proof.
-kubectl apply -f - <<'EOF'
+echo "RBAC shape: approve and manage sit exactly where they should"
+can_i() {
+  kubectl auth can-i "$1" postgrespolicies.pgroles.io --as="$2" -n default
+}
+
+# Every identity that must be *refused* below has to be able to reach the
+# admission chain first. Without this, an ordinary RBAC rejection of the status
+# patch reads exactly like a Kyverno denial, and the denial legs would pass
+# against a policy with no preconditions at all.
+#
+# `kubectl auth can-i` answers "no" on stdout *and* exits non-zero, so the
+# substitution has to tolerate a failing command: a guard that exists to report
+# must not be killed by `set -e` before it can. The three answers are kept
+# distinct — "yes" passes, "no" is retried, and anything else is a broken query
+# rather than a verdict, which must never read as a denial.
+assert_can_patch_status() {
+  local subject="$1" answer attempt
+  for attempt in $(seq 1 15); do
+    answer="$(kubectl auth can-i patch postgrespolicyplans.pgroles.io \
+      --subresource=status --as="$subject" -n default 2>&1)" || true
+    case "$answer" in
+      yes)
+        return 0
+        ;;
+      no)
+        # RBAC is informer-backed and the bindings were created moments ago.
+        sleep 1
+        ;;
+      *)
+        echo "::error::checking status-patch access for ${subject} did not return a verdict: ${answer}"
+        exit 1
+        ;;
+    esac
+  done
+  echo "::error::${subject} cannot patch postgrespolicyplans/status after ${attempt} attempts, so a refused decision would prove nothing about admission"
+  kubectl auth can-i --list --as="$subject" -n default || true
+  exit 1
+}
+test "$(can_i approve system:serviceaccount:default:plan-approver)" = "yes"
+test "$(can_i manage system:serviceaccount:default:plan-approver)" = "no"
+test "$(can_i approve system:serviceaccount:default:plan-status-writer)" = "no"
+test "$(can_i manage system:serviceaccount:default:plan-status-writer)" = "no"
+# The controllers: authority to write plan status, no authority to approve.
+test "$(can_i approve "$operator_subject")" = "no"
+test "$(can_i manage "$operator_subject")" = "yes"
+test "$(can_i approve "$manager_subject")" = "no"
+test "$(can_i manage "$manager_subject")" = "yes"
+# Same name as the default operator, no controller grant.
+test "$(can_i approve "$namesake_subject")" = "no"
+test "$(can_i manage "$namesake_subject")" = "no"
+
+assert_can_patch_status system:serviceaccount:default:plan-status-writer
+assert_can_patch_status "$namesake_subject"
+assert_can_patch_status "$manager_subject"
+
+# A plan under a manual-approval policy, opened while the ClusterPolicy is
+# enforcing. Prints the plan name.
+open_plan() {
+  local policy="$1" role="$2"
+  kubectl apply -f - >&2 <<EOF
 apiVersion: pgroles.io/v1alpha1
 kind: PostgresPolicy
 metadata:
-  name: admission-gate-policy
+  name: ${policy}
   namespace: default
 spec:
   connection:
@@ -49,24 +129,41 @@ spec:
   reconciliation_mode: additive
   interval: 30s
   roles:
-    - name: admission_gate_user
+    - name: ${role}
       login: false
       comment: created only through an admission-authorised approval
 EOF
-plan_name="$(wait_for_current_plan_ref admission-gate-policy)"
+  wait_for_current_plan_ref "$policy"
+}
+
+echo "A manual-approval policy opens a plan under the enforcing admission policy"
+# The operator writes this plan's entire status while the ClusterPolicy is
+# enforcing: creation (Approved=False), revalidation, and later execution.
+# The plan existing at all is the first half of the operator-exemption proof.
+plan_name="$(open_plan admission-gate-policy admission_gate_user)"
 assert_role_absent admission_gate_user
 
-echo "Deny: status patch access without the approve verb records nothing"
-if DECIDE_AS=system:serviceaccount:default:plan-status-writer \
-  approve_plan "$plan_name"; then
-  echo "::error::a caller without the approve verb recorded an approval"
-  exit 1
-fi
-if DECIDE_AS=system:serviceaccount:default:plan-status-writer \
-  reject_plan "$plan_name"; then
-  echo "::error::a caller without the approve verb recorded a denial"
-  exit 1
-fi
+# A refusal only means something if it came from the admission policy. The
+# caller was asserted able to patch plan status above; this also requires the
+# refusal to name the policy, so an unrelated rejection cannot stand in for it.
+assert_admission_denied() {
+  local label="$1" subject="$2" plan="$3" decide="$4" output
+  if output="$(DECIDE_AS="$subject" "$decide" "$plan" 2>&1)"; then
+    echo "::error::${label}: ${subject} recorded a decision"
+    exit 1
+  fi
+  if ! grep -q "$policy_name" <<<"$output"; then
+    echo "::error::${label}: ${subject} was refused, but not by ${policy_name}; the refusal says nothing about admission"
+    printf '%s\n' "$output"
+    exit 1
+  fi
+}
+
+echo "Deny: status patch access without approve or manage records nothing"
+assert_admission_denied "approval without the approve verb" \
+  system:serviceaccount:default:plan-status-writer "$plan_name" approve_plan
+assert_admission_denied "denial without the approve verb" \
+  system:serviceaccount:default:plan-status-writer "$plan_name" reject_plan
 assert_role_absent admission_gate_user
 
 echo "Allow: a bound approver approves, and the forged decider is replaced"
@@ -83,8 +180,49 @@ echo "Exempt: the operator's execution writes pass the policy and the plan appli
 wait_for_plan_phase "$plan_name" Applied
 assert_role_exists admission_gate_user
 
+# ---------------------------------------------------------------------------
+# The exemption is the `manage` grant, not a ServiceAccount name.
+#
+# Everything above runs under the identity the shipped defaults name, so it
+# passes just as well against a policy with that identity hardcoded. What
+# follows does not: a second controller under a different name and namespace
+# decides successfully, the default-named operator keeps working through the
+# same window, and an account that merely carries the default operator's name
+# is refused.
+# ---------------------------------------------------------------------------
+echo "A second controller identity decides without the approve verb"
+manager_plan="$(open_plan admission-manager-policy admission_manager_user)"
+DECIDE_AS="$manager_subject" DECIDE_BY=controller-claimed-identity \
+  approve_plan "$manager_plan"
+
+# Admitted without the approve verb, so the exemption applied. The stamp is not
+# exempt from anything: the claimed decider is replaced here exactly as it is
+# for a reviewer, so `manage` never buys the ability to name someone else.
+manager_decided="$(kubectl get pgplan "$manager_plan" -o jsonpath='{.status.decidedBy.username}')"
+test "$manager_decided" = "$manager_subject" || {
+  echo "::error::decidedBy holds '$manager_decided', not the authenticated controller; a manage holder can name its own decider"
+  exit 1
+}
+
+# The plan reaching Applied is the in-cluster operator — a *differently* named
+# controller in a different namespace — writing execution status through the
+# same enforcing policy that just admitted the decision above. Both controller
+# identities are therefore exempt simultaneously, which no single hardcoded
+# subject can express.
+wait_for_plan_phase "$manager_plan" Applied
+assert_role_exists admission_manager_user
+
+echo "An account named like the operator, without the manage grant, is refused"
+namesake_plan="$(open_plan admission-namesake-policy admission_namesake_user)"
+assert_admission_denied \
+  "an account carrying the default operator's name, with no manage grant" \
+  "$namesake_subject" "$namesake_plan" approve_plan
+assert_role_absent admission_namesake_user
+
 echo "Cleanup"
-kubectl delete pgr admission-gate-policy --wait=true
+kubectl delete pgr admission-gate-policy admission-manager-policy \
+  admission-namesake-policy --wait=true
 pg_query "DROP ROLE IF EXISTS admission_gate_user;"
+pg_query "DROP ROLE IF EXISTS admission_manager_user;"
 
 echo "Plan-decision admission boundary E2E passed"

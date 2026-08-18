@@ -2,26 +2,24 @@
 # Verify the chart-less Kyverno mirrors in k8s/security/ stay in sync with the
 # canonical chart copies in charts/pgroles-operator/files/.
 #
-# The two copies legitimately differ in exactly two ways: their leading header
-# comments, and the operator exemption subject (the chart copy carries the
-# __PGROLES_OPERATOR_SUBJECT__ placeholder that helm substitutes; the mirror
-# pins the default namespace and ServiceAccount name). Everything else must be
-# byte-identical, so drift is checked on a normalized form: comments stripped,
-# placeholder substituted with the default subject.
+# The two copies legitimately differ only in their leading header comments —
+# one is applied by helm, the other with kubectl. Neither carries anything
+# install-specific, so everything else must be byte-identical, and drift is
+# checked with comments and blank lines stripped.
+#
+# The exemption shape itself is checked by
+# scripts/check-kyverno-operator-exemption.sh; a subject hardcoded into both
+# copies at once is invisible to a copy-to-copy diff.
 set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$repo_root"
 
-default_subject="system:serviceaccount:pgroles-system:pgroles-operator"
-
 tmpdir="$(mktemp -d)"
 trap 'rm -rf "$tmpdir"' EXIT
 
 normalize() {
-  # Drop full-line comments and blank lines; substitute the chart placeholder.
-  sed -e 's/__PGROLES_OPERATOR_SUBJECT__/'"$default_subject"'/g' "$1" |
-    grep -vE '^\s*#' | grep -vE '^\s*$'
+  grep -vE '^\s*#' "$1" | grep -vE '^\s*$'
 }
 
 failed=0

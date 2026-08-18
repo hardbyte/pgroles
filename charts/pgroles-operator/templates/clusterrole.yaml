@@ -18,6 +18,13 @@ rules:
   - apiGroups: ["pgroles.io"]
     resources: ["postgrespolicies/finalizers"]
     verbs: ["update"]
+  # Logical verb consumed by the plan-decision admission policy to tell the
+  # operator's own plan-status writes from a reviewer's decision, without
+  # hard-coding a ServiceAccount identity. Grant it to controllers only:
+  # holding it exempts the caller from the approve-verb check on decisions.
+  - apiGroups: ["pgroles.io"]
+    resources: ["postgrespolicies"]
+    verbs: ["manage"]
   # Watch and manage PostgresPolicyPlan CRDs
   - apiGroups: ["pgroles.io"]
     resources: ["postgrespolicyplans"]

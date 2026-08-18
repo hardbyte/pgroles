@@ -104,9 +104,13 @@ order. Only the last one is about human review:
 observe-mode plan is accepted and does nothing, and the policy reports an `ApprovalIgnored`
 condition so this is distinguishable from a stalled operator.
 
-Under `approval: auto` the operator approves its own plan and records
-`status.decidedBy.username` as `system:pgroles-operator(auto-approval)`, so an
-audit trail never shows an unattributed approval.
+Under `approval: auto` the operator approves its own plan, so an audit trail
+never shows an unattributed approval. The `Approved` condition's reason is
+`AutoApproved` either way; `status.decidedBy.username` reads
+`system:pgroles-operator(auto-approval)` on its own, and the operator's
+authenticated ServiceAccount once the admission policy below is installed and
+stamping the identity. The mechanism and the identity are separate facts and
+each field carries its own.
 
 ## Approval identity: the change digest
 
@@ -278,11 +282,45 @@ The trust model has two layers, and both matter:
   status can approve, under any name.
 
 Install it through the chart (`admissionPolicies.enabled=true`, Kyverno 1.18 or
-later), which generates the operator's own exemption from the values you
-installed with; `k8s/security/plan-decision-kyverno.yaml` is the same policy for
-chart-less installs, pinned to the `pgroles-system` namespace and the
-`pgroles-operator` ServiceAccount. Bind the `pgroles-plan-approver` ClusterRole
+later), or apply `k8s/security/plan-decision-kyverno.yaml` — the same policy,
+carrying nothing install-specific. Bind the `pgroles-plan-approver` ClusterRole
 to the humans or groups permitted to authorise changes.
+
+### The exemption is part of the boundary
+
+The operator writes plan status too — it opens plans with `Approved=False`,
+records a rejection it observed, and auto-approves under `approval: auto` — so
+the policy has to let those writes through without the `approve` verb. It
+recognises them by asking a `SubjectAccessReview` whether the writer holds the
+logical `manage` verb on the parent `PostgresPolicy`. That is the same shape
+the ephemeral-access policy uses for controller-owned lifecycle writes.
+
+Keying the exemption on an authorization rather than on a ServiceAccount name
+is what makes it safe to ship one policy for every install:
+
+- **it cannot go stale.** A name-based exemption is wrong the moment the
+  operator runs under a different name or namespace, and wrong silently: the
+  operator's writes are judged as reviewer decisions and plans stall behind an
+  admission denial that appears nowhere in the plan's status.
+- **a name is not a credential.** An exemption naming an account this cluster
+  does not actually run the operator as is a standing bypass of the approve
+  check for anyone able to create or impersonate it. A grant cannot be claimed
+  by minting an account.
+- **it composes.** Several operators, in different namespaces and under
+  different names, are all exempt under the one policy.
+
+The exemption is narrow on purpose: it covers the **approve check only**. The
+`decidedBy` stamp has no exemption at all, so every newly terminal decision
+records the identity the API server authenticated for that write, controllers
+included. Holding `manage` lets you decide without a reviewer's permission; it
+never lets you name someone else as the decider.
+
+The corollary is that `manage` on `postgrespolicies` is a controller-level
+permission. Grant it in the operator's role and nowhere else — the shipped
+`pgroles-plan-approver` role deliberately does not carry it, because a reviewer
+holding it would be exempt from the very check that role exists to be subject
+to. A wildcard rule (`verbs: ["*"]` on `pgroles.io`) confers it too, so avoid
+those on roles bound to people.
 
 Approval RBAC is per-kind: granting a team create on policies grants nothing on
 plan status. Execution settings (`approval`, managed scope) are

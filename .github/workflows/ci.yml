@@ -126,6 +126,11 @@ jobs:
       - name: Kyverno policy mirror drift check
         run: scripts/check-kyverno-drift.sh
 
+      - uses: azure/setup-helm@v5
+
+      - name: Kyverno operator exemption check
+        run: scripts/check-kyverno-operator-exemption.sh
+
       - uses: astral-sh/setup-uv@v9.0.0
 
       - name: Validate Agent Skills

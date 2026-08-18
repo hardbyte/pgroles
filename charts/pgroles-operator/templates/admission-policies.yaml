@@ -4,18 +4,18 @@ Kyverno admission policies for the reviewer-decision boundary.
 These are rendered from files/kyverno-*.yaml rather than written inline
 because the policy bodies are full of Kyverno's own `{{ ... }}` JMESPath
 expressions, which Helm would otherwise try to evaluate. `.Files.Get` returns
-them verbatim; the only substitution is the operator's ServiceAccount
-username, which comes from the same helper the Deployment uses for
-`serviceAccountName` plus `.Release.Namespace`.
+them verbatim, and nothing in them is install-specific: the plan-decision
+policy tells the operator's writes from a reviewer's by SubjectAccessReview on
+the logical `manage` verb, which templates/clusterrole.yaml grants, so no
+ServiceAccount identity is substituted here.
 
 The resources are cluster-scoped and use fixed names, so enable them from a
 single release per cluster.
 */}}
 {{- if .Values.admissionPolicies.enabled }}
-{{- $subject := printf "system:serviceaccount:%s:%s" .Release.Namespace (include "pgroles-operator.serviceAccountName" .) }}
 {{- if .Values.admissionPolicies.planDecision.enabled }}
 ---
-{{ required "files/kyverno-plan-decision.yaml is missing from the packaged chart" (.Files.Get "files/kyverno-plan-decision.yaml") | replace "__PGROLES_OPERATOR_SUBJECT__" $subject }}
+{{ required "files/kyverno-plan-decision.yaml is missing from the packaged chart" (.Files.Get "files/kyverno-plan-decision.yaml") }}
 {{- end }}
 {{- if .Values.admissionPolicies.ephemeralAccess.enabled }}
 ---

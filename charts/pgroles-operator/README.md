@@ -51,9 +51,25 @@ fails the install. Install Kyverno 1.18 or later first, then turn it on. The
 rendered resources are cluster-scoped with fixed names, so enable them from a
 single release per cluster.
 
+The plan-decision policy exempts the operator's own plan-status writes from the
+reviewer rules. It recognises a controller by authorization, not by name: a
+SubjectAccessReview for the logical `manage` verb on the parent
+`PostgresPolicy`, which the chart's operator ClusterRole grants. Nothing about
+the install is baked into the policy, so a custom `operator.serviceAccount.name`
+or namespace needs no adjustment, several operators can share one policy, and
+an account merely *named* like the operator is not exempt without the grant.
+
+Grant `manage` on `postgrespolicies` to controllers only — holding it exempts
+the caller from the approve-verb check on decisions. It does not exempt anyone
+from the `decidedBy` stamp: every newly terminal decision records the identity
+the API server authenticated, controllers included.
+
 For chart-less installs, `k8s/security/*-kyverno.yaml` in the repository mirror
-these policies, pinned to the `pgroles-system` namespace and the
-`pgroles-operator` ServiceAccount name — edit the exemption if yours differ.
+these policies and apply as-is:
+
+```shell
+kubectl apply -f k8s/security/plan-decision-kyverno.yaml
+```
 
 ## Values
 
