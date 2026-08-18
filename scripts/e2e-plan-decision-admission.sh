@@ -40,7 +40,10 @@ kubectl wait --for=condition=Ready "clusterpolicy/${policy_name}" --timeout=120s
 # thing. Exactly one rule — the approve check — may exempt on the manage
 # review, and no rule may key on an identity.
 echo "Guard: the served policy exempts by authorization, not by identity"
-live="$(kubectl get "clusterpolicy/${policy_name}" -o json)"
+live="$(kubectl get "clusterpolicy/${policy_name}" -o json)" || {
+  echo "::error::could not read ${policy_name}; the assertions below would be measuring nothing"
+  exit 1
+}
 manage_reviews="$(grep -c '"verb": "manage"' <<<"$live" || true)"
 if [ "$manage_reviews" -ne 1 ]; then
   echo "::error::${policy_name} performs ${manage_reviews} manage reviews, expected exactly 1"
@@ -61,14 +64,34 @@ can_i() {
 # admission chain first. Without this, an ordinary RBAC rejection of the status
 # patch reads exactly like a Kyverno denial, and the denial legs would pass
 # against a policy with no preconditions at all.
+#
+# `kubectl auth can-i` answers "no" on stdout *and* exits non-zero, so the
+# substitution has to tolerate a failing command: a guard that exists to report
+# must not be killed by `set -e` before it can. The three answers are kept
+# distinct — "yes" passes, "no" is retried, and anything else is a broken query
+# rather than a verdict, which must never read as a denial.
 assert_can_patch_status() {
-  local subject="$1" allowed
-  allowed="$(kubectl auth can-i patch postgrespolicyplans.pgroles.io/status \
-    --as="$subject" -n default)"
-  if [ "$allowed" != "yes" ]; then
-    echo "::error::${subject} cannot patch postgrespolicyplans/status, so a refused decision would prove nothing about admission"
-    exit 1
-  fi
+  local subject="$1" answer attempt
+  for attempt in $(seq 1 15); do
+    answer="$(kubectl auth can-i patch postgrespolicyplans.pgroles.io \
+      --subresource=status --as="$subject" -n default 2>&1)" || true
+    case "$answer" in
+      yes)
+        return 0
+        ;;
+      no)
+        # RBAC is informer-backed and the bindings were created moments ago.
+        sleep 1
+        ;;
+      *)
+        echo "::error::checking status-patch access for ${subject} did not return a verdict: ${answer}"
+        exit 1
+        ;;
+    esac
+  done
+  echo "::error::${subject} cannot patch postgrespolicyplans/status after ${attempt} attempts, so a refused decision would prove nothing about admission"
+  kubectl auth can-i --list --as="$subject" -n default || true
+  exit 1
 }
 test "$(can_i approve system:serviceaccount:default:plan-approver)" = "yes"
 test "$(can_i manage system:serviceaccount:default:plan-approver)" = "no"
