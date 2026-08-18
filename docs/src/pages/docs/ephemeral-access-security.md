@@ -121,8 +121,8 @@ scripts/render-kyverno-policies.sh \
 ```
 
 Pass the namespace and ServiceAccount the operator actually runs as. The script
-refuses to emit a manifest whose exemption is still a placeholder or names an
-empty subject.
+refuses to emit a manifest whose exemption is still a placeholder, or names a
+subject the API server could never issue a token for.
 
 Bind the requester and approver ClusterRoles to deployment-specific users,
 groups, or brokers. Prefer namespace-scoped `RoleBinding` objects so access to

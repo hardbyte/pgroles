@@ -9,7 +9,8 @@
 # create that account.
 #
 # Rendering is therefore mandatory, and this script fails rather than emit a
-# manifest whose exemption is still a placeholder or names an empty subject.
+# manifest whose exemption is still a placeholder, or names a subject the API
+# server could never issue a token for.
 # Chart installs do the same substitution from `operator.serviceAccount.name`
 # and the release namespace.
 #
@@ -33,15 +34,27 @@ usage() {
     "${BASH_SOURCE[0]}" >&2
 }
 
+# The option's value must be present before shifting past it. `shift 2` on a
+# single remaining argument fails without advancing $1, which spins the loop.
+require_value() {
+  if [ "$2" -lt 2 ]; then
+    echo "::error::$1 requires a value" >&2
+    usage
+    exit 2
+  fi
+}
+
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --namespace)
-      namespace="${2-}"
-      shift 2 || true
+      require_value "$1" "$#"
+      namespace="$2"
+      shift 2
       ;;
     --service-account)
-      service_account="${2-}"
-      shift 2 || true
+      require_value "$1" "$#"
+      service_account="$2"
+      shift 2
       ;;
     -h | --help)
       usage
@@ -66,17 +79,24 @@ if [ "${#manifests[@]}" -eq 0 ]; then
   )
 fi
 
-# A ServiceAccount subject is only meaningful if both halves are real names.
-# An empty half renders `system:serviceaccount::name`, which matches no
-# authenticated user and would silently un-exempt the operator.
-dns1123='^[a-z0-9]([-a-z0-9]*[a-z0-9])?$'
-if [[ ! "$namespace" =~ $dns1123 ]]; then
-  echo "::error::--namespace must be a DNS-1123 label; got '${namespace}'" >&2
+# A subject is only meaningful if both halves name something the API server
+# can actually issue a token for. A half that no request can present renders
+# an exemption that matches nobody, which silently un-exempts the operator.
+#
+# The two halves are validated by different rules, as Kubernetes validates
+# them: a Namespace is a DNS-1123 label, a ServiceAccount is a DNS-1123
+# subdomain, so dots are legal in the account name and not in the namespace.
+# Both are length-bounded, because an over-long name is accepted by the
+# character class and rejected by the API server.
+dns_label='^[a-z0-9]([-a-z0-9]*[a-z0-9])?$'
+dns_subdomain="^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*\$"
+if [[ ! "$namespace" =~ $dns_label ]] || [ "${#namespace}" -gt 63 ]; then
+  echo "::error::--namespace must be a DNS-1123 label of at most 63 characters; got '${namespace}'" >&2
   usage
   exit 2
 fi
-if [[ ! "$service_account" =~ $dns1123 ]]; then
-  echo "::error::--service-account must be a DNS-1123 label; got '${service_account}'" >&2
+if [[ ! "$service_account" =~ $dns_subdomain ]] || [ "${#service_account}" -gt 253 ]; then
+  echo "::error::--service-account must be a DNS-1123 subdomain of at most 253 characters; got '${service_account}'" >&2
   usage
   exit 2
 fi
