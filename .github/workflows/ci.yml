@@ -402,7 +402,13 @@ jobs:
           wait_for_event_reason missing-secret-policy SecretFetchFailed
 
           kubectl apply -f k8s/samples/insufficient-privileges-policy.yaml
-          wait_for_ready_reason insufficient-privileges-policy InsufficientPrivileges
+          # PlanRetryDeferred, not InsufficientPrivileges: the first attempt
+          # reports the SQL error, then the retry back-off engages and the
+          # reason settles there for the rest of the window. Asserting the
+          # first-attempt reason would be racing a state that lasts
+          # milliseconds. The cause is not lost — the back-off carries the
+          # original error verbatim, which the lastError assertion checks.
+          wait_for_ready_reason insufficient-privileges-policy PlanRetryDeferred
           wait_for_last_error_contains insufficient-privileges-policy "permission denied to create role"
           assert_role_absent insufficient-privileges-user
 
@@ -412,39 +418,61 @@ jobs:
           # server-side from `current_database()`, so every policy pointed at
           # this server contends for one lock.
           #
-          # Executing a failed plan used to write it twice (Applying, then
-          # Failed with a fresh timestamp), and the controller wakes on its own
-          # plans, so each attempt scheduled the next: ~9 reconciles a second,
-          # each taking that shared lock. Other policies then lost the lock
-          # repeatedly and their waits timed out — an intermittent failure that
-          # took two wrong fixes to pin down, because nothing asserted the rate.
+          # Any write to a plan wakes the policy that owns it, so a retry that
+          # writes before it backs off schedules its own next attempt. Left
+          # unbounded that is several reconciles a second, each one taking the
+          # shared lock, and the policies sharing this database lose it
+          # repeatedly until their waits time out. Nothing else in this suite
+          # asserts a rate, so nothing else catches it.
           #
           # At the policy interval this should be 0 or 1 in a 20s window. The
           # bound is loose because the point is to catch a storm, not to pin a
-          # cadence: the regression produced ~190.
+          # cadence: the unbounded retry produced ~190.
           echo "--- Test: a permanently-failing policy does not spin ---"
-          sleep 20
-          # `--tail=-1` is load-bearing: kubectl defaults --tail to 10 when the
-          # target resolves through a selector, which `deployment/...` does.
-          # Without it this reads ten lines — less than one reconcile — so the
-          # count saturates far below the threshold and a real storm passes.
+          # Count by differencing two whole-log reads of one pod. Two things
+          # this must not do:
           #
-          # Guard against a vacuous pass: if the log format drifts, or the
-          # command reads too little, the counter below reads 0 and the
-          # assertion "succeeds" while measuring nothing. This window covers
-          # the policy's creation and first failures, so it must match. It
-          # caught exactly the --tail default described above.
-          if ! kubectl -n pgroles-system logs deployment/pgroles-operator --since=120s --tail=-1 \
-            | grep -q 'starting reconciliation.*insufficient-privileges-policy'; then
+          #   `--since` — observed returning nothing on kind for windows that
+          #   covered the pod's entire lifetime, while an unwindowed read of
+          #   the same pod a second later returned ~130 matching lines. A
+          #   silently empty read makes the assertion below pass vacuously.
+          #
+          #   `deployment/...` — resolves to one arbitrary pod, which is
+          #   ambiguous while the previous ReplicaSet's pod still exists.
+          #
+          # Differencing needs neither server-side time filtering nor any
+          # comparison between the runner's clock and the node's.
+          operator_pod="$(kubectl -n pgroles-system get pod \
+            -l app.kubernetes.io/name=pgroles-operator \
+            --field-selector=status.phase=Running \
+            --sort-by=.metadata.creationTimestamp \
+            -o jsonpath='{.items[-1:].metadata.name}')"
+          test -n "$operator_pod" || { echo "::error::could not resolve the operator pod"; exit 1; }
+          count_reconciles() {
+            kubectl -n pgroles-system logs "pod/${operator_pod}" --tail=-1 \
+              | grep -c 'starting reconciliation.*insufficient-privileges-policy' || true
+          }
+          # Guard against a vacuous pass: the policy has already reconciled at
+          # least once (its Ready condition and lastError were asserted just
+          # above), so a zero baseline means the log format drifted or the
+          # wrong pod was read — the spin assertion below would then pass
+          # while measuring nothing.
+          baseline="$(count_reconciles)"
+          if [ "$baseline" -eq 0 ]; then
             echo "::error::no reconcile log lines matched for insufficient-privileges-policy; the spin assertion below would pass without measuring anything"
             exit 1
           fi
-          spin_count="$(kubectl -n pgroles-system logs deployment/pgroles-operator --since=20s --tail=-1 \
-            | grep -c 'starting reconciliation.*insufficient-privileges-policy' || true)"
+          sleep 20
+          after="$(count_reconciles)"
+          if [ "$after" -lt "$baseline" ]; then
+            echo "::error::reconcile count went backwards (${baseline} -> ${after}); the operator restarted or its log rotated mid-window, so the spin rate cannot be measured"
+            exit 1
+          fi
+          spin_count=$((after - baseline))
           echo "insufficient-privileges-policy reconciled ${spin_count} times in 20s"
           if [ "$spin_count" -gt 5 ]; then
             echo "::error::failing policy reconciled ${spin_count} times in 20s (>5): it is self-waking and will starve other policies on this database"
-            kubectl -n pgroles-system logs deployment/pgroles-operator --since=20s --tail=40 || true
+            kubectl -n pgroles-system logs "pod/${operator_pod}" --tail=40 || true
             exit 1
           fi
 

@@ -235,10 +235,10 @@ The lock key is computed server-side from `current_database()`, so all policies
 on one server share one lock — deliberately, since two policies converging the
 same database concurrently is the thing it prevents. The hazard is a policy
 whose apply fails permanently: it still holds an approved plan, so every
-reconcile re-executes it, and executing writes the plan twice (`Applying`, then
-`Failed`). The controller wakes on its own plans, so each attempt schedules the
-next. The failing policy reconciles as fast as it can execute — ~9 times a
-second in CI — and takes the shared lock every time.
+reconcile re-executes it, and a failing attempt writes the plan several times
+(re-approval, `Applying`, then `Failed`). The controller wakes on its own plans,
+so each attempt schedules the next. The failing policy reconciles as fast as it
+can execute — several times a second — and takes the shared lock every time.
 
 - **Liveness**: another policy on the same database eventually gets the lock
 
@@ -271,21 +271,21 @@ waiter loses an attempt, the lock is released, and round again — until the
 waiter's caller gives up and the cycle continues without it forever.
 
 `spin` is the behaviour before the fix. `plan_writes_only` is why the model
-exists: it is the *first attempt* at the fix, which suppressed the policy-status
-write and left the plan-status write alone. That self-wake loop was real, so the
-change looked principled, but either write regenerates the wake on its own and
-the storm continued — the observed reconcile rate went *up*, because each cycle
-had one less API write to make. A fix addressing one of two sufficient causes is
-not a fix, and no test in the tree said otherwise. The shipped behaviour makes
-both writes disappear by declining to re-execute a plan that failed inside the
-retry window, so a failing policy takes the lock once per interval.
+exists: it suppresses the policy-status write and leaves the plan-status write
+alone, which is the shape of a plausible partial fix. It is still violated.
+Either write regenerates the wake by itself, so suppressing one buys nothing —
+the reconcile rate rises, because each cycle has one less API write to make.
+Both self-wake sources have to go, and the shipped behaviour removes both by
+declining to re-execute a plan that failed inside the retry window before
+anything is written, so a failing policy takes the lock once per interval.
 
 As in `PlanApproval.tla`, every safety property holds in both failing
 configurations. `LockHeldOnlyWhileRunning` and `BNeverProgressesWhileLocked` are
 checked in all three and never violated: mutual exclusion is respected
 throughout, nothing executes unreviewed, no state is corrupted. The system
-simply stops making progress. That is why a safety-focused suite — unit tests,
-integration tests, and a full green E2E run — reported nothing wrong twice.
+simply stops making progress. A safety-focused suite — unit tests, integration
+tests, and an otherwise green E2E run — cannot see this class of bug at all,
+which is what the liveness property is here to cover.
 
 ## Running
 

@@ -14,12 +14,13 @@ EXTENDS Naturals
   The hazard is what happens when one of those policies can never
   succeed. A policy whose apply fails permanently — `permission denied
   to create role`, say — still holds an approved plan, so every
-  reconcile re-executes it. Executing a plan writes the plan twice:
-  `Applying` on the way in, `Failed` on the way out. The policy
-  controller wakes on its own plans (`reconcile_on(plan_triggers)`), so
-  each attempt schedules the next one. The failing policy then
-  reconciles as fast as it can execute — ~9 times a second in CI — and
-  takes the shared lock every time.
+  reconcile re-executes it. A failing attempt writes that plan several
+  times: re-approval on the way in, `Applying`, then `Failed` with a
+  freshly stamped timestamp. The policy controller wakes on its own
+  plans (`reconcile_on(plan_triggers)`), so each attempt schedules the
+  next one. The failing policy then reconciles as fast as it can
+  execute — several times a second — and takes the shared lock every
+  time.
 
   Nothing unsafe happens. The lock is respected, no plan executes
   without approval, no state is corrupted. Other policies simply never
@@ -39,21 +40,21 @@ EXTENDS Naturals
     `rotated-secret-policy`, whose credentials have just been restored
     and which must reach Ready=True and emit `Recovered`.
 
-  The wake sources are separated, because that distinction is the whole
-  design question and getting it wrong cost two attempts at the fix:
+  The wake sources are separated because the design question is which
+  of them a fix has to suppress:
 
     SelfWakeOnPolicyStatus — the failing reconcile rewrites the
       *policy* status (Reconciling on entry, stripped again on the
       failure path), and the controller watches policies.
 
-    SelfWakeOnPlanStatus — the failing execution rewrites the *plan*
-      status (Applying, then Failed with a freshly stamped timestamp),
-      and the controller wakes on its own plans.
+    SelfWakeOnPlanStatus — the failing attempt rewrites the *plan*
+      status (re-approval, Applying, then Failed with a freshly
+      stamped timestamp), and the controller wakes on its own plans.
 
   Either source alone regenerates A's wake, so either alone sustains
-  the storm. Suppressing one and not the other looks like a fix and is
-  not — see LockStarvation_plan_writes_only.cfg, which is exactly the
-  first attempt.
+  the storm: the answer is both. LockStarvation_plan_writes_only.cfg
+  suppresses only the policy-status source and is still violated,
+  which is what makes a half fix distinguishable from a fix here.
 
   A's other wake source is its ordinary interval requeue, bounded by
   MaxTicks. That bound is what makes the fixed configuration finite:
