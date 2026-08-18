@@ -432,8 +432,10 @@ runs from creation and nothing else. Consulting each candidate's plan for a
 decision would put per-candidate reads back into the parent's critical
 section, which is what these bounds exist to avoid. A proposal that genuinely
 is still in flight after two weeks can be labelled `pgroles.io/keep=true`,
-which exempts it from both the TTL and eviction (it still occupies a budget
-slot, so the exemption cannot be used to enlarge the budget).
+which exempts it from the TTL and from retention pruning. It does not exempt
+it from the budget: a kept candidate past the budget reports
+`CandidateBudgetExceeded` like any other, so the label cannot be used to
+enlarge the bound it exists inside.
 
 Planning the candidates that *are* in budget costs one database inspection per
 reconcile, not one per candidate: their inspection scopes are unioned, the
