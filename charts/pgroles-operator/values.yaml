@@ -69,7 +69,13 @@ operator:
   # `EPHEMERAL_ACCESS_MAXIMUM_DURATION` (default `24h`) and
   # `EPHEMERAL_ACCESS_MAX_PENDING_TTL` (default `1h`) are the only cluster-wide
   # ceilings on ephemeral access, and an access policy exceeding either is
-  # rejected with `Accepted=False`.
+  # rejected with `Accepted=False`; the `PLAN_RETENTION_*` variables bound how
+  # many terminal plans are kept per policy — `PLAN_RETENTION_APPLIED` (default
+  # `25`), `PLAN_RETENTION_APPLIED_MIN_AGE` (default `720h`),
+  # `PLAN_RETENTION_APPLIED_CEILING` (default `200`), `PLAN_RETENTION_DECIDED`
+  # (default `10`, Failed and Rejected shared) and `PLAN_RETENTION_SUPERSEDED`
+  # (default `3`) — and an invalid value refuses operator startup with the
+  # variable named.
   env:
     - name: RUST_LOG
       value: "info,pgroles_operator=debug"
@@ -83,6 +89,16 @@ operator:
     #   value: 24h
     # - name: EPHEMERAL_ACCESS_MAX_PENDING_TTL
     #   value: 1h
+    # - name: PLAN_RETENTION_APPLIED
+    #   value: "25"
+    # - name: PLAN_RETENTION_APPLIED_MIN_AGE
+    #   value: 720h
+    # - name: PLAN_RETENTION_APPLIED_CEILING
+    #   value: "200"
+    # - name: PLAN_RETENTION_DECIDED
+    #   value: "10"
+    # - name: PLAN_RETENTION_SUPERSEDED
+    #   value: "3"
 
   # -- Annotations to add to the operator pod.
   podAnnotations: {}

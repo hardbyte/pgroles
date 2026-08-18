@@ -404,11 +404,66 @@ step one; it never performs the cutover itself.
 ## Retention
 
 Candidates carry an `ownerReference` to their parent policy, and each derived
-plan is owned by its candidate, so pruning cascades. Terminal candidates —
-`Promoted=True`, or `Superseded=True` for any reason including `PlanDenied` —
-are pruned by the same bounded retention loop as plans; label a candidate
-`pgroles.io/keep=true` to exempt it. Plans also expire after a TTL — an
-approval is not an indefinite authorisation.
+plan is owned by its candidate, so deleting a candidate cascades to its plan
+and that plan's SQL ConfigMap. Pruning therefore decides on the pair, never
+the candidate alone. A terminal candidate that owns no `Applied` plan —
+superseded proposals of every kind, and promotions whose execution ran on
+another plan — is proposal churn, bounded at 10 per policy, oldest first by
+creation. A terminal candidate that owns an `Applied` plan is the provenance
+of an execution record: it is held to the `Applied` bounds in the table below
+— same count, age floor, and ceiling, ordered by when its plan applied — so
+filing more proposals can never delete the record of what ran through the
+owner object.
+`pgroles.io/keep=true` on the candidate **or on its plan** exempts the pair.
+Plans also expire after a TTL — an approval is not an indefinite
+authorisation.
+
+### What plan retention keeps
+
+Terminal plans are bounded per phase, not as one pool, because the phases are
+not worth the same and the cheapest one is generated fastest. Every replan
+supersedes its predecessor, so under a single bound `Superseded` records — of
+plans that never ran — would evict the `Applied` ones that record what did.
+
+| Phase | Retained | Notes |
+| --- | --- | --- |
+| `Applied` | 25, and never fewer than 30 days' worth | Hard ceiling of 200 |
+| `Failed`, `Rejected` | 10, shared | Why something did not run, and who declined it |
+| `Superseded` | 3 | Enough to see what a replan replaced |
+| `Pending`, `Approved`, `Applying` | all | Still live; never evicted |
+
+The oldest go first within each bucket. For `Applied`, both the eviction
+order and the age floor measure from `status.appliedAt` — not from creation,
+since a plan can wait on a reviewer for arbitrarily long before it executes.
+A plan applied inside the floor is kept even once the count is exceeded, so
+the audit trail spans a stated period instead of however long the policy's
+churn rate happens to make it. The ceiling overrides the floor — the floor is
+a promise about history, not a licence to keep everything — and a policy applying hard
+enough to reach 200 within the floor period will start losing its oldest.
+
+`pgroles.io/keep=true` exempts a plan from every one of these bounds.
+
+### Configuring the bounds
+
+Each bound is operator-level configuration, set by environment variable on the
+operator Deployment (`operator.env` in the Helm chart) — the same mechanism as
+the `EPHEMERAL_ACCESS_*` ceilings, and the same `s`/`m`/`h` duration syntax:
+
+| Variable | Default | Sets |
+| --- | --- | --- |
+| `PLAN_RETENTION_APPLIED` | `25` | `Applied` count bound |
+| `PLAN_RETENTION_APPLIED_MIN_AGE` | `720h` (30 days) | `Applied` age floor |
+| `PLAN_RETENTION_APPLIED_CEILING` | `200` | `Applied` hard ceiling; must be at least `PLAN_RETENTION_APPLIED` |
+| `PLAN_RETENTION_DECIDED` | `10` | `Failed` + `Rejected` shared bound |
+| `PLAN_RETENTION_SUPERSEDED` | `3` | `Superseded` bound |
+
+An invalid value refuses operator startup with the variable named, rather than
+silently running with bounds the environment did not ask for.
+
+There is deliberately no per-policy retention field on `PostgresPolicy`.
+Retention caps object growth in the cluster — an operational concern, like the
+open-candidate budget and TTL above — not per-policy intent; the per-object
+need ("this specific record matters") is what `pgroles.io/keep=true` is for.
 
 ## Bounding open candidates
 
