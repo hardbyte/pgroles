@@ -424,16 +424,22 @@ jobs:
           # cadence: the regression produced ~190.
           echo "--- Test: a permanently-failing policy does not spin ---"
           sleep 20
-          # Guard against a vacuous pass: if the log format drifts, the counter
-          # below reads 0 and the assertion "succeeds" while measuring nothing.
-          # This window covers the policy's creation and first failures, so it
-          # must match.
-          if ! kubectl -n pgroles-system logs deployment/pgroles-operator --since=120s \
+          # `--tail=-1` is load-bearing: kubectl defaults --tail to 10 when the
+          # target resolves through a selector, which `deployment/...` does.
+          # Without it this reads ten lines — less than one reconcile — so the
+          # count saturates far below the threshold and a real storm passes.
+          #
+          # Guard against a vacuous pass: if the log format drifts, or the
+          # command reads too little, the counter below reads 0 and the
+          # assertion "succeeds" while measuring nothing. This window covers
+          # the policy's creation and first failures, so it must match. It
+          # caught exactly the --tail default described above.
+          if ! kubectl -n pgroles-system logs deployment/pgroles-operator --since=120s --tail=-1 \
             | grep -q 'starting reconciliation.*insufficient-privileges-policy'; then
             echo "::error::no reconcile log lines matched for insufficient-privileges-policy; the spin assertion below would pass without measuring anything"
             exit 1
           fi
-          spin_count="$(kubectl -n pgroles-system logs deployment/pgroles-operator --since=20s \
+          spin_count="$(kubectl -n pgroles-system logs deployment/pgroles-operator --since=20s --tail=-1 \
             | grep -c 'starting reconciliation.*insufficient-privileges-policy' || true)"
           echo "insufficient-privileges-policy reconciled ${spin_count} times in 20s"
           if [ "$spin_count" -gt 5 ]; then
