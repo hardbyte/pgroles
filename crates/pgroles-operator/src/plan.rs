@@ -91,6 +91,12 @@ const CLEANUP_TIMEOUT_SECS: u64 = 5;
 /// churn: every replan supersedes its predecessor, so on an active policy a
 /// single pool fills with records of plans that never ran and evicts the
 /// `Applied` ones, which are the record of what did.
+///
+/// The bounds are operator-level configuration: each field can be overridden
+/// by its `PLAN_RETENTION_*` environment variable (see [`Self::from_env`]).
+/// They are deliberately not per-policy CRD fields — retention caps object
+/// growth in the cluster, it is not policy intent, and the per-object need is
+/// served by the `pgroles.io/keep=true` label.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PlanRetention {
     /// `Applied` plans kept once they are older than `applied_min_age_secs`.
@@ -123,6 +129,126 @@ impl Default for PlanRetention {
             superseded: 3,
         }
     }
+}
+
+impl PlanRetention {
+    /// Overrides [`PlanRetention::applied`].
+    pub const ENV_APPLIED: &'static str = "PLAN_RETENTION_APPLIED";
+    /// Overrides [`PlanRetention::applied_ceiling`].
+    pub const ENV_APPLIED_CEILING: &'static str = "PLAN_RETENTION_APPLIED_CEILING";
+    /// Overrides [`PlanRetention::applied_min_age_secs`]. Takes the same
+    /// `s`/`m`/`h` duration syntax as the `EPHEMERAL_ACCESS_*` ceilings.
+    pub const ENV_APPLIED_MIN_AGE: &'static str = "PLAN_RETENTION_APPLIED_MIN_AGE";
+    /// Overrides [`PlanRetention::decided`].
+    pub const ENV_DECIDED: &'static str = "PLAN_RETENTION_DECIDED";
+    /// Overrides [`PlanRetention::superseded`].
+    pub const ENV_SUPERSEDED: &'static str = "PLAN_RETENTION_SUPERSEDED";
+
+    /// Resolve the retention bounds from the process environment.
+    ///
+    /// Unset variables keep their defaults. An invalid value is an error, not
+    /// a fallback: this is meant to be called once at startup, where refusing
+    /// to start is the only failure mode an operator of the operator will
+    /// actually see. Retention that silently ran with different bounds than
+    /// the environment asked for would only be discovered when the plan
+    /// someone wanted was already deleted.
+    pub fn from_env() -> Result<Self, PlanRetentionConfigError> {
+        Self::from_lookup(|variable| std::env::var(variable).ok())
+    }
+
+    /// [`Self::from_env`] over an arbitrary lookup, so parsing and validation
+    /// are testable without mutating process-global environment state.
+    fn from_lookup(
+        lookup: impl Fn(&str) -> Option<String>,
+    ) -> Result<Self, PlanRetentionConfigError> {
+        let defaults = Self::default();
+        let retention = Self {
+            applied: count_bound(&lookup, Self::ENV_APPLIED, defaults.applied)?,
+            applied_ceiling: count_bound(
+                &lookup,
+                Self::ENV_APPLIED_CEILING,
+                defaults.applied_ceiling,
+            )?,
+            applied_min_age_secs: age_bound(
+                &lookup,
+                Self::ENV_APPLIED_MIN_AGE,
+                defaults.applied_min_age_secs,
+            )?,
+            decided: count_bound(&lookup, Self::ENV_DECIDED, defaults.decided)?,
+            superseded: count_bound(&lookup, Self::ENV_SUPERSEDED, defaults.superseded)?,
+        };
+        // A ceiling below the count bound could never take effect — eviction
+        // already stops at the count — so the configuration says one thing
+        // and the operator would do another. Reject it instead.
+        if retention.applied_ceiling < retention.applied {
+            return Err(PlanRetentionConfigError::CeilingBelowCount {
+                ceiling: retention.applied_ceiling,
+                count: retention.applied,
+            });
+        }
+        Ok(retention)
+    }
+}
+
+/// A count bound from `lookup`, or `default` when the variable is unset.
+fn count_bound(
+    lookup: impl Fn(&str) -> Option<String>,
+    variable: &'static str,
+    default: usize,
+) -> Result<usize, PlanRetentionConfigError> {
+    match lookup(variable) {
+        None => Ok(default),
+        Some(value) => value
+            .trim()
+            .parse()
+            .map_err(|_| PlanRetentionConfigError::InvalidCount { variable, value }),
+    }
+}
+
+/// An age bound in seconds from `lookup`, or `default` when the variable is
+/// unset. The value uses the same duration syntax as the `EPHEMERAL_ACCESS_*`
+/// variables.
+fn age_bound(
+    lookup: impl Fn(&str) -> Option<String>,
+    variable: &'static str,
+    default: i64,
+) -> Result<i64, PlanRetentionConfigError> {
+    let Some(value) = lookup(variable) else {
+        return Ok(default);
+    };
+    let invalid = |detail: String| PlanRetentionConfigError::InvalidDuration {
+        variable,
+        value: value.clone(),
+        detail,
+    };
+    let duration = crate::ephemeral::parse_duration(&value).map_err(|error| {
+        invalid(match error {
+            crate::ephemeral::EphemeralError::Invalid(detail) => detail,
+            other => other.to_string(),
+        })
+    })?;
+    i64::try_from(duration.as_secs()).map_err(|_| invalid("duration is too large".to_string()))
+}
+
+/// Why [`PlanRetention::from_env`] refused the environment's values.
+#[derive(Debug, thiserror::Error)]
+pub enum PlanRetentionConfigError {
+    #[error("{variable} must be a non-negative integer, got {value:?}")]
+    InvalidCount {
+        variable: &'static str,
+        value: String,
+    },
+    #[error("{variable} is not a valid duration ({detail}), got {value:?}")]
+    InvalidDuration {
+        variable: &'static str,
+        value: String,
+        detail: String,
+    },
+    #[error(
+        "PLAN_RETENTION_APPLIED_CEILING ({ceiling}) is below PLAN_RETENTION_APPLIED ({count}); \
+         a ceiling under the count bound can never take effect"
+    )]
+    CeilingBelowCount { ceiling: usize, count: usize },
 }
 
 /// How recently a Failed plan must have been created (in seconds) for the
@@ -451,6 +577,7 @@ pub async fn create_or_update_plan(
     target_identity: &TargetIdentity,
     change_summary: &ChangeSummary,
     password_source_versions: &BTreeMap<String, String>,
+    plan_retention: PlanRetention,
     candidate: Option<CandidatePlanBinding<'_>>,
 ) -> Result<PlanCreationResult, ReconcileError> {
     let namespace = policy.namespace().ok_or(ReconcileError::NoNamespace)?;
@@ -507,7 +634,7 @@ pub async fn create_or_update_plan(
     // Candidate plans are pruned by candidate retention (their owner cascades),
     // never by the policy's plan retention, which would not see them anyway.
     if candidate.is_none() {
-        cleanup_old_plans_best_effort(client, policy, None).await;
+        cleanup_old_plans_best_effort(client, policy, plan_retention).await;
     }
 
     let plans_api: Api<PostgresPolicyPlan> = Api::namespaced(client.clone(), &namespace);
@@ -1324,7 +1451,7 @@ pub(crate) async fn execute_changes_in_transaction(
 pub async fn cleanup_old_plans_best_effort(
     client: &Client,
     policy: &PostgresPolicy,
-    retention: Option<PlanRetention>,
+    retention: PlanRetention,
 ) {
     match tokio::time::timeout(
         Duration::from_secs(CLEANUP_TIMEOUT_SECS),
@@ -1350,11 +1477,10 @@ pub async fn cleanup_old_plans_best_effort(
 pub async fn cleanup_old_plans(
     client: &Client,
     policy: &PostgresPolicy,
-    retention: Option<PlanRetention>,
+    retention: PlanRetention,
 ) -> Result<(), ReconcileError> {
     let namespace = policy.namespace().ok_or(ReconcileError::NoNamespace)?;
     let policy_name = policy.name_any();
-    let retention = retention.unwrap_or_default();
 
     let plans_api: Api<PostgresPolicyPlan> = Api::namespaced(client.clone(), &namespace);
     let selector = policy_selector(&policy_name);
@@ -2716,6 +2842,93 @@ mod tests {
         assert!(!evicted.iter().any(|name| name.starts_with("live-")));
         assert!(!evicted.contains(&"kept".to_string()));
         assert_eq!(evicted.len(), 40 - retention.superseded);
+    }
+
+    /// [`PlanRetention::from_lookup`] over a fixed variable table.
+    fn retention_from(vars: &[(&str, &str)]) -> Result<PlanRetention, PlanRetentionConfigError> {
+        PlanRetention::from_lookup(|variable| {
+            vars.iter()
+                .find(|(name, _)| *name == variable)
+                .map(|(_, value)| value.to_string())
+        })
+    }
+
+    #[test]
+    fn unset_retention_variables_keep_the_defaults() {
+        assert_eq!(
+            retention_from(&[]).expect("an empty environment is valid"),
+            PlanRetention::default()
+        );
+    }
+
+    #[test]
+    fn each_retention_variable_overrides_its_bound() {
+        let resolved = retention_from(&[
+            (PlanRetention::ENV_APPLIED, "7"),
+            (PlanRetention::ENV_APPLIED_CEILING, "70"),
+            (PlanRetention::ENV_APPLIED_MIN_AGE, "36h"),
+            (PlanRetention::ENV_DECIDED, "4"),
+            (PlanRetention::ENV_SUPERSEDED, "1"),
+        ])
+        .expect("all five values are valid");
+
+        let expected = PlanRetention {
+            applied: 7,
+            applied_ceiling: 70,
+            applied_min_age_secs: 36 * 60 * 60,
+            decided: 4,
+            superseded: 1,
+        };
+        // Guard against this test going vacuous: if the fixture ever equalled
+        // the defaults, a lookup that ignored the environment entirely would
+        // still pass the assertion below.
+        assert_ne!(expected, PlanRetention::default());
+        assert_eq!(resolved, expected);
+    }
+
+    #[test]
+    fn an_invalid_retention_count_is_rejected_naming_the_variable() {
+        let error = retention_from(&[(PlanRetention::ENV_DECIDED, "many")])
+            .expect_err("a non-numeric count must be rejected, not defaulted");
+        assert!(
+            error.to_string().contains(PlanRetention::ENV_DECIDED),
+            "the error must name the variable to fix: {error}"
+        );
+    }
+
+    #[test]
+    fn an_invalid_retention_min_age_is_rejected_naming_the_variable() {
+        // Days are deliberately not a unit — this is the same syntax as the
+        // EPHEMERAL_ACCESS_* durations, and "30d" must fail loudly rather
+        // than resolve to something else.
+        let error = retention_from(&[(PlanRetention::ENV_APPLIED_MIN_AGE, "30d")])
+            .expect_err("an unsupported duration unit must be rejected, not defaulted");
+        assert!(
+            error
+                .to_string()
+                .contains(PlanRetention::ENV_APPLIED_MIN_AGE),
+            "the error must name the variable to fix: {error}"
+        );
+    }
+
+    #[test]
+    fn a_ceiling_below_the_applied_count_is_rejected() {
+        // Eviction stops at the count bound before the ceiling is consulted,
+        // so a smaller ceiling could never take effect; accepting it would
+        // mean running with different bounds than the environment states.
+        retention_from(&[
+            (PlanRetention::ENV_APPLIED, "50"),
+            (PlanRetention::ENV_APPLIED_CEILING, "10"),
+        ])
+        .expect_err("a ceiling below the count bound must be rejected");
+
+        // Equal is the degenerate-but-coherent form: the floor never spares
+        // anything, and that is exactly what the configuration says.
+        retention_from(&[
+            (PlanRetention::ENV_APPLIED, "50"),
+            (PlanRetention::ENV_APPLIED_CEILING, "50"),
+        ])
+        .expect("a ceiling equal to the count bound is valid");
     }
 
     fn plan_failed_at(phase: PlanPhase, age_secs: i64, now_ts: i64) -> PostgresPolicyPlan {

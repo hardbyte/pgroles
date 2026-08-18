@@ -433,8 +433,27 @@ enough to reach 200 within the floor period will start losing its oldest.
 
 `pgroles.io/keep=true` exempts a plan from every one of these bounds.
 
-These values are not yet configurable; see
-[#194](https://github.com/hardbyte/pgroles/issues/194).
+### Configuring the bounds
+
+Each bound is operator-level configuration, set by environment variable on the
+operator Deployment (`operator.env` in the Helm chart) — the same mechanism as
+the `EPHEMERAL_ACCESS_*` ceilings, and the same `s`/`m`/`h` duration syntax:
+
+| Variable | Default | Sets |
+| --- | --- | --- |
+| `PLAN_RETENTION_APPLIED` | `25` | `Applied` count bound |
+| `PLAN_RETENTION_APPLIED_MIN_AGE` | `720h` (30 days) | `Applied` age floor |
+| `PLAN_RETENTION_APPLIED_CEILING` | `200` | `Applied` hard ceiling; must be at least `PLAN_RETENTION_APPLIED` |
+| `PLAN_RETENTION_DECIDED` | `10` | `Failed` + `Rejected` shared bound |
+| `PLAN_RETENTION_SUPERSEDED` | `3` | `Superseded` bound |
+
+An invalid value refuses operator startup with the variable named, rather than
+silently running with bounds the environment did not ask for.
+
+There is deliberately no per-policy retention field on `PostgresPolicy`.
+Retention caps object growth in the cluster — an operational concern, like the
+open-candidate budget and TTL above — not per-policy intent; the per-object
+need ("this specific record matters") is what `pgroles.io/keep=true` is for.
 
 ## Bounding open candidates
 

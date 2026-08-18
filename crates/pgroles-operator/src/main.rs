@@ -27,6 +27,7 @@ use pgroles_operator::ephemeral::{
 use pgroles_operator::observability::{
     OperatorObservability, init_log_provider_from_env, serve_health,
 };
+use pgroles_operator::plan::PlanRetention;
 use pgroles_operator::reconciler::{error_policy, reconcile};
 use pgroles_operator::request_index::RequestIndex;
 
@@ -140,14 +141,28 @@ async fn main() -> anyhow::Result<()> {
     }
     let request_index = RequestIndex::default();
 
+    // Resolved once here so a malformed value refuses startup with the exact
+    // variable named, instead of surfacing later as retention quietly running
+    // with bounds the environment did not ask for.
+    let plan_retention = PlanRetention::from_env()?;
+    if plan_retention != PlanRetention::default() {
+        info!(
+            ?plan_retention,
+            "plan retention bounds set from environment"
+        );
+    }
+
     // Create the shared operator context.
-    let ctx = Arc::new(OperatorContext::new_with_runtime_config(
-        client.clone(),
-        observability.clone(),
-        event_recorder,
-        request_index.clone(),
-        watch_namespace.clone(),
-    ));
+    let ctx = Arc::new(
+        OperatorContext::new_with_runtime_config(
+            client.clone(),
+            observability.clone(),
+            event_recorder,
+            request_index.clone(),
+            watch_namespace.clone(),
+        )
+        .with_plan_retention(plan_retention),
+    );
 
     // Watch all PostgresPolicy resources across all namespaces.
     let policies: Api<PostgresPolicy> = match &watch_namespace {

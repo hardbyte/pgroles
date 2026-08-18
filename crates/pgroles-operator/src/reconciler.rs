@@ -1103,7 +1103,8 @@ async fn reconcile_apply_inner(
     // Release advisory lock (always, even on error).
     advisory_lock.release().await;
 
-    crate::plan::cleanup_old_plans_best_effort(&ctx.kube_client, resource, None).await;
+    crate::plan::cleanup_old_plans_best_effort(&ctx.kube_client, resource, ctx.plan_retention)
+        .await;
 
     result
 }
@@ -1411,6 +1412,7 @@ async fn apply_under_lock(
                 &target_identity,
                 &summary,
                 &applied_password_source_versions,
+                ctx.plan_retention,
                 None,
             )
             .await?;
@@ -1530,6 +1532,7 @@ async fn apply_under_lock(
                     &target_identity,
                     &summary,
                     &applied_password_source_versions,
+                    ctx.plan_retention,
                     None,
                 )
                 .await?;
@@ -1866,6 +1869,7 @@ async fn apply_under_lock(
                                 &target_identity,
                                 &summary,
                                 &applied_password_source_versions,
+                                ctx.plan_retention,
                                 None,
                             )
                             .await?;
@@ -2197,6 +2201,7 @@ async fn apply_under_lock(
                                 &target_identity,
                                 &summary,
                                 &applied_password_source_versions,
+                                ctx.plan_retention,
                                 None,
                             )
                             .await?;
@@ -2340,6 +2345,7 @@ async fn apply_under_lock(
                 &target_identity,
                 &summary,
                 &applied_password_source_versions,
+                ctx.plan_retention,
                 None,
             )
             .await?;

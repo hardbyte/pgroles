@@ -742,6 +742,7 @@ async fn plan_against_target(
         target.target_identity(),
         &summary,
         &password_source_versions,
+        ctx.plan_retention,
         Some(CandidatePlanBinding {
             candidate,
             content_digest: &content_digest,

@@ -16,6 +16,7 @@ use tokio::sync::{Mutex, RwLock};
 
 use crate::crd::{ConnectionAuth, ConnectionSpec, SecretKeySelector};
 use crate::observability::OperatorObservability;
+use crate::plan::PlanRetention;
 use crate::request_index::RequestIndex;
 
 /// Minimum pool size required for reconciliation.
@@ -414,6 +415,9 @@ pub struct OperatorContext {
     /// Optional namespace which bounds every operator watch and list.
     pub watch_namespace: Option<String>,
 
+    /// Terminal-plan retention bounds, shared by every policy reconcile.
+    pub plan_retention: PlanRetention,
+
     /// Fetches short-lived provider-backed database passwords.
     gcp_token_provider: Arc<dyn GcpAccessTokenProvider>,
 }
@@ -435,9 +439,18 @@ impl OperatorContext {
             observability,
             request_index,
             watch_namespace,
+            plan_retention: PlanRetention::default(),
             database_locks: Arc::new(Mutex::new(HashMap::new())),
             gcp_token_provider: Arc::new(MetadataGcpAccessTokenProvider::default()),
         }
+    }
+
+    /// Replace the default plan retention bounds — typically with the
+    /// environment-derived values resolved once at startup by
+    /// [`PlanRetention::from_env`].
+    pub fn with_plan_retention(mut self, plan_retention: PlanRetention) -> Self {
+        self.plan_retention = plan_retention;
+        self
     }
 
     /// Try to acquire the in-process lock for the given database identity.
