@@ -9,7 +9,7 @@ use std::fmt::Write as _;
 use serde::{Deserialize, Serialize};
 
 use crate::manifest::{ObjectType, Privilege};
-use crate::model::{DefaultPrivKey, GrantKey, RoleGraph};
+use crate::model::{DefaultPrivKey, GrantKey, PUBLIC_ROLE, RoleGraph};
 use crate::ownership::ManagedScope;
 
 pub const VISUAL_GRAPH_SCHEMA_VERSION: &str = "pgroles.visual_graph.v1";
@@ -173,6 +173,29 @@ pub fn build_visual_graph(graph: &RoleGraph, source: VisualSource) -> VisualGrap
         }
     }
 
+    // --- PUBLIC pseudo-role node ---
+    // Only emitted when something actually addresses PUBLIC, so graphs that
+    // never mention it are unchanged.
+    let grants_public = graph.grants.keys().any(|key| key.role.is_public());
+    let defaults_public = graph
+        .default_privileges
+        .keys()
+        .any(|key| key.grantee.is_public());
+    if grants_public || defaults_public {
+        let node_id = grantee_node_id(PUBLIC_ROLE);
+        if node_ids.insert(node_id.clone()) {
+            nodes.push(VisualNode {
+                id: node_id,
+                label: PUBLIC_ROLE.to_string(),
+                kind: NodeKind::ExternalPrincipal,
+                managed: Some(false),
+                login: None,
+                privileges: Vec::new(),
+                comment: None,
+            });
+        }
+    }
+
     // --- Membership edges ---
     for edge in &graph.memberships {
         let source_id = if managed_role_names.contains(edge.member.as_str()) {
@@ -224,7 +247,7 @@ pub fn build_visual_graph(graph: &RoleGraph, source: VisualSource) -> VisualGrap
             .collect::<Vec<_>>()
             .join(",");
         edges.push(VisualEdge {
-            source: format!("role:{}", collapsed_key.role),
+            source: grantee_node_id(&collapsed_key.role),
             target: node_id,
             kind: EdgeKind::Grant,
             label: privilege_label,
@@ -234,7 +257,11 @@ pub fn build_visual_graph(graph: &RoleGraph, source: VisualSource) -> VisualGrap
     // --- Default privilege nodes and edges ---
     for (key, state) in &graph.default_privileges {
         let node_id = default_priv_node_id(key);
-        let node_label = format!("defaults: {} -> {}.{}s", key.owner, key.schema, key.on_type);
+        let scope_label = key.scope.schema().unwrap_or("(global)");
+        let node_label = format!(
+            "defaults: {} -> {}.{}s",
+            key.owner, scope_label, key.on_type
+        );
 
         if node_ids.insert(node_id.clone()) {
             nodes.push(VisualNode {
@@ -256,7 +283,7 @@ pub fn build_visual_graph(graph: &RoleGraph, source: VisualSource) -> VisualGrap
             .join(",");
         edges.push(VisualEdge {
             source: node_id,
-            target: format!("role:{}", key.grantee),
+            target: grantee_node_id(key.grantee.as_str()),
             kind: EdgeKind::DefaultPrivilege,
             label: privilege_label,
         });
@@ -314,6 +341,19 @@ impl CollapsedGrantKey {
     }
 }
 
+/// Node id for the grantee of a grant or default-privilege edge.
+///
+/// PUBLIC is a pseudo-role, so it never appears in `graph.roles` and a
+/// `role:` id would dangle. It gets an unmanaged node instead, the same way
+/// membership members that name no managed role do.
+fn grantee_node_id(grantee: &str) -> String {
+    if grantee == PUBLIC_ROLE {
+        format!("external:{grantee}")
+    } else {
+        format!("role:{grantee}")
+    }
+}
+
 fn collapse_grants(
     grants: &BTreeMap<GrantKey, crate::model::GrantState>,
 ) -> BTreeMap<CollapsedGrantKey, BTreeSet<Privilege>> {
@@ -335,7 +375,7 @@ fn collapse_grants(
         };
 
         let collapsed_key = CollapsedGrantKey {
-            role: key.role.clone(),
+            role: key.role.as_str().to_string(),
             object_type: key.object_type,
             scope,
         };
@@ -352,7 +392,10 @@ fn collapse_grants(
 fn default_priv_node_id(key: &DefaultPrivKey) -> String {
     format!(
         "default:{}:{}:{}:{}",
-        key.owner, key.schema, key.on_type, key.grantee
+        key.owner,
+        key.scope.schema().unwrap_or("(global)"),
+        key.on_type,
+        key.grantee
     )
 }
 
@@ -860,6 +903,74 @@ memberships:
         assert_eq!(dp_nodes.len(), 1);
         assert!(dp_nodes[0].label.contains("app_owner"));
         assert!(dp_nodes[0].label.contains("orders"));
+    }
+
+    fn build_public_graph() -> RoleGraph {
+        let yaml = r#"
+default_owner: app_owner
+
+schemas:
+  - name: orders
+
+roles:
+  - name: analytics
+    login: true
+
+grants:
+  - role: PUBLIC
+    privileges: [USAGE]
+    object: { type: schema, name: orders }
+
+default_privileges:
+  - owner: app_owner
+    scope: { type: global }
+    grant:
+      - role: PUBLIC
+        privileges: [EXECUTE]
+        on_type: function
+"#;
+        let manifest = parse_manifest(yaml).unwrap();
+        let expanded = expand_manifest(&manifest).unwrap();
+        RoleGraph::from_expanded(&expanded, manifest.default_owner.as_deref()).unwrap()
+    }
+
+    #[test]
+    fn every_edge_endpoint_resolves_to_a_node() {
+        let visual = build_visual_graph(&build_public_graph(), VisualSource::Desired);
+        let ids: BTreeSet<&str> = visual.nodes.iter().map(|n| n.id.as_str()).collect();
+        for edge in &visual.edges {
+            assert!(
+                ids.contains(edge.source.as_str()),
+                "edge source {} has no node (ids: {ids:?})",
+                edge.source
+            );
+            assert!(
+                ids.contains(edge.target.as_str()),
+                "edge target {} has no node (ids: {ids:?})",
+                edge.target
+            );
+        }
+    }
+
+    #[test]
+    fn public_gets_one_unmanaged_node() {
+        let visual = build_visual_graph(&build_public_graph(), VisualSource::Desired);
+        let public: Vec<_> = visual
+            .nodes
+            .iter()
+            .filter(|n| n.label == "PUBLIC")
+            .collect();
+        assert_eq!(public.len(), 1, "expected exactly one PUBLIC node");
+        assert_eq!(public[0].managed, Some(false));
+        assert_eq!(public[0].kind, NodeKind::ExternalPrincipal);
+        // PUBLIC is not a managed role, so it must not claim a `role:` id.
+        assert!(!visual.nodes.iter().any(|n| n.id == "role:PUBLIC"));
+    }
+
+    #[test]
+    fn a_graph_without_public_gains_no_public_node() {
+        let visual = build_visual_graph(&build_test_graph(), VisualSource::Desired);
+        assert!(!visual.nodes.iter().any(|n| n.label == "PUBLIC"));
     }
 
     #[test]

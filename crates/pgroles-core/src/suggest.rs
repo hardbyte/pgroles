@@ -201,6 +201,15 @@ pub fn suggest_profiles(input: &PolicyManifest, opts: &SuggestOptions) -> Sugges
     let mut role_dps: BTreeMap<String, Vec<(String, String, DefaultPrivilegeGrant)>> =
         BTreeMap::new();
     for dp in &input.default_privileges {
+        // Profiles are schema-scoped, so only schema-scoped entries can be
+        // folded into one; global entries stay as-is.
+        let Some(schema) = dp
+            .resolved_scope()
+            .ok()
+            .and_then(|scope| scope.schema().map(str::to_string))
+        else {
+            continue;
+        };
         let owner = dp
             .owner
             .clone()
@@ -210,7 +219,7 @@ pub fn suggest_profiles(input: &PolicyManifest, opts: &SuggestOptions) -> Sugges
             if let Some(role) = &grant.role {
                 role_dps.entry(role.clone()).or_default().push((
                     owner.clone(),
-                    dp.schema.clone(),
+                    schema.clone(),
                     grant.clone(),
                 ));
             }
@@ -293,6 +302,14 @@ pub fn suggest_profiles(input: &PolicyManifest, opts: &SuggestOptions) -> Sugges
         let mut has_unrepresentable_grant = false;
         let role_grants_vec = role_grants.get(role_name).cloned().unwrap_or_default();
         for g in &role_grants_vec {
+            // Profiles are additive templates with no way to say `ensure:
+            // absent`, and a global default privilege has no schema to hang a
+            // profile from. Either one makes the role unclusterable; folding
+            // it anyway would drop the assertion and fail the round-trip
+            // check, abandoning the whole suggestion run.
+            if g.ensure == crate::manifest::Ensure::Absent {
+                has_unrepresentable_grant = true;
+            }
             match g.object.object_type {
                 ObjectType::Schema => match &g.object.name {
                     Some(name) => {
@@ -315,6 +332,15 @@ pub fn suggest_profiles(input: &PolicyManifest, opts: &SuggestOptions) -> Sugges
             });
             continue;
         }
+        if role_has_global_default_privilege(input, role_name)
+            || role_has_absent_default_privilege(input, role_name)
+        {
+            skipped.push(SkipReason::UnrepresentableGrant {
+                role: role_name.clone(),
+            });
+            continue;
+        }
+
         let role_dp_vec = role_dps.get(role_name).cloned().unwrap_or_default();
         for (_, schema, _) in &role_dp_vec {
             schemas_seen.insert(schema.clone());
@@ -607,6 +633,7 @@ pub fn suggest_profiles(input: &PolicyManifest, opts: &SuggestOptions) -> Sugges
                 Some(DefaultPrivilege {
                     owner: dp.owner.clone(),
                     schema: dp.schema.clone(),
+                    scope: dp.scope.clone(),
                     grant: kept,
                 })
             }
@@ -814,6 +841,7 @@ fn collapse_full_coverage_grants(grants: &mut Vec<Grant>, inventory: &Inventory)
         to_add.push(Grant {
             role,
             privileges: first_privs.into_iter().collect(),
+            ensure: crate::manifest::Ensure::Present,
             object: ObjectTarget {
                 object_type,
                 schema: Some(schema),
@@ -981,6 +1009,35 @@ fn is_valid_identifier(s: &str) -> bool {
         && !s.starts_with('_')
 }
 
+/// Whether any global-scope default privilege names this role as grantee.
+///
+/// Global scope has no schema, so a profile cannot express it. `role_dps`
+/// deliberately skips these entries, which would otherwise be silently lost.
+/// Whether any default privilege for `role` asserts absence.
+///
+/// Profiles are additive templates, so folding such an entry in would turn the
+/// assertion into its opposite. The round-trip check catches that and abandons
+/// the whole candidate manifest, so one unfoldable role would cost every other
+/// role its clustering. Skipping the role keeps the loss local.
+fn role_has_absent_default_privilege(input: &PolicyManifest, role: &str) -> bool {
+    input.default_privileges.iter().any(|dp| {
+        dp.grant.iter().any(|grant| {
+            grant.role.as_deref() == Some(role) && grant.ensure == crate::manifest::Ensure::Absent
+        })
+    })
+}
+
+fn role_has_global_default_privilege(input: &PolicyManifest, role: &str) -> bool {
+    input.default_privileges.iter().any(|dp| {
+        dp.resolved_scope()
+            .is_ok_and(|scope| scope.schema().is_none())
+            && dp
+                .grant
+                .iter()
+                .any(|grant| grant.role.as_deref() == Some(role))
+    })
+}
+
 fn build_profile(
     login: Option<bool>,
     inherit: Option<bool>,
@@ -1017,6 +1074,7 @@ fn build_profile(
             ProfileGrant {
                 privileges: privs,
                 object,
+                ensure: crate::manifest::Ensure::Present,
             }
         })
         .collect();
@@ -1036,6 +1094,7 @@ fn build_profile(
                 role: None, // expansion fills this in
                 privileges: privs,
                 on_type: dpg.on_type,
+                ensure: crate::manifest::Ensure::Present,
             }
         })
         .collect();
@@ -1115,6 +1174,7 @@ fn expand_wildcards_in_place(grants: &mut Vec<Grant>, inventory: &Inventory) {
                 out.push(Grant {
                     role: g.role.clone(),
                     privileges: g.privileges.clone(),
+                    ensure: g.ensure,
                     object: ObjectTarget {
                         object_type: g.object.object_type,
                         schema: g.object.schema.clone(),
@@ -2197,6 +2257,60 @@ default_privileges:
                 .skipped
                 .iter()
                 .any(|s| matches!(s, SkipReason::OwnerMismatch { role, .. } if role == "a-rw"))
+        );
+    }
+
+    #[test]
+    fn absent_default_privilege_excludes_only_its_own_role() {
+        let m = parse(
+            r#"
+schemas:
+  - name: a
+    owner: app_owner
+  - name: b
+    owner: app_owner
+roles:
+  - name: a-rw
+  - name: b-rw
+grants:
+  - role: a-rw
+    privileges: [SELECT]
+    object: { type: table, schema: a, name: "*" }
+  - role: b-rw
+    privileges: [SELECT]
+    object: { type: table, schema: b, name: "*" }
+default_privileges:
+  - owner: app_owner
+    schema: a
+    grant:
+      - role: a-rw
+        ensure: absent
+        privileges: [DELETE]
+        on_type: table
+  - owner: app_owner
+    schema: b
+    grant:
+      - role: b-rw
+        privileges: [SELECT]
+        on_type: table
+"#,
+        );
+        let report = suggest_profiles(&m, &SuggestOptions::default());
+        assert!(
+            report
+                .skipped
+                .iter()
+                .any(|s| matches!(s, SkipReason::UnrepresentableGrant { role } if role == "a-rw")),
+            "a profile cannot assert absence, so a-rw must be skipped: {:?}",
+            report.skipped
+        );
+        assert!(
+            !report
+                .skipped
+                .iter()
+                .any(|s| matches!(s, SkipReason::UnrepresentableGrant { role } if role == "b-rw")),
+            "b-rw asserts nothing absent and must be unaffected: {:?}",
+            report.skipped
         );
     }
 

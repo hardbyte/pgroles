@@ -42,6 +42,128 @@ ALTER DEFAULT PRIVILEGES FOR ROLE "app_owner"
   GRANT SELECT, USAGE ON SEQUENCES TO "analytics";
 ```
 
+## Scope: one schema or the whole database
+
+The `schema:` field above is shorthand. The long form names a scope explicitly:
+
+```yaml
+default_privileges:
+  # These two entries mean the same thing.
+  - owner: app_owner
+    schema: public
+    grant: [...]
+
+  - owner: app_owner
+    scope: { type: schema, schema: public }
+    grant: [...]
+```
+
+Global scope has no schema at all. It sets the owner's defaults for every
+schema in the database:
+
+```yaml
+default_privileges:
+  - owner: app_owner
+    scope: { type: global }
+    grant:
+      - role: analytics
+        privileges: [SELECT]
+        on_type: table
+```
+
+```sql
+ALTER DEFAULT PRIVILEGES FOR ROLE "app_owner"
+  GRANT SELECT ON TABLES TO "analytics";
+```
+
+An entry must set either `schema` or `scope`, never both and never neither.
+
+PostgreSQL layers the two. The global rule applies everywhere, and a
+schema-scoped rule adds to it for that one schema. A schema-scoped rule cannot
+subtract a privilege the global layer grants, which matters when you remove
+`PUBLIC EXECUTE`. See [Removing PUBLIC privileges](#removing-public-privileges).
+
+Global scope accepts `on_type: schema` as well as table, sequence, function,
+and type. Schema scope accepts everything except `schema`, because a schema is
+not contained in another schema. PostgreSQL has no database-level default
+privileges, so `on_type: database` is rejected in both.
+
+`pg_default_acl` records views and materialized views as plain tables, so
+declare `on_type: table` for them. pgroles rejects `on_type: view` here rather
+than emit a rule that could never converge.
+
+{% callout type="warning" title="Global rules reach every schema" %}
+A global rule affects every schema in the database, including ones no policy
+manages. `pgroles diff` counts global changes on their own line so they stand
+out in a plan.
+{% /callout %}
+
+## Removing PUBLIC privileges
+
+PostgreSQL grants `EXECUTE` on every new function to `PUBLIC`, and it does so
+without writing an ACL entry. Granting `EXECUTE` to the roles you intend
+therefore does not stop anyone else from calling the function.
+
+Write `ensure: absent` to assert that a privilege must not exist:
+
+```yaml
+grants:
+  # Existing routines.
+  - role: PUBLIC
+    ensure: absent
+    privileges: [EXECUTE]
+    object: { type: function, schema: privileged_api, name: "*" }
+
+default_privileges:
+  # Future routines, everywhere this owner creates them.
+  - owner: function_owner
+    scope: { type: global }
+    grant:
+      - role: PUBLIC
+        ensure: absent
+        privileges: [EXECUTE]
+        on_type: function
+
+  # Defend one schema against a later schema-scoped re-grant.
+  - owner: function_owner
+    scope: { type: schema, schema: privileged_api }
+    grant:
+      - role: PUBLIC
+        ensure: absent
+        privileges: [EXECUTE]
+        on_type: function
+```
+
+The global rule is what removes PostgreSQL's built-in default. The
+schema-scoped rule cannot do that on its own, because schema defaults add to
+the global layer instead of subtracting from it. Its job is to remove a
+schema-scoped `GRANT ... TO PUBLIC` if one appears later.
+
+The inverse works too. Remove the privilege globally, then hand it back in one
+schema:
+
+```yaml
+default_privileges:
+  - owner: function_owner
+    scope: { type: global }
+    grant:
+      - role: PUBLIC
+        ensure: absent
+        privileges: [EXECUTE]
+        on_type: function
+  - owner: function_owner
+    scope: { type: schema, schema: public_api }
+    grant:
+      - role: PUBLIC
+        privileges: [EXECUTE]
+        on_type: function
+```
+
+Read [Grants](/docs/grants) for `ensure: absent` on existing objects, and for
+what pgroles does and does not manage about `PUBLIC`. The complete worked
+manifest is
+[examples/security-definer-api.yaml](https://github.com/hardbyte/pgroles/blob/main/examples/security-definer-api.yaml).
+
 ## Owner context
 
 The `owner` field specifies which role's object creation triggers the default grant. This is typically the role that creates tables, such as `app_migrator` or `app_owner`.

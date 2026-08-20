@@ -94,6 +94,8 @@ profiles:
 | `default_privileges` | list[default privilege template] | `[]` | Default privileges expanded into each bound schema |
 | `config` | map | `{}` | Role-level configuration defaults for generated roles (`ALTER ROLE ... SET`); values support `{schema}`/`{profile}` placeholders — see [role configuration defaults](#role-configuration-defaults) |
 
+A profile is an additive template, so neither `grants` nor `default_privileges` may set `ensure: absent`. Validation rejects the manifest and names the profile. Declare the absence as a top-level `grants` or `default_privileges` entry instead.
+
 The generated role attributes apply only to roles created from `schema x profile` expansion. One-off roles under `roles:` still declare their own attributes directly.
 
 ## schemas
@@ -235,6 +237,23 @@ Supported object `type` values: `table`, `view`, `materialized_view`, `sequence`
 
 pgroles also accepts a quoted legacy `"on"` key when parsing older manifests, but `object` is the supported spelling for new manifests and generated output.
 
+Each entry also accepts `ensure`:
+
+| Field | Default | Description |
+|---|---|---|
+| `role` | required | Grantee. The exact value `PUBLIC` means the PostgreSQL pseudo-role |
+| `ensure` | `present` | `present` grants the privileges; `absent` revokes them where held |
+
+```yaml
+grants:
+  - role: PUBLIC
+    ensure: absent
+    privileges: [EXECUTE]
+    object: { type: function, schema: privileged_api, name: "*" }
+```
+
+See [Grants](/docs/grants#asserting-a-privilege-is-absent) for what `absent` does and does not promise.
+
 ## default_privileges
 
 Default privileges configure what happens when new objects are created:
@@ -256,6 +275,30 @@ default_privileges:
 ```
 
 If `owner` is omitted, the top-level `default_owner` is used.
+
+| Field | Default | Description |
+|---|---|---|
+| `owner` | `default_owner` | The role whose newly created objects get these defaults |
+| `schema` | — | Shorthand for `scope: {type: schema, schema: ...}` |
+| `scope` | — | `{type: schema, schema: NAME}` or `{type: global}`. Set exactly one of `schema` and `scope` |
+| `grant[].role` | required | Grantee; `PUBLIC` means the pseudo-role |
+| `grant[].ensure` | `present` | `absent` revokes the default where it exists |
+| `grant[].on_type` | required | `table`, `sequence`, `function`, `type`, or `schema` (global scope only) |
+
+Global scope omits the `IN SCHEMA` clause and applies to every schema in the database:
+
+```yaml
+default_privileges:
+  - owner: function_owner
+    scope: { type: global }
+    grant:
+      - role: PUBLIC
+        ensure: absent
+        privileges: [EXECUTE]
+        on_type: function
+```
+
+`on_type: database` is rejected because PostgreSQL has no database-level default privileges. `on_type: schema` is global-only. Declare views and materialized views as `table`, which is how `pg_default_acl` records them.
 
 ## memberships
 

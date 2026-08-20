@@ -3,13 +3,15 @@ use thiserror::Error;
 
 use crate::diff::Change;
 use crate::manifest::{ObjectType, SchemaBindingFacet};
-use crate::model::{DefaultPrivKey, GrantKey};
+use crate::model::{DefaultPrivKey, DefaultPrivilegeScope, GrantKey, Grantee};
 use crate::ownership::{
     ManagedScope, MembershipKey, OwnershipIndex, SchemaFacetKey, describe_change, grant_schema_name,
 };
 use crate::visual::VisualManagedScope;
 
-pub const BUNDLE_PLAN_SCHEMA_VERSION: &str = "pgroles.bundle_plan.v1";
+// v2: default-privilege changes and ownership keys carry a tagged `scope`
+// instead of a bare `schema` string, to represent global (owner-wide) scope.
+pub const BUNDLE_PLAN_SCHEMA_VERSION: &str = "pgroles.bundle_plan.v2";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PlanOutputMode {
@@ -83,16 +85,16 @@ pub enum ManagedOwnershipKey {
         facet: SchemaBindingFacet,
     },
     Grant {
-        role: String,
+        role: Grantee,
         object_type: ObjectType,
         schema: Option<String>,
         name: Option<String>,
     },
     DefaultPrivilege {
         owner: String,
-        schema: String,
+        scope: DefaultPrivilegeScope,
         on_type: ObjectType,
-        grantee: String,
+        grantee: Grantee,
     },
     Membership {
         role: String,
@@ -243,11 +245,13 @@ fn lookup_bundle_change_owner(
             if *object_type == ObjectType::Database {
                 return ownership
                     .roles
-                    .get(role)
+                    .get(role.as_str())
                     .cloned()
                     .map(|document| BundleChangeOwner {
                         document,
-                        managed_key: ManagedOwnershipKey::Role { name: role.clone() },
+                        managed_key: ManagedOwnershipKey::Role {
+                            name: role.as_str().to_string(),
+                        },
                     })
                     .ok_or_else(|| BundlePlanError::MissingOwner {
                         change: describe_change(change),
@@ -267,21 +271,21 @@ fn lookup_bundle_change_owner(
         }
         Change::SetDefaultPrivilege {
             owner,
-            schema,
+            scope,
             on_type,
             grantee,
             ..
         }
         | Change::RevokeDefaultPrivilege {
             owner,
-            schema,
+            scope,
             on_type,
             grantee,
             ..
         } => {
             let key = DefaultPrivKey {
                 owner: owner.clone(),
-                schema: schema.clone(),
+                scope: scope.clone(),
                 on_type: *on_type,
                 grantee: grantee.clone(),
             };
@@ -291,14 +295,35 @@ fn lookup_bundle_change_owner(
                     document: document.clone(),
                     managed_key: ManagedOwnershipKey::DefaultPrivilege {
                         owner: key.owner.clone(),
-                        schema: key.schema.clone(),
+                        scope: key.scope.clone(),
                         on_type: key.on_type,
                         grantee: key.grantee.clone(),
                     },
                 });
             }
 
-            lookup_bundle_schema_facet(schema, SchemaBindingFacet::Bindings, ownership, change)
+            match scope {
+                DefaultPrivilegeScope::Schema { schema } => lookup_bundle_schema_facet(
+                    schema,
+                    SchemaBindingFacet::Bindings,
+                    ownership,
+                    change,
+                ),
+                // Global defaults belong to whichever document owns the role.
+                DefaultPrivilegeScope::Global => ownership
+                    .roles
+                    .get(owner)
+                    .cloned()
+                    .map(|document| BundleChangeOwner {
+                        document,
+                        managed_key: ManagedOwnershipKey::Role {
+                            name: owner.clone(),
+                        },
+                    })
+                    .ok_or_else(|| BundlePlanError::MissingOwner {
+                        change: describe_change(change),
+                    }),
+            }
         }
         Change::AddMember { role, member, .. } | Change::RemoveMember { role, member } => {
             let key = MembershipKey {
@@ -454,6 +479,10 @@ roles:
         .expect("bundle plan should annotate");
         let json = serde_json::to_value(&plan).expect("bundle plan should serialize");
 
+        // Pinned to the literal on purpose: comparing against the constant
+        // the code writes would let a version bump through without anyone
+        // documenting the migration.
+        assert_eq!(json["schema_version"], "pgroles.bundle_plan.v2");
         assert_eq!(json["schema_version"], BUNDLE_PLAN_SCHEMA_VERSION);
         assert_eq!(json["managed_scope"]["roles"][0], "app");
         assert_eq!(json["changes"][0]["category"], "role");

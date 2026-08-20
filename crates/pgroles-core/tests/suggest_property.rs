@@ -11,8 +11,8 @@
 
 use pgroles_core::diff::{Change, diff};
 use pgroles_core::manifest::{
-    DefaultPrivilege, DefaultPrivilegeGrant, Grant, ObjectTarget, ObjectType, PolicyManifest,
-    Privilege, RoleDefinition, SchemaBinding, expand_manifest,
+    DefaultPrivilege, DefaultPrivilegeGrant, Ensure, Grant, ObjectTarget, ObjectType,
+    PolicyManifest, Privilege, RoleDefinition, SchemaBinding, expand_manifest,
 };
 use pgroles_core::model::RoleGraph;
 use pgroles_core::suggest::{
@@ -211,6 +211,7 @@ fn random_manifest(rng: &mut Rng) -> PolicyManifest {
                     role: role_name.clone(),
                     privileges: privs.clone(),
                     object,
+                    ensure: Ensure::Present,
                 });
             }
             for (ot, privs) in &kind.dp_templates {
@@ -221,6 +222,7 @@ fn random_manifest(rng: &mut Rng) -> PolicyManifest {
                         role: Some(role_name.clone()),
                         privileges: privs.clone(),
                         on_type: *ot,
+                        ensure: Ensure::Present,
                     });
             }
         }
@@ -230,7 +232,8 @@ fn random_manifest(rng: &mut Rng) -> PolicyManifest {
         .into_iter()
         .map(|((owner, schema), grant)| DefaultPrivilege {
             owner: Some(owner),
-            schema,
+            schema: Some(schema),
+            scope: None,
             grant,
         })
         .collect();

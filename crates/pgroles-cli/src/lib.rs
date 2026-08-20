@@ -13,7 +13,7 @@ pub mod candidate;
 use pgroles_core::composition::{self, ComposedPolicy, PolicyBundle, PolicyDocument};
 use pgroles_core::diff::{self, Change};
 use pgroles_core::manifest::{self, ExpandedManifest, PolicyManifest, RoleRetirement};
-use pgroles_core::model::RoleGraph;
+use pgroles_core::model::{DefaultPrivilegeScope, RoleGraph};
 use pgroles_core::ownership::ManagedScope;
 use pgroles_core::report::{self, PlanOutputMode};
 use pgroles_core::sql;
@@ -214,6 +214,11 @@ pub struct PlanSummary {
     pub revokes: usize,
     pub default_privileges_set: usize,
     pub default_privileges_revoked: usize,
+    /// Global (owner-wide) default privilege changes, counted separately from
+    /// the schema-scoped totals above because they affect every schema in the
+    /// database.
+    pub global_default_privileges_set: usize,
+    pub global_default_privileges_revoked: usize,
     pub members_added: usize,
     pub members_removed: usize,
     pub passwords_set: usize,
@@ -238,8 +243,20 @@ impl PlanSummary {
                     summary.grants += 1
                 }
                 Change::Revoke { .. } => summary.revokes += 1,
-                Change::SetDefaultPrivilege { .. } => summary.default_privileges_set += 1,
-                Change::RevokeDefaultPrivilege { .. } => summary.default_privileges_revoked += 1,
+                Change::SetDefaultPrivilege { scope, .. } => {
+                    if matches!(scope, DefaultPrivilegeScope::Global) {
+                        summary.global_default_privileges_set += 1;
+                    } else {
+                        summary.default_privileges_set += 1;
+                    }
+                }
+                Change::RevokeDefaultPrivilege { scope, .. } => {
+                    if matches!(scope, DefaultPrivilegeScope::Global) {
+                        summary.global_default_privileges_revoked += 1;
+                    } else {
+                        summary.default_privileges_revoked += 1;
+                    }
+                }
                 Change::AddMember { .. } => summary.members_added += 1,
                 Change::RemoveMember { .. } => summary.members_removed += 1,
                 Change::SetPassword { .. } => summary.passwords_set += 1,
@@ -263,6 +280,8 @@ impl PlanSummary {
             + self.revokes
             + self.default_privileges_set
             + self.default_privileges_revoked
+            + self.global_default_privileges_set
+            + self.global_default_privileges_revoked
             + self.members_added
             + self.members_removed
             + self.passwords_set
@@ -314,6 +333,14 @@ impl PlanSummary {
             (
                 "default privilege(s) to revoke",
                 self.default_privileges_revoked,
+            ),
+            (
+                "GLOBAL default privilege(s) to set (affects every schema)",
+                self.global_default_privileges_set,
+            ),
+            (
+                "GLOBAL default privilege(s) to revoke (affects every schema)",
+                self.global_default_privileges_revoked,
             ),
             ("membership(s) to add", self.members_added),
             ("membership(s) to remove", self.members_removed),
@@ -1080,7 +1107,7 @@ schemas:
             .insert("stale-role".to_string(), RoleState::default());
         current.grants.insert(
             GrantKey {
-                role: "analytics".to_string(),
+                role: "analytics".into(),
                 object_type: ObjectType::Table,
                 schema: Some("public".to_string()),
                 name: Some("*".to_string()),
@@ -1169,7 +1196,10 @@ roles:
         let parsed: serde_json::Value = serde_json::from_str(&json_output).unwrap();
 
         assert!(parsed.is_object());
-        assert_eq!(parsed["schema_version"], "pgroles.bundle_plan.v1");
+        assert_eq!(
+            parsed["schema_version"],
+            pgroles_core::report::BUNDLE_PLAN_SCHEMA_VERSION
+        );
         assert_eq!(parsed["managed_scope"]["roles"][0], "app");
         assert_eq!(parsed["changes"][0]["owner"]["document"], "app");
         assert_eq!(parsed["changes"][0]["owner"]["managed_key"]["kind"], "role");

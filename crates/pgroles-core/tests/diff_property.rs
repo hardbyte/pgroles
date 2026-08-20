@@ -55,8 +55,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use pgroles_core::diff::{Change, ReconciliationMode, diff, filter_changes};
 use pgroles_core::manifest::{ObjectType, Privilege};
 use pgroles_core::model::{
-    DefaultPrivKey, DefaultPrivState, GrantKey, GrantState, MembershipEdge, RoleAttribute,
-    RoleGraph, RoleState, SchemaState, default_schema_owner_privileges,
+    DefaultPrivKey, DefaultPrivState, DefaultPrivilegeScope, GrantKey, GrantState, Grantee,
+    MembershipEdge, RoleAttribute, RoleGraph, RoleState, SchemaState,
+    default_schema_owner_privileges,
 };
 
 // ---------------------------------------------------------------------------
@@ -220,7 +221,7 @@ fn gen_grants(rng: &mut Rng, roles: &[String]) -> BTreeMap<GrantKey, GrantState>
         };
         out.insert(
             GrantKey {
-                role,
+                role: Grantee::Role(role),
                 object_type,
                 schema,
                 name,
@@ -251,9 +252,11 @@ fn gen_default_privs(
         out.insert(
             DefaultPrivKey {
                 owner: format!("own{}", rng.usize(3)),
-                schema: format!("s{}", rng.usize(3)),
+                scope: DefaultPrivilegeScope::Schema {
+                    schema: format!("s{}", rng.usize(3)),
+                },
                 on_type,
-                grantee: roles[rng.usize(roles.len())].clone(),
+                grantee: Grantee::Role(roles[rng.usize(roles.len())].clone()),
             },
             DefaultPrivState {
                 privileges: gen_priv_set(rng),
@@ -306,7 +309,9 @@ fn gen_graph(rng: &mut Rng, allow_none: bool, messy: bool) -> RoleGraph {
         roles,
         schemas: gen_schemas(rng, allow_none),
         grants: gen_grants(rng, &role_names),
+        grant_absences: BTreeMap::new(),
         default_privileges: gen_default_privs(rng, &role_names),
+        default_privilege_absences: BTreeMap::new(),
         memberships: gen_memberships(rng, &role_names),
     }
 }
@@ -399,7 +404,7 @@ fn derive_current(rng: &mut Rng, desired: &RoleGraph) -> RoleGraph {
     for _ in 0..rng.usize(3) {
         c.grants.insert(
             GrantKey {
-                role: format!("r{}", rng.usize(6)),
+                role: Grantee::Role(format!("r{}", rng.usize(6))),
                 object_type: ObjectType::Table,
                 schema: Some(format!("s{}", rng.usize(3))),
                 name: Some(format!("stray{}", rng.usize(3))),
@@ -436,9 +441,11 @@ fn derive_current(rng: &mut Rng, desired: &RoleGraph) -> RoleGraph {
         c.default_privileges.insert(
             DefaultPrivKey {
                 owner: format!("own{}", rng.usize(3)),
-                schema: format!("s{}", rng.usize(3)),
+                scope: DefaultPrivilegeScope::Schema {
+                    schema: format!("s{}", rng.usize(3)),
+                },
                 on_type: ObjectType::Table,
-                grantee: format!("r{}", rng.usize(6)),
+                grantee: Grantee::Role(format!("r{}", rng.usize(6))),
             },
             DefaultPrivState {
                 privileges: [Privilege::Select].into_iter().collect(),
@@ -583,7 +590,7 @@ fn apply_changes(graph: &RoleGraph, changes: &[Change]) -> RoleGraph {
                 state.owner_privileges =
                     [Privilege::Create, Privilege::Usage].into_iter().collect();
                 g.grants.remove(&GrantKey {
-                    role: owner.clone(),
+                    role: Grantee::Role(owner.clone()),
                     object_type: ObjectType::Schema,
                     schema: None,
                     name: Some(name.clone()),
@@ -626,36 +633,53 @@ fn apply_changes(graph: &RoleGraph, changes: &[Change]) -> RoleGraph {
                 schema,
                 name,
             } => {
-                let key = GrantKey {
-                    role: role.clone(),
-                    object_type: *object_type,
-                    schema: schema.clone(),
-                    name: name.clone(),
-                };
-                let now_empty = if let Some(entry) = g.grants.get_mut(&key) {
-                    for p in privileges {
-                        entry.privileges.remove(p);
-                    }
-                    entry.privileges.is_empty()
+                // `REVOKE ... ON ALL ... IN SCHEMA` reaches every object of
+                // that type in the schema, not one key.
+                let affected: Vec<GrantKey> = if name.as_deref() == Some("*") {
+                    g.grants
+                        .keys()
+                        .filter(|key| {
+                            key.role == *role
+                                && key.object_type == *object_type
+                                && key.schema == *schema
+                        })
+                        .cloned()
+                        .collect()
                 } else {
-                    false
+                    vec![GrantKey {
+                        role: role.clone(),
+                        object_type: *object_type,
+                        schema: schema.clone(),
+                        name: name.clone(),
+                    }]
                 };
-                // An emptied grant is indistinguishable from "no grant" in the
-                // model (from_expanded only ever inserts non-empty entries).
-                if now_empty {
-                    g.grants.remove(&key);
+
+                for key in affected {
+                    let now_empty = if let Some(entry) = g.grants.get_mut(&key) {
+                        for p in privileges {
+                            entry.privileges.remove(p);
+                        }
+                        entry.privileges.is_empty()
+                    } else {
+                        false
+                    };
+                    // An emptied grant is indistinguishable from "no grant" in
+                    // the model (from_expanded only inserts non-empty entries).
+                    if now_empty {
+                        g.grants.remove(&key);
+                    }
                 }
             }
             Change::SetDefaultPrivilege {
                 owner,
-                schema,
+                scope,
                 on_type,
                 grantee,
                 privileges,
             } => {
                 let key = DefaultPrivKey {
                     owner: owner.clone(),
-                    schema: schema.clone(),
+                    scope: scope.clone(),
                     on_type: *on_type,
                     grantee: grantee.clone(),
                 };
@@ -671,14 +695,14 @@ fn apply_changes(graph: &RoleGraph, changes: &[Change]) -> RoleGraph {
             }
             Change::RevokeDefaultPrivilege {
                 owner,
-                schema,
+                scope,
                 on_type,
                 grantee,
                 privileges,
             } => {
                 let key = DefaultPrivKey {
                     owner: owner.clone(),
-                    schema: schema.clone(),
+                    scope: scope.clone(),
                     on_type: *on_type,
                     grantee: grantee.clone(),
                 };
@@ -916,6 +940,316 @@ fn additive_mode_soundness() {
                 }
                 _ => {}
             }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Property 6: absence assertions and the PUBLIC exemption
+// ---------------------------------------------------------------------------
+//
+// The equality-based properties above cannot express these semantics: a
+// converged graph legitimately keeps PUBLIC privileges no rule mentions, so it
+// is not equal to `desired`. The invariants that do hold are checked directly.
+//
+// Objects are generated across several schemas and object types on purpose. A
+// wildcard absence range-scans current grants by `(grantee, object_type,
+// schema)` prefix, so a prefix mistake would revoke across a neighbouring
+// schema or type and fail `unmanaged_public_survives` or `present_preserved`.
+
+/// A deliberately tiny privilege alphabet. Absence assertions only bite where
+/// the same privilege appears in several scopes, so a wide pool would make the
+/// interesting collisions vanishingly rare and the range-scan prefix would go
+/// untested.
+fn gen_narrow_priv_set(rng: &mut Rng) -> BTreeSet<Privilege> {
+    let pool = [Privilege::Select, Privilege::Execute];
+    let mut out = BTreeSet::new();
+    out.insert(pool[rng.usize(pool.len())]);
+    if rng.usize(3) == 0 {
+        out.insert(pool[rng.usize(pool.len())]);
+    }
+    out
+}
+
+/// Every object coordinate the absence generators draw from.
+fn absence_universe() -> Vec<(ObjectType, Option<String>, String)> {
+    let mut out = Vec::new();
+    for schema in ["s0", "s1"] {
+        for name in ["a", "b"] {
+            out.push((
+                ObjectType::Function,
+                Some(schema.to_string()),
+                format!("fn_{name}"),
+            ));
+            out.push((
+                ObjectType::Table,
+                Some(schema.to_string()),
+                format!("t_{name}"),
+            ));
+        }
+    }
+    out
+}
+
+fn gen_absence_pair(rng: &mut Rng) -> (RoleGraph, RoleGraph) {
+    let universe = absence_universe();
+    let grantees = [
+        Grantee::Public,
+        Grantee::Role("r0".to_string()),
+        Grantee::Role("r1".to_string()),
+    ];
+
+    // --- current: live ACLs, PUBLIC and roles alike ---
+    let mut current = RoleGraph::default();
+    for (object_type, schema, name) in &universe {
+        for grantee in &grantees {
+            if rng.usize(3) == 0 {
+                continue;
+            }
+            current.grants.insert(
+                GrantKey {
+                    role: grantee.clone(),
+                    object_type: *object_type,
+                    schema: schema.clone(),
+                    name: Some(name.clone()),
+                },
+                GrantState {
+                    privileges: gen_narrow_priv_set(rng),
+                },
+            );
+        }
+    }
+
+    // --- desired: present grants plus absence assertions ---
+    let mut desired = RoleGraph::default();
+    for (object_type, schema, name) in &universe {
+        for grantee in &grantees {
+            if rng.usize(4) != 0 {
+                continue;
+            }
+            desired.grants.insert(
+                GrantKey {
+                    role: grantee.clone(),
+                    object_type: *object_type,
+                    schema: schema.clone(),
+                    name: Some(name.clone()),
+                },
+                GrantState {
+                    privileges: gen_narrow_priv_set(rng),
+                },
+            );
+        }
+    }
+
+    // Absences, exact and wildcard. A real manifest can never assert the same
+    // key+privilege both ways (validation rejects it), and a wildcard may not
+    // disagree with a named selector in the same scope — mirror both so the
+    // generated pair stays reachable from valid YAML.
+    let absence_count = rng.usize(5);
+    for _ in 0..absence_count {
+        let grantee = grantees[rng.usize(grantees.len())].clone();
+        let (object_type, schema, name) = &universe[rng.usize(universe.len())];
+        let wildcard = rng.usize(2) == 0;
+        let key = GrantKey {
+            role: grantee.clone(),
+            object_type: *object_type,
+            schema: schema.clone(),
+            name: Some(if wildcard {
+                "*".to_string()
+            } else {
+                name.clone()
+            }),
+        };
+
+        // Privileges already claimed present anywhere in this scope are off
+        // limits for an absence assertion.
+        let claimed: BTreeSet<Privilege> = desired
+            .grants
+            .iter()
+            .filter(|(k, _)| {
+                k.role == grantee && k.object_type == *object_type && k.schema == *schema
+            })
+            .flat_map(|(_, state)| state.privileges.iter().copied())
+            .collect();
+        let absent: BTreeSet<Privilege> = gen_narrow_priv_set(rng)
+            .into_iter()
+            .filter(|p| !claimed.contains(p))
+            .collect();
+        if absent.is_empty() {
+            continue;
+        }
+        desired
+            .grant_absences
+            .entry(key)
+            .or_default()
+            .extend(absent);
+    }
+
+    // Default-privilege absences, in both scopes.
+    let dp_count = rng.usize(3);
+    for _ in 0..dp_count {
+        let grantee = grantees[rng.usize(grantees.len())].clone();
+        let scope = if rng.usize(2) == 0 {
+            DefaultPrivilegeScope::Global
+        } else {
+            DefaultPrivilegeScope::Schema {
+                schema: format!("s{}", rng.usize(2)),
+            }
+        };
+        let key = DefaultPrivKey {
+            owner: format!("r{}", rng.usize(2)),
+            scope,
+            on_type: ObjectType::Function,
+            grantee,
+        };
+        if desired.default_privileges.contains_key(&key) {
+            continue;
+        }
+        let privileges = gen_narrow_priv_set(rng);
+        if privileges.is_empty() {
+            continue;
+        }
+        if rng.usize(2) == 0 {
+            current.default_privileges.insert(
+                key.clone(),
+                DefaultPrivState {
+                    privileges: gen_narrow_priv_set(rng),
+                },
+            );
+        }
+        desired.default_privilege_absences.insert(key, privileges);
+    }
+
+    (current, desired)
+}
+
+#[test]
+fn absence_assertions_converge_and_leave_unmanaged_public_alone() {
+    let mut outer = Rng::new(0xAB5E_17CE);
+    for _ in 0..ITERATIONS {
+        let seed = outer.next_u64();
+        let mut rng = Rng::new(seed);
+        let (current, desired) = gen_absence_pair(&mut rng);
+
+        let changes = diff(&current, &desired);
+        let converged = apply_changes(&current, &changes);
+
+        // 1. Every asserted absence holds afterwards.
+        for (key, absent) in &desired.grant_absences {
+            let held: BTreeSet<Privilege> = if key.name.as_deref() == Some("*") {
+                converged
+                    .grants
+                    .iter()
+                    .filter(|(k, _)| {
+                        k.role == key.role
+                            && k.object_type == key.object_type
+                            && k.schema == key.schema
+                    })
+                    .flat_map(|(_, state)| state.privileges.iter().copied())
+                    .collect()
+            } else {
+                converged
+                    .grants
+                    .get(key)
+                    .map(|state| state.privileges.clone())
+                    .unwrap_or_default()
+            };
+            let still_held: Vec<&Privilege> = absent.intersection(&held).collect();
+            assert!(
+                still_held.is_empty(),
+                "seed {seed}: absence not satisfied for {key:?}: {still_held:?}\n\
+                 --- CURRENT ---\n{current:#?}\n--- CHANGES ---\n{changes:#?}"
+            );
+        }
+        for (key, absent) in &desired.default_privilege_absences {
+            if let Some(state) = converged.default_privileges.get(key) {
+                let still_held: Vec<&Privilege> = absent.intersection(&state.privileges).collect();
+                assert!(
+                    still_held.is_empty(),
+                    "seed {seed}: default-privilege absence not satisfied for {key:?}: {still_held:?}"
+                );
+            }
+        }
+
+        // 2. Everything asserted present is present.
+        for (key, want) in &desired.grants {
+            let got = converged
+                .grants
+                .get(key)
+                .map(|state| state.privileges.clone())
+                .unwrap_or_default();
+            let missing: Vec<&Privilege> = want.privileges.difference(&got).collect();
+            assert!(
+                missing.is_empty(),
+                "seed {seed}: present grant not satisfied for {key:?}: missing {missing:?}"
+            );
+        }
+
+        // 3. PUBLIC privileges no rule names survive. This is the property
+        //    that keeps authoritative mode from stripping ACLs pgroles was
+        //    never told about, and the one a bad range-scan prefix breaks.
+        for (key, state) in &current.grants {
+            if !key.role.is_public() {
+                continue;
+            }
+            for privilege in &state.privileges {
+                let named_absent = desired.grant_absences.iter().any(|(k, absent)| {
+                    k.role == key.role
+                        && k.object_type == key.object_type
+                        && k.schema == key.schema
+                        && (k.name == key.name || k.name.as_deref() == Some("*"))
+                        && absent.contains(privilege)
+                });
+                if named_absent {
+                    continue;
+                }
+                assert!(
+                    converged
+                        .grants
+                        .get(key)
+                        .is_some_and(|state| state.privileges.contains(privilege)),
+                    "seed {seed}: unmanaged PUBLIC {privilege} on {key:?} was revoked\n\
+                     --- CHANGES ---\n{changes:#?}"
+                );
+            }
+        }
+
+        // 4. Idempotence.
+        let residual = diff(&converged, &desired);
+        assert!(
+            residual.is_empty(),
+            "seed {seed}: not idempotent, residual: {residual:#?}\n\
+             --- CURRENT ---\n{current:#?}\n--- CHANGES ---\n{changes:#?}"
+        );
+    }
+}
+
+#[test]
+fn absence_assertions_are_ignored_in_additive_mode() {
+    let mut outer = Rng::new(0xADD1_71FE);
+    for _ in 0..ITERATIONS {
+        let seed = outer.next_u64();
+        let mut rng = Rng::new(seed);
+        let (current, desired) = gen_absence_pair(&mut rng);
+
+        let additive = pgroles_core::diff::filter_changes(
+            diff(&current, &desired),
+            pgroles_core::diff::ReconciliationMode::Additive,
+        );
+        let converged = apply_changes(&current, &additive);
+
+        // Additive never revokes, so nothing loses a privilege it held.
+        for (key, state) in &current.grants {
+            let after = converged
+                .grants
+                .get(key)
+                .map(|s| s.privileges.clone())
+                .unwrap_or_default();
+            let lost: Vec<&Privilege> = state.privileges.difference(&after).collect();
+            assert!(
+                lost.is_empty(),
+                "seed {seed}: additive mode revoked {lost:?} from {key:?}"
+            );
         }
     }
 }

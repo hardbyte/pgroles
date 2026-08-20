@@ -35,6 +35,11 @@ pub enum CompositionError {
     )]
     SchemaBindingsOutOfScope { document: String, schema: String },
 
+    #[error(
+        "policy document \"{document}\" declares global default privileges for owner \"{owner}\" but does not own that role — global defaults affect every schema, so only the document with role \"{owner}\" in its scope may manage them"
+    )]
+    GlobalDefaultPrivilegeOutOfScope { document: String, owner: String },
+
     #[error("policy documents \"{first}\" and \"{second}\" both manage role \"{role}\"")]
     DuplicateManagedRole {
         role: String,
@@ -347,15 +352,34 @@ fn validate_document_scope(
     }
 
     for default_privilege in &document.fragment.default_privileges {
-        if !has_schema_facet(
-            &schema_scope,
-            &default_privilege.schema,
-            SchemaBindingFacet::Bindings,
-        ) {
-            return Err(CompositionError::SchemaBindingsOutOfScope {
+        let scope = default_privilege.resolved_scope().map_err(|error| {
+            CompositionError::InvalidDocument {
                 document: document_name.clone(),
-                schema: default_privilege.schema.clone(),
-            });
+                error,
+            }
+        })?;
+        match scope {
+            crate::model::DefaultPrivilegeScope::Schema { schema } => {
+                if !has_schema_facet(&schema_scope, &schema, SchemaBindingFacet::Bindings) {
+                    return Err(CompositionError::SchemaBindingsOutOfScope {
+                        document: document_name.clone(),
+                        schema,
+                    });
+                }
+            }
+            crate::model::DefaultPrivilegeScope::Global => {
+                let owner = default_privilege
+                    .owner
+                    .as_deref()
+                    .or(bundle.shared.default_owner.as_deref())
+                    .unwrap_or("postgres");
+                if !owned_roles.contains(owner) {
+                    return Err(CompositionError::GlobalDefaultPrivilegeOutOfScope {
+                        document: document_name.clone(),
+                        owner: owner.to_string(),
+                    });
+                }
+            }
         }
     }
 
@@ -417,11 +441,25 @@ fn register_document_ownership(
         }
     }
 
-    for grant in desired.grants.keys() {
+    // Absence keys claim ownership too: two fragments may not assert the same
+    // key even with opposite ensure, and the index collision is what catches
+    // a present-vs-absent split across fragments. One document may hold the
+    // same key in both maps (disjoint privileges), so deduplicate first.
+    let grant_keys: BTreeSet<&crate::model::GrantKey> = desired
+        .grants
+        .keys()
+        .chain(desired.grant_absences.keys())
+        .collect();
+    for grant in grant_keys {
         register_grant_owner(ownership, grant, &label)?;
     }
 
-    for default_privilege in desired.default_privileges.keys() {
+    let default_privilege_keys: BTreeSet<&crate::model::DefaultPrivKey> = desired
+        .default_privileges
+        .keys()
+        .chain(desired.default_privilege_absences.keys())
+        .collect();
+    for default_privilege in default_privilege_keys {
         register_default_privilege_owner(ownership, default_privilege, &label)?;
     }
 
@@ -549,8 +587,8 @@ fn format_grant_key(key: &GrantKey) -> String {
 
 fn format_default_privilege_key(key: &DefaultPrivKey) -> String {
     format!(
-        "owner \"{}\" schema \"{}\" on {} to \"{}\"",
-        key.owner, key.schema, key.on_type, key.grantee
+        "owner \"{}\" {} on {} to \"{}\"",
+        key.owner, key.scope, key.on_type, key.grantee
     )
 }
 
@@ -829,9 +867,11 @@ grants:
         let mut ownership = OwnershipIndex::default();
         let key = DefaultPrivKey {
             owner: "app_owner".to_string(),
-            schema: "inventory".to_string(),
+            scope: crate::model::DefaultPrivilegeScope::Schema {
+                schema: "inventory".to_string(),
+            },
             on_type: crate::manifest::ObjectType::Table,
-            grantee: "app".to_string(),
+            grantee: "app".into(),
         };
 
         register_default_privilege_owner(&mut ownership, &key, "first")
@@ -906,7 +946,7 @@ memberships:
 
         let result = validate_changes_against_managed_surface(
             &[Change::Revoke {
-                role: "app".to_string(),
+                role: "app".into(),
                 privileges: BTreeSet::from([Privilege::Connect]),
                 object_type: ObjectType::Database,
                 schema: None,
@@ -942,5 +982,200 @@ memberships:
         assert_eq!(SchemaBindingFacet::Owner.to_string(), "owner");
         assert_eq!(SchemaBindingFacet::Bindings.to_string(), "bindings");
         assert_eq!(Privilege::Usage.to_string(), "USAGE");
+    }
+
+    // -----------------------------------------------------------------------
+    // Global default privileges and absence assertions across fragments
+    // -----------------------------------------------------------------------
+
+    fn single_source_bundle(file: &str) -> PolicyBundle {
+        PolicyBundle {
+            shared: SharedPolicy::default(),
+            sources: vec![BundleSource {
+                file: file.to_string(),
+            }],
+        }
+    }
+
+    fn document(source: &str, yaml: &str) -> PolicyDocument {
+        PolicyDocument {
+            source: source.to_string(),
+            fragment: parse_policy_fragment(yaml).expect("fragment should parse"),
+        }
+    }
+
+    #[test]
+    fn global_default_privileges_require_owning_the_owner_role() {
+        let owned = document(
+            "api.yaml",
+            r#"
+scope:
+  roles: [api_owner]
+roles:
+  - name: api_owner
+default_privileges:
+  - owner: api_owner
+    scope: { type: global }
+    grant:
+      - role: PUBLIC
+        ensure: absent
+        privileges: [EXECUTE]
+        on_type: function
+"#,
+        );
+        compose_bundle(&single_source_bundle("api.yaml"), &[owned])
+            .expect("owning the role should allow managing its global defaults");
+
+        // A global default reaches every schema in the database, so a document
+        // that does not own the role must not declare one.
+        let unowned = document(
+            "api.yaml",
+            r#"
+scope:
+  roles: [someone_else]
+default_privileges:
+  - owner: api_owner
+    scope: { type: global }
+    grant:
+      - role: PUBLIC
+        ensure: absent
+        privileges: [EXECUTE]
+        on_type: function
+"#,
+        );
+        let error = compose_bundle(&single_source_bundle("api.yaml"), &[unowned])
+            .expect_err("scope validation should fail");
+        assert!(matches!(
+            error,
+            CompositionError::GlobalDefaultPrivilegeOutOfScope { owner, .. } if owner == "api_owner"
+        ));
+    }
+
+    #[test]
+    fn two_fragments_may_not_split_one_assertion_into_present_and_absent() {
+        let bundle = PolicyBundle {
+            shared: SharedPolicy::default(),
+            sources: vec![
+                BundleSource {
+                    file: "a.yaml".to_string(),
+                },
+                BundleSource {
+                    file: "b.yaml".to_string(),
+                },
+            ],
+        };
+        let present = document(
+            "a.yaml",
+            r#"
+policy:
+  name: a
+scope:
+  schemas:
+    - name: api
+      facets: [bindings]
+grants:
+  - role: PUBLIC
+    privileges: [EXECUTE]
+    object: { type: function, schema: api, name: "f()" }
+"#,
+        );
+        let absent = document(
+            "b.yaml",
+            r#"
+policy:
+  name: b
+scope:
+  schemas:
+    - name: api
+      facets: [bindings]
+grants:
+  - role: PUBLIC
+    ensure: absent
+    privileges: [EXECUTE]
+    object: { type: function, schema: api, name: "f()" }
+"#,
+        );
+
+        // Managing a schema's grants requires its `bindings` facet, and one
+        // facet has exactly one owner, so the split is caught before the
+        // grant keys are even compared.
+        let error = compose_bundle(&bundle, &[present, absent])
+            .expect_err("the same key claimed twice must fail");
+        assert!(
+            matches!(
+                error,
+                CompositionError::DuplicateManagedSchemaFacet { ref schema, .. } if schema == "api"
+            ),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn one_fragment_may_not_split_an_assertion_into_present_and_absent() {
+        let document = document(
+            "api.yaml",
+            r#"
+scope:
+  schemas:
+    - name: api
+      facets: [bindings]
+grants:
+  - role: PUBLIC
+    privileges: [EXECUTE]
+    object: { type: function, schema: api, name: "f()" }
+  - role: PUBLIC
+    ensure: absent
+    privileges: [EXECUTE]
+    object: { type: function, schema: api, name: "f()" }
+"#,
+        );
+
+        let error = compose_bundle(&single_source_bundle("api.yaml"), &[document])
+            .expect_err("conflicting ensure must fail");
+        assert!(
+            matches!(
+                error,
+                CompositionError::InvalidDocument {
+                    error: ManifestError::ConflictingGrantEnsure { .. },
+                    ..
+                }
+            ),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn managed_surface_allows_global_defaults_only_for_owned_owners() {
+        let mut surface = ManagedChangeSurface {
+            roles: BTreeSet::from(["api_owner".to_string()]),
+            ..ManagedChangeSurface::default()
+        };
+
+        let change_for = |owner: &str| Change::RevokeDefaultPrivilege {
+            owner: owner.to_string(),
+            scope: crate::model::DefaultPrivilegeScope::Global,
+            on_type: ObjectType::Function,
+            grantee: crate::model::Grantee::Public,
+            privileges: BTreeSet::from([Privilege::Execute]),
+        };
+
+        validate_changes_against_managed_surface(&[change_for("api_owner")], &surface)
+            .expect("owned owner is in scope");
+
+        let error = validate_changes_against_managed_surface(&[change_for("stranger")], &surface)
+            .expect_err("unowned owner is out of scope");
+        assert!(matches!(error, ManagedChangeError::OutOfScope { .. }));
+
+        // An explicitly claimed key is allowed regardless of role ownership.
+        surface
+            .explicit_default_privileges
+            .insert(crate::model::DefaultPrivKey {
+                owner: "stranger".to_string(),
+                scope: crate::model::DefaultPrivilegeScope::Global,
+                on_type: ObjectType::Function,
+                grantee: crate::model::Grantee::Public,
+            });
+        validate_changes_against_managed_surface(&[change_for("stranger")], &surface)
+            .expect("explicit claim is in scope");
     }
 }

@@ -11,7 +11,8 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use pgroles_core::bounds::*;
 use pgroles_core::manifest::{
-    DefaultPrivilege, Grant, Membership, ObjectType, Privilege, RoleRetirement, SchemaBinding,
+    DefaultPrivilege, Ensure, Grant, Membership, ObjectType, Privilege, RoleRetirement,
+    SchemaBinding,
 };
 
 /// Valid PostgreSQL SSL modes for connection params.
@@ -651,6 +652,12 @@ pub struct ProfileGrantSpec {
     pub privileges: Vec<Privilege>,
     #[serde(alias = "on")]
     pub object: ProfileObjectTargetSpec,
+    /// Whether the privilege must be present or absent. Matches the top-level
+    /// `grants` entries, which carry the same field. Profiles are additive
+    /// templates, so validation rejects `absent`; the schema accepts it so the
+    /// API server does not prune the value before that check can name it.
+    #[serde(default, skip_serializing_if = "Ensure::is_present")]
+    pub ensure: Ensure,
 }
 
 /// Object target within a profile.
@@ -672,6 +679,10 @@ pub struct DefaultPrivilegeGrantSpec {
     #[schemars(length(min = 1, max = MAX_PRIVILEGES))]
     pub privileges: Vec<Privilege>,
     pub on_type: ObjectType,
+    /// Whether the privilege must be present or absent. Matches the
+    /// top-level `default_privileges` entries, which carry the same field.
+    #[serde(default, skip_serializing_if = "Ensure::is_present")]
+    pub ensure: Ensure,
 }
 
 /// A concrete role definition (CRD-compatible version).
@@ -1733,17 +1744,34 @@ impl DatabaseIdentity {
 pub struct OwnershipClaims {
     pub roles: BTreeSet<String>,
     pub schemas: BTreeSet<String>,
+    /// Databases whose PUBLIC privileges this policy asserts.
+    ///
+    /// A database-level rule names no schema, and PUBLIC cannot be claimed as
+    /// a role, so such a rule would otherwise claim nothing at all. PUBLIC is
+    /// one shared surface per database, so two policies writing it conflict
+    /// even when their roles and schemas are disjoint. Database grants to a
+    /// named role are already covered by the role claim, and are deliberately
+    /// not claimed here — two teams granting CONNECT to their own roles on a
+    /// shared database do not conflict.
+    pub public_databases: BTreeSet<String>,
 }
 
 impl OwnershipClaims {
     pub fn overlaps(&self, other: &Self) -> bool {
-        !self.roles.is_disjoint(&other.roles) || !self.schemas.is_disjoint(&other.schemas)
+        !self.roles.is_disjoint(&other.roles)
+            || !self.schemas.is_disjoint(&other.schemas)
+            || !self.public_databases.is_disjoint(&other.public_databases)
     }
 
     pub fn overlap_summary(&self, other: &Self) -> String {
         let overlapping_roles: Vec<_> = self.roles.intersection(&other.roles).cloned().collect();
         let overlapping_schemas: Vec<_> =
             self.schemas.intersection(&other.schemas).cloned().collect();
+        let overlapping_databases: Vec<_> = self
+            .public_databases
+            .intersection(&other.public_databases)
+            .cloned()
+            .collect();
 
         let mut parts = Vec::new();
         if !overlapping_roles.is_empty() {
@@ -1751,6 +1779,12 @@ impl OwnershipClaims {
         }
         if !overlapping_schemas.is_empty() {
             parts.push(format!("schemas: {}", overlapping_schemas.join(", ")));
+        }
+        if !overlapping_databases.is_empty() {
+            parts.push(format!(
+                "PUBLIC on databases: {}",
+                overlapping_databases.join(", ")
+            ));
         }
 
         parts.join("; ")
@@ -2060,6 +2094,7 @@ fn build_policy_manifest<'a>(
                             object_type: g.object.object_type,
                             name: g.object.name.clone(),
                         },
+                        ensure: g.ensure,
                     })
                     .collect(),
                 default_privileges: spec
@@ -2069,6 +2104,7 @@ fn build_policy_manifest<'a>(
                         role: dp.role.clone(),
                         privileges: dp.privileges.clone(),
                         on_type: dp.on_type,
+                        ensure: dp.ensure,
                     })
                     .collect(),
                 config: spec.config.clone(),
@@ -2214,14 +2250,29 @@ impl PostgresPolicySpec {
 
         let mut roles: BTreeSet<String> = expanded.roles.into_iter().map(|r| r.name).collect();
         let mut schemas: BTreeSet<String> = self.schemas.iter().map(|s| s.name.clone()).collect();
+        // A database-level PUBLIC rule names no schema and no claimable role.
+        let public_databases: BTreeSet<String> = manifest
+            .grants
+            .iter()
+            .filter(|g| g.object.object_type == ObjectType::Database && g.role == "PUBLIC")
+            .map(|g| g.object.name.clone().unwrap_or_default())
+            .collect();
 
         roles.extend(manifest.retirements.into_iter().map(|r| r.role));
-        roles.extend(manifest.grants.iter().map(|g| g.role.clone()));
+        // PUBLIC is a pseudo-role, not a role this policy may claim.
+        roles.extend(
+            manifest
+                .grants
+                .iter()
+                .map(|g| g.role.clone())
+                .filter(|role| role != "PUBLIC"),
+        );
         roles.extend(
             manifest
                 .default_privileges
                 .iter()
-                .flat_map(|dp| dp.grant.iter().filter_map(|grant| grant.role.clone())),
+                .flat_map(|dp| dp.grant.iter().filter_map(|grant| grant.role.clone()))
+                .filter(|role| role != "PUBLIC"),
         );
         roles.extend(manifest.memberships.iter().map(|m| m.role.clone()));
         roles.extend(
@@ -2241,14 +2292,31 @@ impl PostgresPolicySpec {
                     _ => g.object.schema.clone(),
                 }),
         );
-        schemas.extend(
-            manifest
-                .default_privileges
-                .iter()
-                .map(|dp| dp.schema.clone()),
-        );
+        // Global-scope entries have no schema; their claim is the owner role.
+        for dp in &manifest.default_privileges {
+            match dp.resolved_scope() {
+                Ok(scope) => match scope.schema() {
+                    Some(schema) => {
+                        schemas.insert(schema.to_string());
+                    }
+                    // An entry that omits `owner` still resolves to one, so it
+                    // has to claim the same role the reconcile will act as.
+                    None => {
+                        if let Some(owner) = dp.owner.as_ref().or(manifest.default_owner.as_ref()) {
+                            roles.insert(owner.clone());
+                        }
+                    }
+                },
+                // expand_manifest above already rejected invalid scopes.
+                Err(_) => continue,
+            }
+        }
 
-        Ok(OwnershipClaims { roles, schemas })
+        Ok(OwnershipClaims {
+            roles,
+            schemas,
+            public_databases,
+        })
     }
 }
 
@@ -3168,6 +3236,54 @@ mod tests {
         assert!(claims.roles.contains("app-service"));
         assert!(claims.roles.contains("legacy-app"));
         assert!(claims.schemas.contains("inventory"));
+    }
+
+    #[test]
+    fn a_global_default_privilege_claims_the_implicit_default_owner() {
+        let spec = PostgresPolicySpec {
+            connection: ConnectionSpec {
+                secret_ref: Some(SecretReference {
+                    name: "pg-secret".to_string(),
+                }),
+                secret_key: Some("DATABASE_URL".to_string()),
+                params: None,
+                require_physical_identity: None,
+            },
+            interval: "5m".to_string(),
+            suspend: false,
+            mode: PolicyMode::Apply,
+            reconciliation_mode: CrdReconciliationMode::default(),
+            default_owner: Some("app_owner".to_string()),
+            profiles: std::collections::HashMap::new(),
+            schemas: vec![],
+            roles: vec![],
+            grants: vec![],
+            // No `owner`, so the claim has to come from `default_owner`.
+            default_privileges: vec![DefaultPrivilege {
+                owner: None,
+                schema: None,
+                scope: Some(pgroles_core::manifest::DefaultPrivilegeScopeSpec {
+                    scope_type: pgroles_core::manifest::DefaultPrivilegeScopeType::Global,
+                    schema: None,
+                }),
+                grant: vec![pgroles_core::manifest::DefaultPrivilegeGrant {
+                    role: Some("reader".to_string()),
+                    privileges: vec![pgroles_core::manifest::Privilege::Select],
+                    on_type: ObjectType::Table,
+                    ensure: pgroles_core::manifest::Ensure::Present,
+                }],
+            }],
+            memberships: vec![],
+            retirements: vec![],
+            approval: None,
+        };
+
+        let claims = spec.ownership_claims().unwrap();
+        assert!(
+            claims.roles.contains("app_owner"),
+            "expected the resolved default owner to be claimed, got {:?}",
+            claims.roles
+        );
     }
 
     #[test]
@@ -4186,6 +4302,78 @@ params:
         assert!(!left.overlaps(&right));
         let summary = left.overlap_summary(&right);
         assert!(summary.is_empty());
+    }
+
+    /// Build a spec whose only content is one database-level PUBLIC grant.
+    fn public_connect_spec(
+        database: &str,
+        ensure: pgroles_core::manifest::Ensure,
+    ) -> PostgresPolicySpec {
+        PostgresPolicySpec {
+            connection: ConnectionSpec {
+                secret_ref: Some(SecretReference {
+                    name: "pg-secret".to_string(),
+                }),
+                secret_key: Some("DATABASE_URL".to_string()),
+                params: None,
+                require_physical_identity: None,
+            },
+            interval: "5m".to_string(),
+            suspend: false,
+            mode: PolicyMode::Apply,
+            reconciliation_mode: CrdReconciliationMode::default(),
+            default_owner: None,
+            profiles: std::collections::HashMap::new(),
+            schemas: vec![],
+            roles: vec![],
+            grants: vec![Grant {
+                role: "PUBLIC".to_string(),
+                privileges: vec![pgroles_core::manifest::Privilege::Connect],
+                object: pgroles_core::manifest::ObjectTarget {
+                    object_type: ObjectType::Database,
+                    schema: None,
+                    name: Some(database.to_string()),
+                },
+                ensure,
+            }],
+            default_privileges: vec![],
+            memberships: vec![],
+            retirements: vec![],
+            approval: None,
+        }
+    }
+
+    #[test]
+    fn contradictory_public_database_rules_are_detected_as_conflicting() {
+        use pgroles_core::manifest::Ensure;
+        // Disjoint in roles and schemas: both claim nothing but PUBLIC on the
+        // same database, and they assert opposite states for it.
+        let present = public_connect_spec("mydb", Ensure::Present)
+            .ownership_claims()
+            .unwrap();
+        let absent = public_connect_spec("mydb", Ensure::Absent)
+            .ownership_claims()
+            .unwrap();
+
+        assert!(present.roles.is_disjoint(&absent.roles));
+        assert!(present.schemas.is_disjoint(&absent.schemas));
+        assert!(
+            present.overlaps(&absent),
+            "two policies writing PUBLIC on the same database must conflict"
+        );
+        assert!(present.overlap_summary(&absent).contains("mydb"));
+    }
+
+    #[test]
+    fn public_rules_on_different_databases_do_not_conflict() {
+        use pgroles_core::manifest::Ensure;
+        let left = public_connect_spec("orders", Ensure::Present)
+            .ownership_claims()
+            .unwrap();
+        let right = public_connect_spec("billing", Ensure::Present)
+            .ownership_claims()
+            .unwrap();
+        assert!(!left.overlaps(&right));
     }
 
     #[test]

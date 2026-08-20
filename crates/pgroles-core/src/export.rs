@@ -7,17 +7,30 @@
 use std::collections::BTreeMap;
 
 use crate::manifest::{
-    DefaultPrivilege, DefaultPrivilegeGrant, Grant, MemberSpec, Membership, ObjectTarget,
-    PolicyManifest, RoleDefinition, SchemaBinding,
+    DefaultPrivilege, DefaultPrivilegeGrant, DefaultPrivilegeScopeSpec, DefaultPrivilegeScopeType,
+    Ensure, Grant, MemberSpec, Membership, ObjectTarget, PolicyManifest, RoleDefinition,
+    SchemaBinding,
 };
-use crate::model::RoleGraph;
+use crate::model::{DefaultPrivilegeScope, RoleGraph};
 
 /// Convert a [`RoleGraph`] into a flat [`PolicyManifest`].
 ///
 /// The resulting manifest uses no profiles — all roles, grants, default
 /// privileges, and memberships are emitted as top-level entries. This makes
 /// the output straightforward and correct for round-tripping.
+///
+/// Absence assertions are intentionally not exported. `generate` builds
+/// this from an inspected graph, where the maps are always empty, and inventing
+/// `ensure: absent` from a privilege that merely happens to be missing would
+/// assert policy the user never stated. A caller passing a *desired* graph
+/// would lose those assertions — export the manifest it came from instead.
 pub fn role_graph_to_manifest(graph: &RoleGraph) -> PolicyManifest {
+    debug_assert!(
+        graph.grant_absences.is_empty() && graph.default_privilege_absences.is_empty(),
+        "role_graph_to_manifest cannot represent absence assertions; \
+         export the source manifest rather than a desired graph"
+    );
+
     // --- Roles ---
     let roles: Vec<RoleDefinition> = graph
         .roles
@@ -89,13 +102,14 @@ pub fn role_graph_to_manifest(graph: &RoleGraph) -> PolicyManifest {
         .grants
         .iter()
         .map(|(key, state)| Grant {
-            role: key.role.clone(),
+            role: key.role.as_str().to_string(),
             privileges: state.privileges.iter().copied().collect(),
             object: ObjectTarget {
                 object_type: key.object_type,
                 schema: key.schema.clone(),
                 name: key.name.clone(),
             },
+            ensure: Ensure::Present,
         })
         .collect();
 
@@ -112,24 +126,42 @@ pub fn role_graph_to_manifest(graph: &RoleGraph) -> PolicyManifest {
         .collect();
 
     // --- Default privileges ---
-    // Group by (owner, schema) to produce compact default_privileges entries.
-    let mut dp_groups: BTreeMap<(String, String), Vec<DefaultPrivilegeGrant>> = BTreeMap::new();
+    // Group by (owner, scope) to produce compact default_privileges entries.
+    let mut dp_groups: BTreeMap<(String, DefaultPrivilegeScope), Vec<DefaultPrivilegeGrant>> =
+        BTreeMap::new();
     for (key, state) in &graph.default_privileges {
         dp_groups
-            .entry((key.owner.clone(), key.schema.clone()))
+            .entry((key.owner.clone(), key.scope.clone()))
             .or_default()
             .push(DefaultPrivilegeGrant {
-                role: Some(key.grantee.clone()),
+                role: Some(key.grantee.as_str().to_string()),
                 privileges: state.privileges.iter().copied().collect(),
                 on_type: key.on_type,
+                ensure: Ensure::Present,
             });
     }
     let default_privileges: Vec<DefaultPrivilege> = dp_groups
         .into_iter()
-        .map(|((owner, schema), grant)| DefaultPrivilege {
-            owner: Some(owner),
-            schema,
-            grant,
+        .map(|((owner, scope), grant)| {
+            // Schema scope keeps the `schema:` shorthand so exported YAML for
+            // existing databases is unchanged; only global scope needs the
+            // explicit `scope` field.
+            let (schema, scope) = match scope {
+                DefaultPrivilegeScope::Schema { schema } => (Some(schema), None),
+                DefaultPrivilegeScope::Global => (
+                    None,
+                    Some(DefaultPrivilegeScopeSpec {
+                        scope_type: DefaultPrivilegeScopeType::Global,
+                        schema: None,
+                    }),
+                ),
+            };
+            DefaultPrivilege {
+                owner: Some(owner),
+                schema,
+                scope,
+                grant,
+            }
         })
         .collect();
 

@@ -2,33 +2,50 @@
 //!
 //! Default privileges control the ACLs automatically applied to newly created
 //! objects. They are set via `ALTER DEFAULT PRIVILEGES FOR ROLE <owner>
-//! IN SCHEMA <schema> GRANT ... ON <type> TO <grantee>`.
+//! [IN SCHEMA <schema>] GRANT/REVOKE ... ON <type> TO/FROM <grantee>`.
 //!
 //! The `pg_default_acl` table stores:
 //!   - `defaclrole`: OID of the owner role
-//!   - `defaclnamespace`: OID of the schema (0 = global, i.e. all schemas)
+//!   - `defaclnamespace`: OID of the schema (0 = the owner-wide global layer)
 //!   - `defaclobjtype`: char indicating the object type
 //!     'r' = relation (table), 'S' = sequence, 'f' = function, 'T' = type, 'n' = schema
 //!   - `defaclacl`: the ACL array
 //!
 //! We use `aclexplode(defaclacl)` to decompose the ACL into individual grants.
+//!
+//! Two layers are inspected. The schema layer covers explicit rows in managed
+//! schemas. The global layer is fetched only for `(owner, type)` pairs the
+//! manifest declares with `scope: {type: global}`, and it reports the
+//! *effective* default: when no explicit row exists, `acldefault(type, owner)`
+//! stands in, so PostgreSQL's built-in `PUBLIC EXECUTE` on routines (and
+//! `PUBLIC USAGE` on types) is visible to `ensure: absent` rules. Owner
+//! self-entries are excluded in SQL: every `ALTER DEFAULT PRIVILEGES`
+//! materializes the owner's implicit self-grant into the explicit row, and
+//! reporting it would make authoritative mode revoke the owner's own default
+//! on the next reconcile. The accepted blind spot is that an intentional
+//! owner-self default change is invisible to pgroles.
 
 use std::collections::BTreeMap;
 
 use sqlx::PgPool;
 
 use pgroles_core::manifest::{ObjectType, Privilege};
-use pgroles_core::model::{DefaultPrivKey, DefaultPrivState};
+use pgroles_core::model::{DefaultPrivKey, DefaultPrivState, DefaultPrivilegeScope, Grantee};
 
-/// A raw row from the `pg_default_acl` + `aclexplode()` query.
+use crate::DefaultPrivScopePattern;
+
+/// A raw row from the `pg_default_acl` + `aclexplode()` queries.
 #[derive(Debug, sqlx::FromRow)]
 struct DefaultAclRow {
     /// The owner role name (whose newly-created objects get these defaults).
     owner_name: String,
-    /// The schema name (NULL for global defaults — we filter these out).
+    /// The schema name (NULL for global-layer rows).
     schema_name: Option<String>,
-    /// The grantee role name (NULL means PUBLIC — we skip those).
+    /// The grantee role name. NULL for PUBLIC (see `is_public`) and for
+    /// dangling grantee OIDs.
     grantee: Option<String>,
+    /// True when the ACL grantee is OID 0, i.e. PUBLIC.
+    is_public: bool,
     /// The privilege character (same mapping as regular ACLs).
     privilege_type: String,
     /// The object type character from `defaclobjtype`.
@@ -69,25 +86,57 @@ fn acl_char_to_privilege(character: &str) -> Option<Privilege> {
     }
 }
 
-/// Fetch all default privileges from `pg_default_acl` for the given schemas and roles.
+/// Map `ObjectType` to the `defaclobjtype` character.
+fn object_type_to_defacl_char(object_type: ObjectType) -> Option<&'static str> {
+    match object_type {
+        ObjectType::Table => Some("r"),
+        ObjectType::Sequence => Some("S"),
+        ObjectType::Function => Some("f"),
+        ObjectType::Type => Some("T"),
+        ObjectType::Schema => Some("n"),
+        _ => None,
+    }
+}
+
+/// Map `ObjectType` to the character `acldefault()` expects.
 ///
-/// Returns a map of `DefaultPrivKey → DefaultPrivState` ready for insertion into a `RoleGraph`.
+/// This is not the same alphabet as `defaclobjtype`. `acldefault` spells a
+/// sequence `s`, and reads `S` as a foreign server, so passing the
+/// `pg_default_acl` character straight through returns a foreign server's
+/// defaults for sequences instead of erroring.
+fn object_type_to_acldefault_char(object_type: ObjectType) -> Option<&'static str> {
+    match object_type {
+        ObjectType::Sequence => Some("s"),
+        other => object_type_to_defacl_char(other),
+    }
+}
+
+/// Fetch default privileges for the managed schemas, roles, and declared
+/// entry scopes.
 ///
-/// Only returns defaults where the schema is in `managed_schemas` and the grantee
-/// is in `managed_roles`. Owner filtering is intentionally NOT done here — we want
-/// to capture defaults set by any owner (the manifest's `default_owner` or
-/// per-schema `owner`) as long as the grantee is managed.
-pub async fn fetch_default_privileges(
+/// Returns a map of `DefaultPrivKey → DefaultPrivState` ready for insertion
+/// into a `RoleGraph`.
+///
+/// Role-grantee rows in the schema layer keep the historical rule: any owner,
+/// as long as the schema is managed and the grantee is managed. PUBLIC rows
+/// and everything in the global layer are assertion-scoped instead — they are
+/// reported only for the exact `(owner, scope, on_type)` patterns the
+/// manifest declares, and PUBLIC rows only for the privileges its rules
+/// mention. That keeps pgroles from ever revoking a default it wasn't told
+/// about.
+pub(crate) async fn fetch_default_privileges(
     pool: &PgPool,
     managed_schemas: &[&str],
     managed_roles: &[&str],
+    scopes: &[DefaultPrivScopePattern],
 ) -> Result<BTreeMap<DefaultPrivKey, DefaultPrivState>, sqlx::Error> {
-    let rows = sqlx::query_as::<_, DefaultAclRow>(
+    let mut rows = sqlx::query_as::<_, DefaultAclRow>(
         r#"
         SELECT
             owner_role.rolname AS owner_name,
             n.nspname AS schema_name,
             grantee_role.rolname AS grantee,
+            (acl.grantee = 0) AS is_public,
             acl.privilege_type,
             da.defaclobjtype::text AS obj_type_char
         FROM pg_default_acl da
@@ -104,25 +153,74 @@ pub async fn fetch_default_privileges(
     .fetch_all(pool)
     .await?;
 
+    // Global layer: effective defaults for the declared (owner, type) pairs.
+    // The LEFT JOIN plus COALESCE(acldefault) is what synthesizes PostgreSQL's
+    // built-ins when no explicit row exists yet; `acl.grantee <> r.oid` drops
+    // owner self-entries (module doc explains why that is load-bearing).
+    let global_pairs: std::collections::BTreeSet<(String, String, String)> = scopes
+        .iter()
+        .filter(|pattern| pattern.schema.is_none())
+        .filter_map(|pattern| {
+            let stored = object_type_to_defacl_char(pattern.on_type)?;
+            let builtin = object_type_to_acldefault_char(pattern.on_type)?;
+            Some((
+                pattern.owner.clone(),
+                stored.to_string(),
+                builtin.to_string(),
+            ))
+        })
+        .collect();
+    if !global_pairs.is_empty() {
+        let owners: Vec<String> = global_pairs
+            .iter()
+            .map(|(owner, _, _)| owner.clone())
+            .collect();
+        let chars: Vec<String> = global_pairs
+            .iter()
+            .map(|(_, stored, _)| stored.clone())
+            .collect();
+        let builtin_chars: Vec<String> = global_pairs
+            .iter()
+            .map(|(_, _, builtin)| builtin.clone())
+            .collect();
+        rows.extend(
+            sqlx::query_as::<_, DefaultAclRow>(
+                r#"
+                WITH global_scope(owner_name, obj_char, builtin_char) AS (
+                    SELECT * FROM unnest($1::text[], $2::text[], $3::text[])
+                )
+                SELECT
+                    r.rolname::text AS owner_name,
+                    NULL::text AS schema_name,
+                    grantee_role.rolname::text AS grantee,
+                    (acl.grantee = 0) AS is_public,
+                    acl.privilege_type,
+                    s.obj_char AS obj_type_char
+                FROM global_scope s
+                JOIN pg_roles r ON r.rolname = s.owner_name
+                LEFT JOIN pg_default_acl da
+                       ON da.defaclrole = r.oid
+                      AND da.defaclnamespace = 0
+                      AND da.defaclobjtype = s.obj_char::"char"
+                CROSS JOIN LATERAL aclexplode(
+                    COALESCE(da.defaclacl, acldefault(s.builtin_char::"char", r.oid))
+                ) AS acl
+                LEFT JOIN pg_roles grantee_role ON grantee_role.oid = acl.grantee
+                WHERE acl.grantee <> r.oid
+                ORDER BY r.rolname, s.obj_char
+                "#,
+            )
+            .bind(&owners)
+            .bind(&chars)
+            .bind(&builtin_chars)
+            .fetch_all(pool)
+            .await?,
+        );
+    }
+
     let mut defaults: BTreeMap<DefaultPrivKey, DefaultPrivState> = BTreeMap::new();
 
     for row in rows {
-        // Skip PUBLIC grantee (NULL)
-        let grantee = match row.grantee {
-            Some(ref name) => name,
-            None => continue,
-        };
-
-        // Skip if grantee isn't in the managed set
-        if !managed_roles.contains(&grantee.as_str()) {
-            continue;
-        }
-
-        let schema_name = match row.schema_name {
-            Some(ref name) => name,
-            None => continue, // global defaults (namespace=0) — we don't manage these
-        };
-
         let privilege = match acl_char_to_privilege(&row.privilege_type) {
             Some(privilege) => privilege,
             None => continue,
@@ -133,11 +231,43 @@ pub async fn fetch_default_privileges(
             None => continue,
         };
 
+        let scope = match &row.schema_name {
+            Some(schema) => DefaultPrivilegeScope::Schema {
+                schema: schema.clone(),
+            },
+            None => DefaultPrivilegeScope::Global,
+        };
+
+        let grantee = if row.is_public {
+            // PUBLIC rows are kept only when the manifest names this exact
+            // (owner, scope, type) pattern with this privilege.
+            let covered = scopes.iter().any(|pattern| {
+                pattern.owner == row.owner_name
+                    && pattern.schema.as_deref() == row.schema_name.as_deref()
+                    && pattern.on_type == on_type
+                    && pattern.public_privileges.contains(&privilege)
+            });
+            if !covered {
+                continue;
+            }
+            Grantee::Public
+        } else {
+            // Skip dangling grantee OIDs (NULL name but not PUBLIC). The
+            // global-layer query is already scoped to declared (owner, type)
+            // pairs, so the managed-role filter is the only check left for
+            // both layers.
+            let Some(name) = &row.grantee else { continue };
+            if !managed_roles.contains(&name.as_str()) {
+                continue;
+            }
+            Grantee::Role(name.clone())
+        };
+
         let key = DefaultPrivKey {
             owner: row.owner_name.clone(),
-            schema: schema_name.clone(),
+            scope,
             on_type,
-            grantee: grantee.clone(),
+            grantee,
         };
 
         let entry = defaults.entry(key).or_insert_with(|| DefaultPrivState {

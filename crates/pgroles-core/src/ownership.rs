@@ -4,7 +4,7 @@ use thiserror::Error;
 
 use crate::diff::Change;
 use crate::manifest::{ObjectType, SchemaBindingFacet};
-use crate::model::{DefaultPrivKey, GrantKey};
+use crate::model::{DefaultPrivKey, DefaultPrivilegeScope, GrantKey, Grantee};
 
 #[derive(Debug, Clone, Default)]
 pub struct OwnershipIndex {
@@ -160,20 +160,20 @@ impl ManagedChangeSurface {
             }),
             Change::SetDefaultPrivilege {
                 owner,
-                schema,
+                scope,
                 on_type,
                 grantee,
                 ..
             }
             | Change::RevokeDefaultPrivilege {
                 owner,
-                schema,
+                scope,
                 on_type,
                 grantee,
                 ..
             } => self.allows_default_privilege_change(&DefaultPrivKey {
                 owner: owner.clone(),
-                schema: schema.clone(),
+                scope: scope.clone(),
                 on_type: *on_type,
                 grantee: grantee.clone(),
             }),
@@ -200,11 +200,20 @@ impl ManagedChangeSurface {
             return true;
         }
 
-        key.object_type == ObjectType::Database && self.roles.contains(&key.role)
+        key.object_type == ObjectType::Database
+            && matches!(&key.role, Grantee::Role(role) if self.roles.contains(role))
     }
 
     fn allows_default_privilege_change(&self, key: &DefaultPrivKey) -> bool {
-        self.explicit_default_privileges.contains(key) || self.binding_schemas.contains(&key.schema)
+        if self.explicit_default_privileges.contains(key) {
+            return true;
+        }
+        match &key.scope {
+            DefaultPrivilegeScope::Schema { schema } => self.binding_schemas.contains(schema),
+            // A global default is a property of the owner role, so the
+            // authority over the owner is the authority over the default.
+            DefaultPrivilegeScope::Global => self.roles.contains(&key.owner),
+        }
     }
 }
 
@@ -262,21 +271,23 @@ pub(crate) fn describe_change(change: &Change) -> String {
         ),
         Change::SetDefaultPrivilege {
             owner,
-            schema,
+            scope,
             on_type,
             grantee,
             ..
         } => format!(
-            "set default privilege for owner \"{owner}\" schema \"{schema}\" on {on_type} to \"{grantee}\""
+            "set default privilege for owner \"{owner}\" {scope} on {on_type} to {}",
+            describe_grantee(grantee)
         ),
         Change::RevokeDefaultPrivilege {
             owner,
-            schema,
+            scope,
             on_type,
             grantee,
             ..
         } => format!(
-            "revoke default privilege for owner \"{owner}\" schema \"{schema}\" on {on_type} from \"{grantee}\""
+            "revoke default privilege for owner \"{owner}\" {scope} on {on_type} from {}",
+            describe_grantee(grantee)
         ),
         Change::AddMember { role, member, .. } => {
             format!("add membership \"{role}\" -> \"{member}\"")
@@ -292,9 +303,20 @@ pub(crate) fn describe_change(change: &Change) -> String {
     }
 }
 
+/// Name a grantee in prose.
+///
+/// PUBLIC is a pseudo-role, so it is neither labelled `role` nor quoted —
+/// `"PUBLIC"` would name a real role of that name, which cannot exist.
+fn describe_grantee(grantee: &Grantee) -> String {
+    match grantee {
+        Grantee::Public => "PUBLIC".to_string(),
+        Grantee::Role(name) => format!("role \"{name}\""),
+    }
+}
+
 fn format_grant_action(
     action: &str,
-    role: &str,
+    role: &Grantee,
     object_type: ObjectType,
     schema: Option<&str>,
     name: Option<&str>,
@@ -305,5 +327,54 @@ fn format_grant_action(
         (None, Some(name)) => name.to_string(),
         (None, None) => "<unnamed>".to_string(),
     };
-    format!("{action} for role \"{role}\" on {object_type} \"{target}\"")
+    format!(
+        "{action} for {} on {object_type} \"{target}\"",
+        describe_grantee(role)
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::manifest::Privilege;
+    use std::collections::BTreeSet;
+
+    #[test]
+    fn public_is_named_as_the_pseudo_role_not_as_a_quoted_role() {
+        let described = describe_change(&Change::Revoke {
+            role: Grantee::Public,
+            privileges: BTreeSet::from([Privilege::Execute]),
+            object_type: ObjectType::Function,
+            schema: Some("app".to_string()),
+            name: Some("f()".to_string()),
+        });
+        assert!(described.contains("for PUBLIC"), "got {described}");
+        assert!(!described.contains("\"PUBLIC\""), "got {described}");
+    }
+
+    #[test]
+    fn a_named_grantee_keeps_the_role_label() {
+        let described = describe_change(&Change::Revoke {
+            role: Grantee::Role("reader".to_string()),
+            privileges: BTreeSet::from([Privilege::Select]),
+            object_type: ObjectType::Table,
+            schema: Some("app".to_string()),
+            name: Some("orders".to_string()),
+        });
+        assert!(described.contains("for role \"reader\""), "got {described}");
+    }
+
+    #[test]
+    fn a_global_default_privilege_scope_reads_without_a_doubled_noun() {
+        let described = describe_change(&Change::SetDefaultPrivilege {
+            owner: "app_owner".to_string(),
+            scope: DefaultPrivilegeScope::Global,
+            on_type: ObjectType::Table,
+            grantee: Grantee::Public,
+            privileges: BTreeSet::from([Privilege::Select]),
+        });
+        assert!(described.contains("global scope"), "got {described}");
+        assert!(!described.contains("scope scope"), "got {described}");
+        assert!(described.contains("to PUBLIC"), "got {described}");
+    }
 }

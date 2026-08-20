@@ -8,6 +8,7 @@ pub mod cloud;
 mod defaults;
 mod identity;
 mod memberships;
+mod preflight;
 mod privileges;
 mod public_grants;
 mod roles;
@@ -28,9 +29,9 @@ use pgroles_core::ownership::ManagedScope;
 
 // Re-export the sub-modules' public items for testing / advanced use.
 pub use cloud::{CloudProvider, PrivilegeLevel, detect_privilege_level};
-pub use defaults::fetch_default_privileges;
 pub use identity::detect_system_identifier;
 pub use memberships::fetch_memberships;
+pub use preflight::{AuthorityIssue, preflight_authority_issues};
 pub use privileges::{
     fetch_column_level_grants, fetch_database_privileges, fetch_object_inventory, fetch_privileges,
     fetch_relation_inventory,
@@ -267,6 +268,8 @@ pub struct WildcardInspectionStats {
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) struct WildcardGrantPattern {
+    /// Grantee name. The reserved value `PUBLIC` means the pseudo-role;
+    /// key construction parses it via `Grantee::parse`.
     pub role: String,
     pub object_type: pgroles_core::manifest::ObjectType,
     pub schema: String,
@@ -274,6 +277,39 @@ pub(crate) struct WildcardGrantPattern {
     /// vacuously-satisfied wildcard when no objects of this type exist in the
     /// schema, so the diff engine sees exact parity and produces no change.
     pub privileges: std::collections::BTreeSet<pgroles_core::manifest::Privilege>,
+}
+
+/// An object scope for which the manifest declares PUBLIC rules (present or
+/// absent). PUBLIC ACL rows enter the current graph only inside these scopes,
+/// and only for the privileges the rules mention — pgroles never manages a
+/// PUBLIC edge the manifest doesn't name.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct PublicObjectScope {
+    pub object_type: pgroles_core::manifest::ObjectType,
+    /// Schema containing the objects. `None` for schema- and database-typed
+    /// targets (which put the schema/database name in `name`).
+    pub schema: Option<String>,
+    /// Object name, `"*"` for every object of the type in the schema, `None`
+    /// for database targets.
+    pub name: Option<String>,
+    /// Union of the privileges named by rules for this scope; rows are
+    /// filtered to this set.
+    pub privileges: std::collections::BTreeSet<pgroles_core::manifest::Privilege>,
+}
+
+/// A default-privileges entry scope from the manifest, used to decide which
+/// `pg_default_acl` layers to fetch and which PUBLIC rows to keep.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct DefaultPrivScopePattern {
+    /// The resolved owner (entry owner, or the manifest default_owner, or
+    /// "postgres").
+    pub owner: String,
+    /// `None` means global scope (`pg_default_acl.defaclnamespace = 0`).
+    pub schema: Option<String>,
+    pub on_type: pgroles_core::manifest::ObjectType,
+    /// Union of privileges from rules whose grantee is PUBLIC; empty when the
+    /// entry has no PUBLIC rules, in which case PUBLIC rows are skipped.
+    pub public_privileges: std::collections::BTreeSet<pgroles_core::manifest::Privilege>,
 }
 
 // ---------------------------------------------------------------------------
@@ -300,8 +336,15 @@ pub struct InspectConfig {
     /// Usually only needed if the manifest includes database-level grants.
     pub include_database_privileges: bool,
 
-    /// Wildcard grant selectors from the desired manifest.
+    /// Wildcard grant selectors from the desired manifest (present-ensure
+    /// only — absence assertions must stay per-object).
     pub(crate) wildcard_grants: Vec<WildcardGrantPattern>,
+
+    /// Object scopes with declared PUBLIC rules.
+    pub(crate) public_object_scopes: Vec<PublicObjectScope>,
+
+    /// Default-privilege entry scopes from the manifest.
+    pub(crate) default_priv_scopes: Vec<DefaultPrivScopePattern>,
 }
 
 impl InspectConfig {
@@ -311,12 +354,26 @@ impl InspectConfig {
         expanded: &pgroles_core::manifest::ExpandedManifest,
         include_database_privileges: bool,
     ) -> Self {
+        use pgroles_core::manifest::{Ensure, ObjectType};
+
         let mut managed_roles: BTreeSet<String> = BTreeSet::new();
         let mut managed_schemas: BTreeSet<String> = BTreeSet::new();
         // Key for deduplicating wildcard grants: (role, object_type, schema).
-        type WildcardKey = (String, pgroles_core::manifest::ObjectType, String);
+        type WildcardKey = (String, ObjectType, String);
         let mut wildcard_map: BTreeMap<WildcardKey, BTreeSet<pgroles_core::manifest::Privilege>> =
             BTreeMap::new();
+        // Keyed by (object_type, schema, name) with privileges unioned across
+        // present and absent rules.
+        type PublicScopeKey = (ObjectType, Option<String>, Option<String>);
+        let mut public_scope_map: BTreeMap<
+            PublicScopeKey,
+            BTreeSet<pgroles_core::manifest::Privilege>,
+        > = BTreeMap::new();
+        type DefaultScopeKey = (String, Option<String>, ObjectType);
+        let mut default_scope_map: BTreeMap<
+            DefaultScopeKey,
+            BTreeSet<pgroles_core::manifest::Privilege>,
+        > = BTreeMap::new();
 
         // Collect role names
         for role_def in &expanded.roles {
@@ -329,16 +386,18 @@ impl InspectConfig {
                 managed_schemas.insert(schema.clone());
             }
             // Schema-level grants use the name field as the schema name
-            if grant.object.object_type == pgroles_core::manifest::ObjectType::Schema
+            if grant.object.object_type == ObjectType::Schema
                 && let Some(ref name) = grant.object.name
             {
                 managed_schemas.insert(name.clone());
             }
+            // Absence assertions must stay per-object for the diff's
+            // range-scan, so only present wildcards become patterns.
             if grant.object.name.as_deref() == Some("*")
+                && grant.ensure == Ensure::Present
                 && !matches!(
                     grant.object.object_type,
-                    pgroles_core::manifest::ObjectType::Schema
-                        | pgroles_core::manifest::ObjectType::Database
+                    ObjectType::Schema | ObjectType::Database
                 )
                 && let Some(schema) = &grant.object.schema
             {
@@ -348,11 +407,42 @@ impl InspectConfig {
                     .or_default()
                     .extend(grant.privileges.iter().copied());
             }
+            if grant.role == "PUBLIC" {
+                let key = (
+                    grant.object.object_type,
+                    grant.object.schema.clone(),
+                    grant.object.name.clone(),
+                );
+                public_scope_map
+                    .entry(key)
+                    .or_default()
+                    .extend(grant.privileges.iter().copied());
+            }
         }
 
-        // Collect schema names from default privileges
+        // Collect schema names and scope patterns from default privileges
         for dp in &expanded.default_privileges {
-            managed_schemas.insert(dp.schema.clone());
+            // expand_manifest validated the scope already; ignore entries it
+            // would have rejected.
+            let Ok(scope) = dp.resolved_scope() else {
+                continue;
+            };
+            let schema = scope.schema().map(str::to_string);
+            if let Some(schema) = &schema {
+                managed_schemas.insert(schema.clone());
+            }
+            // Expansion has already resolved `default_owner` into every entry,
+            // so a still-missing owner means the manifest set neither. That is
+            // the same fallback the desired-state build applies.
+            let owner = dp.owner.clone().unwrap_or_else(|| "postgres".to_string());
+            for grant in &dp.grant {
+                let entry = default_scope_map
+                    .entry((owner.clone(), schema.clone(), grant.on_type))
+                    .or_default();
+                if grant.role.as_deref() == Some("PUBLIC") {
+                    entry.extend(grant.privileges.iter().copied());
+                }
+            }
         }
 
         for schema in &expanded.schemas {
@@ -375,6 +465,28 @@ impl InspectConfig {
                     },
                 )
                 .collect(),
+            public_object_scopes: public_scope_map
+                .into_iter()
+                .map(
+                    |((object_type, schema, name), privileges)| PublicObjectScope {
+                        object_type,
+                        schema,
+                        name,
+                        privileges,
+                    },
+                )
+                .collect(),
+            default_priv_scopes: default_scope_map
+                .into_iter()
+                .map(
+                    |((owner, schema, on_type), public_privileges)| DefaultPrivScopePattern {
+                        owner,
+                        schema,
+                        on_type,
+                        public_privileges,
+                    },
+                )
+                .collect(),
         }
     }
 
@@ -388,6 +500,13 @@ impl InspectConfig {
     ) -> Self {
         let base = Self::from_expanded(expanded, include_database_privileges);
 
+        let has_bindings = |schema: &str| {
+            scope
+                .schemas
+                .get(schema)
+                .is_some_and(|managed| managed.bindings)
+        };
+
         Self {
             managed_roles: scope.roles.iter().cloned().collect(),
             managed_schemas: scope.schemas.keys().cloned().collect(),
@@ -400,11 +519,46 @@ impl InspectConfig {
             wildcard_grants: base
                 .wildcard_grants
                 .into_iter()
-                .filter(|pattern| {
-                    scope
-                        .schemas
-                        .get(&pattern.schema)
-                        .is_some_and(|managed| managed.bindings)
+                .filter(|pattern| has_bindings(&pattern.schema))
+                .collect(),
+            public_object_scopes: base
+                .public_object_scopes
+                .into_iter()
+                .filter(|public_scope| match &public_scope.schema {
+                    Some(schema) => has_bindings(schema),
+                    // Schema-typed targets carry the schema in `name`;
+                    // database targets pass through.
+                    None => match public_scope.object_type {
+                        pgroles_core::manifest::ObjectType::Schema => {
+                            public_scope.name.as_deref().is_some_and(has_bindings)
+                        }
+                        _ => true,
+                    },
+                })
+                .collect(),
+            default_priv_scopes: base
+                .default_priv_scopes
+                .into_iter()
+                .filter(|pattern| match &pattern.schema {
+                    Some(schema) => has_bindings(schema),
+                    // Global defaults belong to whoever owns the owner role.
+                    // Composition already rejects a fragment declaring one for
+                    // a role outside its scope, so reaching this branch means
+                    // the owner was named in `scope.roles` without being
+                    // defined. Dropping it silently would leave the rule
+                    // planning nothing forever, so say so.
+                    None => {
+                        let owned = scope.roles.contains(&pattern.owner);
+                        if !owned {
+                            tracing::warn!(
+                                owner = %pattern.owner,
+                                on_type = %pattern.on_type,
+                                "global default privileges declared for a role this policy does \
+                                 not manage; the rule will not be inspected or reconciled"
+                            );
+                        }
+                        owned
+                    }
                 })
                 .collect(),
         }
@@ -429,6 +583,16 @@ impl InspectConfig {
         type WildcardKey = (String, pgroles_core::manifest::ObjectType, String);
         let mut wildcard_map: BTreeMap<WildcardKey, BTreeSet<pgroles_core::manifest::Privilege>> =
             BTreeMap::new();
+        let mut default_priv_scopes: BTreeSet<DefaultPrivScopePattern> = BTreeSet::new();
+        type PublicScopeKey = (
+            pgroles_core::manifest::ObjectType,
+            Option<String>,
+            Option<String>,
+        );
+        let mut public_scope_map: BTreeMap<
+            PublicScopeKey,
+            BTreeSet<pgroles_core::manifest::Privilege>,
+        > = BTreeMap::new();
 
         for config in configs {
             managed_roles.extend(config.managed_roles.iter().cloned());
@@ -445,6 +609,17 @@ impl InspectConfig {
                     .or_default()
                     .extend(pattern.privileges.iter().copied());
             }
+            default_priv_scopes.extend(config.default_priv_scopes.iter().cloned());
+            for public_scope in &config.public_object_scopes {
+                public_scope_map
+                    .entry((
+                        public_scope.object_type,
+                        public_scope.schema.clone(),
+                        public_scope.name.clone(),
+                    ))
+                    .or_default()
+                    .extend(public_scope.privileges.iter().copied());
+            }
         }
 
         Self {
@@ -459,6 +634,18 @@ impl InspectConfig {
                         role,
                         object_type,
                         schema,
+                        privileges,
+                    },
+                )
+                .collect(),
+            default_priv_scopes: default_priv_scopes.into_iter().collect(),
+            public_object_scopes: public_scope_map
+                .into_iter()
+                .map(
+                    |((object_type, schema, name), privileges)| PublicObjectScope {
+                        object_type,
+                        schema,
+                        name,
                         privileges,
                     },
                 )
@@ -551,14 +738,13 @@ pub async fn inspect_all(
 
     // Object privileges (no wildcard patterns for unscoped inspection)
     if !schema_refs.is_empty() {
-        let privilege_grants = privileges::fetch_privileges_with_wildcards(
-            pool,
-            &schema_refs,
-            &role_refs,
-            &[], // no wildcard patterns
-        )
-        .await?
-        .grants;
+        // No wildcard patterns and no PUBLIC scopes: `generate` reads only
+        // explicit managed-role state and never invents PUBLIC or absence
+        // policy from what it finds.
+        let privilege_grants =
+            privileges::fetch_privileges_with_wildcards(pool, &schema_refs, &role_refs, &[], &[])
+                .await?
+                .grants;
         for (key, state) in privilege_grants {
             graph.grants.insert(key, state);
         }
@@ -571,9 +757,11 @@ pub async fn inspect_all(
         graph.grants.insert(key, state);
     }
 
-    // Default privileges
+    // Default privileges (schema layer only — no declared scopes, so no
+    // global rows and no PUBLIC rows)
     if !schema_refs.is_empty() {
-        let default_privs = fetch_default_privileges(pool, &schema_refs, &role_refs).await?;
+        let default_privs =
+            defaults::fetch_default_privileges(pool, &schema_refs, &role_refs, &[]).await?;
         for (key, state) in default_privs {
             graph.default_privileges.insert(key, state);
         }
@@ -827,7 +1015,7 @@ roles:
         );
         graph.grants.insert(
             pgroles_core::model::GrantKey {
-                role: "inventory_owner".to_string(),
+                role: "inventory_owner".into(),
                 object_type: pgroles_core::manifest::ObjectType::Schema,
                 schema: None,
                 name: Some("inventory".to_string()),
@@ -840,7 +1028,7 @@ roles:
         );
         graph.grants.insert(
             pgroles_core::model::GrantKey {
-                role: "inventory_reader".to_string(),
+                role: "inventory_reader".into(),
                 object_type: pgroles_core::manifest::ObjectType::Schema,
                 schema: None,
                 name: Some("inventory".to_string()),
@@ -859,7 +1047,7 @@ roles:
             graph
                 .grants
                 .keys()
-                .all(|key| key.role == "inventory_reader")
+                .all(|key| key.role.as_str() == "inventory_reader")
         );
     }
 

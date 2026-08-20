@@ -3,11 +3,16 @@
 //! Uses `aclexplode()` to decompose explicit ACL arrays from `pg_class`,
 //! `pg_namespace`, `pg_proc`, `pg_type`, and `pg_database`.
 //!
-//! Managed-state inspection intentionally does not synthesize owner/default ACLs
+//! Managed-role inspection intentionally does not synthesize owner/default ACLs
 //! from `acldefault(...)`. Doing so would make implicit owner privileges appear
 //! as explicit managed grants, causing drift where the manifest never declared
-//! those self-grants. PUBLIC/default visibility is handled separately by the
-//! `public_grants` module for informational output.
+//! those self-grants.
+//!
+//! PUBLIC (ACL grantee OID 0) is different: when the manifest declares PUBLIC
+//! rules, [`fetch_public_object_privileges`] reports PUBLIC's *effective*
+//! privileges for exactly those scopes, using `acldefault` for NULL ACLs and
+//! keeping only grantee-0 entries. Informational PUBLIC display for `inspect`
+//! output still lives in the `public_grants` module.
 //!
 //! The privilege character mapping:
 //!   r = SELECT, a = INSERT, w = UPDATE, d = DELETE, D = TRUNCATE,
@@ -23,7 +28,9 @@ use crate::{
     WildcardGrantPattern, WildcardInspectionStats,
 };
 use pgroles_core::manifest::{ObjectType, Privilege};
-use pgroles_core::model::{GrantKey, GrantState};
+use pgroles_core::model::{GrantKey, GrantState, Grantee};
+
+use crate::PublicObjectScope;
 
 /// A raw ACL row returned by our `aclexplode()` queries.
 ///
@@ -319,7 +326,7 @@ pub async fn fetch_privileges(
     managed_roles: &[&str],
 ) -> Result<BTreeMap<GrantKey, GrantState>, sqlx::Error> {
     Ok(
-        fetch_privileges_with_wildcards(pool, managed_schemas, managed_roles, &[])
+        fetch_privileges_with_wildcards(pool, managed_schemas, managed_roles, &[], &[])
             .await?
             .grants,
     )
@@ -586,6 +593,10 @@ pub(crate) struct RawPrivilegeState {
     pub(crate) acl_rows: Vec<AclRow>,
     /// Objects in each wildcard `(object_type, schema)` scope that was read.
     pub(crate) inventory: BTreeMap<(ObjectType, String), BTreeSet<String>>,
+    /// Grantee-0 rows for the object families the read's PUBLIC scopes named.
+    /// Kept apart from `acl_rows` because they are synthesized through
+    /// `acldefault` and carry no grantee name to filter on.
+    pub(crate) public_acl_rows: Vec<AclRow>,
 }
 
 /// The unmasked grantability of every object in a set of wildcard scopes,
@@ -595,16 +606,17 @@ pub(crate) struct RawGrantability {
     pub(crate) rows: BTreeMap<(ObjectType, String, String), GrantabilityRow>,
 }
 
-/// Read privilege rows and wildcard inventory for a scope.
+/// Read privilege rows, wildcard inventory, and PUBLIC rows for a scope.
 ///
-/// `managed_schemas` × `managed_roles` bound the ACL rows and
-/// `wildcard_scopes` the inventory, so the result covers every narrower scope
-/// contained in those three.
+/// `managed_schemas` × `managed_roles` bound the ACL rows, `wildcard_scopes`
+/// the inventory and `public_scopes` the PUBLIC rows, so the result covers
+/// every narrower scope contained in those four.
 pub(crate) async fn read_raw_privileges(
     pool: &PgPool,
     managed_schemas: &[&str],
     managed_roles: &[&str],
     wildcard_scopes: &BTreeSet<(ObjectType, String)>,
+    public_scopes: &[PublicObjectScope],
 ) -> Result<RawPrivilegeState, sqlx::Error> {
     let mut inventory: BTreeMap<(ObjectType, String), BTreeSet<String>> = BTreeMap::new();
     if !wildcard_scopes.is_empty() {
@@ -627,6 +639,12 @@ pub(crate) async fn read_raw_privileges(
     let function_rows = fetch_function_privileges(pool, managed_schemas, managed_roles).await?;
     let type_rows = fetch_type_privileges(pool, managed_schemas, managed_roles).await?;
 
+    let public_acl_rows = if public_scopes.is_empty() {
+        Vec::new()
+    } else {
+        read_raw_public_privileges(pool, public_scopes).await?
+    };
+
     Ok(RawPrivilegeState {
         acl_rows: relation_rows
             .into_iter()
@@ -635,6 +653,7 @@ pub(crate) async fn read_raw_privileges(
             .chain(type_rows)
             .collect(),
         inventory,
+        public_acl_rows,
     })
 }
 
@@ -658,14 +677,23 @@ pub(crate) async fn fetch_privileges_with_wildcards(
     managed_schemas: &[&str],
     managed_roles: &[&str],
     wildcard_grants: &[WildcardGrantPattern],
+    public_scopes: &[PublicObjectScope],
 ) -> Result<PrivilegeInspectionResult, sqlx::Error> {
     let wildcard_scopes = wildcard_scopes_of(wildcard_grants);
-    let raw = read_raw_privileges(pool, managed_schemas, managed_roles, &wildcard_scopes).await?;
+    let raw = read_raw_privileges(
+        pool,
+        managed_schemas,
+        managed_roles,
+        &wildcard_scopes,
+        public_scopes,
+    )
+    .await?;
     let derived = derive_privileges(
         &raw,
         &managed_schemas.iter().map(|s| s.to_string()).collect(),
         &managed_roles.iter().map(|s| s.to_string()).collect(),
         wildcard_grants,
+        public_scopes,
     );
     let grantability = if derived.unsatisfied.is_empty() {
         None
@@ -713,6 +741,7 @@ pub(crate) fn derive_privileges(
     managed_schemas: &BTreeSet<String>,
     managed_roles: &BTreeSet<String>,
     wildcard_grants: &[WildcardGrantPattern],
+    public_scopes: &[PublicObjectScope],
 ) -> DerivedPrivileges {
     let mut grants: BTreeMap<GrantKey, GrantState> = BTreeMap::new();
     let has_wildcards = !wildcard_grants.is_empty();
@@ -777,7 +806,9 @@ pub(crate) fn derive_privileges(
         };
 
         let key = GrantKey {
-            role: grantee.clone(),
+            // Joined through pg_roles, so this is always a real role name —
+            // even one spelled "PUBLIC" — never the pseudo-role.
+            role: Grantee::Role(grantee.clone()),
             object_type,
             schema,
             name,
@@ -787,6 +818,17 @@ pub(crate) fn derive_privileges(
             privileges: BTreeSet::new(),
         });
         entry.privileges.insert(privilege);
+    }
+
+    // PUBLIC state, kept only for declared scopes. Merged before wildcard
+    // normalization so a present-ensure PUBLIC wildcard collapses its
+    // per-object rows like any role wildcard; scopes declared only absent are
+    // not wildcard patterns, so their rows stay per-object for the diff's
+    // range-scan.
+    if !public_scopes.is_empty() {
+        for (key, state) in derive_public_privileges(&raw.public_acl_rows, public_scopes) {
+            grants.insert(key, state);
+        }
     }
 
     let unsatisfied = if has_wildcards {
@@ -870,6 +912,282 @@ async fn fetch_current_user(pool: &PgPool) -> Result<String, sqlx::Error> {
     Ok(user)
 }
 
+/// Read raw PUBLIC (ACL grantee OID 0) rows for the object families the
+/// declared scopes name.
+///
+/// Unlike the managed-role reads above, NULL ACLs are exploded through
+/// `acldefault(...)` so PostgreSQL's implicit built-ins — EXECUTE on
+/// routines, USAGE on types, CONNECT/TEMPORARY on the database — are visible.
+/// An `ensure: absent` rule must see them or no revoke would ever be planned
+/// on a fresh object. Only grantee-0 entries are returned, so the synthesis
+/// can never leak implicit owner privileges into managed-role state.
+///
+/// `acldefault` is applied to every object family for uniformity; it only
+/// changes the result for functions, types, and the database, because the
+/// other families' defaults contain no grantee-0 entries. Its contents are
+/// identical on PG 16, 17, and 18.
+///
+/// The rows are unfiltered beyond the object families and schemas queried.
+/// [`derive_public_privileges`] applies the per-scope privilege filter, so a
+/// read over several configs' scopes can serve each of them.
+pub(crate) async fn read_raw_public_privileges(
+    pool: &PgPool,
+    scopes: &[PublicObjectScope],
+) -> Result<Vec<AclRow>, sqlx::Error> {
+    let unique_schemas = |predicate: &dyn Fn(ObjectType) -> bool| -> Vec<String> {
+        scopes
+            .iter()
+            .filter(|scope| predicate(scope.object_type))
+            .filter_map(|scope| scope.schema.clone())
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect()
+    };
+
+    let mut rows: Vec<AclRow> = Vec::new();
+
+    let relation_schemas = unique_schemas(&|object_type| {
+        matches!(
+            object_type,
+            ObjectType::Table
+                | ObjectType::View
+                | ObjectType::MaterializedView
+                | ObjectType::Sequence
+        )
+    });
+    if !relation_schemas.is_empty() {
+        rows.extend(
+            sqlx::query_as::<_, AclRow>(
+                r#"
+                SELECT
+                    NULL::text AS grantee,
+                    acl.privilege_type,
+                    n.nspname::text AS schema_name,
+                    c.relname::text AS object_name,
+                    CASE c.relkind
+                        WHEN 'r' THEN 'table'
+                        WHEN 'p' THEN 'table'
+                        WHEN 'v' THEN 'view'
+                        WHEN 'm' THEN 'materialized_view'
+                        WHEN 'S' THEN 'sequence'
+                    END AS obj_type
+                FROM pg_class c
+                JOIN pg_namespace n ON n.oid = c.relnamespace
+                CROSS JOIN LATERAL aclexplode(
+                    COALESCE(
+                        c.relacl,
+                        acldefault(
+                            CASE WHEN c.relkind = 'S' THEN 'S' ELSE 'r' END::"char",
+                            c.relowner
+                        )
+                    )
+                ) AS acl
+                WHERE n.nspname = ANY($1)
+                  AND c.relkind IN ('r', 'p', 'v', 'm', 'S')
+                  AND acl.grantee = 0
+                ORDER BY n.nspname, c.relname
+                "#,
+            )
+            .bind(&relation_schemas)
+            .fetch_all(pool)
+            .await?,
+        );
+    }
+
+    let function_schemas = unique_schemas(&|object_type| object_type == ObjectType::Function);
+    if !function_schemas.is_empty() {
+        rows.extend(
+            sqlx::query_as::<_, AclRow>(
+                r#"
+                SELECT
+                    NULL::text AS grantee,
+                    acl.privilege_type,
+                    n.nspname::text AS schema_name,
+                    (p.proname || '(' || pg_catalog.pg_get_function_identity_arguments(p.oid) || ')')::text AS object_name,
+                    'function' AS obj_type
+                FROM pg_proc p
+                JOIN pg_namespace n ON n.oid = p.pronamespace
+                CROSS JOIN LATERAL aclexplode(
+                    COALESCE(p.proacl, acldefault('f'::"char", p.proowner))
+                ) AS acl
+                WHERE n.nspname = ANY($1)
+                  AND acl.grantee = 0
+                ORDER BY n.nspname, p.proname
+                "#,
+            )
+            .bind(&function_schemas)
+            .fetch_all(pool)
+            .await?,
+        );
+    }
+
+    let type_schemas = unique_schemas(&|object_type| object_type == ObjectType::Type);
+    if !type_schemas.is_empty() {
+        rows.extend(
+            sqlx::query_as::<_, AclRow>(
+                r#"
+                SELECT
+                    NULL::text AS grantee,
+                    acl.privilege_type,
+                    n.nspname::text AS schema_name,
+                    t.typname::text AS object_name,
+                    'type' AS obj_type
+                FROM pg_type t
+                JOIN pg_namespace n ON n.oid = t.typnamespace
+                CROSS JOIN LATERAL aclexplode(
+                    COALESCE(t.typacl, acldefault('T'::"char", t.typowner))
+                ) AS acl
+                WHERE n.nspname = ANY($1)
+                  AND t.typname NOT LIKE '\_%'
+                  AND t.typtype <> 'p'
+                  AND acl.grantee = 0
+                ORDER BY n.nspname, t.typname
+                "#,
+            )
+            .bind(&type_schemas)
+            .fetch_all(pool)
+            .await?,
+        );
+    }
+
+    let schema_names: Vec<String> = scopes
+        .iter()
+        .filter(|scope| scope.object_type == ObjectType::Schema)
+        .filter_map(|scope| scope.name.clone())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    if !schema_names.is_empty() {
+        rows.extend(
+            sqlx::query_as::<_, AclRow>(
+                r#"
+                SELECT
+                    NULL::text AS grantee,
+                    acl.privilege_type,
+                    NULL::text AS schema_name,
+                    n.nspname::text AS object_name,
+                    'schema' AS obj_type
+                FROM pg_namespace n
+                CROSS JOIN LATERAL aclexplode(
+                    COALESCE(n.nspacl, acldefault('n'::"char", n.nspowner))
+                ) AS acl
+                WHERE n.nspname = ANY($1)
+                  AND acl.grantee = 0
+                ORDER BY n.nspname
+                "#,
+            )
+            .bind(&schema_names)
+            .fetch_all(pool)
+            .await?,
+        );
+    }
+
+    if scopes
+        .iter()
+        .any(|scope| scope.object_type == ObjectType::Database)
+    {
+        rows.extend(
+            sqlx::query_as::<_, AclRow>(
+                r#"
+                SELECT
+                    NULL::text AS grantee,
+                    acl.privilege_type,
+                    NULL::text AS schema_name,
+                    db.datname::text AS object_name,
+                    'database' AS obj_type
+                FROM pg_database db
+                CROSS JOIN LATERAL aclexplode(
+                    COALESCE(db.datacl, acldefault('d'::"char", db.datdba))
+                ) AS acl
+                WHERE db.datname = current_database()
+                  AND acl.grantee = 0
+                "#,
+            )
+            .fetch_all(pool)
+            .await?,
+        );
+    }
+
+    Ok(rows)
+}
+
+/// Narrow raw PUBLIC rows to the scopes one manifest declared.
+///
+/// Rows are filtered to the privileges the manifest's PUBLIC rules mention
+/// for the matching scope. A PUBLIC edge the manifest never names stays out
+/// of the graph entirely, which is what keeps convergence from revoking
+/// unmanaged PUBLIC grants (see the #108 wildcard regression).
+pub(crate) fn derive_public_privileges(
+    rows: &[AclRow],
+    scopes: &[PublicObjectScope],
+) -> BTreeMap<GrantKey, GrantState> {
+    let mut grants: BTreeMap<GrantKey, GrantState> = BTreeMap::new();
+    for row in rows {
+        let Some(privilege) = acl_char_to_privilege(&row.privilege_type) else {
+            continue;
+        };
+        let Some(object_type) = obj_type_str_to_object_type(&row.obj_type) else {
+            continue;
+        };
+
+        if !public_scopes_cover(
+            scopes,
+            object_type,
+            row.schema_name.as_deref(),
+            &row.object_name,
+            privilege,
+        ) {
+            continue;
+        }
+
+        let (schema, name) = match object_type {
+            ObjectType::Schema | ObjectType::Database => (None, Some(row.object_name.clone())),
+            _ => (row.schema_name.clone(), Some(row.object_name.clone())),
+        };
+        grants
+            .entry(GrantKey {
+                role: Grantee::Public,
+                object_type,
+                schema,
+                name,
+            })
+            .or_insert_with(|| GrantState {
+                privileges: BTreeSet::new(),
+            })
+            .privileges
+            .insert(privilege);
+    }
+
+    grants
+}
+
+/// Whether some declared PUBLIC scope covers this object and names this
+/// privilege.
+fn public_scopes_cover(
+    scopes: &[PublicObjectScope],
+    object_type: ObjectType,
+    schema_name: Option<&str>,
+    object_name: &str,
+    privilege: Privilege,
+) -> bool {
+    scopes.iter().any(|scope| {
+        if scope.object_type != object_type || !scope.privileges.contains(&privilege) {
+            return false;
+        }
+        match object_type {
+            ObjectType::Schema => scope.name.as_deref() == Some(object_name),
+            ObjectType::Database => scope.name.as_deref().is_none_or(|name| name == object_name),
+            _ => {
+                scope.schema.as_deref() == schema_name
+                    && scope
+                        .name
+                        .as_deref()
+                        .is_some_and(|name| name == "*" || name == object_name)
+            }
+        }
+    })
+}
+
 fn unsatisfied_wildcard_grants(
     grants: &BTreeMap<GrantKey, GrantState>,
     inventory: &BTreeMap<(ObjectType, String), BTreeSet<String>>,
@@ -890,7 +1208,7 @@ fn unsatisfied_wildcard_grants(
         let mut missing_privileges = BTreeSet::new();
         for object_name in object_names {
             let key = GrantKey {
-                role: wildcard.role.clone(),
+                role: Grantee::parse(&wildcard.role),
                 object_type: wildcard.object_type,
                 schema: Some(wildcard.schema.clone()),
                 name: Some(object_name.clone()),
@@ -1150,7 +1468,7 @@ fn detect_unsatisfiable_wildcards(
             }
 
             let key = GrantKey {
-                role: wildcard.role.clone(),
+                role: Grantee::parse(&wildcard.role),
                 object_type: wildcard.object_type,
                 schema: Some(wildcard.schema.clone()),
                 name: Some(object_name.clone()),
@@ -1218,7 +1536,7 @@ fn insert_vacuous_wildcard(
     wildcard: &WildcardGrantPattern,
 ) {
     let wildcard_key = GrantKey {
-        role: wildcard.role.clone(),
+        role: Grantee::parse(&wildcard.role),
         object_type: wildcard.object_type,
         schema: Some(wildcard.schema.clone()),
         name: Some("*".to_string()),
@@ -1253,7 +1571,7 @@ fn normalize_wildcard_grants(
 
         for object_name in object_names {
             let key = GrantKey {
-                role: wildcard.role.clone(),
+                role: Grantee::parse(&wildcard.role),
                 object_type: wildcard.object_type,
                 schema: Some(wildcard.schema.clone()),
                 name: Some(object_name.clone()),
@@ -1272,7 +1590,7 @@ fn normalize_wildcard_grants(
         }
 
         let wildcard_key = GrantKey {
-            role: wildcard.role.clone(),
+            role: Grantee::parse(&wildcard.role),
             object_type: wildcard.object_type,
             schema: Some(wildcard.schema.clone()),
             name: Some("*".to_string()),
@@ -1287,7 +1605,7 @@ fn normalize_wildcard_grants(
 
         for object_name in object_names {
             let key = GrantKey {
-                role: wildcard.role.clone(),
+                role: Grantee::parse(&wildcard.role),
                 object_type: wildcard.object_type,
                 schema: Some(wildcard.schema.clone()),
                 name: Some(object_name.clone()),
@@ -1515,7 +1833,7 @@ pub async fn fetch_database_privileges(
         };
 
         let key = GrantKey {
-            role: grantee.clone(),
+            role: Grantee::Role(grantee.clone()),
             object_type: ObjectType::Database,
             schema: None,
             name: Some(row.object_name.clone()),
@@ -1791,7 +2109,7 @@ mod tests {
     fn diagnostics_ignore_non_grantable_object_that_already_has_privilege() {
         let grants = BTreeMap::from([(
             GrantKey {
-                role: "app-editor".to_string(),
+                role: "app-editor".into(),
                 object_type: ObjectType::Function,
                 schema: Some("app".to_string()),
                 name: Some("f2()".to_string()),
@@ -1820,7 +2138,7 @@ mod tests {
         let grants = BTreeMap::from([
             (
                 GrantKey {
-                    role: "app-editor".to_string(),
+                    role: "app-editor".into(),
                     object_type: ObjectType::Function,
                     schema: Some("app".to_string()),
                     name: Some("f1()".to_string()),
@@ -1831,7 +2149,7 @@ mod tests {
             ),
             (
                 GrantKey {
-                    role: "app-editor".to_string(),
+                    role: "app-editor".into(),
                     object_type: ObjectType::Function,
                     schema: Some("app".to_string()),
                     name: Some("f2()".to_string()),
@@ -1861,7 +2179,7 @@ mod tests {
         };
         let grants = BTreeMap::from([(
             GrantKey {
-                role: "app-editor".to_string(),
+                role: "app-editor".into(),
                 object_type: ObjectType::Table,
                 schema: Some("app".to_string()),
                 name: Some("widgets".to_string()),
@@ -1940,7 +2258,7 @@ mod tests {
         let mut grants = BTreeMap::new();
         grants.insert(
             GrantKey {
-                role: "inventory-editor".to_string(),
+                role: "inventory-editor".into(),
                 object_type: ObjectType::Table,
                 schema: Some("inventory".to_string()),
                 name: Some("widgets".to_string()),
@@ -1951,7 +2269,7 @@ mod tests {
         );
         grants.insert(
             GrantKey {
-                role: "inventory-editor".to_string(),
+                role: "inventory-editor".into(),
                 object_type: ObjectType::Table,
                 schema: Some("inventory".to_string()),
                 name: Some("orders".to_string()),
@@ -1981,7 +2299,7 @@ mod tests {
 
         let wildcard = normalized
             .get(&GrantKey {
-                role: "inventory-editor".to_string(),
+                role: "inventory-editor".into(),
                 object_type: ObjectType::Table,
                 schema: Some("inventory".to_string()),
                 name: Some("*".to_string()),
@@ -1991,7 +2309,7 @@ mod tests {
 
         let specific = normalized
             .get(&GrantKey {
-                role: "inventory-editor".to_string(),
+                role: "inventory-editor".into(),
                 object_type: ObjectType::Table,
                 schema: Some("inventory".to_string()),
                 name: Some("widgets".to_string()),
@@ -2020,7 +2338,7 @@ mod tests {
         let result = normalize_wildcard_grants(grants, &inventory, &wildcards);
 
         let wildcard_key = GrantKey {
-            role: "accounts-editor".to_string(),
+            role: "accounts-editor".into(),
             object_type: ObjectType::Sequence,
             schema: Some("accounts".to_string()),
             name: Some("*".to_string()),
@@ -2055,7 +2373,7 @@ mod tests {
         let result = normalize_wildcard_grants(grants, &inventory, &wildcards);
 
         let wildcard_key = GrantKey {
-            role: "accounts-editor".to_string(),
+            role: "accounts-editor".into(),
             object_type: ObjectType::Function,
             schema: Some("accounts".to_string()),
             name: Some("*".to_string()),
@@ -2077,7 +2395,7 @@ mod tests {
         let mut grants = BTreeMap::new();
         grants.insert(
             GrantKey {
-                role: "app".to_string(),
+                role: "app".into(),
                 object_type: ObjectType::Sequence,
                 schema: Some("public".to_string()),
                 name: Some("seq1".to_string()),
@@ -2088,7 +2406,7 @@ mod tests {
         );
         grants.insert(
             GrantKey {
-                role: "app".to_string(),
+                role: "app".into(),
                 object_type: ObjectType::Sequence,
                 schema: Some("public".to_string()),
                 name: Some("seq2".to_string()),
@@ -2118,7 +2436,7 @@ mod tests {
         let result = normalize_wildcard_grants(grants, &inventory, &wildcards);
 
         let wildcard_key = GrantKey {
-            role: "app".to_string(),
+            role: "app".into(),
             object_type: ObjectType::Sequence,
             schema: Some("public".to_string()),
             name: Some("*".to_string()),
@@ -2177,7 +2495,7 @@ mod tests {
 
         assert!(
             !result.contains_key(&GrantKey {
-                role: "app".to_string(),
+                role: "app".into(),
                 object_type: ObjectType::Function,
                 schema: Some("public".to_string()),
                 name: Some("*".to_string()),
@@ -2186,7 +2504,7 @@ mod tests {
         );
         assert!(
             !result.contains_key(&GrantKey {
-                role: "app".to_string(),
+                role: "app".into(),
                 object_type: ObjectType::Type,
                 schema: Some("public".to_string()),
                 name: Some("*".to_string()),
@@ -2195,7 +2513,7 @@ mod tests {
         );
         assert!(
             !result.contains_key(&GrantKey {
-                role: "app".to_string(),
+                role: "app".into(),
                 object_type: ObjectType::Sequence,
                 schema: Some("public".to_string()),
                 name: Some("*".to_string()),
@@ -2375,6 +2693,8 @@ mod tests {
             privilege_schemas: vec![schema.to_string()],
             include_database_privileges: false,
             wildcard_grants: vec![],
+            public_object_scopes: vec![],
+            default_priv_scopes: vec![],
         }
     }
 

@@ -50,13 +50,17 @@ use crate::diff::{Change, ReconciliationMode};
 /// superseded rather than silently accepted.
 pub const APPROVAL_EFFECT_ENCODING_V1: &str = "pgroles.io/approval-effect/v1";
 
+/// v2 adds the resolved target identity — physical (`system_identifier`) and
+/// logical (host/port/database fingerprint) — to the bound inputs.
+pub const APPROVAL_EFFECT_ENCODING_V2: &str = "pgroles.io/approval-effect/v2";
+
 /// Current canonical effect encoding.
 ///
-/// v2 adds the resolved target identity — physical (`system_identifier`) and
-/// logical (host/port/database fingerprint) — to the bound inputs. Every
-/// digest changes once when an operator upgrades to this encoding, so every
-/// open plan supersedes exactly once and is re-reviewed.
-pub const APPROVAL_EFFECT_ENCODING_V2: &str = "pgroles.io/approval-effect/v2";
+/// v3 carries a default-privilege rule's scope as a tagged `scope` value
+/// instead of a bare `schema` string, which could not express an owner-wide
+/// rule. Every digest changes once when an operator upgrades to this
+/// encoding, so every open plan supersedes exactly once and is re-reviewed.
+pub const APPROVAL_EFFECT_ENCODING_V3: &str = "pgroles.io/approval-effect/v3";
 
 /// Refusal to produce a digest that would not bind what it claims to bind.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -303,7 +307,7 @@ pub fn canonical_change_set_bytes(
     let owned_schemas: BTreeSet<&str> = inputs.owned_schemas.iter().map(String::as_str).collect();
 
     Ok(serde_json::to_vec(&CanonicalChangeSet {
-        effect_encoding: APPROVAL_EFFECT_ENCODING_V2,
+        effect_encoding: APPROVAL_EFFECT_ENCODING_V3,
         reconciliation_mode: inputs.reconciliation_mode,
         target: inputs.target,
         target_physical_identity: inputs.target_identity.physical.as_deref(),
@@ -355,7 +359,7 @@ fn sha256_prefixed(bytes: &[u8]) -> String {
 mod tests {
     use super::*;
     use crate::manifest::{ObjectType, Privilege};
-    use crate::model::RoleState;
+    use crate::model::{Grantee, RoleState};
 
     fn versions(entries: &[(&str, &str)]) -> BTreeMap<String, String> {
         entries
@@ -440,7 +444,7 @@ mod tests {
 
     fn grant(role: &str) -> Change {
         Change::Grant {
-            role: role.to_string(),
+            role: Grantee::parse(role),
             privileges: [Privilege::Select].into_iter().collect(),
             object_type: ObjectType::Table,
             schema: Some("inventory".to_string()),
@@ -807,7 +811,7 @@ mod tests {
         // first released v2 onward, any change here means a new constant.
         assert_eq!(
             encoded,
-            r#"{"effect_encoding":"pgroles.io/approval-effect/v2","reconciliation_mode":"Authoritative","target":"default/postgres-credentials:url","target_physical_identity":"7412330000000000001","target_logical_fingerprint":"sha256:fingerprint","owned_roles":[],"owned_schemas":[],"effects":[{"Grant":{"name":"orders","object_type":"table","privileges":["SELECT"],"role":"reporting","schema":"inventory"}},{"SetPassword":{"name":"app","password_source":"role-passwords:app:7"}}]}"#,
+            r#"{"effect_encoding":"pgroles.io/approval-effect/v3","reconciliation_mode":"Authoritative","target":"default/postgres-credentials:url","target_physical_identity":"7412330000000000001","target_logical_fingerprint":"sha256:fingerprint","owned_roles":[],"owned_schemas":[],"effects":[{"Grant":{"name":"orders","object_type":"table","privileges":["SELECT"],"role":"reporting","schema":"inventory"}},{"SetPassword":{"name":"app","password_source":"role-passwords:app:7"}}]}"#,
             "canonical encoding changed; bump the encoding constant rather than \
              editing this fixture"
         );

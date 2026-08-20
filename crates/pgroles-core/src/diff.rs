@@ -12,8 +12,8 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use crate::manifest::{ObjectType, Privilege, RoleDefinition, RoleRetirement};
 use crate::model::{
-    DefaultPrivKey, GrantKey, MembershipEdge, RoleAttribute, RoleGraph, RoleState,
-    default_schema_owner_privileges,
+    DefaultPrivKey, DefaultPrivilegeScope, GrantKey, Grantee, MembershipEdge, RoleAttribute,
+    RoleGraph, RoleState, default_schema_owner_privileges,
 };
 
 // ---------------------------------------------------------------------------
@@ -62,18 +62,18 @@ pub enum Change {
         comment: Option<String>,
     },
 
-    /// Grant privileges on an object to a role.
+    /// Grant privileges on an object to a grantee.
     Grant {
-        role: String,
+        role: Grantee,
         privileges: BTreeSet<Privilege>,
         object_type: ObjectType,
         schema: Option<String>,
         name: Option<String>,
     },
 
-    /// Revoke privileges on an object from a role.
+    /// Revoke privileges on an object from a grantee.
     Revoke {
-        role: String,
+        role: Grantee,
         privileges: BTreeSet<Privilege>,
         object_type: ObjectType,
         schema: Option<String>,
@@ -83,18 +83,18 @@ pub enum Change {
     /// Set default privileges (ALTER DEFAULT PRIVILEGES ... GRANT ...).
     SetDefaultPrivilege {
         owner: String,
-        schema: String,
+        scope: DefaultPrivilegeScope,
         on_type: ObjectType,
-        grantee: String,
+        grantee: Grantee,
         privileges: BTreeSet<Privilege>,
     },
 
     /// Revoke default privileges (ALTER DEFAULT PRIVILEGES ... REVOKE ...).
     RevokeDefaultPrivilege {
         owner: String,
-        schema: String,
+        scope: DefaultPrivilegeScope,
         on_type: ObjectType,
-        grantee: String,
+        grantee: Grantee,
         privileges: BTreeSet<Privilege>,
     },
 
@@ -272,9 +272,11 @@ fn filter_additive_changes(changes: Vec<Change>) -> Vec<Change> {
             Change::EnsureSchemaOwnerPrivileges { name, owner, .. } => {
                 !skipped_owner_transfers.contains(&(name.clone(), owner.clone()))
             }
-            Change::SetDefaultPrivilege { schema, owner, .. } => {
-                !skipped_owner_transfers.contains(&(schema.clone(), owner.clone()))
-            }
+            Change::SetDefaultPrivilege {
+                scope: DefaultPrivilegeScope::Schema { schema },
+                owner,
+                ..
+            } => !skipped_owner_transfers.contains(&(schema.clone(), owner.clone())),
             Change::AlterRole { name, attributes } => {
                 created_roles.contains(name)
                     && attributes
@@ -691,28 +693,46 @@ fn diff_grants(
     //     privilege the wildcard still declares).
     //   - the absent-key branch (current has a per-name entry that desired
     //     covers only via wildcard).
-    let desired_wildcards: BTreeMap<(&str, &Option<String>, ObjectType), &BTreeSet<Privilege>> =
+    let desired_wildcards: BTreeMap<(&Grantee, &Option<String>, ObjectType), &BTreeSet<Privilege>> =
         desired
             .grants
             .iter()
             .filter(|(k, _)| k.name.as_deref() == Some("*") && k.schema.is_some())
-            .map(|(k, v)| ((k.role.as_str(), &k.schema, k.object_type), &v.privileges))
+            .map(|(k, v)| ((&k.role, &k.schema, k.object_type), &v.privileges))
+            .collect();
+
+    // Absence wildcards suppress per-name revokes for the same reason: the
+    // single `ON ALL` revoke they emit already covers every object, so a
+    // per-name revoke of the same privilege would only duplicate it.
+    let absence_wildcards: BTreeMap<(&Grantee, &Option<String>, ObjectType), &BTreeSet<Privilege>> =
+        desired
+            .grant_absences
+            .iter()
+            .filter(|(k, _)| k.name.as_deref() == Some("*") && k.schema.is_some())
+            .map(|(k, v)| ((&k.role, &k.schema, k.object_type), v))
             .collect();
 
     // Returns the subset of `candidate` not shadowed by a desired wildcard
-    // for the same (role, schema, type). The wildcard itself is never
-    // shadowed (it has name="*", not a specific object name).
+    // (present or absent) for the same (role, schema, type). The wildcard
+    // itself is never shadowed (it has name="*", not a specific object name).
     let shadow_filter = |key: &GrantKey, candidate: BTreeSet<Privilege>| -> BTreeSet<Privilege> {
         if key.name.as_deref() == Some("*") {
             return candidate;
         }
-        match desired_wildcards.get(&(key.role.as_str(), &key.schema, key.object_type)) {
-            Some(wildcard_privileges) => {
-                candidate.difference(wildcard_privileges).copied().collect()
-            }
-            None => candidate,
+        let mut filtered = candidate;
+        let selector = (&key.role, &key.schema, key.object_type);
+        if let Some(wildcard_privileges) = desired_wildcards.get(&selector) {
+            filtered = filtered.difference(wildcard_privileges).copied().collect();
         }
+        if let Some(absent_privileges) = absence_wildcards.get(&selector) {
+            filtered = filtered.difference(absent_privileges).copied().collect();
+        }
+        filtered
     };
+
+    // Revokes accumulate per key so a key hit by both a convergence branch
+    // and an absence assertion emits one merged REVOKE.
+    let mut revokes: BTreeMap<GrantKey, BTreeSet<Privilege>> = BTreeMap::new();
 
     // Grants in desired but not in current → GRANT (full set)
     // Grants in both → diff the privilege sets
@@ -729,34 +749,81 @@ fn diff_grants(
                     .difference(&current_state.privileges)
                     .copied()
                     .collect();
+                if !to_add.is_empty() {
+                    grants_out.push(change_grant(key, &to_add));
+                }
+
+                // PUBLIC state is assertion-driven: only an `ensure: absent`
+                // rule may revoke from PUBLIC, never mere absence from the
+                // desired set.
+                if key.role.is_public() {
+                    continue;
+                }
+
                 let to_remove: BTreeSet<Privilege> = current_state
                     .privileges
                     .difference(&desired_state.privileges)
                     .copied()
                     .collect();
                 let to_remove = shadow_filter(key, to_remove);
-
-                if !to_add.is_empty() {
-                    grants_out.push(change_grant(key, &to_add));
-                }
                 if !to_remove.is_empty() {
-                    revokes_out.push(change_revoke(key, &to_remove));
+                    revokes.entry(key.clone()).or_default().extend(to_remove);
                 }
             }
         }
     }
 
     // Grant targets in current but not in desired → REVOKE the privileges
-    // that aren't shadowed by a desired wildcard for the same scope.
+    // that aren't shadowed by a desired wildcard for the same scope. PUBLIC
+    // keys are exempt: unmentioned PUBLIC ACLs are unmanaged, not drift.
     for (key, current_state) in &current.grants {
-        if desired.grants.contains_key(key) {
+        if desired.grants.contains_key(key) || key.role.is_public() {
             continue;
         }
 
         let to_revoke = shadow_filter(key, current_state.privileges.clone());
         if !to_revoke.is_empty() {
-            revokes_out.push(change_revoke(key, &to_revoke));
+            revokes.entry(key.clone()).or_default().extend(to_revoke);
         }
+    }
+
+    // Absence assertions: revoke `absent ∩ current`. A wildcard assertion
+    // range-scans every current key under its (grantee, type, schema) prefix,
+    // so one `ON ALL` revoke covers however many objects still hold the
+    // privilege, and an empty range is vacuously converged.
+    for (key, absent_privileges) in &desired.grant_absences {
+        let held: BTreeSet<Privilege> = if key.name.as_deref() == Some("*") {
+            let range_start = GrantKey {
+                role: key.role.clone(),
+                object_type: key.object_type,
+                schema: key.schema.clone(),
+                name: None,
+            };
+            current
+                .grants
+                .range(range_start..)
+                .take_while(|(k, _)| {
+                    k.role == key.role && k.object_type == key.object_type && k.schema == key.schema
+                })
+                .flat_map(|(_, state)| state.privileges.iter().copied())
+                .collect()
+        } else {
+            current
+                .grants
+                .get(key)
+                .map(|state| state.privileges.clone())
+                .unwrap_or_default()
+        };
+
+        let to_revoke: BTreeSet<Privilege> =
+            absent_privileges.intersection(&held).copied().collect();
+        if !to_revoke.is_empty() {
+            revokes.entry(key.clone()).or_default().extend(to_revoke);
+        }
+    }
+
+    for (key, privileges) in &revokes {
+        revokes_out.push(change_revoke(key, privileges));
     }
 }
 
@@ -790,6 +857,10 @@ fn diff_default_privileges(
     set_out: &mut Vec<Change>,
     revoke_out: &mut Vec<Change>,
 ) {
+    // Revokes accumulate per key so a key hit by both a convergence branch
+    // and an absence assertion emits one merged REVOKE.
+    let mut revokes: BTreeMap<DefaultPrivKey, BTreeSet<Privilege>> = BTreeMap::new();
+
     for (key, desired_state) in &desired.default_privileges {
         match current.default_privileges.get(key) {
             None => {
@@ -801,33 +872,61 @@ fn diff_default_privileges(
                     .difference(&current_state.privileges)
                     .copied()
                     .collect();
+                if !to_add.is_empty() {
+                    set_out.push(change_set_default(key, &to_add));
+                }
+
+                // PUBLIC defaults are assertion-driven: only `ensure: absent`
+                // may revoke them.
+                if key.grantee.is_public() {
+                    continue;
+                }
+
                 let to_remove: BTreeSet<Privilege> = current_state
                     .privileges
                     .difference(&desired_state.privileges)
                     .copied()
                     .collect();
-
-                if !to_add.is_empty() {
-                    set_out.push(change_set_default(key, &to_add));
-                }
                 if !to_remove.is_empty() {
-                    revoke_out.push(change_revoke_default(key, &to_remove));
+                    revokes.entry(key.clone()).or_default().extend(to_remove);
                 }
             }
         }
     }
 
     for (key, current_state) in &current.default_privileges {
-        if !desired.default_privileges.contains_key(key) {
-            revoke_out.push(change_revoke_default(key, &current_state.privileges));
+        if desired.default_privileges.contains_key(key) || key.grantee.is_public() {
+            continue;
         }
+        revokes
+            .entry(key.clone())
+            .or_default()
+            .extend(current_state.privileges.iter().copied());
+    }
+
+    // Absence assertions: revoke `absent ∩ current`. Keys here are exact —
+    // default privileges have no wildcard selector.
+    for (key, absent_privileges) in &desired.default_privilege_absences {
+        if let Some(current_state) = current.default_privileges.get(key) {
+            let to_revoke: BTreeSet<Privilege> = absent_privileges
+                .intersection(&current_state.privileges)
+                .copied()
+                .collect();
+            if !to_revoke.is_empty() {
+                revokes.entry(key.clone()).or_default().extend(to_revoke);
+            }
+        }
+    }
+
+    for (key, privileges) in &revokes {
+        revoke_out.push(change_revoke_default(key, privileges));
     }
 }
 
 fn change_set_default(key: &DefaultPrivKey, privileges: &BTreeSet<Privilege>) -> Change {
     Change::SetDefaultPrivilege {
         owner: key.owner.clone(),
-        schema: key.schema.clone(),
+        scope: key.scope.clone(),
         on_type: key.on_type,
         grantee: key.grantee.clone(),
         privileges: privileges.clone(),
@@ -837,7 +936,7 @@ fn change_set_default(key: &DefaultPrivKey, privileges: &BTreeSet<Privilege>) ->
 fn change_revoke_default(key: &DefaultPrivKey, privileges: &BTreeSet<Privilege>) -> Change {
     Change::RevokeDefaultPrivilege {
         owner: key.owner.clone(),
-        schema: key.schema.clone(),
+        scope: key.scope.clone(),
         on_type: key.on_type,
         grantee: key.grantee.clone(),
         privileges: privileges.clone(),
@@ -1033,7 +1132,7 @@ mod tests {
         for grantee in ["z", "bystander"] {
             current.grants.insert(
                 GrantKey {
-                    role: grantee.to_string(),
+                    role: grantee.into(),
                     object_type: ObjectType::Schema,
                     schema: None,
                     name: Some("s".to_string()),
@@ -1071,7 +1170,7 @@ mod tests {
             !changes.iter().any(|c| matches!(
                 c,
                 Change::Revoke { role, object_type: ObjectType::Schema, name: Some(n), .. }
-                    if role == "z" && n == "s"
+                    if role.as_str() == "z" && n == "s"
             )),
             "revoke against incoming owner must be suppressed: {changes:?}"
         );
@@ -1080,7 +1179,7 @@ mod tests {
             changes.iter().any(|c| matches!(
                 c,
                 Change::Revoke { role, object_type: ObjectType::Schema, name: Some(n), .. }
-                    if role == "bystander" && n == "s"
+                    if role.as_str() == "bystander" && n == "s"
             )),
             "bystander's stale grant must still be revoked: {changes:?}"
         );
@@ -1330,7 +1429,7 @@ memberships:
         let current = empty_graph();
         let mut desired = empty_graph();
         let key = GrantKey {
-            role: "r1".to_string(),
+            role: "r1".into(),
             object_type: ObjectType::Table,
             schema: Some("public".to_string()),
             name: Some("*".to_string()),
@@ -1348,7 +1447,7 @@ memberships:
             Change::Grant {
                 role, privileges, ..
             } => {
-                assert_eq!(role, "r1");
+                assert_eq!(role.as_str(), "r1");
                 assert!(privileges.contains(&Privilege::Select));
                 assert!(privileges.contains(&Privilege::Insert));
             }
@@ -1360,7 +1459,7 @@ memberships:
     fn diff_revokes_removed_privileges() {
         let mut current = empty_graph();
         let key = GrantKey {
-            role: "r1".to_string(),
+            role: "r1".into(),
             object_type: ObjectType::Table,
             schema: Some("public".to_string()),
             name: Some("*".to_string()),
@@ -1386,7 +1485,7 @@ memberships:
             Change::Revoke {
                 role, privileges, ..
             } => {
-                assert_eq!(role, "r1");
+                assert_eq!(role.as_str(), "r1");
                 assert!(privileges.contains(&Privilege::Insert));
                 assert!(!privileges.contains(&Privilege::Select));
             }
@@ -1398,7 +1497,7 @@ memberships:
     fn diff_revokes_entire_grant_target_when_absent_from_desired() {
         let mut current = empty_graph();
         let key = GrantKey {
-            role: "r1".to_string(),
+            role: "r1".into(),
             object_type: ObjectType::Schema,
             schema: None,
             name: Some("myschema".to_string()),
@@ -1413,7 +1512,7 @@ memberships:
 
         let changes = diff(&current, &desired);
         assert_eq!(changes.len(), 1);
-        assert!(matches!(&changes[0], Change::Revoke { role, .. } if role == "r1"));
+        assert!(matches!(&changes[0], Change::Revoke { role, .. } if role.as_str() == "r1"));
     }
 
     #[test]
@@ -1505,9 +1604,11 @@ memberships:
         let mut current = empty_graph();
         let key = DefaultPrivKey {
             owner: "app_owner".to_string(),
-            schema: "inventory".to_string(),
+            scope: DefaultPrivilegeScope::Schema {
+                schema: "inventory".to_string(),
+            },
             on_type: ObjectType::Table,
-            grantee: "inventory-editor".to_string(),
+            grantee: "inventory-editor".into(),
         };
         current.default_privileges.insert(
             key.clone(),
@@ -1577,7 +1678,7 @@ memberships:
             .insert("role1".to_string(), RoleState::default());
         graph.grants.insert(
             GrantKey {
-                role: "role1".to_string(),
+                role: "role1".into(),
                 object_type: ObjectType::Table,
                 schema: Some("public".to_string()),
                 name: Some("*".to_string()),
@@ -1705,14 +1806,14 @@ memberships:
                 comment: Some("hello".to_string()),
             },
             Change::Grant {
-                role: "r1".to_string(),
+                role: "r1".into(),
                 privileges: BTreeSet::from([Privilege::Select]),
                 object_type: ObjectType::Table,
                 schema: Some("public".to_string()),
                 name: Some("*".to_string()),
             },
             Change::Revoke {
-                role: "r1".to_string(),
+                role: "r1".into(),
                 privileges: BTreeSet::from([Privilege::Insert]),
                 object_type: ObjectType::Table,
                 schema: Some("public".to_string()),
@@ -1720,16 +1821,20 @@ memberships:
             },
             Change::SetDefaultPrivilege {
                 owner: "owner".to_string(),
-                schema: "public".to_string(),
+                scope: DefaultPrivilegeScope::Schema {
+                    schema: "public".to_string(),
+                },
                 on_type: ObjectType::Table,
-                grantee: "r1".to_string(),
+                grantee: "r1".into(),
                 privileges: BTreeSet::from([Privilege::Select]),
             },
             Change::RevokeDefaultPrivilege {
                 owner: "owner".to_string(),
-                schema: "public".to_string(),
+                scope: DefaultPrivilegeScope::Schema {
+                    schema: "public".to_string(),
+                },
                 on_type: ObjectType::Table,
-                grantee: "r1".to_string(),
+                grantee: "r1".into(),
                 privileges: BTreeSet::from([Privilege::Delete]),
             },
             Change::AddMember {
@@ -1902,13 +2007,15 @@ memberships:
             },
             Change::SetDefaultPrivilege {
                 owner: "new_owner".to_string(),
-                schema: "inventory".to_string(),
+                scope: DefaultPrivilegeScope::Schema {
+                    schema: "inventory".to_string(),
+                },
                 on_type: ObjectType::Table,
-                grantee: "inventory-editor".to_string(),
+                grantee: "inventory-editor".into(),
                 privileges: BTreeSet::from([Privilege::Select]),
             },
             Change::Grant {
-                role: "inventory-editor".to_string(),
+                role: "inventory-editor".into(),
                 privileges: BTreeSet::from([Privilege::Usage]),
                 object_type: ObjectType::Schema,
                 schema: None,
@@ -1918,7 +2025,9 @@ memberships:
 
         let filtered = filter_changes(changes, ReconciliationMode::Additive);
         assert_eq!(filtered.len(), 1);
-        assert!(matches!(&filtered[0], Change::Grant { role, .. } if role == "inventory-editor"));
+        assert!(
+            matches!(&filtered[0], Change::Grant { role, .. } if role.as_str() == "inventory-editor")
+        );
     }
 
     #[test]
@@ -1966,7 +2075,7 @@ memberships:
     fn filter_additive_only_destructive_changes_yields_empty() {
         let changes = vec![
             Change::Revoke {
-                role: "r1".to_string(),
+                role: "r1".into(),
                 privileges: BTreeSet::from([Privilege::Select]),
                 object_type: ObjectType::Table,
                 schema: Some("public".to_string()),
@@ -1988,14 +2097,14 @@ memberships:
                 state: RoleState::default(),
             },
             Change::Grant {
-                role: "new-role".to_string(),
+                role: "new-role".into(),
                 privileges: BTreeSet::from([Privilege::Select]),
                 object_type: ObjectType::Table,
                 schema: Some("public".to_string()),
                 name: Some("*".to_string()),
             },
             Change::Revoke {
-                role: "existing-role".to_string(),
+                role: "existing-role".into(),
                 privileges: BTreeSet::from([Privilege::Insert]),
                 object_type: ObjectType::Table,
                 schema: Some("public".to_string()),
@@ -2039,7 +2148,7 @@ memberships:
     fn apply_role_retirements_inserts_cleanup_before_drop() {
         let changes = vec![
             Change::Grant {
-                role: "analytics".to_string(),
+                role: "analytics".into(),
                 privileges: BTreeSet::from([Privilege::Select]),
                 object_type: ObjectType::Table,
                 schema: Some("public".to_string()),
@@ -2104,7 +2213,7 @@ memberships:
     fn inject_password_for_existing_role() {
         // No CreateRole — role already exists. Only grants change.
         let changes = vec![Change::Grant {
-            role: "app-svc".to_string(),
+            role: "app-svc".into(),
             privileges: BTreeSet::from([crate::manifest::Privilege::Select]),
             object_type: crate::manifest::ObjectType::Table,
             schema: Some("public".to_string()),
@@ -2305,7 +2414,7 @@ memberships:
                 state: RoleState::default(),
             },
             Change::Grant {
-                role: "role-c".to_string(),
+                role: "role-c".into(),
                 privileges: BTreeSet::from([crate::manifest::Privilege::Select]),
                 object_type: crate::manifest::ObjectType::Table,
                 schema: Some("public".to_string()),
@@ -2379,7 +2488,7 @@ memberships:
     /// oscillation between two stable states.
     #[test]
     fn diff_does_not_revoke_per_name_grants_covered_by_desired_wildcard() {
-        let role = "cdc-editor".to_string();
+        let role: Grantee = "cdc-editor".into();
         let schema = "cdc".to_string();
         let object_type = ObjectType::Function;
 
@@ -2466,7 +2575,7 @@ memberships:
     /// wildcard is unsatisfied, the next reconcile inverts again).
     #[test]
     fn diff_does_not_revoke_extra_privileges_covered_by_desired_wildcard() {
-        let role = "viewer".to_string();
+        let role: Grantee = "viewer".into();
         let schema = "myschema".to_string();
         let object_type = ObjectType::Table;
 
@@ -2574,6 +2683,271 @@ memberships:
                 assert!(attributes.contains(&RoleAttribute::ValidUntil(None)));
             }
             other => panic!("expected AlterRole, got: {other:?}"),
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Absence assertions (ensure: absent)
+    // -----------------------------------------------------------------------
+
+    fn public_function_key(schema: &str, name: &str) -> GrantKey {
+        GrantKey {
+            role: Grantee::Public,
+            object_type: ObjectType::Function,
+            schema: Some(schema.to_string()),
+            name: Some(name.to_string()),
+        }
+    }
+
+    fn graph_with_public_grant(schema: &str, name: &str, privileges: &[Privilege]) -> RoleGraph {
+        let mut graph = RoleGraph::default();
+        graph.grants.insert(
+            public_function_key(schema, name),
+            GrantState {
+                privileges: privileges.iter().copied().collect(),
+            },
+        );
+        graph
+    }
+
+    #[test]
+    fn absence_revokes_only_the_privileges_actually_held() {
+        let current = graph_with_public_grant("api", "f()", &[Privilege::Execute]);
+        let mut desired = RoleGraph::default();
+        desired.grant_absences.insert(
+            public_function_key("api", "f()"),
+            [Privilege::Execute, Privilege::Usage].into_iter().collect(),
+        );
+
+        let changes = diff(&current, &desired);
+        assert_eq!(
+            changes,
+            vec![Change::Revoke {
+                role: Grantee::Public,
+                privileges: [Privilege::Execute].into_iter().collect(),
+                object_type: ObjectType::Function,
+                schema: Some("api".to_string()),
+                name: Some("f()".to_string()),
+            }]
+        );
+    }
+
+    #[test]
+    fn absence_of_a_privilege_that_is_not_held_plans_nothing() {
+        let current = graph_with_public_grant("api", "f()", &[Privilege::Execute]);
+        let mut desired = RoleGraph::default();
+        desired.grant_absences.insert(
+            public_function_key("api", "f()"),
+            [Privilege::Usage].into_iter().collect(),
+        );
+
+        assert!(diff(&current, &desired).is_empty());
+    }
+
+    #[test]
+    fn wildcard_absence_emits_one_revoke_covering_every_matching_object() {
+        let mut current = RoleGraph::default();
+        for name in ["f(integer)", "f(text)", "g()"] {
+            current.grants.insert(
+                public_function_key("api", name),
+                GrantState {
+                    privileges: [Privilege::Execute].into_iter().collect(),
+                },
+            );
+        }
+
+        let mut desired = RoleGraph::default();
+        desired.grant_absences.insert(
+            GrantKey {
+                role: Grantee::Public,
+                object_type: ObjectType::Function,
+                schema: Some("api".to_string()),
+                name: Some("*".to_string()),
+            },
+            [Privilege::Execute].into_iter().collect(),
+        );
+
+        let changes = diff(&current, &desired);
+        assert_eq!(
+            changes,
+            vec![Change::Revoke {
+                role: Grantee::Public,
+                privileges: [Privilege::Execute].into_iter().collect(),
+                object_type: ObjectType::Function,
+                schema: Some("api".to_string()),
+                name: Some("*".to_string()),
+            }]
+        );
+    }
+
+    #[test]
+    fn wildcard_absence_over_an_empty_scope_is_vacuously_converged() {
+        let mut desired = RoleGraph::default();
+        desired.grant_absences.insert(
+            GrantKey {
+                role: Grantee::Public,
+                object_type: ObjectType::Function,
+                schema: Some("api".to_string()),
+                name: Some("*".to_string()),
+            },
+            [Privilege::Execute].into_iter().collect(),
+        );
+
+        assert!(diff(&RoleGraph::default(), &desired).is_empty());
+    }
+
+    #[test]
+    fn unmentioned_public_grants_are_never_revoked() {
+        // PUBLIC state is assertion-driven: without an absence rule naming it,
+        // a live PUBLIC grant is unmanaged, not drift.
+        let current = graph_with_public_grant("api", "f()", &[Privilege::Execute]);
+        assert!(diff(&current, &RoleGraph::default()).is_empty());
+
+        // Same for a PUBLIC key the manifest declares with other privileges.
+        let mut desired = RoleGraph::default();
+        desired.grants.insert(
+            public_function_key("api", "f()"),
+            GrantState {
+                privileges: [Privilege::Usage].into_iter().collect(),
+            },
+        );
+        let changes = diff(&current, &desired);
+        assert!(
+            changes
+                .iter()
+                .all(|change| !matches!(change, Change::Revoke { .. })),
+            "unexpected revoke in {changes:?}"
+        );
+    }
+
+    #[test]
+    fn a_key_hit_by_convergence_and_absence_emits_one_merged_revoke() {
+        let key = GrantKey {
+            role: "reader".into(),
+            object_type: ObjectType::Table,
+            schema: Some("app".to_string()),
+            name: Some("t".to_string()),
+        };
+        let mut current = RoleGraph::default();
+        current.grants.insert(
+            key.clone(),
+            GrantState {
+                privileges: [Privilege::Select, Privilege::Insert, Privilege::Delete]
+                    .into_iter()
+                    .collect(),
+            },
+        );
+
+        let mut desired = RoleGraph::default();
+        desired.grants.insert(
+            key.clone(),
+            GrantState {
+                privileges: [Privilege::Select].into_iter().collect(),
+            },
+        );
+        desired
+            .grant_absences
+            .insert(key, [Privilege::Delete].into_iter().collect());
+
+        let changes = diff(&current, &desired);
+        let revokes: Vec<&Change> = changes
+            .iter()
+            .filter(|change| matches!(change, Change::Revoke { .. }))
+            .collect();
+        assert_eq!(revokes.len(), 1, "expected one merged revoke: {revokes:?}");
+        let Change::Revoke { privileges, .. } = revokes[0] else {
+            unreachable!()
+        };
+        assert_eq!(
+            *privileges,
+            [Privilege::Insert, Privilege::Delete]
+                .into_iter()
+                .collect::<BTreeSet<_>>()
+        );
+    }
+
+    #[test]
+    fn default_privilege_absence_revokes_in_both_scopes() {
+        let global_key = DefaultPrivKey {
+            owner: "owner".to_string(),
+            scope: DefaultPrivilegeScope::Global,
+            on_type: ObjectType::Function,
+            grantee: Grantee::Public,
+        };
+        let schema_key = DefaultPrivKey {
+            owner: "owner".to_string(),
+            scope: DefaultPrivilegeScope::Schema {
+                schema: "api".to_string(),
+            },
+            on_type: ObjectType::Function,
+            grantee: Grantee::Public,
+        };
+
+        let mut current = RoleGraph::default();
+        for key in [&global_key, &schema_key] {
+            current.default_privileges.insert(
+                key.clone(),
+                DefaultPrivState {
+                    privileges: [Privilege::Execute].into_iter().collect(),
+                },
+            );
+        }
+
+        let mut desired = RoleGraph::default();
+        for key in [&global_key, &schema_key] {
+            desired
+                .default_privilege_absences
+                .insert(key.clone(), [Privilege::Execute].into_iter().collect());
+        }
+
+        let changes = diff(&current, &desired);
+        assert_eq!(changes.len(), 2, "{changes:?}");
+        assert!(changes.iter().all(|change| matches!(
+            change,
+            Change::RevokeDefaultPrivilege {
+                grantee: Grantee::Public,
+                ..
+            }
+        )));
+    }
+
+    #[test]
+    fn additive_mode_ignores_absence_while_adopt_and_authoritative_apply_it() {
+        let current = graph_with_public_grant("api", "f()", &[Privilege::Execute]);
+        let mut desired = RoleGraph::default();
+        desired.grant_absences.insert(
+            public_function_key("api", "f()"),
+            [Privilege::Execute].into_iter().collect(),
+        );
+        // A role creation in the same plan proves additive keeps the rest of it.
+        desired
+            .roles
+            .insert("newcomer".to_string(), RoleState::default());
+
+        let changes = diff(&current, &desired);
+
+        let additive = filter_changes(changes.clone(), ReconciliationMode::Additive);
+        assert!(
+            !additive
+                .iter()
+                .any(|change| matches!(change, Change::Revoke { .. })),
+            "additive must ignore absence: {additive:?}"
+        );
+        assert!(
+            additive
+                .iter()
+                .any(|change| matches!(change, Change::CreateRole { .. })),
+            "additive must keep the rest of the plan"
+        );
+
+        for mode in [ReconciliationMode::Adopt, ReconciliationMode::Authoritative] {
+            let filtered = filter_changes(changes.clone(), mode);
+            assert!(
+                filtered
+                    .iter()
+                    .any(|change| matches!(change, Change::Revoke { .. })),
+                "{mode:?} must apply absence"
+            );
         }
     }
 }

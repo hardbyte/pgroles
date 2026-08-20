@@ -27,7 +27,7 @@ use crate::crd::{
 };
 use crate::k8s_names::{LabelValue, truncate_name_prefix};
 use crate::reconciler::ReconcileError;
-use pgroles_core::approval::{APPROVAL_EFFECT_ENCODING_V2, TargetIdentity};
+use pgroles_core::approval::{APPROVAL_EFFECT_ENCODING_V3, TargetIdentity};
 
 /// Result of plan creation — distinguishes genuinely new plans from
 /// deduplication hits so callers can decide whether to emit events.
@@ -906,7 +906,7 @@ pub async fn create_or_update_plan(
         last_error: None,
         sql_hash: Some(sql_hash),
         change_digest: Some(change_digest.clone()),
-        change_digest_encoding: Some(APPROVAL_EFFECT_ENCODING_V2.to_string()),
+        change_digest_encoding: Some(APPROVAL_EFFECT_ENCODING_V3.to_string()),
         target_physical_identity: target_identity.physical.clone(),
         target_logical_fingerprint: target_identity.logical.clone(),
         physical_identity_available: Some(target_identity.has_physical()),
@@ -1929,7 +1929,7 @@ pub(crate) fn plan_matches_digest(
     status: &crate::crd::PostgresPolicyPlanStatus,
     change_digest: &str,
 ) -> bool {
-    status.change_digest_encoding.as_deref() == Some(APPROVAL_EFFECT_ENCODING_V2)
+    status.change_digest_encoding.as_deref() == Some(APPROVAL_EFFECT_ENCODING_V3)
         && status.change_digest.as_deref() == Some(change_digest)
 }
 
@@ -4329,7 +4329,7 @@ mod tests {
 
     fn grant_change(role: &str) -> pgroles_core::diff::Change {
         pgroles_core::diff::Change::Grant {
-            role: role.to_string(),
+            role: pgroles_core::model::Grantee::parse(role),
             privileges: [pgroles_core::manifest::Privilege::Select]
                 .into_iter()
                 .collect(),
@@ -4450,7 +4450,7 @@ mod tests {
         let pending = PostgresPolicyPlanStatus {
             phase: PlanPhase::Pending,
             change_digest: Some(planned.clone()),
-            change_digest_encoding: Some(APPROVAL_EFFECT_ENCODING_V2.to_string()),
+            change_digest_encoding: Some(APPROVAL_EFFECT_ENCODING_V3.to_string()),
             revalidated_generation: Some(1),
             ..Default::default()
         };
@@ -4481,7 +4481,7 @@ mod tests {
         let pending = PostgresPolicyPlanStatus {
             phase: PlanPhase::Pending,
             change_digest: Some(old_digest.clone()),
-            change_digest_encoding: Some(APPROVAL_EFFECT_ENCODING_V2.to_string()),
+            change_digest_encoding: Some(APPROVAL_EFFECT_ENCODING_V3.to_string()),
             ..Default::default()
         };
         // At most one plan may await a decision, so a pending plan is retired
@@ -4499,7 +4499,7 @@ mod tests {
         let approved = PostgresPolicyPlanStatus {
             phase: PlanPhase::Approved,
             change_digest: Some(approved_digest.clone()),
-            change_digest_encoding: Some(APPROVAL_EFFECT_ENCODING_V2.to_string()),
+            change_digest_encoding: Some(APPROVAL_EFFECT_ENCODING_V3.to_string()),
             ..Default::default()
         };
 
@@ -4598,7 +4598,7 @@ mod tests {
 
         let current = PostgresPolicyPlanStatus {
             change_digest: Some(digest.clone()),
-            change_digest_encoding: Some(APPROVAL_EFFECT_ENCODING_V2.to_string()),
+            change_digest_encoding: Some(APPROVAL_EFFECT_ENCODING_V3.to_string()),
             ..Default::default()
         };
         assert!(plan_matches_digest(&current, &digest));
@@ -4620,10 +4620,22 @@ mod tests {
 
         let different_effects = PostgresPolicyPlanStatus {
             change_digest: Some("sha256:0000".to_string()),
-            change_digest_encoding: Some(APPROVAL_EFFECT_ENCODING_V2.to_string()),
+            change_digest_encoding: Some(APPROVAL_EFFECT_ENCODING_V3.to_string()),
             ..Default::default()
         };
         assert!(!plan_matches_digest(&different_effects, &digest));
+
+        // A plan carrying the same digest string under v2 encodes
+        // default-privilege scope differently, so it is not comparable and
+        // must supersede instead of being accepted.
+        let previous_encoding = PostgresPolicyPlanStatus {
+            change_digest: Some(digest.clone()),
+            change_digest_encoding: Some(
+                pgroles_core::approval::APPROVAL_EFFECT_ENCODING_V2.to_string(),
+            ),
+            ..Default::default()
+        };
+        assert!(!plan_matches_digest(&previous_encoding, &digest));
     }
 
     /// A pending plan whose effects disappear before anyone decides on it must
@@ -4636,7 +4648,7 @@ mod tests {
         let pending = PostgresPolicyPlanStatus {
             phase: PlanPhase::Pending,
             change_digest: Some(planned),
-            change_digest_encoding: Some(APPROVAL_EFFECT_ENCODING_V2.to_string()),
+            change_digest_encoding: Some(APPROVAL_EFFECT_ENCODING_V3.to_string()),
             ..Default::default()
         };
         let empty_digest = digest_for(&[], &versions);
@@ -4651,7 +4663,7 @@ mod tests {
         let empty_plan = PostgresPolicyPlanStatus {
             phase: PlanPhase::Pending,
             change_digest: Some(empty_digest.clone()),
-            change_digest_encoding: Some(APPROVAL_EFFECT_ENCODING_V2.to_string()),
+            change_digest_encoding: Some(APPROVAL_EFFECT_ENCODING_V3.to_string()),
             ..Default::default()
         };
         assert_eq!(
@@ -4668,7 +4680,7 @@ mod tests {
         let pending = PostgresPolicyPlanStatus {
             phase: PlanPhase::Pending,
             change_digest: Some(digest_for(&original, &versions)),
-            change_digest_encoding: Some(APPROVAL_EFFECT_ENCODING_V2.to_string()),
+            change_digest_encoding: Some(APPROVAL_EFFECT_ENCODING_V3.to_string()),
             ..Default::default()
         };
 
@@ -4708,7 +4720,7 @@ mod tests {
         let approved = PostgresPolicyPlanStatus {
             phase: PlanPhase::Approved,
             change_digest: Some(approved_digest.clone()),
-            change_digest_encoding: Some(APPROVAL_EFFECT_ENCODING_V2.to_string()),
+            change_digest_encoding: Some(APPROVAL_EFFECT_ENCODING_V3.to_string()),
             ..Default::default()
         };
 
@@ -4757,7 +4769,7 @@ mod tests {
 
         let approved = PostgresPolicyPlanStatus {
             change_digest: Some(digest_for(&changes, &versions)),
-            change_digest_encoding: Some(APPROVAL_EFFECT_ENCODING_V2.to_string()),
+            change_digest_encoding: Some(APPROVAL_EFFECT_ENCODING_V3.to_string()),
             target_physical_identity: test_target_identity().physical,
             target_logical_fingerprint: test_target_identity().logical,
             physical_identity_available: Some(true),
@@ -4823,7 +4835,7 @@ mod tests {
         let approved = PostgresPolicyPlanStatus {
             phase: PlanPhase::Approved,
             change_digest: Some(digest_for(&[grant_change("reporting")], &versions)),
-            change_digest_encoding: Some(APPROVAL_EFFECT_ENCODING_V2.to_string()),
+            change_digest_encoding: Some(APPROVAL_EFFECT_ENCODING_V3.to_string()),
             ..Default::default()
         };
         let empty_digest = digest_for(&[], &versions);
@@ -4839,7 +4851,7 @@ mod tests {
         let approved_empty = PostgresPolicyPlanStatus {
             phase: PlanPhase::Approved,
             change_digest: Some(empty_digest.clone()),
-            change_digest_encoding: Some(APPROVAL_EFFECT_ENCODING_V2.to_string()),
+            change_digest_encoding: Some(APPROVAL_EFFECT_ENCODING_V3.to_string()),
             ..Default::default()
         };
         assert_eq!(

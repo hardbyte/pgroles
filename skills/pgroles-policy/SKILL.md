@@ -56,7 +56,8 @@ changes remain in the plan:
 - `additive`: creates and additions only. It filters revokes, membership
   removals, existing schema-owner transfers, existing-role rewrites, and role
   retirement. It also omits role comments. Configured password updates are a
-  deliberate exception.
+  deliberate exception. Because it never revokes, it silently ignores every
+  `ensure: absent` rule without failing the run.
 - `adopt`: authoritative convergence except role drops and their retirement
   steps. Revokes and membership removals still occur.
 - `authoritative`: retains every change computed within pgroles' managed
@@ -99,12 +100,24 @@ ACL becomes visible, authoritative reconciliation can revoke privileges not
 declared for that managed role. Declare the ordinary object privileges an owner
 must retain when applications use that role for DML.
 
+PostgreSQL materializes an object's whole ACL, owner entry included, the first
+time anything is granted or revoked on it. Any first-time grant does this, and
+so does revoking `EXECUTE` from PUBLIC. Expect one extra convergence pass on
+such objects, and declare the owner privileges that must survive it.
+
 Ownership rights such as altering or dropping an object, and the owner's
 implicit grant options, remain PostgreSQL behavior outside the object ACL model.
 
-Default privileges are per creating role, schema, and object type. A default
-owner declaration does not retroactively grant existing objects and does not
-cover objects created by another role.
+Default privileges are per creating role, scope, and object type, where a scope
+is one schema or the owner-wide global layer. A default owner declaration does
+not retroactively grant existing objects and does not cover objects created by
+another role.
+
+Schema defaults add to the global layer and cannot subtract from it. Removing
+PostgreSQL's built-in `PUBLIC EXECUTE` on functions therefore needs a global
+rule with `ensure: absent`; a schema-scoped one only removes a schema-scoped
+re-grant. Global rules reach every schema in the database, so only the bundle
+document that owns the owner role may declare them.
 
 ## Privilege Review
 
@@ -118,8 +131,11 @@ Review effective and transitive privileges, not role names alone.
   schema-wide wildcards as security-sensitive.
 - Owner, definer, and other group roles may carry much broader inherited access
   than the new membership suggests.
-- PUBLIC and column-level grants are outside desired-state reconciliation. Read
-  inspection warnings and review them separately.
+- Column-level grants are outside desired-state reconciliation. Read inspection
+  warnings and review them separately.
+- PUBLIC is reconciled only where a rule names it. A privilege PUBLIC holds that
+  no rule mentions is left alone in every mode, so deleting a `present` PUBLIC
+  rule does not revoke anything — switch it to `ensure: absent` instead.
 
 ## Safe Removal
 
