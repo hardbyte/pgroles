@@ -49,6 +49,15 @@
 //!   functions, no types, no database privileges. That keeps object bootstrap
 //!   simple; wildcard/function coverage lives in the pure harness and the
 //!   targeted live tests. **Coverage boundary, not an accident.**
+//! * PUBLIC grantees are never generated: PUBLIC ACL entries are
+//!   database-global state with no schema prefix to isolate them, so
+//!   concurrent seeds would corrupt them for each other.
+//! * `ensure: absent` assertions are never generated; absence semantics are
+//!   covered by targeted live tests in `crates/pgroles-cli/tests/cli.rs`.
+//! * Global-scope default privileges are never generated: like PUBLIC ACLs,
+//!   global `pg_default_acl` rows are database-global state with no schema
+//!   prefix to isolate them, so concurrent seeds would corrupt them for
+//!   each other.
 //! * Relation grants (tables/sequences) only target the base schemas present
 //!   in *both* graphs: pgroles manages grants, not tables, so an object must
 //!   exist before a grant on it can execute — and a schema created by the
@@ -84,8 +93,9 @@ use sqlx::{Executor, PgPool};
 use pgroles_core::diff::{Change, diff};
 use pgroles_core::manifest::{ExpandedManifest, ExpandedSchema, ObjectType, Privilege};
 use pgroles_core::model::{
-    DefaultPrivKey, DefaultPrivState, GrantKey, GrantState, MembershipEdge, RoleAttribute,
-    RoleGraph, RoleState, SchemaState, default_schema_owner_privileges,
+    DefaultPrivKey, DefaultPrivState, DefaultPrivilegeScope, GrantKey, GrantState, Grantee,
+    MembershipEdge, RoleAttribute, RoleGraph, RoleState, SchemaState,
+    default_schema_owner_privileges,
 };
 use pgroles_core::sql::{quote_ident, render_statements};
 use pgroles_inspect::{InspectConfig, inspect};
@@ -330,7 +340,7 @@ fn gen_grants(rng: &mut Rng, graph: &mut RoleGraph, names: &Names) {
     let role_names: Vec<String> = graph.roles.keys().cloned().collect();
     let schema_names: Vec<String> = graph.schemas.keys().cloned().collect();
     for _ in 0..rng.usize(7) {
-        let role = pick(rng, &role_names).clone();
+        let role = Grantee::Role(pick(rng, &role_names).clone());
         let (key, privileges) = match rng.usize(3) {
             0 => {
                 let schema = pick(rng, &schema_names).clone();
@@ -386,9 +396,11 @@ fn gen_default_privileges(rng: &mut Rng, graph: &mut RoleGraph, names: &Names) {
         graph.default_privileges.insert(
             DefaultPrivKey {
                 owner,
-                schema: pick(rng, &names.base_schemas).clone(),
+                scope: DefaultPrivilegeScope::Schema {
+                    schema: pick(rng, &names.base_schemas).clone(),
+                },
                 on_type,
-                grantee,
+                grantee: Grantee::Role(grantee),
             },
             DefaultPrivState { privileges },
         );
@@ -477,10 +489,10 @@ fn remove_role(graph: &mut RoleGraph, role: &str) {
             state.owner_privileges = default_schema_owner_privileges(&survivor);
         }
     }
-    graph.grants.retain(|key, _| key.role != role);
+    graph.grants.retain(|key, _| key.role.as_str() != role);
     graph
         .default_privileges
-        .retain(|key, _| key.owner != role && key.grantee != role);
+        .retain(|key, _| key.owner != role && key.grantee.as_str() != role);
     graph
         .memberships
         .retain(|edge| edge.role != role && edge.member != role);
@@ -594,7 +606,7 @@ fn derive_current(rng: &mut Rng, desired: &RoleGraph, names: &Names) -> RoleGrap
     for _ in 0..rng.usize(3) {
         c.grants.insert(
             GrantKey {
-                role: pick(rng, &current_roles).clone(),
+                role: Grantee::Role(pick(rng, &current_roles).clone()),
                 object_type: ObjectType::Table,
                 schema: Some(pick(rng, &names.base_schemas).clone()),
                 name: Some(pick(rng, &names.tables).clone()),
@@ -644,9 +656,11 @@ fn derive_current(rng: &mut Rng, desired: &RoleGraph, names: &Names) -> RoleGrap
             c.default_privileges.insert(
                 DefaultPrivKey {
                     owner,
-                    schema: pick(rng, &names.base_schemas).clone(),
+                    scope: DefaultPrivilegeScope::Schema {
+                        schema: pick(rng, &names.base_schemas).clone(),
+                    },
                     on_type: ObjectType::Table,
-                    grantee,
+                    grantee: Grantee::Role(grantee),
                 },
                 DefaultPrivState {
                     privileges: [Privilege::Select].into_iter().collect(),
@@ -722,10 +736,9 @@ fn strip_owner_schema_grants(current: &mut RoleGraph, desired: &mut RoleGraph) {
             .collect();
         graph.grants.retain(|key, _| {
             !(key.object_type == ObjectType::Schema
-                && key
-                    .name
-                    .as_ref()
-                    .is_some_and(|name| owners.contains(&(name.clone(), key.role.clone()))))
+                && key.name.as_ref().is_some_and(|name| {
+                    owners.contains(&(name.clone(), key.role.as_str().to_string()))
+                }))
         });
     }
 }
@@ -863,7 +876,7 @@ fn apply_changes(graph: &RoleGraph, changes: &[Change]) -> RoleGraph {
                 state.owner_privileges =
                     [Privilege::Create, Privilege::Usage].into_iter().collect();
                 g.grants.remove(&GrantKey {
-                    role: owner.clone(),
+                    role: Grantee::Role(owner.clone()),
                     object_type: ObjectType::Schema,
                     schema: None,
                     name: Some(name.clone()),
@@ -927,14 +940,14 @@ fn apply_changes(graph: &RoleGraph, changes: &[Change]) -> RoleGraph {
             }
             Change::SetDefaultPrivilege {
                 owner,
-                schema,
+                scope,
                 on_type,
                 grantee,
                 privileges,
             } => {
                 let key = DefaultPrivKey {
                     owner: owner.clone(),
-                    schema: schema.clone(),
+                    scope: scope.clone(),
                     on_type: *on_type,
                     grantee: grantee.clone(),
                 };
@@ -950,14 +963,14 @@ fn apply_changes(graph: &RoleGraph, changes: &[Change]) -> RoleGraph {
             }
             Change::RevokeDefaultPrivilege {
                 owner,
-                schema,
+                scope,
                 on_type,
                 grantee,
                 privileges,
             } => {
                 let key = DefaultPrivKey {
                     owner: owner.clone(),
-                    schema: schema.clone(),
+                    scope: scope.clone(),
                     on_type: *on_type,
                     grantee: grantee.clone(),
                 };
@@ -1048,9 +1061,10 @@ fn filter_prefix(graph: &RoleGraph, prefix: &str) -> RoleGraph {
     let mut g = graph.clone();
     g.roles.retain(|name, _| name.starts_with(prefix));
     g.schemas.retain(|name, _| name.starts_with(prefix));
-    g.grants.retain(|key, _| key.role.starts_with(prefix));
+    g.grants
+        .retain(|key, _| key.role.as_str().starts_with(prefix));
     g.default_privileges
-        .retain(|key, _| key.owner.starts_with(prefix) && key.grantee.starts_with(prefix));
+        .retain(|key, _| key.owner.starts_with(prefix) && key.grantee.as_str().starts_with(prefix));
     g.memberships
         .retain(|edge| edge.role.starts_with(prefix) && edge.member.starts_with(prefix));
     g

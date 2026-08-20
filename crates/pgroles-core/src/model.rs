@@ -7,7 +7,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use crate::manifest::{ExpandedManifest, Grant, ObjectType, Privilege, RoleDefinition};
+use crate::manifest::{Ensure, ExpandedManifest, Grant, ObjectType, Privilege, RoleDefinition};
 
 // ---------------------------------------------------------------------------
 // Role attributes
@@ -177,16 +177,115 @@ pub struct SchemaState {
 }
 
 // ---------------------------------------------------------------------------
+// Grantees and scopes
+// ---------------------------------------------------------------------------
+
+/// A privilege grantee: either an ordinary role or the PostgreSQL PUBLIC
+/// pseudo-role (ACL grantee OID 0).
+///
+/// PUBLIC is typed rather than spelled as a magic string so that SQL rendering
+/// can never quote it (`"PUBLIC"` would name a real role) and so a role
+/// literally named `PUBLIC` can never be confused with the pseudo-role.
+/// `Public` sorts before every role name, which keeps BTreeMap output
+/// deterministic.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum Grantee {
+    Public,
+    Role(String),
+}
+
+/// How the PUBLIC pseudo-role spells itself wherever a grantee is carried as a
+/// bare string.
+pub const PUBLIC_ROLE: &str = "PUBLIC";
+
+impl Grantee {
+    /// Parse a manifest grantee string. The exact-uppercase `PUBLIC` is the
+    /// pseudo-role; everything else is a role name.
+    pub fn parse(s: &str) -> Self {
+        if s == PUBLIC_ROLE {
+            Grantee::Public
+        } else {
+            Grantee::Role(s.to_string())
+        }
+    }
+
+    pub fn is_public(&self) -> bool {
+        matches!(self, Grantee::Public)
+    }
+
+    pub fn as_str(&self) -> &str {
+        match self {
+            Grantee::Public => PUBLIC_ROLE,
+            Grantee::Role(name) => name,
+        }
+    }
+}
+
+impl std::fmt::Display for Grantee {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl From<&str> for Grantee {
+    fn from(s: &str) -> Self {
+        Grantee::parse(s)
+    }
+}
+
+// Serialized as a plain string so plan JSON keeps the shape it had when the
+// grantee was a `String`.
+impl serde::Serialize for Grantee {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.as_str())
+    }
+}
+
+/// Where a default-privilege rule applies.
+///
+/// `Global` is the owner-wide layer (`pg_default_acl.defaclnamespace = 0`),
+/// which affects every schema in the database and renders without an
+/// `IN SCHEMA` clause. `Global` sorts before `Schema` so the global layer
+/// appears first in deterministic output.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize)]
+#[serde(tag = "type", rename_all = "lowercase")]
+pub enum DefaultPrivilegeScope {
+    Global,
+    Schema { schema: String },
+}
+
+impl DefaultPrivilegeScope {
+    pub fn schema(&self) -> Option<&str> {
+        match self {
+            DefaultPrivilegeScope::Global => None,
+            DefaultPrivilegeScope::Schema { schema } => Some(schema),
+        }
+    }
+}
+
+impl std::fmt::Display for DefaultPrivilegeScope {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            DefaultPrivilegeScope::Global => write!(f, "global scope"),
+            DefaultPrivilegeScope::Schema { schema } => write!(f, "schema \"{schema}\""),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Grants
 // ---------------------------------------------------------------------------
 
 /// Unique key identifying a grant target — (grantee, object_type, schema, name).
 ///
 /// We use `Ord` so these can live in a `BTreeMap` for deterministic output.
+/// The field order also matters for the diff engine: absence assertions with a
+/// wildcard name range-scan all keys sharing the (role, object_type, schema)
+/// prefix, which needs `name` to be the last field.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize)]
 pub struct GrantKey {
-    /// The role receiving the privilege.
-    pub role: String,
+    /// The grantee receiving the privilege.
+    pub role: Grantee,
     /// The kind of object.
     pub object_type: ObjectType,
     /// Schema name. `None` for schema-level and database-level grants.
@@ -210,12 +309,12 @@ pub struct GrantState {
 pub struct DefaultPrivKey {
     /// The owner role context (whose newly-created objects get these defaults).
     pub owner: String,
-    /// The schema where the default applies.
-    pub schema: String,
+    /// Where the default applies: one schema, or owner-wide.
+    pub scope: DefaultPrivilegeScope,
     /// The type of object affected.
     pub on_type: ObjectType,
-    /// The grantee role.
-    pub grantee: String,
+    /// The grantee.
+    pub grantee: Grantee,
 }
 
 /// The privilege set for a default privilege rule.
@@ -257,10 +356,16 @@ pub struct RoleGraph {
     pub schemas: BTreeMap<String, SchemaState>,
     /// Object privilege grants, keyed by grant target.
     pub grants: BTreeMap<GrantKey, GrantState>,
-    /// Default privilege rules, keyed by (owner, schema, type, grantee).
+    /// Default privilege rules, keyed by (owner, scope, type, grantee).
     pub default_privileges: BTreeMap<DefaultPrivKey, DefaultPrivState>,
     /// Membership edges.
     pub memberships: BTreeSet<MembershipEdge>,
+    /// Privileges asserted absent per grant target (`ensure: absent`).
+    /// Only the desired graph populates this; inspection leaves it empty.
+    pub grant_absences: BTreeMap<GrantKey, BTreeSet<Privilege>>,
+    /// Privileges asserted absent per default-privilege rule.
+    /// Only the desired graph populates this; inspection leaves it empty.
+    pub default_privilege_absences: BTreeMap<DefaultPrivKey, BTreeSet<Privilege>>,
 }
 
 impl RoleGraph {
@@ -298,11 +403,20 @@ impl RoleGraph {
         // --- Grants ---
         for grant in &expanded.grants {
             let key = grant_key_from_manifest(grant);
-            let entry = graph.grants.entry(key).or_insert_with(|| GrantState {
-                privileges: BTreeSet::new(),
-            });
+            let privileges = match grant.ensure {
+                Ensure::Present => {
+                    &mut graph
+                        .grants
+                        .entry(key)
+                        .or_insert_with(|| GrantState {
+                            privileges: BTreeSet::new(),
+                        })
+                        .privileges
+                }
+                Ensure::Absent => graph.grant_absences.entry(key).or_default(),
+            };
             for privilege in &grant.privileges {
-                entry.privileges.insert(*privilege);
+                privileges.insert(*privilege);
             }
         }
 
@@ -314,30 +428,36 @@ impl RoleGraph {
                 .or(default_owner)
                 .unwrap_or("postgres")
                 .to_string();
+            let scope = default_priv.resolved_scope()?;
 
             for grant in &default_priv.grant {
-                let grantee = grant.role.clone().ok_or_else(|| {
+                let grantee = grant.role.as_deref().map(Grantee::parse).ok_or_else(|| {
                     crate::manifest::ManifestError::MissingDefaultPrivilegeRole {
-                        schema: default_priv.schema.clone(),
+                        scope: scope.to_string(),
                     }
                 })?;
 
                 let key = DefaultPrivKey {
                     owner: owner.clone(),
-                    schema: default_priv.schema.clone(),
+                    scope: scope.clone(),
                     on_type: grant.on_type,
                     grantee,
                 };
 
-                let entry =
-                    graph
-                        .default_privileges
-                        .entry(key)
-                        .or_insert_with(|| DefaultPrivState {
-                            privileges: BTreeSet::new(),
-                        });
+                let privileges = match grant.ensure {
+                    Ensure::Present => {
+                        &mut graph
+                            .default_privileges
+                            .entry(key)
+                            .or_insert_with(|| DefaultPrivState {
+                                privileges: BTreeSet::new(),
+                            })
+                            .privileges
+                    }
+                    Ensure::Absent => graph.default_privilege_absences.entry(key).or_default(),
+                };
                 for privilege in &grant.privileges {
-                    entry.privileges.insert(*privilege);
+                    privileges.insert(*privilege);
                 }
             }
         }
@@ -364,7 +484,7 @@ impl RoleGraph {
 
 fn grant_key_from_manifest(grant: &Grant) -> GrantKey {
     GrantKey {
-        role: grant.role.clone(),
+        role: Grantee::parse(&grant.role),
         object_type: grant.object.object_type,
         schema: grant.object.schema.clone(),
         name: grant.object.name.clone(),
@@ -626,9 +746,14 @@ memberships:
         assert_eq!(graph.default_privileges.len(), 1);
         let dp_key = graph.default_privileges.keys().next().unwrap();
         assert_eq!(dp_key.owner, "app_owner");
-        assert_eq!(dp_key.schema, "inventory");
+        assert_eq!(
+            dp_key.scope,
+            DefaultPrivilegeScope::Schema {
+                schema: "inventory".to_string()
+            }
+        );
         assert_eq!(dp_key.on_type, ObjectType::Table);
-        assert_eq!(dp_key.grantee, "inventory-editor");
+        assert_eq!(dp_key.grantee.as_str(), "inventory-editor");
         let dp_privs = &graph.default_privileges.values().next().unwrap().privileges;
         assert!(dp_privs.contains(&Privilege::Select));
         assert!(dp_privs.contains(&Privilege::Insert));

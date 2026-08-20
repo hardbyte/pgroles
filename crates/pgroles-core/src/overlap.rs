@@ -28,7 +28,7 @@
 //!
 //! # Intersection
 //!
-//! Two pairs intersect only if their roles are equal, and then:
+//! Two pairs intersect only if their roles match, and then:
 //!
 //! * a schema-level object intersects any object *within* that schema, because
 //!   a grant on the schema and a grant on a table in it can be the same access;
@@ -37,12 +37,15 @@
 //!   the conservative direction: the cost of a false intersection is one extra
 //!   review round, the cost of a false miss is an unreviewed effect.
 //! * everything else intersects only itself.
+//!
+//! Roles match when they are equal, and `PUBLIC` matches every role, because a
+//! privilege held by PUBLIC is held by every role.
 
 use std::collections::BTreeSet;
 
 use crate::diff::Change;
 use crate::manifest::ObjectType;
-use crate::model::MembershipEdge;
+use crate::model::{DefaultPrivilegeScope, MembershipEdge, PUBLIC_ROLE};
 
 /// The object half of an effect pair.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -82,8 +85,15 @@ impl EffectPair {
 
     /// Does this pair intersect `other` under the ADR-001 Decision 6 rule?
     pub fn intersects(&self, other: &EffectPair) -> bool {
-        self.role == other.role && objects_intersect(&self.object, &other.object)
+        roles_intersect(&self.role, &other.role) && objects_intersect(&self.object, &other.object)
     }
+}
+
+/// A privilege held by PUBLIC is held by every role, so an effect on PUBLIC
+/// reaches the same objects as an effect on any named role. `PUBLIC` is
+/// reserved and can never name a real role, so the comparison is unambiguous.
+fn roles_intersect(left: &str, right: &str) -> bool {
+    left == right || left == PUBLIC_ROLE || right == PUBLIC_ROLE
 }
 
 fn objects_intersect(left: &EffectObject, right: &EffectObject) -> bool {
@@ -110,6 +120,17 @@ fn objects_intersect(left: &EffectObject, right: &EffectObject) -> bool {
         ) => a_schema == b_schema && a_name == b_name && a_type == b_type,
         (Database(a), Database(b)) => a == b,
         _ => false,
+    }
+}
+
+/// Project a default-privilege scope into the pair space.
+fn default_privilege_object(scope: &DefaultPrivilegeScope) -> EffectObject {
+    match scope {
+        DefaultPrivilegeScope::Schema { schema } => EffectObject::Schema(schema.clone()),
+        // A global rule applies in every schema the owner creates objects in,
+        // including schemas no policy names, so nothing bounds it to a schema
+        // and it must be treated as overlapping anything on the same role.
+        DefaultPrivilegeScope::Global => EffectObject::RoleAttributes,
     }
 }
 
@@ -187,27 +208,30 @@ pub fn change_pairs(change: &Change) -> Vec<EffectPair> {
             name,
             ..
         } => vec![EffectPair::new(
-            role,
+            role.as_str(),
             grant_object(*object_type, schema.as_deref(), name.as_deref()),
         )],
-        // Default privileges are scoped to a schema and change what the
-        // grantee will hold on objects the owner creates there. Both roles are
-        // touched: the grantee gains access, the owner's future objects change.
+        // Default privileges change what the grantee will hold on objects the
+        // owner creates. Both roles are touched: the grantee gains access, the
+        // owner's future objects change.
         Change::SetDefaultPrivilege {
             owner,
-            schema,
+            scope,
             grantee,
             ..
         }
         | Change::RevokeDefaultPrivilege {
             owner,
-            schema,
+            scope,
             grantee,
             ..
-        } => vec![
-            EffectPair::new(grantee, EffectObject::Schema(schema.clone())),
-            EffectPair::new(owner, EffectObject::Schema(schema.clone())),
-        ],
+        } => {
+            let object = default_privilege_object(scope);
+            vec![
+                EffectPair::new(grantee.as_str(), object.clone()),
+                EffectPair::new(owner, object),
+            ]
+        }
         Change::AddMember { role, member, .. } | Change::RemoveMember { role, member } => {
             vec![EffectPair::new(member, EffectObject::Role(role.clone()))]
         }
@@ -272,6 +296,7 @@ pub fn describe_pair(pair: &EffectPair) -> String {
 mod tests {
     use super::*;
     use crate::manifest::Privilege;
+    use crate::model::Grantee;
 
     fn grant(
         role: &str,
@@ -280,7 +305,7 @@ mod tests {
         name: Option<&str>,
     ) -> Change {
         Change::Grant {
-            role: role.to_string(),
+            role: Grantee::parse(role),
             privileges: BTreeSet::from([Privilege::Select]),
             object_type,
             schema: schema.map(str::to_string),
@@ -412,7 +437,7 @@ mod tests {
             Some("orders"),
         )]);
         let revoked = effect_pairs(&[Change::Revoke {
-            role: "app_rw".to_string(),
+            role: Grantee::parse("app_rw"),
             privileges: BTreeSet::from([Privilege::Select]),
             object_type: ObjectType::Table,
             schema: Some("app".to_string()),
@@ -425,9 +450,11 @@ mod tests {
     fn default_privileges_touch_both_grantee_and_owner_at_schema_level() {
         let pairs = effect_pairs(&[Change::SetDefaultPrivilege {
             owner: "app_owner".to_string(),
-            schema: "app".to_string(),
+            scope: DefaultPrivilegeScope::Schema {
+                schema: "app".to_string(),
+            },
             on_type: ObjectType::Table,
-            grantee: "app_ro".to_string(),
+            grantee: Grantee::parse("app_ro"),
             privileges: BTreeSet::from([Privilege::Select]),
         }]);
         assert_eq!(
@@ -436,6 +463,52 @@ mod tests {
                 EffectPair::new("app_owner", EffectObject::Schema("app".to_string())),
                 EffectPair::new("app_ro", EffectObject::Schema("app".to_string())),
             ])
+        );
+    }
+
+    #[test]
+    fn a_public_effect_overlaps_every_named_role_on_the_same_object() {
+        let object = EffectObject::Relation {
+            schema: "app".to_string(),
+            name: "orders".to_string(),
+            object_type: ObjectType::Table,
+        };
+        let public = EffectPair::new(PUBLIC_ROLE, object.clone());
+        let named = EffectPair::new("alice", object);
+        assert!(public.intersects(&named));
+        assert!(named.intersects(&public));
+    }
+
+    #[test]
+    fn a_public_effect_still_respects_object_scope() {
+        let public = EffectPair::new(PUBLIC_ROLE, EffectObject::Schema("app".to_string()));
+        let elsewhere = EffectPair::new("alice", EffectObject::Schema("other".to_string()));
+        assert!(!public.intersects(&elsewhere));
+    }
+
+    #[test]
+    fn a_global_default_privilege_is_not_bounded_to_any_schema() {
+        let pairs = effect_pairs(&[Change::SetDefaultPrivilege {
+            owner: "app_owner".to_string(),
+            scope: DefaultPrivilegeScope::Global,
+            on_type: ObjectType::Table,
+            grantee: Grantee::parse("app_ro"),
+            privileges: BTreeSet::from([Privilege::Select]),
+        }]);
+        assert_eq!(
+            pairs,
+            BTreeSet::from([
+                EffectPair::new("app_owner", EffectObject::RoleAttributes),
+                EffectPair::new("app_ro", EffectObject::RoleAttributes),
+            ])
+        );
+        // It must overlap a schema-scoped effect on the same role, since the
+        // global rule reaches every schema.
+        assert!(
+            EffectPair::new("app_ro", EffectObject::RoleAttributes).intersects(&EffectPair::new(
+                "app_ro",
+                EffectObject::Schema("anything".to_string())
+            ))
         );
     }
 

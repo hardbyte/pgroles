@@ -3142,7 +3142,10 @@ roles:
 
         let parsed: serde_json::Value =
             serde_json::from_slice(&output).expect("diff json should parse");
-        assert_eq!(parsed["schema_version"], "pgroles.bundle_plan.v1");
+        assert_eq!(
+            parsed["schema_version"],
+            pgroles_core::report::BUNDLE_PLAN_SCHEMA_VERSION
+        );
         assert_eq!(parsed["managed_scope"]["roles"][0], managed_role);
         assert_eq!(parsed["changes"][0]["owner"]["document"], "app");
         assert_eq!(parsed["changes"][0]["owner"]["managed_key"]["kind"], "role");
@@ -4889,5 +4892,681 @@ grants:
             DROP ROLE IF EXISTS "{role}";
             "#
         ));
+    }
+
+    /// The `pg_default_acl` ACL text for an owner's global (namespace 0)
+    /// defaults, or `None` when PostgreSQL has not materialized a row yet.
+    fn query_global_default_acl(owner: &str, object_type: &str) -> Option<String> {
+        with_runtime(async {
+            let pool = PgPool::connect(&database_url())
+                .await
+                .expect("failed to connect to live test database");
+            let row = sqlx::query(
+                r#"
+                SELECT da.defaclacl::text AS acl
+                FROM pg_default_acl da
+                JOIN pg_roles owner_role ON owner_role.oid = da.defaclrole
+                WHERE owner_role.rolname = $1
+                  AND da.defaclnamespace = 0
+                  AND da.defaclobjtype::text = $2
+                "#,
+            )
+            .bind(owner)
+            .bind(object_type)
+            .fetch_optional(&pool)
+            .await
+            .expect("failed to query global default privileges");
+            row.map(|row| row.get("acl"))
+        })
+    }
+
+    /// Set up the proposal's SECURITY DEFINER scenario: an owner role, an
+    /// allowed caller, an unrelated bystander, and one existing routine.
+    struct PublicFixture {
+        schema: String,
+        owner: String,
+        caller: String,
+        bystander: String,
+    }
+
+    impl PublicFixture {
+        fn new(prefix: &str) -> (Self, TestDbCleanup) {
+            let fixture = PublicFixture {
+                schema: unique_name(&format!("{prefix}_schema")),
+                owner: unique_name(&format!("{prefix}_owner")),
+                caller: unique_name(&format!("{prefix}_caller")),
+                bystander: unique_name(&format!("{prefix}_bystander")),
+            };
+            // DROP OWNED must run first: a role owning global default
+            // privileges is undroppable while pg_default_acl references it.
+            let cleanup = TestDbCleanup::new(format!(
+                r#"DROP SCHEMA IF EXISTS "{schema}" CASCADE;
+                   DO $$ BEGIN
+                     IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = '{owner}') THEN
+                       EXECUTE 'DROP OWNED BY "{owner}" CASCADE';
+                     END IF;
+                     IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = '{caller}') THEN
+                       EXECUTE 'DROP OWNED BY "{caller}" CASCADE';
+                     END IF;
+                   END $$;
+                   DROP ROLE IF EXISTS "{owner}";
+                   DROP ROLE IF EXISTS "{caller}";
+                   DROP ROLE IF EXISTS "{bystander}";"#,
+                schema = fixture.schema,
+                owner = fixture.owner,
+                caller = fixture.caller,
+                bystander = fixture.bystander,
+            ));
+            execute_sql(&format!(
+                r#"CREATE ROLE "{owner}";
+                   CREATE ROLE "{caller}";
+                   CREATE ROLE "{bystander}";
+                   CREATE SCHEMA "{schema}" AUTHORIZATION "{owner}";
+                   SET ROLE "{owner}";
+                   CREATE FUNCTION "{schema}".secret(x integer) RETURNS integer
+                       LANGUAGE sql SECURITY DEFINER AS 'SELECT x';
+                   RESET ROLE;"#,
+                schema = fixture.schema,
+                owner = fixture.owner,
+                caller = fixture.caller,
+                bystander = fixture.bystander,
+            ));
+            (fixture, cleanup)
+        }
+
+        fn secret_signature(&self) -> String {
+            format!("\"{}\".secret(integer)", self.schema)
+        }
+
+        /// A manifest asserting PUBLIC holds no EXECUTE on existing or future
+        /// routines, while the caller keeps access.
+        fn manifest(&self) -> String {
+            self.manifest_with_extra("", "")
+        }
+
+        /// `extra_roles` and `extra_grants` are spliced into the matching
+        /// sections so callers never append after `default_privileges`.
+        fn manifest_with_extra(&self, extra_roles: &str, extra_grants: &str) -> String {
+            format!(
+                r#"
+roles:
+  - name: {owner}
+  - name: {caller}
+{extra_roles}grants:
+  - role: PUBLIC
+    ensure: absent
+    privileges: [EXECUTE]
+    object: {{ type: function, schema: {schema}, name: "*" }}
+{extra_grants}
+  - role: {caller}
+    privileges: [USAGE]
+    object: {{ type: schema, name: {schema} }}
+  - role: {caller}
+    privileges: [EXECUTE]
+    object: {{ type: function, schema: {schema}, name: "*" }}
+default_privileges:
+  - owner: {owner}
+    scope: {{ type: global }}
+    grant:
+      - role: PUBLIC
+        ensure: absent
+        privileges: [EXECUTE]
+        on_type: function
+  - owner: {owner}
+    schema: {schema}
+    grant:
+      - role: PUBLIC
+        ensure: absent
+        privileges: [EXECUTE]
+        on_type: function
+      - role: {caller}
+        privileges: [EXECUTE]
+        on_type: function
+"#,
+                owner = self.owner,
+                caller = self.caller,
+                schema = self.schema,
+                extra_roles = extra_roles,
+                extra_grants = extra_grants,
+            )
+        }
+    }
+
+    /// Apply until the plan is empty, returning the number of passes.
+    ///
+    /// pgroles needs a second pass whenever the first one materializes an
+    /// object ACL: PostgreSQL writes the owner's implicit self-grant into the
+    /// ACL at that moment, and authoritative mode then revokes it. That is
+    /// pre-existing behavior for any grant on an owner-managed object, not
+    /// something absence assertions introduce.
+    fn apply_until_converged(manifest_path: &std::path::Path, max_passes: usize) -> usize {
+        for pass in 1..=max_passes {
+            pgroles_cmd()
+                .args([
+                    "apply",
+                    "--file",
+                    manifest_path.to_str().unwrap(),
+                    "--database-url",
+                    &database_url(),
+                ])
+                .assert()
+                .success();
+
+            let output = pgroles_cmd()
+                .args([
+                    "diff",
+                    "--file",
+                    manifest_path.to_str().unwrap(),
+                    "--database-url",
+                    &database_url(),
+                    "--format",
+                    "summary",
+                    "--no-exit-code",
+                ])
+                .assert()
+                .success()
+                .get_output()
+                .stdout
+                .clone();
+            if String::from_utf8_lossy(&output).contains("No changes needed") {
+                return pass;
+            }
+        }
+        panic!("plan did not converge within {max_passes} passes");
+    }
+
+    #[test]
+    #[ignore]
+    fn public_absence_revokes_implicit_execute_and_converges() {
+        let (fixture, _cleanup) = PublicFixture::new("pubabs");
+        let manifest = write_temp_manifest(&fixture.manifest());
+
+        // PostgreSQL grants EXECUTE to PUBLIC implicitly, with no ACL row.
+        assert!(query_has_function_privilege(
+            &fixture.bystander,
+            &fixture.secret_signature()
+        ));
+
+        let plan = String::from_utf8_lossy(
+            &pgroles_cmd()
+                .args([
+                    "diff",
+                    "--file",
+                    manifest.path().to_str().unwrap(),
+                    "--database-url",
+                    &database_url(),
+                    "--format",
+                    "sql",
+                    "--no-exit-code",
+                ])
+                .assert()
+                .success()
+                .get_output()
+                .stdout,
+        )
+        .to_string();
+        assert!(
+            plan.contains(&format!(
+                r#"REVOKE EXECUTE ON ALL ROUTINES IN SCHEMA "{}" FROM PUBLIC;"#,
+                fixture.schema
+            )),
+            "plan should revoke PUBLIC EXECUTE on existing routines:\n{plan}"
+        );
+
+        apply_until_converged(manifest.path(), 3);
+
+        assert!(
+            !query_has_function_privilege(&fixture.bystander, &fixture.secret_signature()),
+            "PUBLIC EXECUTE should be gone"
+        );
+        assert!(
+            query_has_function_privilege(&fixture.caller, &fixture.secret_signature()),
+            "the allowed caller should keep EXECUTE"
+        );
+    }
+
+    #[test]
+    #[ignore]
+    fn global_default_revoke_renders_without_in_schema_and_protects_new_routines() {
+        let (fixture, _cleanup) = PublicFixture::new("pubglobal");
+        let manifest = write_temp_manifest(&fixture.manifest());
+
+        let plan = String::from_utf8_lossy(
+            &pgroles_cmd()
+                .args([
+                    "diff",
+                    "--file",
+                    manifest.path().to_str().unwrap(),
+                    "--database-url",
+                    &database_url(),
+                    "--format",
+                    "sql",
+                    "--no-exit-code",
+                ])
+                .assert()
+                .success()
+                .get_output()
+                .stdout,
+        )
+        .to_string();
+        let global_revoke = format!(
+            r#"ALTER DEFAULT PRIVILEGES FOR ROLE "{}" REVOKE EXECUTE ON ROUTINES FROM PUBLIC;"#,
+            fixture.owner
+        );
+        assert!(
+            plan.contains(&global_revoke),
+            "global default revoke must omit IN SCHEMA:\n{plan}"
+        );
+
+        apply_until_converged(manifest.path(), 3);
+
+        // The built-in default is now an explicit row without PUBLIC.
+        let acl = query_global_default_acl(&fixture.owner, "f")
+            .expect("global default row should exist after the revoke");
+        // A PUBLIC entry has an empty grantee, so it renders as `{=X/owner}`
+        // or `,=X/owner`. The owner's own `owner=X/owner` entry must remain.
+        assert!(
+            !acl.contains("{=") && !acl.contains(",="),
+            "no PUBLIC entry expected in global defaults, got {acl}"
+        );
+        assert!(
+            acl.contains(&format!("{owner}=X/", owner = fixture.owner)),
+            "the owner keeps its own default EXECUTE, got {acl}"
+        );
+
+        // Routines created afterwards inherit the corrected default.
+        execute_sql(&format!(
+            r#"SET ROLE "{owner}";
+               CREATE FUNCTION "{schema}".later(y integer) RETURNS integer
+                   LANGUAGE sql AS 'SELECT y';
+               CREATE PROCEDURE "{schema}".later_proc() LANGUAGE sql AS 'SELECT 1';
+               RESET ROLE;"#,
+            owner = fixture.owner,
+            schema = fixture.schema,
+        ));
+
+        for signature in [
+            format!("\"{}\".later(integer)", fixture.schema),
+            format!("\"{}\".later_proc()", fixture.schema),
+        ] {
+            assert!(
+                !query_has_function_privilege(&fixture.bystander, &signature),
+                "new routine {signature} must not be executable by PUBLIC"
+            );
+            assert!(
+                query_has_function_privilege(&fixture.caller, &signature),
+                "new routine {signature} should be executable by the allowed caller"
+            );
+        }
+
+        // Creating routines must not reopen PUBLIC drift. (pgroles may still
+        // plan a revoke of the owner's self-grant that PostgreSQL
+        // materialized into each new ACL — pre-existing behavior for any
+        // grant on an owner-managed object, unrelated to PUBLIC.)
+        let plan_after = String::from_utf8_lossy(
+            &pgroles_cmd()
+                .args([
+                    "diff",
+                    "--file",
+                    manifest.path().to_str().unwrap(),
+                    "--database-url",
+                    &database_url(),
+                    "--format",
+                    "sql",
+                    "--no-exit-code",
+                ])
+                .assert()
+                .success()
+                .get_output()
+                .stdout,
+        )
+        .to_string();
+        assert!(
+            !plan_after.contains("FROM PUBLIC"),
+            "new routines must not reopen PUBLIC drift:\n{plan_after}"
+        );
+    }
+
+    #[test]
+    #[ignore]
+    fn drifted_public_grant_is_revoked_again() {
+        let (fixture, _cleanup) = PublicFixture::new("pubdrift");
+        let manifest = write_temp_manifest(&fixture.manifest());
+        apply_until_converged(manifest.path(), 3);
+
+        // Someone re-grants by hand, both on the object and as a schema default.
+        execute_sql(&format!(
+            r#"GRANT EXECUTE ON FUNCTION "{schema}".secret(integer) TO PUBLIC;
+               ALTER DEFAULT PRIVILEGES FOR ROLE "{owner}" IN SCHEMA "{schema}"
+                   GRANT EXECUTE ON FUNCTIONS TO PUBLIC;"#,
+            schema = fixture.schema,
+            owner = fixture.owner,
+        ));
+        assert!(query_has_function_privilege(
+            &fixture.bystander,
+            &fixture.secret_signature()
+        ));
+
+        apply_until_converged(manifest.path(), 3);
+
+        assert!(
+            !query_has_function_privilege(&fixture.bystander, &fixture.secret_signature()),
+            "the re-granted PUBLIC EXECUTE should be revoked again"
+        );
+    }
+
+    #[test]
+    #[ignore]
+    fn additive_mode_ignores_absence_while_adopt_applies_it() {
+        let (fixture, _cleanup) = PublicFixture::new("pubmode");
+        let manifest = write_temp_manifest(&fixture.manifest());
+
+        // Additive never revokes, so the absence assertion is skipped rather
+        // than failing the run.
+        pgroles_cmd()
+            .args([
+                "apply",
+                "--file",
+                manifest.path().to_str().unwrap(),
+                "--database-url",
+                &database_url(),
+                "--mode",
+                "additive",
+            ])
+            .assert()
+            .success();
+        assert!(
+            query_has_function_privilege(&fixture.bystander, &fixture.secret_signature()),
+            "additive mode must not revoke PUBLIC EXECUTE"
+        );
+
+        // Adopt applies the same assertion.
+        pgroles_cmd()
+            .args([
+                "apply",
+                "--file",
+                manifest.path().to_str().unwrap(),
+                "--database-url",
+                &database_url(),
+                "--mode",
+                "adopt",
+            ])
+            .assert()
+            .success();
+        assert!(
+            !query_has_function_privilege(&fixture.bystander, &fixture.secret_signature()),
+            "adopt mode must apply the absence assertion"
+        );
+    }
+
+    #[test]
+    #[ignore]
+    fn overloaded_routines_converge_under_one_wildcard_absence() {
+        let (fixture, _cleanup) = PublicFixture::new("puboverload");
+        execute_sql(&format!(
+            r#"SET ROLE "{owner}";
+               CREATE FUNCTION "{schema}".secret(x text) RETURNS text
+                   LANGUAGE sql SECURITY DEFINER AS 'SELECT x';
+               CREATE PROCEDURE "{schema}".secret_proc() LANGUAGE sql AS 'SELECT 1';
+               RESET ROLE;"#,
+            owner = fixture.owner,
+            schema = fixture.schema,
+        ));
+
+        let manifest = write_temp_manifest(&fixture.manifest());
+        apply_until_converged(manifest.path(), 3);
+
+        for signature in [
+            format!("\"{}\".secret(integer)", fixture.schema),
+            format!("\"{}\".secret(text)", fixture.schema),
+            format!("\"{}\".secret_proc()", fixture.schema),
+        ] {
+            assert!(
+                !query_has_function_privilege(&fixture.bystander, &signature),
+                "{signature} should not be executable by PUBLIC"
+            );
+        }
+    }
+
+    #[test]
+    #[ignore]
+    fn unmanaged_public_grants_in_other_schemas_are_left_alone() {
+        // Guards the #108 class of regression: declaring PUBLIC rules for one
+        // schema must not turn every other PUBLIC ACL into drift, and a role
+        // wildcard elsewhere must still converge.
+        let (fixture, _cleanup) = PublicFixture::new("pubscope");
+        let other_schema = unique_name("pubscope_other");
+        let _other_cleanup = TestDbCleanup::new(format!(
+            r#"DROP SCHEMA IF EXISTS "{other_schema}" CASCADE;"#
+        ));
+        execute_sql(&format!(
+            r#"CREATE SCHEMA "{other_schema}" AUTHORIZATION "{owner}";
+               SET ROLE "{owner}";
+               CREATE FUNCTION "{other_schema}".extension_like() RETURNS integer
+                   LANGUAGE sql AS 'SELECT 1';
+               GRANT EXECUTE ON FUNCTION "{other_schema}".extension_like() TO PUBLIC;
+               RESET ROLE;"#,
+            other_schema = other_schema,
+            owner = fixture.owner,
+        ));
+
+        let manifest = write_temp_manifest(&fixture.manifest_with_extra(
+            "",
+            &format!(
+                r#"  - role: {caller}
+    privileges: [EXECUTE]
+    object: {{ type: function, schema: {other_schema}, name: "*" }}
+"#,
+                caller = fixture.caller,
+                other_schema = other_schema,
+            ),
+        ));
+
+        apply_until_converged(manifest.path(), 3);
+
+        assert!(
+            query_has_function_privilege(
+                &fixture.bystander,
+                &format!("\"{other_schema}\".extension_like()")
+            ),
+            "PUBLIC EXECUTE outside the declared scope must survive"
+        );
+        assert!(
+            query_has_function_privilege(
+                &fixture.caller,
+                &format!("\"{other_schema}\".extension_like()")
+            ),
+            "the role wildcard in the other schema should converge"
+        );
+    }
+
+    #[test]
+    #[ignore]
+    fn a_role_named_public_is_not_the_public_pseudo_role() {
+        let (fixture, _cleanup) = PublicFixture::new("publower");
+        // PostgreSQL reserves the bare name `public`, so use the closest
+        // legal spelling. It must survive while PUBLIC is revoked.
+        let role = unique_name("public_role");
+        let _role_cleanup = TestDbCleanup::new(format!(
+            r#"DO $$ BEGIN
+                 IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = '{role}') THEN
+                   EXECUTE 'DROP OWNED BY "{role}" CASCADE';
+                 END IF;
+               END $$;
+               DROP ROLE IF EXISTS "{role}";"#
+        ));
+        execute_sql(&format!(r#"CREATE ROLE "{role}";"#));
+
+        let manifest = write_temp_manifest(&fixture.manifest_with_extra(
+            &format!("  - name: {role}\n"),
+            &format!(
+                r#"  - role: {role}
+    privileges: [EXECUTE]
+    object: {{ type: function, schema: {schema}, name: "*" }}
+"#,
+                role = role,
+                schema = fixture.schema,
+            ),
+        ));
+
+        apply_until_converged(manifest.path(), 3);
+
+        // The quoted role keeps EXECUTE; the pseudo-role does not.
+        assert!(
+            query_has_function_privilege(&role, &fixture.secret_signature()),
+            "a role whose name resembles the keyword should keep EXECUTE"
+        );
+        assert!(
+            !query_has_function_privilege(&fixture.bystander, &fixture.secret_signature()),
+            "PUBLIC should still be revoked"
+        );
+    }
+
+    #[test]
+    #[ignore]
+    fn empty_schema_absence_is_vacuously_converged() {
+        let schema = unique_name("pubempty_schema");
+        let owner = unique_name("pubempty_owner");
+        let _cleanup = TestDbCleanup::new(format!(
+            r#"DROP SCHEMA IF EXISTS "{schema}" CASCADE; DROP ROLE IF EXISTS "{owner}";"#
+        ));
+        execute_sql(&format!(
+            r#"CREATE ROLE "{owner}"; CREATE SCHEMA "{schema}" AUTHORIZATION "{owner}";"#
+        ));
+
+        let manifest = write_temp_manifest(&format!(
+            r#"
+roles:
+  - name: {owner}
+grants:
+  - role: PUBLIC
+    ensure: absent
+    privileges: [EXECUTE]
+    object: {{ type: function, schema: {schema}, name: "*" }}
+"#
+        ));
+
+        pgroles_cmd()
+            .args([
+                "diff",
+                "--file",
+                manifest.path().to_str().unwrap(),
+                "--database-url",
+                &database_url(),
+                "--format",
+                "summary",
+                "--no-exit-code",
+            ])
+            .assert()
+            .success()
+            .stdout(predicate::str::contains("No changes needed"));
+    }
+
+    #[test]
+    #[ignore]
+    fn preflight_warns_on_diff_and_blocks_only_on_apply() {
+        let (fixture, _cleanup) = PublicFixture::new("pfgate");
+        let reporter = unique_name("pfgate_reporter");
+        let _reporter_cleanup = TestDbCleanup::new(format!(
+            r#"DO $$ BEGIN
+                 IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = '{reporter}') THEN
+                   EXECUTE 'DROP OWNED BY "{reporter}" CASCADE';
+                 END IF;
+               END $$;
+               DROP ROLE IF EXISTS "{reporter}";"#
+        ));
+        execute_sql(&format!(
+            r#"CREATE ROLE "{reporter}" LOGIN PASSWORD 'testpassword';
+               GRANT USAGE ON SCHEMA "{schema}" TO "{reporter}";"#,
+            reporter = reporter,
+            schema = fixture.schema,
+        ));
+
+        // Only the absence rules: a positive wildcard grant would trip the
+        // pre-existing UnsatisfiableWildcardGrant diagnostic first and mask
+        // what this test is about.
+        let manifest = write_temp_manifest(&format!(
+            r#"
+roles:
+  - name: {owner}
+grants:
+  - role: PUBLIC
+    ensure: absent
+    privileges: [EXECUTE]
+    object: {{ type: function, schema: {schema}, name: "*" }}
+default_privileges:
+  - owner: {owner}
+    scope: {{ type: global }}
+    grant:
+      - role: PUBLIC
+        ensure: absent
+        privileges: [EXECUTE]
+        on_type: function
+"#,
+            owner = fixture.owner,
+            schema = fixture.schema,
+        ));
+        let reporter_url = database_url_for_role(&reporter, "testpassword");
+
+        // A CI drift check running as a read-only role must still get its
+        // plan: diff executes no SQL, so authority problems are warnings.
+        let diff_output = pgroles_cmd()
+            .args([
+                "diff",
+                "--file",
+                manifest.path().to_str().unwrap(),
+                "--database-url",
+                &reporter_url,
+                "--format",
+                "summary",
+                "--no-exit-code",
+            ])
+            .assert()
+            .success()
+            .get_output()
+            .clone();
+        assert!(
+            String::from_utf8_lossy(&diff_output.stdout).contains("change(s)"),
+            "diff should still produce a plan for a low-privilege role"
+        );
+        assert!(
+            String::from_utf8_lossy(&diff_output.stderr)
+                .contains("UnsatisfiableDefaultPrivilegeChange"),
+            "diff should warn about executor authority"
+        );
+
+        // A dry run executes nothing either, so it also only warns.
+        pgroles_cmd()
+            .args([
+                "apply",
+                "--file",
+                manifest.path().to_str().unwrap(),
+                "--database-url",
+                &reporter_url,
+                "--dry-run",
+            ])
+            .assert()
+            .success();
+
+        // The real apply is where authority actually matters.
+        pgroles_cmd()
+            .args([
+                "apply",
+                "--file",
+                manifest.path().to_str().unwrap(),
+                "--database-url",
+                &reporter_url,
+            ])
+            .assert()
+            .failure()
+            .stderr(predicate::str::contains(
+                "UnsatisfiableDefaultPrivilegeChange",
+            ));
+
+        // Nothing ran, so PUBLIC still holds EXECUTE.
+        assert!(
+            query_has_function_privilege(&reporter, &fixture.secret_signature()),
+            "the blocked apply must not have changed anything"
+        );
     }
 }

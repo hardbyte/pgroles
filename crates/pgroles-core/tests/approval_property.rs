@@ -26,7 +26,7 @@ use pgroles_core::approval::{
 };
 use pgroles_core::diff::{Change, ReconciliationMode};
 use pgroles_core::manifest::{ObjectType, Privilege};
-use pgroles_core::model::{RoleAttribute, RoleState};
+use pgroles_core::model::{DefaultPrivilegeScope, Grantee, RoleAttribute, RoleState};
 
 const CASES: usize = 400;
 
@@ -90,6 +90,26 @@ fn privileges(rng: &mut Rng) -> BTreeSet<Privilege> {
     (0..count).map(|_| ALL[rng.usize(ALL.len())]).collect()
 }
 
+fn grantee(rng: &mut Rng) -> Grantee {
+    // PUBLIC is a legal grantee everywhere a role name is, so the digest
+    // properties have to hold for it too.
+    if rng.usize(8) == 0 {
+        Grantee::Public
+    } else {
+        Grantee::Role(role(rng))
+    }
+}
+
+fn default_privilege_scope(rng: &mut Rng) -> DefaultPrivilegeScope {
+    if rng.bool() {
+        DefaultPrivilegeScope::Global
+    } else {
+        DefaultPrivilegeScope::Schema {
+            schema: SCHEMAS[rng.usize(SCHEMAS.len())].to_string(),
+        }
+    }
+}
+
 fn object_type(rng: &mut Rng) -> ObjectType {
     const ALL: &[ObjectType] = &[
         ObjectType::Table,
@@ -145,14 +165,14 @@ fn change(rng: &mut Rng) -> Change {
             },
         },
         5 => Change::Grant {
-            role: role(rng),
+            role: grantee(rng),
             privileges: privileges(rng),
             object_type: object_type(rng),
             schema: Some(SCHEMAS[rng.usize(SCHEMAS.len())].to_string()),
             name: Some(OBJECTS[rng.usize(OBJECTS.len())].to_string()),
         },
         6 => Change::Revoke {
-            role: role(rng),
+            role: grantee(rng),
             privileges: privileges(rng),
             object_type: object_type(rng),
             schema: Some(SCHEMAS[rng.usize(SCHEMAS.len())].to_string()),
@@ -160,16 +180,16 @@ fn change(rng: &mut Rng) -> Change {
         },
         7 => Change::SetDefaultPrivilege {
             owner: role(rng),
-            schema: SCHEMAS[rng.usize(SCHEMAS.len())].to_string(),
+            scope: default_privilege_scope(rng),
             on_type: object_type(rng),
-            grantee: role(rng),
+            grantee: grantee(rng),
             privileges: privileges(rng),
         },
         8 => Change::RevokeDefaultPrivilege {
             owner: role(rng),
-            schema: SCHEMAS[rng.usize(SCHEMAS.len())].to_string(),
+            scope: default_privilege_scope(rng),
             on_type: object_type(rng),
-            grantee: role(rng),
+            grantee: grantee(rng),
             privileges: privileges(rng),
         },
         9 => Change::AddMember {

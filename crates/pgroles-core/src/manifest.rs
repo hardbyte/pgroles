@@ -26,8 +26,8 @@ pub enum ManifestError {
     #[error("role_pattern must contain {{profile}} placeholder, got: \"{0}\"")]
     InvalidRolePattern(String),
 
-    #[error("top-level default privilege for schema \"{schema}\" must specify grant.role")]
-    MissingDefaultPrivilegeRole { schema: String },
+    #[error("top-level default privilege for {scope} must specify grant.role")]
+    MissingDefaultPrivilegeRole { scope: String },
 
     #[error("duplicate retirement entry for role: \"{0}\"")]
     DuplicateRetirement(String),
@@ -72,6 +72,53 @@ pub enum ManifestError {
         actual: usize,
         limit: u32,
     },
+
+    #[error(
+        "\"PUBLIC\" is reserved for the PostgreSQL PUBLIC pseudo-role and cannot be used as {context}"
+    )]
+    ReservedPublicName { context: String },
+
+    // The conflict variants describe their assertion in one preformatted
+    // `target` string. Keeping each field count low matters: `ManifestError`
+    // travels inside `CompositionError`, whose size clippy polices.
+    #[error("grant {target} declares privilege {privilege} as both present and absent")]
+    ConflictingGrantEnsure { target: String, privilege: String },
+
+    #[error(
+        "grants {target} declare privilege {privilege} as present for one object selector and absent for another — grants apply before revokes, so the plan could never converge"
+    )]
+    ConflictingWildcardEnsure { target: String, privilege: String },
+
+    #[error("default privileges {target} declare privilege {privilege} as both present and absent")]
+    ConflictingDefaultPrivilegeEnsure { target: String, privilege: String },
+
+    #[error(
+        "default privilege entry for owner \"{owner}\" sets both `schema` and `scope` — use exactly one"
+    )]
+    DefaultPrivilegeScopeConflict { owner: String },
+
+    #[error("default privilege entry for owner \"{owner}\" needs either `schema` or `scope`")]
+    DefaultPrivilegeScopeMissing { owner: String },
+
+    #[error("default privilege scope of type `schema` needs a `schema` name")]
+    DefaultPrivilegeScopeSchemaMissing,
+
+    #[error("default privilege scope of type `global` must not name a schema (got \"{schema}\")")]
+    DefaultPrivilegeScopeSchemaForbidden { schema: String },
+
+    // `scope` renders its own noun, so the template must not add one.
+    #[error("default privileges cannot target on_type `{on_type}` in {scope}")]
+    InvalidDefaultPrivilegeOnType { on_type: String, scope: String },
+
+    #[error(
+        "profile \"{profile}\" declares an `ensure: absent` default privilege — profiles are additive templates and cannot assert absence"
+    )]
+    ProfileAbsentDefaultPrivilege { profile: String },
+
+    #[error(
+        "profile \"{profile}\" declares an `ensure: absent` grant — profiles are additive templates and cannot assert absence"
+    )]
+    ProfileAbsentGrant { profile: String },
 }
 
 // ---------------------------------------------------------------------------
@@ -142,6 +189,25 @@ impl std::fmt::Display for Privilege {
             Privilege::Connect => write!(f, "CONNECT"),
             Privilege::Temporary => write!(f, "TEMPORARY"),
         }
+    }
+}
+
+/// Whether the listed privileges must exist or must not exist.
+///
+/// `absent` asserts one ACL edge only. It plans a REVOKE when the privilege is
+/// found live, and it says nothing about access the grantee may still have
+/// through role membership or ownership.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum Ensure {
+    #[default]
+    Present,
+    Absent,
+}
+
+impl Ensure {
+    pub fn is_present(&self) -> bool {
+        matches!(self, Ensure::Present)
     }
 }
 
@@ -278,6 +344,13 @@ pub struct ProfileGrant {
     pub privileges: Vec<Privilege>,
     #[serde(alias = "on")]
     pub object: ProfileObjectTarget,
+    /// Whether the privilege must be present or absent. Expansion rejects
+    /// `absent`, because a profile is an additive template. The field exists
+    /// so that rejection can name the offending profile, instead of the value
+    /// being dropped as an unknown key and the grant expanding to its
+    /// opposite.
+    #[serde(default, skip_serializing_if = "Ensure::is_present")]
+    pub ensure: Ensure,
 }
 
 /// Object target within a profile — schema is omitted (filled during expansion).
@@ -495,12 +568,16 @@ pub struct PasswordSource {
 /// A concrete grant on a specific object or wildcard.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct Grant {
+    /// The grantee. The exact-uppercase value `PUBLIC` means the PostgreSQL
+    /// PUBLIC pseudo-role; any other value is an ordinary role name.
     #[schemars(length(min = 1, max = MAX_IDENTIFIER))]
     pub role: String,
     #[schemars(length(min = 1, max = MAX_PRIVILEGES))]
     pub privileges: Vec<Privilege>,
     #[serde(alias = "on")]
     pub object: ObjectTarget,
+    #[serde(default, skip_serializing_if = "Ensure::is_present")]
+    pub ensure: Ensure,
 }
 
 /// Target object for a grant.
@@ -521,25 +598,107 @@ pub struct ObjectTarget {
 }
 
 /// Default privilege configuration.
+///
+/// The scope rules are also expressed as CEL so the API server rejects a bad
+/// entry at apply time. `resolved_scope` enforces the same rules for the CLI,
+/// which has no admission step.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[schemars(extend("x-kubernetes-validations" = [serde_json::json!({
+    "rule": "has(self.schema) != has(self.scope)",
+    "message": "exactly one of `schema` and `scope` must be set"
+})]))]
 pub struct DefaultPrivilege {
     /// The role that owns newly created objects. If omitted, uses manifest's default_owner.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(length(min = 1, max = MAX_IDENTIFIER))]
     pub owner: Option<String>,
 
+    /// Schema shorthand, equivalent to `scope: {type: schema, schema: ...}`.
+    /// Exactly one of `schema` and `scope` must be set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(length(min = 1, max = MAX_IDENTIFIER))]
-    pub schema: String,
+    pub schema: Option<String>,
+
+    /// Where the defaults apply: one schema, or owner-wide (global). Global
+    /// scope renders `ALTER DEFAULT PRIVILEGES` without an `IN SCHEMA` clause.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope: Option<DefaultPrivilegeScopeSpec>,
 
     #[schemars(length(max = MAX_DEFAULT_PRIVILEGE_GRANTS))]
     pub grant: Vec<DefaultPrivilegeGrant>,
+}
+
+/// Scope selector for a default-privileges entry.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[schemars(extend("x-kubernetes-validations" = [serde_json::json!({
+    "rule": "has(self.schema) == (self.type == 'schema')",
+    "message": "`schema` is required when type is `schema` and forbidden when type is `global`"
+})]))]
+pub struct DefaultPrivilegeScopeSpec {
+    #[serde(rename = "type")]
+    pub scope_type: DefaultPrivilegeScopeType,
+
+    /// Schema name. Required for `type: schema`, forbidden for `type: global`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(length(min = 1, max = MAX_IDENTIFIER))]
+    pub schema: Option<String>,
+}
+
+/// The kind of default-privilege scope.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum DefaultPrivilegeScopeType {
+    Global,
+    Schema,
+}
+
+impl DefaultPrivilege {
+    /// Resolve the `schema` shorthand and the `scope` field into one scope.
+    pub fn resolved_scope(&self) -> Result<crate::model::DefaultPrivilegeScope, ManifestError> {
+        use crate::model::DefaultPrivilegeScope;
+
+        let owner_context = || {
+            self.owner
+                .clone()
+                .unwrap_or_else(|| "(default owner)".to_string())
+        };
+
+        match (&self.schema, &self.scope) {
+            (Some(_), Some(_)) => Err(ManifestError::DefaultPrivilegeScopeConflict {
+                owner: owner_context(),
+            }),
+            (None, None) => Err(ManifestError::DefaultPrivilegeScopeMissing {
+                owner: owner_context(),
+            }),
+            (Some(schema), None) => Ok(DefaultPrivilegeScope::Schema {
+                schema: schema.clone(),
+            }),
+            (None, Some(spec)) => match (spec.scope_type, &spec.schema) {
+                (DefaultPrivilegeScopeType::Global, None) => Ok(DefaultPrivilegeScope::Global),
+                (DefaultPrivilegeScopeType::Global, Some(schema)) => {
+                    Err(ManifestError::DefaultPrivilegeScopeSchemaForbidden {
+                        schema: schema.clone(),
+                    })
+                }
+                (DefaultPrivilegeScopeType::Schema, Some(schema)) => {
+                    Ok(DefaultPrivilegeScope::Schema {
+                        schema: schema.clone(),
+                    })
+                }
+                (DefaultPrivilegeScopeType::Schema, None) => {
+                    Err(ManifestError::DefaultPrivilegeScopeSchemaMissing)
+                }
+            },
+        }
+    }
 }
 
 /// A single default privilege grant entry.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct DefaultPrivilegeGrant {
     /// The role receiving the default privilege. Only used in top-level default_privileges
-    /// (in profiles, the role is determined by expansion).
+    /// (in profiles, the role is determined by expansion). The exact-uppercase
+    /// value `PUBLIC` means the PostgreSQL PUBLIC pseudo-role.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(length(min = 1, max = MAX_IDENTIFIER))]
     pub role: Option<String>,
@@ -547,6 +706,9 @@ pub struct DefaultPrivilegeGrant {
     #[schemars(length(min = 1, max = MAX_PRIVILEGES))]
     pub privileges: Vec<Privilege>,
     pub on_type: ObjectType,
+
+    #[serde(default, skip_serializing_if = "Ensure::is_present")]
+    pub ensure: Ensure,
 }
 
 /// A membership declaration — which members belong to a role.
@@ -789,11 +951,16 @@ pub fn validate_bounds(manifest: &PolicyManifest) -> Result<(), ManifestError> {
         MAX_DEFAULT_PRIVILEGES,
     )?;
     for default_privilege in &manifest.default_privileges {
-        text(
-            "default privilege schema",
-            &default_privilege.schema,
-            MAX_IDENTIFIER,
-        )?;
+        if let Some(schema) = &default_privilege.schema {
+            text("default privilege schema", schema, MAX_IDENTIFIER)?;
+        }
+        if let Some(schema) = default_privilege
+            .scope
+            .as_ref()
+            .and_then(|s| s.schema.as_ref())
+        {
+            text("default privilege scope schema", schema, MAX_IDENTIFIER)?;
+        }
         if let Some(owner) = &default_privilege.owner {
             text("default privilege owner", owner, MAX_IDENTIFIER)?;
         }
@@ -1002,10 +1169,17 @@ pub fn expand_manifest(manifest: &PolicyManifest) -> Result<ExpandedManifest, Ma
                     },
                 };
 
+                if profile_grant.ensure == Ensure::Absent {
+                    return Err(ManifestError::ProfileAbsentGrant {
+                        profile: profile_name.clone(),
+                    });
+                }
+
                 grants.push(Grant {
                     role: role_name.clone(),
                     privileges: profile_grant.privileges.clone(),
                     object: object_target,
+                    ensure: Ensure::Present,
                 });
             }
 
@@ -1019,16 +1193,25 @@ pub fn expand_manifest(manifest: &PolicyManifest) -> Result<ExpandedManifest, Ma
                 let expanded_grants: Vec<DefaultPrivilegeGrant> = profile
                     .default_privileges
                     .iter()
-                    .map(|dp| DefaultPrivilegeGrant {
-                        role: Some(role_name.clone()),
-                        privileges: dp.privileges.clone(),
-                        on_type: dp.on_type,
+                    .map(|dp| {
+                        if dp.ensure == Ensure::Absent {
+                            return Err(ManifestError::ProfileAbsentDefaultPrivilege {
+                                profile: profile_name.clone(),
+                            });
+                        }
+                        Ok(DefaultPrivilegeGrant {
+                            role: Some(role_name.clone()),
+                            privileges: dp.privileges.clone(),
+                            on_type: dp.on_type,
+                            ensure: Ensure::Present,
+                        })
                     })
-                    .collect();
+                    .collect::<Result<_, _>>()?;
 
                 default_privileges.push(DefaultPrivilege {
                     owner,
-                    schema: schema_binding.name.clone(),
+                    schema: Some(schema_binding.name.clone()),
+                    scope: None,
                     grant: expanded_grants,
                 });
             }
@@ -1040,7 +1223,7 @@ pub fn expand_manifest(manifest: &PolicyManifest) -> Result<ExpandedManifest, Ma
         for grant in &default_priv.grant {
             if grant.role.is_none() {
                 return Err(ManifestError::MissingDefaultPrivilegeRole {
-                    schema: default_priv.schema.clone(),
+                    scope: default_priv.resolved_scope()?.to_string(),
                 });
             }
         }
@@ -1051,6 +1234,29 @@ pub fn expand_manifest(manifest: &PolicyManifest) -> Result<ExpandedManifest, Ma
     grants.extend(manifest.grants.clone());
     default_privileges.extend(manifest.default_privileges.clone());
     let memberships = manifest.memberships.clone();
+
+    // Normalize the owner fallback here so every consumer of the expanded
+    // manifest (model, inspection scoping, composition) sees the same owner
+    // without re-deriving it from default_owner.
+    for default_priv in &mut default_privileges {
+        if default_priv.owner.is_none() {
+            default_priv.owner = manifest.default_owner.clone();
+        }
+    }
+
+    validate_public_reservation(
+        manifest,
+        &roles,
+        &schemas,
+        &default_privileges,
+        &memberships,
+    )?;
+    validate_default_privilege_scopes(&default_privileges)?;
+    validate_ensure_conflicts(
+        manifest.default_owner.as_deref(),
+        &grants,
+        &default_privileges,
+    )?;
 
     // Validate no duplicate role names
     let mut seen_roles: HashSet<String> = HashSet::new();
@@ -1148,6 +1354,216 @@ pub fn expand_manifest(manifest: &PolicyManifest) -> Result<ExpandedManifest, Ma
 // ---------------------------------------------------------------------------
 // Validation helpers
 // ---------------------------------------------------------------------------
+
+/// The exact-uppercase `PUBLIC` is reserved for the PostgreSQL pseudo-role.
+/// It may appear as a grantee, but nowhere that names a real role.
+fn validate_public_reservation(
+    manifest: &PolicyManifest,
+    roles: &[RoleDefinition],
+    schemas: &[ExpandedSchema],
+    default_privileges: &[DefaultPrivilege],
+    memberships: &[Membership],
+) -> Result<(), ManifestError> {
+    let reserved = |value: Option<&str>, context: &str| -> Result<(), ManifestError> {
+        if value == Some("PUBLIC") {
+            return Err(ManifestError::ReservedPublicName {
+                context: context.to_string(),
+            });
+        }
+        Ok(())
+    };
+
+    reserved(manifest.default_owner.as_deref(), "default_owner")?;
+    for role in roles {
+        reserved(Some(&role.name), "a role name")?;
+    }
+    for schema in schemas {
+        reserved(schema.owner.as_deref(), "a schema owner")?;
+    }
+    for default_priv in default_privileges {
+        reserved(default_priv.owner.as_deref(), "a default privilege owner")?;
+    }
+    for membership in memberships {
+        reserved(Some(&membership.role), "a membership role")?;
+        for member in &membership.members {
+            reserved(Some(&member.name), "a membership member")?;
+        }
+    }
+    for retirement in &manifest.retirements {
+        reserved(Some(&retirement.role), "a retirement role")?;
+        reserved(
+            retirement.reassign_owned_to.as_deref(),
+            "a retirement ownership target",
+        )?;
+    }
+    Ok(())
+}
+
+/// Resolve every default-privilege scope and check the on_type matrix.
+///
+/// Database defaults do not exist in PostgreSQL. Schema defaults exist only in
+/// global scope because schemas are not contained in another schema. Views and
+/// materialized views are rejected because `pg_default_acl` stores them as
+/// plain relations ('r'), so a view-typed key could never converge — declare
+/// `on_type: table` instead, which is what PostgreSQL actually applies.
+fn validate_default_privilege_scopes(
+    default_privileges: &[DefaultPrivilege],
+) -> Result<(), ManifestError> {
+    use crate::model::DefaultPrivilegeScope;
+
+    for default_priv in default_privileges {
+        let scope = default_priv.resolved_scope()?;
+        for grant in &default_priv.grant {
+            let allowed = !matches!(
+                (&scope, grant.on_type),
+                (_, ObjectType::Database)
+                    | (_, ObjectType::View | ObjectType::MaterializedView)
+                    | (DefaultPrivilegeScope::Schema { .. }, ObjectType::Schema)
+            );
+            if !allowed {
+                return Err(ManifestError::InvalidDefaultPrivilegeOnType {
+                    on_type: grant.on_type.to_string(),
+                    scope: scope.to_string(),
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
+fn describe_object_target(target: &ObjectTarget) -> String {
+    match (&target.schema, &target.name) {
+        (Some(schema), Some(name)) => {
+            format!("{} \"{}\".\"{}\"", target.object_type, schema, name)
+        }
+        (Some(schema), None) => format!("{} in schema \"{}\"", target.object_type, schema),
+        (None, Some(name)) => format!("{} \"{}\"", target.object_type, name),
+        (None, None) => target.object_type.to_string(),
+    }
+}
+
+/// Reject the same assertion key declared both present and absent.
+///
+/// Grants are keyed per privilege on (grantee, object type, schema, name);
+/// defaults on (resolved owner, scope, grantee, on_type). A wildcard and a
+/// named selector with opposite ensure for the same privilege are also
+/// rejected: grants apply before revokes, so such a pair re-grants or
+/// re-revokes itself every reconcile and never converges.
+fn validate_ensure_conflicts(
+    default_owner: Option<&str>,
+    grants: &[Grant],
+    default_privileges: &[DefaultPrivilege],
+) -> Result<(), ManifestError> {
+    type GrantAssertionKey = (
+        String,
+        ObjectType,
+        Option<String>,
+        Option<String>,
+        Privilege,
+    );
+    let mut grant_assertions: BTreeMap<GrantAssertionKey, Ensure> = BTreeMap::new();
+    // (grantee, object_type, schema, privilege) -> ensures seen on wildcard
+    // and on named selectors, for the cross-selector rule.
+    let mut selector_ensures: BTreeMap<(String, ObjectType, String, Privilege), [bool; 4]> =
+        BTreeMap::new();
+
+    for grant in grants {
+        for privilege in &grant.privileges {
+            let key = (
+                grant.role.clone(),
+                grant.object.object_type,
+                grant.object.schema.clone(),
+                grant.object.name.clone(),
+                *privilege,
+            );
+            if let Some(existing) = grant_assertions.insert(key, grant.ensure)
+                && existing != grant.ensure
+            {
+                return Err(ManifestError::ConflictingGrantEnsure {
+                    target: format!(
+                        "for \"{}\" on {}",
+                        grant.role,
+                        describe_object_target(&grant.object)
+                    ),
+                    privilege: privilege.to_string(),
+                });
+            }
+
+            if let (Some(schema), Some(name)) = (&grant.object.schema, &grant.object.name) {
+                let flags = selector_ensures
+                    .entry((
+                        grant.role.clone(),
+                        grant.object.object_type,
+                        schema.clone(),
+                        *privilege,
+                    ))
+                    .or_default();
+                let index = match (name == "*", grant.ensure) {
+                    (true, Ensure::Present) => 0,
+                    (true, Ensure::Absent) => 1,
+                    (false, Ensure::Present) => 2,
+                    (false, Ensure::Absent) => 3,
+                };
+                flags[index] = true;
+                let (wild_present, wild_absent, named_present, named_absent) =
+                    (flags[0], flags[1], flags[2], flags[3]);
+                if (wild_present && named_absent) || (wild_absent && named_present) {
+                    return Err(ManifestError::ConflictingWildcardEnsure {
+                        target: format!(
+                            "for \"{}\" on {} in schema \"{schema}\"",
+                            grant.role, grant.object.object_type
+                        ),
+                        privilege: privilege.to_string(),
+                    });
+                }
+            }
+        }
+    }
+
+    type DefaultAssertionKey = (
+        String,
+        crate::model::DefaultPrivilegeScope,
+        String,
+        ObjectType,
+        Privilege,
+    );
+    let mut default_assertions: BTreeMap<DefaultAssertionKey, Ensure> = BTreeMap::new();
+
+    for default_priv in default_privileges {
+        let owner = default_priv
+            .owner
+            .as_deref()
+            .or(default_owner)
+            .unwrap_or("postgres")
+            .to_string();
+        let scope = default_priv.resolved_scope()?;
+        for grant in &default_priv.grant {
+            let Some(grantee) = &grant.role else { continue };
+            for privilege in &grant.privileges {
+                let key = (
+                    owner.clone(),
+                    scope.clone(),
+                    grantee.clone(),
+                    grant.on_type,
+                    *privilege,
+                );
+                if let Some(existing) = default_assertions.insert(key, grant.ensure)
+                    && existing != grant.ensure
+                {
+                    return Err(ManifestError::ConflictingDefaultPrivilegeEnsure {
+                        target: format!(
+                            "for owner \"{owner}\" ({scope}, {} to \"{grantee}\")",
+                            grant.on_type
+                        ),
+                        privilege: privilege.to_string(),
+                    });
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
 
 /// Validate that a string is a plausible ISO 8601 timestamp.
 ///
@@ -1818,14 +2234,20 @@ schemas:
             expanded.default_privileges[0].owner,
             Some("app_owner".to_string())
         );
-        assert_eq!(expanded.default_privileges[0].schema, "inventory");
+        assert_eq!(
+            expanded.default_privileges[0].schema.as_deref(),
+            Some("inventory")
+        );
 
         // legacy uses override
         assert_eq!(
             expanded.default_privileges[1].owner,
             Some("legacy_admin".to_string())
         );
-        assert_eq!(expanded.default_privileges[1].schema, "legacy");
+        assert_eq!(
+            expanded.default_privileges[1].schema.as_deref(),
+            Some("legacy")
+        );
     }
 
     #[test]
@@ -2380,5 +2802,360 @@ spec:
         assert_eq!(from_bare.roles.len(), from_cr.roles.len());
         assert_eq!(from_bare.schemas.len(), from_cr.schemas.len());
         assert_eq!(from_bare.profiles.len(), from_cr.profiles.len());
+    }
+
+    // -----------------------------------------------------------------------
+    // ensure / PUBLIC / default-privilege scopes
+    // -----------------------------------------------------------------------
+
+    fn expand(yaml: &str) -> Result<ExpandedManifest, ManifestError> {
+        expand_manifest(&parse_manifest(yaml).unwrap())
+    }
+
+    #[test]
+    fn legacy_manifest_defaults_to_present_and_schema_scope() {
+        let expanded = expand(
+            r#"
+grants:
+  - role: reader
+    privileges: [SELECT]
+    object: { type: table, schema: app, name: "*" }
+default_privileges:
+  - owner: app_owner
+    schema: app
+    grant:
+      - role: reader
+        privileges: [SELECT]
+        on_type: table
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(expanded.grants[0].ensure, Ensure::Present);
+        assert_eq!(
+            expanded.default_privileges[0].grant[0].ensure,
+            Ensure::Present
+        );
+        assert_eq!(
+            expanded.default_privileges[0].resolved_scope().unwrap(),
+            crate::model::DefaultPrivilegeScope::Schema {
+                schema: "app".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn ensure_and_scope_round_trip_through_yaml() {
+        let yaml = r#"
+grants:
+  - role: PUBLIC
+    ensure: absent
+    privileges: [EXECUTE]
+    object: { type: function, schema: api, name: "*" }
+default_privileges:
+  - owner: api_owner
+    scope: { type: global }
+    grant:
+      - role: PUBLIC
+        ensure: absent
+        privileges: [EXECUTE]
+        on_type: function
+"#;
+        let manifest = parse_manifest(yaml).unwrap();
+        assert_eq!(manifest.grants[0].ensure, Ensure::Absent);
+        assert_eq!(
+            manifest.default_privileges[0].resolved_scope().unwrap(),
+            crate::model::DefaultPrivilegeScope::Global
+        );
+
+        // Present/schema entries stay out of the serialized form so existing
+        // manifests keep their shape.
+        let reserialized = serde_yaml::to_string(&manifest).unwrap();
+        assert!(reserialized.contains("ensure: absent"));
+        assert!(!reserialized.contains("ensure: present"));
+    }
+
+    #[test]
+    fn public_is_reserved_everywhere_a_real_role_is_named() {
+        let cases = [
+            "roles:\n  - name: PUBLIC\n",
+            "memberships:\n  - role: PUBLIC\n    members:\n      - name: app\n",
+            "memberships:\n  - role: app\n    members:\n      - name: PUBLIC\n",
+            "retirements:\n  - role: PUBLIC\n",
+            "default_owner: PUBLIC\n",
+            "schemas:\n  - name: app\n    owner: PUBLIC\n    profiles: []\n",
+            "default_privileges:\n  - owner: PUBLIC\n    schema: app\n    grant:\n      - role: r\n        privileges: [SELECT]\n        on_type: table\n",
+        ];
+        for yaml in cases {
+            assert!(
+                matches!(expand(yaml), Err(ManifestError::ReservedPublicName { .. })),
+                "expected PUBLIC to be rejected in: {yaml}"
+            );
+        }
+    }
+
+    #[test]
+    fn public_is_allowed_as_a_grantee_and_lowercase_public_is_an_ordinary_role() {
+        expand(
+            r#"
+roles:
+  - name: public
+grants:
+  - role: PUBLIC
+    ensure: absent
+    privileges: [EXECUTE]
+    object: { type: function, schema: api, name: "*" }
+  - role: public
+    privileges: [USAGE]
+    object: { type: schema, name: api }
+"#,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn default_privilege_scope_must_be_specified_exactly_once() {
+        let both = expand(
+            r#"
+default_privileges:
+  - owner: o
+    schema: app
+    scope: { type: global }
+    grant:
+      - role: r
+        privileges: [SELECT]
+        on_type: table
+"#,
+        );
+        assert!(matches!(
+            both,
+            Err(ManifestError::DefaultPrivilegeScopeConflict { .. })
+        ));
+
+        let neither = expand(
+            r#"
+default_privileges:
+  - owner: o
+    grant:
+      - role: r
+        privileges: [SELECT]
+        on_type: table
+"#,
+        );
+        assert!(matches!(
+            neither,
+            Err(ManifestError::DefaultPrivilegeScopeMissing { .. })
+        ));
+
+        let schema_scope_without_name = expand(
+            r#"
+default_privileges:
+  - owner: o
+    scope: { type: schema }
+    grant:
+      - role: r
+        privileges: [SELECT]
+        on_type: table
+"#,
+        );
+        assert!(matches!(
+            schema_scope_without_name,
+            Err(ManifestError::DefaultPrivilegeScopeSchemaMissing)
+        ));
+
+        let global_with_name = expand(
+            r#"
+default_privileges:
+  - owner: o
+    scope: { type: global, schema: app }
+    grant:
+      - role: r
+        privileges: [SELECT]
+        on_type: table
+"#,
+        );
+        assert!(matches!(
+            global_with_name,
+            Err(ManifestError::DefaultPrivilegeScopeSchemaForbidden { .. })
+        ));
+    }
+
+    #[test]
+    fn default_privilege_on_type_matrix_is_enforced_per_scope() {
+        let dp = |scope: &str, on_type: &str| {
+            expand(&format!(
+                r#"
+default_privileges:
+  - owner: o
+    {scope}
+    grant:
+      - role: r
+        privileges: [USAGE]
+        on_type: {on_type}
+"#
+            ))
+        };
+
+        // Schemas are not contained in a schema, so they are global-only.
+        assert!(dp("scope: { type: global }", "schema").is_ok());
+        assert!(matches!(
+            dp("schema: app", "schema"),
+            Err(ManifestError::InvalidDefaultPrivilegeOnType { .. })
+        ));
+
+        // PostgreSQL has no database-level default privileges.
+        for scope in ["scope: { type: global }", "schema: app"] {
+            assert!(matches!(
+                dp(scope, "database"),
+                Err(ManifestError::InvalidDefaultPrivilegeOnType { .. })
+            ));
+            // pg_default_acl stores views as plain relations, so a view-typed
+            // key could never converge.
+            assert!(matches!(
+                dp(scope, "view"),
+                Err(ManifestError::InvalidDefaultPrivilegeOnType { .. })
+            ));
+            for on_type in ["table", "sequence", "function", "type"] {
+                assert!(dp(scope, on_type).is_ok(), "{scope} / {on_type}");
+            }
+        }
+    }
+
+    #[test]
+    fn same_assertion_declared_present_and_absent_is_rejected() {
+        let grants = expand(
+            r#"
+grants:
+  - role: PUBLIC
+    privileges: [EXECUTE]
+    object: { type: function, schema: api, name: f() }
+  - role: PUBLIC
+    ensure: absent
+    privileges: [EXECUTE]
+    object: { type: function, schema: api, name: f() }
+"#,
+        );
+        assert!(matches!(
+            grants,
+            Err(ManifestError::ConflictingGrantEnsure { .. })
+        ));
+
+        let defaults = expand(
+            r#"
+default_privileges:
+  - owner: o
+    schema: app
+    grant:
+      - role: r
+        privileges: [SELECT]
+        on_type: table
+      - role: r
+        ensure: absent
+        privileges: [SELECT]
+        on_type: table
+"#,
+        );
+        assert!(matches!(
+            defaults,
+            Err(ManifestError::ConflictingDefaultPrivilegeEnsure { .. })
+        ));
+    }
+
+    #[test]
+    fn disjoint_privileges_on_one_target_may_mix_present_and_absent() {
+        expand(
+            r#"
+grants:
+  - role: reader
+    privileges: [SELECT]
+    object: { type: table, schema: app, name: t }
+  - role: reader
+    ensure: absent
+    privileges: [DELETE]
+    object: { type: table, schema: app, name: t }
+"#,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn wildcard_and_named_selectors_may_not_disagree_on_ensure() {
+        // Grants run before revokes, so this pair would never converge.
+        let conflicting = expand(
+            r#"
+grants:
+  - role: PUBLIC
+    privileges: [EXECUTE]
+    object: { type: function, schema: api, name: "*" }
+  - role: PUBLIC
+    ensure: absent
+    privileges: [EXECUTE]
+    object: { type: function, schema: api, name: f() }
+"#,
+        );
+        assert!(matches!(
+            conflicting,
+            Err(ManifestError::ConflictingWildcardEnsure { .. })
+        ));
+
+        // A different privilege on each selector is fine.
+        expand(
+            r#"
+grants:
+  - role: reader
+    privileges: [SELECT]
+    object: { type: table, schema: app, name: "*" }
+  - role: reader
+    ensure: absent
+    privileges: [DELETE]
+    object: { type: table, schema: app, name: t }
+"#,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn profiles_may_not_assert_absence() {
+        let result = expand(
+            r#"
+profiles:
+  editor:
+    default_privileges:
+      - ensure: absent
+        privileges: [SELECT]
+        on_type: table
+schemas:
+  - name: app
+    profiles: [editor]
+"#,
+        );
+        assert!(matches!(
+            result,
+            Err(ManifestError::ProfileAbsentDefaultPrivilege { .. })
+        ));
+    }
+
+    #[test]
+    fn profile_grants_may_not_assert_absence() {
+        let result = expand(
+            r#"
+roles:
+  - name: reader
+    profiles: [editor]
+profiles:
+  editor:
+    grants:
+      - ensure: absent
+        privileges: [SELECT]
+        object: { type: table, name: "*" }
+schemas:
+  - name: app
+    profiles: [editor]
+"#,
+        );
+        assert!(
+            matches!(result, Err(ManifestError::ProfileAbsentGrant { .. })),
+            "a profile grant asserting absence must be rejected, got: {result:?}"
+        );
     }
 }

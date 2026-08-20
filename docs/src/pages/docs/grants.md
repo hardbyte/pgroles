@@ -127,3 +127,76 @@ This is equivalent to granting `SELECT, INSERT, UPDATE` on all tables.
 ## Convergent revocation
 
 Privileges present in the database but absent from the manifest are revoked. If a role has `DELETE` on a table but your manifest only grants `SELECT`, pgroles will generate a `REVOKE DELETE` statement.
+
+Revocation is driven by the manifest as a whole, so removing a grant entry is
+enough to revoke it. `PUBLIC` is the exception, described below.
+
+## Asserting a privilege is absent
+
+Some privileges exist without anyone granting them. PostgreSQL gives `EXECUTE`
+on every function to `PUBLIC`, `USAGE` on every type to `PUBLIC`, and `CONNECT`
+plus `TEMPORARY` on the database to `PUBLIC`. There is no ACL entry to delete,
+so leaving them out of the manifest changes nothing.
+
+`ensure: absent` states that a privilege must not exist:
+
+```yaml
+grants:
+  - role: PUBLIC
+    ensure: absent
+    privileges: [EXECUTE]
+    object: { type: function, schema: privileged_api, name: "*" }
+```
+
+```sql
+REVOKE EXECUTE ON ALL ROUTINES IN SCHEMA "privileged_api" FROM PUBLIC;
+```
+
+Every grant entry carries `ensure`, which defaults to `present`. An absent rule
+revokes only the privileges it lists, and only where they are actually held. If
+nothing holds them, it plans nothing.
+
+`ensure: absent` is not a PostgreSQL deny. It controls one ACL edge. A role that
+also reaches the object through membership or ownership still reaches it.
+
+Use `ensure: absent` on the objects that exist today, and pair it with a global
+default-privilege rule for the objects created tomorrow. See
+[Default privileges](/docs/default-privileges#removing-public-privileges).
+
+## PUBLIC
+
+`PUBLIC` is the PostgreSQL pseudo-role that every role belongs to. Write it as
+the exact uppercase value `PUBLIC` in a `role:` field:
+
+```yaml
+grants:
+  - role: PUBLIC
+    privileges: [USAGE]
+    object: { type: schema, name: public_api }
+```
+
+The name is reserved. pgroles rejects a manifest that declares a role, a
+membership, a retirement, a schema owner, or a default-privilege owner called
+`PUBLIC`. A role whose name merely resembles the keyword is an ordinary role and
+is quoted as one in the generated SQL.
+
+pgroles manages a `PUBLIC` privilege only where a rule names it. This differs
+from ordinary roles:
+
+- A `PUBLIC` privilege no rule mentions is left alone, even in authoritative
+  mode. Databases are full of `PUBLIC` grants that extensions and PostgreSQL
+  itself created, and revoking them wholesale would break things pgroles was
+  never asked to manage.
+- Deleting a `present` rule for `PUBLIC` therefore does not revoke anything.
+  Change it to `ensure: absent` when you want the privilege gone.
+
+`pgroles generate` never emits `PUBLIC` rules or `ensure: absent`. A privilege
+that happens to be missing today is not evidence you want pgroles to keep it
+missing.
+
+{% callout title="Migrations still matter" %}
+Reconciliation is not part of your migration transaction. A function created
+between two pgroles runs carries the built-in `PUBLIC EXECUTE` until the next
+run. Apply the global default rule before the migration that creates the
+function, or revoke inside the migration itself.
+{% /callout %}

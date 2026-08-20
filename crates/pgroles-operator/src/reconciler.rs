@@ -161,6 +161,9 @@ pub enum ReconcileError {
     UnsatisfiableWildcardGrant(String),
 
     #[error("{0}")]
+    ExecutorAuthority(String),
+
+    #[error("{0}")]
     ConflictingPolicy(String),
 
     #[error("lock contention on database \"{0}\": {1}")]
@@ -512,6 +515,7 @@ fn retry_class_for_reconcile_error(error: &ReconcileError) -> RetryClass {
         | ReconcileError::InvalidSpec(_)
         | ReconcileError::MissingDatabaseObjects(_)
         | ReconcileError::UnsatisfiableWildcardGrant(_)
+        | ReconcileError::ExecutorAuthority(_)
         | ReconcileError::ConflictingPolicy(_)
         | ReconcileError::UnsafeRoleDrops(_)
         | ReconcileError::EmptyPasswordSecret { .. }
@@ -652,7 +656,14 @@ fn referenced_schema_names(
         }
     }
     for dp in &expanded.default_privileges {
-        names.insert(dp.schema.clone());
+        if let Some(schema) = &dp.schema {
+            names.insert(schema.clone());
+        }
+        if let Some(spec) = &dp.scope
+            && let Some(schema) = &spec.schema
+        {
+            names.insert(schema.clone());
+        }
     }
     names
 }
@@ -774,9 +785,10 @@ async fn reconcile_apply(
                 }
                 "InvalidSpec" => ctx.observability.record_invalid_spec(),
                 "ConflictingPolicy" => ctx.observability.record_policy_conflict(),
-                "ApplyFailed" | "MissingDatabaseObject" | "UnsatisfiableWildcardGrant" => {
-                    ctx.observability.record_apply_result("error")
-                }
+                "ApplyFailed"
+                | "MissingDatabaseObject"
+                | "UnsatisfiableWildcardGrant"
+                | "ExecutorAuthority" => ctx.observability.record_apply_result("error"),
                 _ => {}
             }
             reconcile_guard.record_result("error", error_reason);
@@ -1335,6 +1347,32 @@ async fn apply_under_lock(
         ));
     }
 
+    // Planned default-privilege changes and PUBLIC revokes need owner
+    // authority the executor may lack; a PUBLIC revoke without it silently
+    // no-ops and the controller would flap.
+    //
+    // Only executing is blocked. Producing and reviewing a plan needs no
+    // authority, and failing here instead would leave an operator with a
+    // Degraded policy and nothing to look at.
+    let authority_issues =
+        pgroles_inspect::preflight_authority_issues(pool, &changes, &current).await?;
+    let authority_block: Option<String> = if authority_issues.is_empty() {
+        None
+    } else {
+        let message = authority_issues
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+        tracing::warn!(
+            name,
+            namespace,
+            issues = %message,
+            "executor lacks the authority to apply these changes; planning continues, execution is blocked"
+        );
+        Some(message)
+    };
+
     let summary = summarize_changes(&changes);
     let sql_ctx = detect_sql_context(pool, &inspect_config).await?;
 
@@ -1585,6 +1623,14 @@ async fn apply_under_lock(
                 // Re-fetch after approval status update.
                 let plan = plans_api.get(&plan_name).await?;
                 emit_plan_event(ctx, resource, &plan, PlanEventType::Approved).await;
+
+                // The plan exists and is reviewable; this is the point past
+                // which it would execute, so this is where missing authority
+                // stops it.
+                if let Some(message) = &authority_block {
+                    return Err(ReconcileError::ExecutorAuthority(message.clone()));
+                }
+
                 emit_plan_event(ctx, resource, &plan, PlanEventType::ApplyStarted).await;
 
                 // Generated Secrets are created here, after approval and before
@@ -1975,6 +2021,13 @@ async fn apply_under_lock(
                         let plans_api: Api<PostgresPolicyPlan> =
                             Api::namespaced(ctx.kube_client.clone(), namespace);
                         let plan = plans_api.get(&current_plan.name_any()).await?;
+
+                        // The decision is recorded and the plan stays
+                        // reviewable; this is the point past which it would
+                        // execute, so this is where missing authority stops it.
+                        if let Some(message) = &authority_block {
+                            return Err(ReconcileError::ExecutorAuthority(message.clone()));
+                        }
 
                         emit_plan_event(ctx, resource, &plan, PlanEventType::ApplyStarted).await;
 
@@ -3293,6 +3346,7 @@ impl ReconcileError {
             ReconcileError::ApprovalDigest(_) => "ApprovalDigestFailed",
             ReconcileError::ConflictingPolicy(_) => "ConflictingPolicy",
             ReconcileError::UnsatisfiableWildcardGrant(_) => "UnsatisfiableWildcardGrant",
+            ReconcileError::ExecutorAuthority(_) => "ExecutorAuthority",
             ReconcileError::LockContention(_, _) => "LockContention",
             ReconcileError::RequestIndexNotReady(_) => "RequestIndexNotReady",
             ReconcileError::Context(context) => match context.as_ref() {
@@ -3881,7 +3935,7 @@ mod tests {
         accumulate_summary(
             &mut summary,
             &Change::Grant {
-                role: "test".to_string(),
+                role: "test".into(),
                 object_type: pgroles_core::manifest::ObjectType::Schema,
                 schema: None,
                 name: Some("public".to_string()),
@@ -3943,7 +3997,7 @@ mod tests {
                 owner: Some("inventory_owner".to_string()),
             },
             Change::Grant {
-                role: "test".to_string(),
+                role: "test".into(),
                 object_type: pgroles_core::manifest::ObjectType::Schema,
                 schema: None,
                 name: Some("public".to_string()),
@@ -4030,7 +4084,7 @@ mod tests {
         accumulate_summary(
             &mut summary,
             &Change::Grant {
-                role: "r1".to_string(),
+                role: "r1".into(),
                 object_type: pgroles_core::manifest::ObjectType::Table,
                 schema: Some("public".to_string()),
                 name: Some("*".to_string()),
@@ -4042,7 +4096,7 @@ mod tests {
         accumulate_summary(
             &mut summary,
             &Change::Revoke {
-                role: "r1".to_string(),
+                role: "r1".into(),
                 object_type: pgroles_core::manifest::ObjectType::Table,
                 schema: Some("public".to_string()),
                 name: Some("*".to_string()),
@@ -4054,9 +4108,11 @@ mod tests {
         accumulate_summary(
             &mut summary,
             &Change::SetDefaultPrivilege {
-                schema: "public".to_string(),
+                scope: pgroles_core::model::DefaultPrivilegeScope::Schema {
+                    schema: "public".to_string(),
+                },
                 owner: "owner".to_string(),
-                grantee: "r1".to_string(),
+                grantee: "r1".into(),
                 on_type: pgroles_core::manifest::ObjectType::Table,
                 privileges: [pgroles_core::manifest::Privilege::Select]
                     .into_iter()
@@ -4066,9 +4122,11 @@ mod tests {
         accumulate_summary(
             &mut summary,
             &Change::RevokeDefaultPrivilege {
-                schema: "public".to_string(),
+                scope: pgroles_core::model::DefaultPrivilegeScope::Schema {
+                    schema: "public".to_string(),
+                },
                 owner: "owner".to_string(),
-                grantee: "r1".to_string(),
+                grantee: "r1".into(),
                 on_type: pgroles_core::manifest::ObjectType::Table,
                 privileges: [pgroles_core::manifest::Privilege::Select]
                     .into_iter()
@@ -4261,6 +4319,7 @@ mod tests {
             schemas: Vec::new(),
             roles: Vec::new(),
             grants: vec![Grant {
+                ensure: pgroles_core::manifest::Ensure::Present,
                 role: "app".into(),
                 privileges: vec![Privilege::Usage],
                 object: ObjectTarget {
@@ -4285,6 +4344,7 @@ mod tests {
             schemas: Vec::new(),
             roles: Vec::new(),
             grants: vec![Grant {
+                ensure: pgroles_core::manifest::Ensure::Present,
                 role: "app".into(),
                 privileges: vec![Privilege::Select],
                 object: ObjectTarget {
@@ -4310,9 +4370,11 @@ mod tests {
             roles: Vec::new(),
             grants: Vec::new(),
             default_privileges: vec![DefaultPrivilege {
+                scope: None,
                 owner: Some("app_owner".into()),
-                schema: "reporting".into(),
+                schema: Some("reporting".to_string()),
                 grant: vec![DefaultPrivilegeGrant {
+                    ensure: pgroles_core::manifest::Ensure::Present,
                     role: Some("app".into()),
                     privileges: vec![Privilege::Select],
                     on_type: ObjectType::Table,
@@ -4335,6 +4397,7 @@ mod tests {
             roles: Vec::new(),
             grants: vec![
                 Grant {
+                    ensure: pgroles_core::manifest::Ensure::Present,
                     role: "app".into(),
                     privileges: vec![Privilege::Usage],
                     object: ObjectTarget {
@@ -4344,6 +4407,7 @@ mod tests {
                     },
                 },
                 Grant {
+                    ensure: pgroles_core::manifest::Ensure::Present,
                     role: "app".into(),
                     privileges: vec![Privilege::Select],
                     object: ObjectTarget {
@@ -4354,9 +4418,11 @@ mod tests {
                 },
             ],
             default_privileges: vec![DefaultPrivilege {
+                scope: None,
                 owner: Some("app_owner".into()),
-                schema: "shared".into(),
+                schema: Some("shared".to_string()),
                 grant: vec![DefaultPrivilegeGrant {
+                    ensure: pgroles_core::manifest::Ensure::Present,
                     role: Some("app".into()),
                     privileges: vec![Privilege::Select],
                     on_type: ObjectType::Table,
@@ -4379,6 +4445,7 @@ mod tests {
             schemas: Vec::new(),
             roles: Vec::new(),
             grants: vec![Grant {
+                ensure: pgroles_core::manifest::Ensure::Present,
                 role: "app".into(),
                 privileges: vec![Privilege::Connect],
                 object: ObjectTarget {
@@ -4461,6 +4528,7 @@ mod tests {
             roles: Vec::new(),
             grants: vec![
                 Grant {
+                    ensure: pgroles_core::manifest::Ensure::Present,
                     role: "app".into(),
                     privileges: vec![Privilege::Usage],
                     object: ObjectTarget {
@@ -4470,6 +4538,7 @@ mod tests {
                     },
                 },
                 Grant {
+                    ensure: pgroles_core::manifest::Ensure::Present,
                     role: "app".into(),
                     privileges: vec![Privilege::Select],
                     object: ObjectTarget {

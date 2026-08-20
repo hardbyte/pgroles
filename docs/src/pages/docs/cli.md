@@ -395,6 +395,8 @@ pgroles apply --database-url postgres://localhost/mydb --mode additive
 
 Additive mode filters out: `ALTER ROLE`, `COMMENT ON ROLE`, `REVOKE`, `REVOKE DEFAULT PRIVILEGE`, `REMOVE MEMBER`, `ALTER SCHEMA ... OWNER TO ...`, `DROP ROLE`, `DROP OWNED`, `REASSIGN OWNED`, and `TERMINATE SESSIONS`.
 
+Because additive mode never revokes, it also ignores every `ensure: absent` rule. The rest of the plan still applies, and the run does not fail. Use `adopt` or `authoritative` when you need those assertions enforced.
+
 If additive mode skips a schema ownership transfer, pgroles also defers owner-bound follow-up steps such as schema-owner privilege repair and `ALTER DEFAULT PRIVILEGES FOR ROLE ...` for that owner context.
 
 For brownfield roles that already exist, additive mode intentionally leaves role attributes and comments unchanged. That means a pre-existing `LOGIN NOINHERIT` role can stay that way during adoption even if a minimal manifest would otherwise imply `NOLOGIN INHERIT`.
@@ -407,7 +409,7 @@ Manage declared roles fully (including revoking excess grants within their scope
 pgroles apply --database-url postgres://localhost/mydb --mode adopt
 ```
 
-Adopt mode filters out: `DROP ROLE`, `DROP OWNED`, `REASSIGN OWNED`, and `TERMINATE SESSIONS`. Revokes and membership removals for managed roles still apply.
+Adopt mode filters out: `DROP ROLE`, `DROP OWNED`, `REASSIGN OWNED`, and `TERMINATE SESSIONS`. Revokes and membership removals for managed roles still apply. `ensure: absent` rules apply in this mode.
 
 {% callout type="note" title="Adoption path" %}
 A common adoption path is: start with `--mode additive` to verify the manifest produces the right grants, then move to `--mode adopt` to start revoking excess grants within managed roles, and finally switch to `--mode authoritative` when you're confident the manifest is complete.

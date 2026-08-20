@@ -834,6 +834,7 @@ async fn cmd_diff(
             &changes,
             &validated.composed.managed_change_surface,
         )?;
+        preflight_authority(&pool, &changes, &current, false).await?;
         let drop_safety =
             inspect_drop_safety(&pool, &changes, &validated.composed.manifest.retirements).await?;
         let summary = PlanSummary::from_changes(&changes);
@@ -893,6 +894,7 @@ async fn cmd_diff(
     let resolved_passwords =
         resolve_passwords(&validated.expanded).context("failed to resolve role passwords")?;
     let changes = inject_password_changes(changes, &resolved_passwords);
+    preflight_authority(&pool, &changes, &current, false).await?;
     let drop_safety = inspect_drop_safety(&pool, &changes, &validated.manifest.retirements).await?;
     let summary = PlanSummary::from_changes(&changes);
 
@@ -968,7 +970,6 @@ async fn cmd_apply(
             &changes,
             &validated.composed.managed_change_surface,
         )?;
-
         // Validate changes against privilege level.
         let priv_warnings = pgroles_inspect::cloud::validate_changes_for_privilege_level(
             &changes,
@@ -995,11 +996,14 @@ async fn cmd_apply(
             println!("-- DRY RUN: the following SQL would be executed:\n");
             print!("{sql_output}");
             eprintln!("\n{}", summary.format_plan());
+            preflight_authority(&pool, &changes, &current, false).await?;
             if !drop_safety.is_empty() {
                 eprintln!("\n{drop_safety}");
             }
             return Ok(());
         }
+
+        preflight_authority(&pool, &changes, &current, true).await?;
 
         if drop_safety.has_blockers() {
             anyhow::bail!("{}", drop_safety.blockers);
@@ -1051,7 +1055,6 @@ async fn cmd_apply(
     let resolved_passwords =
         resolve_passwords(&validated.expanded).context("failed to resolve role passwords")?;
     let changes = inject_password_changes(changes, &resolved_passwords);
-
     // Validate changes against privilege level.
     let priv_warnings =
         pgroles_inspect::cloud::validate_changes_for_privilege_level(&changes, &privilege_level);
@@ -1075,11 +1078,14 @@ async fn cmd_apply(
         println!("-- DRY RUN: the following SQL would be executed:\n");
         print!("{sql_output}");
         eprintln!("\n{}", summary.format_plan());
+        preflight_authority(&pool, &changes, &current, false).await?;
         if !drop_safety.is_empty() {
             eprintln!("\n{drop_safety}");
         }
         return Ok(());
     }
+
+    preflight_authority(&pool, &changes, &current, true).await?;
 
     if drop_safety.has_blockers() {
         anyhow::bail!("{}", drop_safety.blockers);
@@ -1668,6 +1674,40 @@ async fn inspect_current_for_plan_with_config(
         eprintln!("Warning: {diagnostic}");
     }
     Ok(inspection.graph)
+}
+
+/// Report planned default-privilege changes and PUBLIC revokes the executor
+/// lacks the authority to perform. Runs on the final change list, so converged
+/// state never reports anything.
+///
+/// `blocking` is true only where SQL actually runs. `diff` and `apply
+/// --dry-run` execute nothing, so they warn and still produce their plan —
+/// a CI drift check running as a read-only role keeps working. This mirrors
+/// how drop safety is handled, which also warns until the moment of execution.
+async fn preflight_authority(
+    pool: &PgPool,
+    changes: &[pgroles_core::diff::Change],
+    current: &pgroles_core::model::RoleGraph,
+    blocking: bool,
+) -> Result<()> {
+    let issues = pgroles_inspect::preflight_authority_issues(pool, changes, current)
+        .await
+        .context("failed to check executor authority")?;
+    if issues.is_empty() {
+        return Ok(());
+    }
+    let message = issues
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join("\n");
+    if blocking {
+        anyhow::bail!("{message}");
+    }
+    for issue in &issues {
+        eprintln!("Warning: {issue}");
+    }
+    Ok(())
 }
 
 async fn inspect_drop_safety(

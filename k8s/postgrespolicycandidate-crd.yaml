@@ -69,12 +69,20 @@
                       "default_privileges": {
                         "description": "One-off default privileges.",
                         "items": {
-                          "description": "Default privilege configuration.",
+                          "description": "Default privilege configuration.\n\nThe scope rules are also expressed as CEL so the API server rejects a bad\nentry at apply time. `resolved_scope` enforces the same rules for the CLI,\nwhich has no admission step.",
                           "properties": {
                             "grant": {
                               "items": {
                                 "description": "A single default privilege grant entry.",
                                 "properties": {
+                                  "ensure": {
+                                    "description": "Whether the listed privileges must exist or must not exist.\n\n`absent` asserts one ACL edge only. It plans a REVOKE when the privilege is\nfound live, and it says nothing about access the grantee may still have\nthrough role membership or ownership.",
+                                    "enum": [
+                                      "present",
+                                      "absent"
+                                    ],
+                                    "type": "string"
+                                  },
                                   "on_type": {
                                     "description": "PostgreSQL object types that can have privileges granted on them.",
                                     "enum": [
@@ -113,7 +121,7 @@
                                     "type": "array"
                                   },
                                   "role": {
-                                    "description": "The role receiving the default privilege. Only used in top-level default_privileges\n(in profiles, the role is determined by expansion).",
+                                    "description": "The role receiving the default privilege. Only used in top-level default_privileges\n(in profiles, the role is determined by expansion). The exact-uppercase\nvalue `PUBLIC` means the PostgreSQL PUBLIC pseudo-role.",
                                     "maxLength": 63,
                                     "minLength": 1,
                                     "nullable": true,
@@ -137,16 +145,54 @@
                               "type": "string"
                             },
                             "schema": {
+                              "description": "Schema shorthand, equivalent to `scope: {type: schema, schema: ...}`.\nExactly one of `schema` and `scope` must be set.",
                               "maxLength": 63,
                               "minLength": 1,
+                              "nullable": true,
                               "type": "string"
+                            },
+                            "scope": {
+                              "description": "Where the defaults apply: one schema, or owner-wide (global). Global\nscope renders `ALTER DEFAULT PRIVILEGES` without an `IN SCHEMA` clause.",
+                              "nullable": true,
+                              "properties": {
+                                "schema": {
+                                  "description": "Schema name. Required for `type: schema`, forbidden for `type: global`.",
+                                  "maxLength": 63,
+                                  "minLength": 1,
+                                  "nullable": true,
+                                  "type": "string"
+                                },
+                                "type": {
+                                  "description": "The kind of default-privilege scope.",
+                                  "enum": [
+                                    "global",
+                                    "schema"
+                                  ],
+                                  "type": "string"
+                                }
+                              },
+                              "required": [
+                                "type"
+                              ],
+                              "type": "object",
+                              "x-kubernetes-validations": [
+                                {
+                                  "message": "`schema` is required when type is `schema` and forbidden when type is `global`",
+                                  "rule": "has(self.schema) == (self.type == 'schema')"
+                                }
+                              ]
                             }
                           },
                           "required": [
-                            "grant",
-                            "schema"
+                            "grant"
                           ],
-                          "type": "object"
+                          "type": "object",
+                          "x-kubernetes-validations": [
+                            {
+                              "message": "exactly one of `schema` and `scope` must be set",
+                              "rule": "has(self.schema) != has(self.scope)"
+                            }
+                          ]
                         },
                         "maxItems": 512,
                         "type": "array"
@@ -156,6 +202,14 @@
                         "items": {
                           "description": "A concrete grant on a specific object or wildcard.",
                           "properties": {
+                            "ensure": {
+                              "description": "Whether the listed privileges must exist or must not exist.\n\n`absent` asserts one ACL edge only. It plans a REVOKE when the privilege is\nfound live, and it says nothing about access the grantee may still have\nthrough role membership or ownership.",
+                              "enum": [
+                                "present",
+                                "absent"
+                              ],
+                              "type": "string"
+                            },
                             "object": {
                               "description": "Target object for a grant.",
                               "properties": {
@@ -217,6 +271,7 @@
                               "type": "array"
                             },
                             "role": {
+                              "description": "The grantee. The exact-uppercase value `PUBLIC` means the PostgreSQL\nPUBLIC pseudo-role; any other value is an ordinary role name.",
                               "maxLength": 63,
                               "minLength": 1,
                               "type": "string"
@@ -298,6 +353,14 @@
                               "items": {
                                 "description": "Default privilege grant within a profile.",
                                 "properties": {
+                                  "ensure": {
+                                    "description": "Whether the privilege must be present or absent. Matches the\ntop-level `default_privileges` entries, which carry the same field.",
+                                    "enum": [
+                                      "present",
+                                      "absent"
+                                    ],
+                                    "type": "string"
+                                  },
                                   "on_type": {
                                     "description": "PostgreSQL object types that can have privileges granted on them.",
                                     "enum": [
@@ -355,6 +418,14 @@
                               "items": {
                                 "description": "Grant template within a profile.",
                                 "properties": {
+                                  "ensure": {
+                                    "description": "Whether the privilege must be present or absent. Matches the top-level\n`grants` entries, which carry the same field. Profiles are additive\ntemplates, so validation rejects `absent`; the schema accepts it so the\nAPI server does not prune the value before that check can name it.",
+                                    "enum": [
+                                      "present",
+                                      "absent"
+                                    ],
+                                    "type": "string"
+                                  },
                                   "object": {
                                     "description": "Object target within a profile.",
                                     "properties": {

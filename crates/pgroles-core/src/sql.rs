@@ -9,7 +9,7 @@ use std::fmt::Write;
 
 use crate::diff::Change;
 use crate::manifest::{ObjectType, Privilege};
-use crate::model::{RoleAttribute, RoleState};
+use crate::model::{DefaultPrivilegeScope, Grantee, RoleAttribute, RoleState};
 
 // ---------------------------------------------------------------------------
 // Identifier quoting
@@ -103,7 +103,7 @@ pub fn render_statements_with_context(change: &Change, ctx: &SqlContext) -> Vec<
             owner,
             privileges,
         } => render_grant(
-            owner,
+            &Grantee::Role(owner.clone()),
             privileges,
             ObjectType::Schema,
             None,
@@ -142,18 +142,18 @@ pub fn render_statements_with_context(change: &Change, ctx: &SqlContext) -> Vec<
         ),
         Change::SetDefaultPrivilege {
             owner,
-            schema,
+            scope,
             on_type,
             grantee,
             privileges,
-        } => render_set_default_privilege(owner, schema, *on_type, grantee, privileges),
+        } => render_set_default_privilege(owner, scope, *on_type, grantee, privileges),
         Change::RevokeDefaultPrivilege {
             owner,
-            schema,
+            scope,
             on_type,
             grantee,
             privileges,
-        } => render_revoke_default_privilege(owner, schema, *on_type, grantee, privileges),
+        } => render_revoke_default_privilege(owner, scope, *on_type, grantee, privileges),
         Change::AddMember {
             role,
             member,
@@ -381,8 +381,19 @@ fn render_set_comment(name: &str, comment: &Option<String>) -> Vec<String> {
 // GRANT / REVOKE
 // ---------------------------------------------------------------------------
 
+/// Render a grantee for a GRANT/REVOKE subject position.
+///
+/// The PUBLIC pseudo-role must stay unquoted: `"PUBLIC"` would name an
+/// ordinary role called PUBLIC instead.
+pub fn render_grantee(grantee: &Grantee) -> String {
+    match grantee {
+        Grantee::Public => "PUBLIC".to_string(),
+        Grantee::Role(name) => quote_ident(name),
+    }
+}
+
 fn render_grant(
-    role: &str,
+    role: &Grantee,
     privileges: &BTreeSet<Privilege>,
     object_type: ObjectType,
     schema: Option<&str>,
@@ -402,7 +413,7 @@ fn render_grant(
 }
 
 fn render_revoke(
-    role: &str,
+    role: &Grantee,
     privileges: &BTreeSet<Privilege>,
     object_type: ObjectType,
     schema: Option<&str>,
@@ -423,7 +434,7 @@ fn render_revoke(
 
 fn render_privilege_statements(
     action: &str,
-    role: &str,
+    role: &Grantee,
     privilege_list: &str,
     object_type: ObjectType,
     schema: Option<&str>,
@@ -450,14 +461,14 @@ fn render_privilege_statements(
     let target = format_object_target(object_type, schema, name);
     vec![format!(
         "{action} {privilege_list} ON {target} {subject_preposition} {};",
-        quote_ident(role)
+        render_grantee(role)
     )]
 }
 
 fn render_relation_wildcard(
     action: &str,
     subject_preposition: &str,
-    role: &str,
+    role: &Grantee,
     privilege_list: &str,
     object_type: ObjectType,
     schema: Option<&str>,
@@ -476,20 +487,29 @@ fn render_relation_wildcard(
                     "{action} {privilege_list} ON TABLE {}.{} {subject_preposition} {};",
                     quote_ident(schema_name),
                     quote_ident(object_name),
-                    quote_ident(role),
+                    render_grantee(role),
                 )
             })
             .collect();
     }
 
+    // Inside the DO-block the grantee is normally a `%I` format argument.
+    // PUBLIC must instead be embedded literally: `%I` would render it as the
+    // quoted identifier "PUBLIC", which names an ordinary role.
+    let (grantee_placeholder, grantee_argument) = match role {
+        Grantee::Public => ("PUBLIC".to_string(), String::new()),
+        Grantee::Role(name) => ("%I".to_string(), format!(", {}", quote_literal(name))),
+    };
+
     vec![format!(
-        "DO $pgroles$\nDECLARE obj record;\nBEGIN\n  FOR obj IN\n    SELECT n.nspname AS schema_name, c.relname AS object_name\n    FROM pg_class c\n    JOIN pg_namespace n ON n.oid = c.relnamespace\n    WHERE c.relkind IN ({})\n      AND n.nspname = {}\n    ORDER BY c.relname\n  LOOP\n    EXECUTE format('{} {} ON TABLE %I.%I {} %I;', obj.schema_name, obj.object_name, {});\n  END LOOP;\nEND\n$pgroles$;",
+        "DO $pgroles$\nDECLARE obj record;\nBEGIN\n  FOR obj IN\n    SELECT n.nspname AS schema_name, c.relname AS object_name\n    FROM pg_class c\n    JOIN pg_namespace n ON n.oid = c.relnamespace\n    WHERE c.relkind IN ({})\n      AND n.nspname = {}\n    ORDER BY c.relname\n  LOOP\n    EXECUTE format('{} {} ON TABLE %I.%I {} {};', obj.schema_name, obj.object_name{});\n  END LOOP;\nEND\n$pgroles$;",
         relation_relkinds_sql(object_type),
         quote_literal(schema_name),
         action,
         privilege_list,
         subject_preposition,
-        quote_literal(role),
+        grantee_placeholder,
+        grantee_argument,
     )]
 }
 
@@ -627,41 +647,72 @@ fn format_privileges(privileges: &BTreeSet<Privilege>) -> String {
 // ALTER DEFAULT PRIVILEGES
 // ---------------------------------------------------------------------------
 
+/// Map ObjectType to the keyword used in `ALTER DEFAULT PRIVILEGES ... ON`.
+///
+/// This differs from [`sql_object_type_plural`]: default privileges support
+/// TYPES and SCHEMAS, and there is no `ALL ... IN SCHEMA` restriction here.
+/// Manifest validation guarantees SCHEMAS only appears in global scope and
+/// DATABASE never appears.
+fn default_privilege_object_keyword(on_type: ObjectType) -> &'static str {
+    match on_type {
+        ObjectType::Table | ObjectType::View | ObjectType::MaterializedView => "TABLES",
+        ObjectType::Sequence => "SEQUENCES",
+        ObjectType::Function => "ROUTINES",
+        ObjectType::Type => "TYPES",
+        ObjectType::Schema => "SCHEMAS",
+        // Manifest validation rejects database default privileges, so this is
+        // unreachable. Rendering `TABLES` here would silently target the wrong
+        // objects if that ever changed.
+        ObjectType::Database => {
+            unreachable!("default privileges on a database are rejected during manifest validation")
+        }
+    }
+}
+
+fn render_default_privilege_scope_clause(scope: &DefaultPrivilegeScope) -> String {
+    match scope {
+        DefaultPrivilegeScope::Global => String::new(),
+        DefaultPrivilegeScope::Schema { schema } => {
+            format!(" IN SCHEMA {}", quote_ident(schema))
+        }
+    }
+}
+
 fn render_set_default_privilege(
     owner: &str,
-    schema: &str,
+    scope: &DefaultPrivilegeScope,
     on_type: ObjectType,
-    grantee: &str,
+    grantee: &Grantee,
     privileges: &BTreeSet<Privilege>,
 ) -> Vec<String> {
     let privilege_list = format_privileges(privileges);
-    let type_plural = sql_object_type_plural(on_type);
+    let type_keyword = default_privilege_object_keyword(on_type);
     vec![format!(
-        "ALTER DEFAULT PRIVILEGES FOR ROLE {} IN SCHEMA {} GRANT {} ON {} TO {};",
+        "ALTER DEFAULT PRIVILEGES FOR ROLE {}{} GRANT {} ON {} TO {};",
         quote_ident(owner),
-        quote_ident(schema),
+        render_default_privilege_scope_clause(scope),
         privilege_list,
-        type_plural,
-        quote_ident(grantee)
+        type_keyword,
+        render_grantee(grantee)
     )]
 }
 
 fn render_revoke_default_privilege(
     owner: &str,
-    schema: &str,
+    scope: &DefaultPrivilegeScope,
     on_type: ObjectType,
-    grantee: &str,
+    grantee: &Grantee,
     privileges: &BTreeSet<Privilege>,
 ) -> Vec<String> {
     let privilege_list = format_privileges(privileges);
-    let type_plural = sql_object_type_plural(on_type);
+    let type_keyword = default_privilege_object_keyword(on_type);
     vec![format!(
-        "ALTER DEFAULT PRIVILEGES FOR ROLE {} IN SCHEMA {} REVOKE {} ON {} FROM {};",
+        "ALTER DEFAULT PRIVILEGES FOR ROLE {}{} REVOKE {} ON {} FROM {};",
         quote_ident(owner),
-        quote_ident(schema),
+        render_default_privilege_scope_clause(scope),
         privilege_list,
-        type_plural,
-        quote_ident(grantee)
+        type_keyword,
+        render_grantee(grantee)
     )]
 }
 
@@ -994,7 +1045,7 @@ mod tests {
     #[test]
     fn render_grant_schema_usage() {
         let change = Change::Grant {
-            role: "inventory-editor".to_string(),
+            role: "inventory-editor".into(),
             privileges: BTreeSet::from([Privilege::Usage]),
             object_type: ObjectType::Schema,
             schema: None,
@@ -1010,7 +1061,7 @@ mod tests {
     #[test]
     fn render_grant_all_tables() {
         let change = Change::Grant {
-            role: "inventory-editor".to_string(),
+            role: "inventory-editor".into(),
             privileges: BTreeSet::from([Privilege::Select, Privilege::Insert]),
             object_type: ObjectType::Table,
             schema: Some("inventory".to_string()),
@@ -1033,7 +1084,7 @@ mod tests {
     #[test]
     fn render_grant_specific_table() {
         let change = Change::Grant {
-            role: "r1".to_string(),
+            role: "r1".into(),
             privileges: BTreeSet::from([Privilege::Select]),
             object_type: ObjectType::Table,
             schema: Some("public".to_string()),
@@ -1046,7 +1097,7 @@ mod tests {
     #[test]
     fn render_grant_specific_function() {
         let change = Change::Grant {
-            role: "r1".to_string(),
+            role: "r1".into(),
             privileges: BTreeSet::from([Privilege::Execute]),
             object_type: ObjectType::Function,
             schema: Some("public".to_string()),
@@ -1062,7 +1113,7 @@ mod tests {
     #[test]
     fn render_revoke_specific_routine_for_function_object() {
         let change = Change::Revoke {
-            role: "r1".to_string(),
+            role: "r1".into(),
             privileges: BTreeSet::from([Privilege::Execute]),
             object_type: ObjectType::Function,
             schema: Some("public".to_string()),
@@ -1078,7 +1129,7 @@ mod tests {
     #[test]
     fn render_grant_all_routines_for_function_wildcard() {
         let change = Change::Grant {
-            role: "inventory-editor".to_string(),
+            role: "inventory-editor".into(),
             privileges: BTreeSet::from([Privilege::Execute]),
             object_type: ObjectType::Function,
             schema: Some("inventory".to_string()),
@@ -1094,7 +1145,7 @@ mod tests {
     #[test]
     fn render_revoke_all_sequences() {
         let change = Change::Revoke {
-            role: "inventory-editor".to_string(),
+            role: "inventory-editor".into(),
             privileges: BTreeSet::from([Privilege::Usage, Privilege::Select]),
             object_type: ObjectType::Sequence,
             schema: Some("inventory".to_string()),
@@ -1111,9 +1162,11 @@ mod tests {
     fn render_set_default_privilege() {
         let change = Change::SetDefaultPrivilege {
             owner: "app_owner".to_string(),
-            schema: "inventory".to_string(),
+            scope: DefaultPrivilegeScope::Schema {
+                schema: "inventory".to_string(),
+            },
             on_type: ObjectType::Table,
-            grantee: "inventory-editor".to_string(),
+            grantee: "inventory-editor".into(),
             privileges: BTreeSet::from([Privilege::Select, Privilege::Insert]),
         };
         let sql = render(&change);
@@ -1127,9 +1180,11 @@ mod tests {
     fn render_revoke_default_privilege() {
         let change = Change::RevokeDefaultPrivilege {
             owner: "app_owner".to_string(),
-            schema: "inventory".to_string(),
+            scope: DefaultPrivilegeScope::Schema {
+                schema: "inventory".to_string(),
+            },
             on_type: ObjectType::Function,
-            grantee: "inventory-editor".to_string(),
+            grantee: "inventory-editor".into(),
             privileges: BTreeSet::from([Privilege::Execute]),
         };
         let sql = render(&change);
@@ -1311,7 +1366,7 @@ mod tests {
             vec!["daily_sales".to_string(), "weekly_sales".to_string()],
         )]));
         let change = Change::Revoke {
-            role: "analytics".to_string(),
+            role: "analytics".into(),
             privileges: [Privilege::Select].into_iter().collect(),
             object_type: ObjectType::MaterializedView,
             schema: Some("reporting".to_string()),
@@ -1333,7 +1388,7 @@ mod tests {
     #[test]
     fn render_materialized_view_wildcard_without_inventory_uses_catalog_loop() {
         let change = Change::Revoke {
-            role: "analytics".to_string(),
+            role: "analytics".into(),
             privileges: [Privilege::Select].into_iter().collect(),
             object_type: ObjectType::MaterializedView,
             schema: Some("reporting".to_string()),
@@ -1524,5 +1579,128 @@ memberships:
         };
         let sql = render(&change);
         assert_eq!(sql, "ALTER ROLE \"r1\" VALID UNTIL 'infinity';");
+    }
+
+    // -----------------------------------------------------------------------
+    // PUBLIC grantee and global default privileges
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn public_renders_unquoted_but_a_role_named_public_does_not() {
+        let revoke_public = render(&Change::Revoke {
+            role: Grantee::Public,
+            privileges: [Privilege::Execute].into_iter().collect(),
+            object_type: ObjectType::Function,
+            schema: Some("api".to_string()),
+            name: Some("f()".to_string()),
+        });
+        assert_eq!(
+            revoke_public,
+            r#"REVOKE EXECUTE ON ROUTINE "api"."f"() FROM PUBLIC;"#
+        );
+
+        let grant_public = render(&Change::Grant {
+            role: Grantee::Public,
+            privileges: [Privilege::Usage].into_iter().collect(),
+            object_type: ObjectType::Schema,
+            schema: None,
+            name: Some("api".to_string()),
+        });
+        assert_eq!(grant_public, r#"GRANT USAGE ON SCHEMA "api" TO PUBLIC;"#);
+
+        // A real role that merely looks like the keyword stays quoted.
+        let lowercase = render(&Change::Grant {
+            role: "public".into(),
+            privileges: [Privilege::Usage].into_iter().collect(),
+            object_type: ObjectType::Schema,
+            schema: None,
+            name: Some("api".to_string()),
+        });
+        assert_eq!(lowercase, r#"GRANT USAGE ON SCHEMA "api" TO "public";"#);
+    }
+
+    #[test]
+    fn public_wildcard_revoke_uses_all_routines_in_schema() {
+        assert_eq!(
+            render(&Change::Revoke {
+                role: Grantee::Public,
+                privileges: [Privilege::Execute].into_iter().collect(),
+                object_type: ObjectType::Function,
+                schema: Some("api".to_string()),
+                name: Some("*".to_string()),
+            }),
+            r#"REVOKE EXECUTE ON ALL ROUTINES IN SCHEMA "api" FROM PUBLIC;"#
+        );
+    }
+
+    #[test]
+    fn relation_wildcard_do_block_embeds_public_literally() {
+        // `%I` would render the keyword as the quoted identifier "PUBLIC",
+        // which names an ordinary role.
+        let sql = render(&Change::Revoke {
+            role: Grantee::Public,
+            privileges: [Privilege::Select].into_iter().collect(),
+            object_type: ObjectType::Table,
+            schema: Some("app".to_string()),
+            name: Some("*".to_string()),
+        });
+        assert!(sql.contains("FROM PUBLIC;'"), "{sql}");
+        assert!(!sql.contains("FROM %I"), "{sql}");
+
+        // Ordinary roles still go through the %I parameter.
+        let role_sql = render(&Change::Revoke {
+            role: "reader".into(),
+            privileges: [Privilege::Select].into_iter().collect(),
+            object_type: ObjectType::Table,
+            schema: Some("app".to_string()),
+            name: Some("*".to_string()),
+        });
+        assert!(role_sql.contains("FROM %I"), "{role_sql}");
+        assert!(role_sql.contains("'reader'"), "{role_sql}");
+    }
+
+    #[test]
+    fn global_default_privileges_render_without_in_schema() {
+        assert_eq!(
+            render(&Change::RevokeDefaultPrivilege {
+                owner: "function_owner".to_string(),
+                scope: DefaultPrivilegeScope::Global,
+                on_type: ObjectType::Function,
+                grantee: Grantee::Public,
+                privileges: [Privilege::Execute].into_iter().collect(),
+            }),
+            r#"ALTER DEFAULT PRIVILEGES FOR ROLE "function_owner" REVOKE EXECUTE ON ROUTINES FROM PUBLIC;"#
+        );
+
+        assert_eq!(
+            render(&Change::SetDefaultPrivilege {
+                owner: "app_owner".to_string(),
+                scope: DefaultPrivilegeScope::Schema {
+                    schema: "app".to_string()
+                },
+                on_type: ObjectType::Function,
+                grantee: "reader".into(),
+                privileges: [Privilege::Execute].into_iter().collect(),
+            }),
+            r#"ALTER DEFAULT PRIVILEGES FOR ROLE "app_owner" IN SCHEMA "app" GRANT EXECUTE ON ROUTINES TO "reader";"#
+        );
+    }
+
+    #[test]
+    fn default_privilege_object_keywords_cover_types_and_schemas() {
+        let keyword_for = |on_type| {
+            render(&Change::SetDefaultPrivilege {
+                owner: "o".to_string(),
+                scope: DefaultPrivilegeScope::Global,
+                on_type,
+                grantee: "r".into(),
+                privileges: [Privilege::Usage].into_iter().collect(),
+            })
+        };
+        assert!(keyword_for(ObjectType::Type).contains("ON TYPES"));
+        assert!(keyword_for(ObjectType::Schema).contains("ON SCHEMAS"));
+        assert!(keyword_for(ObjectType::Table).contains("ON TABLES"));
+        assert!(keyword_for(ObjectType::Sequence).contains("ON SEQUENCES"));
+        assert!(keyword_for(ObjectType::Function).contains("ON ROUTINES"));
     }
 }

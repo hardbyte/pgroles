@@ -116,21 +116,40 @@ pgroles can create schemas that are explicitly declared under `schemas:`. Schema
 
 ## PUBLIC privilege caveats
 
-PostgreSQL grants certain default privileges to the `PUBLIC` pseudo-role on every database (e.g. `CONNECT`, `TEMPORARY`). pgroles **does not inspect or manage PUBLIC grants**.
+PostgreSQL grants some privileges to the `PUBLIC` pseudo-role on every database,
+such as `CONNECT` and `TEMPORARY` on the database, `EXECUTE` on every function,
+and `USAGE` on every type. Several of these have no ACL entry behind them, so
+they are invisible until you look for them.
 
-This means:
+pgroles manages a `PUBLIC` privilege only where a rule names it. Until you write
+one, `PUBLIC` behaves exactly as it did before:
 
-- A role may have effective privileges not visible in `pgroles inspect` output
-- A manifest that omits `TEMPORARY` does not guarantee the role lacks `TEMPORARY` — it may still inherit it from `PUBLIC`
-- `additive` mode showing "no changes needed" does not mean effective privileges or existing role attributes match the manifest exactly
+- A role may hold effective privileges that `pgroles inspect` does not list
+  among its grants.
+- A manifest that omits `TEMPORARY` does not prove the role lacks it, because it
+  may still reach it through `PUBLIC`.
+- `additive` mode reporting "no changes needed" does not mean effective
+  privileges match the manifest.
 
-If least-privilege enforcement is important, you may need to manually revoke unwanted `PUBLIC` grants:
+To close a gap, assert it:
 
-```sql
-REVOKE TEMPORARY ON DATABASE mydb FROM PUBLIC;
-REVOKE CREATE ON SCHEMA public FROM PUBLIC;
+```yaml
+grants:
+  - role: PUBLIC
+    ensure: absent
+    privileges: [TEMPORARY]
+    object: { type: database, name: mydb }
+  - role: PUBLIC
+    ensure: absent
+    privileges: [CREATE]
+    object: { type: schema, name: public }
 ```
 
-{% callout type="warning" title="PUBLIC is outside pgroles scope" %}
-pgroles intentionally excludes PUBLIC from inspection and management. Revoking PUBLIC grants is a manual, database-level decision that should be made carefully — it affects all roles, not just those managed by pgroles.
+Read [Grants](/docs/grants#public) for how `PUBLIC` rules behave, and
+[Default privileges](/docs/default-privileges#removing-public-privileges) for
+removing the built-in `EXECUTE` on future functions.
+
+{% callout type="warning" title="Revoking from PUBLIC affects every role" %}
+A `PUBLIC` revoke reaches every role in the database, not only the ones your
+policy manages. Decide these deliberately, and check the plan before applying.
 {% /callout %}

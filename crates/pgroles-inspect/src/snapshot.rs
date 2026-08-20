@@ -34,8 +34,10 @@ use std::time::{Duration, Instant};
 use sqlx::PgPool;
 use tracing::debug;
 
+use pgroles_core::manifest::{ObjectType, Privilege};
 use pgroles_core::model::{
-    DefaultPrivKey, DefaultPrivState, GrantKey, GrantState, RoleGraph, SchemaState,
+    DefaultPrivKey, DefaultPrivState, DefaultPrivilegeScope, GrantKey, GrantState, Grantee,
+    RoleGraph, SchemaState,
 };
 
 use crate::defaults::fetch_default_privileges;
@@ -45,8 +47,8 @@ use crate::privileges::{
 };
 use crate::roles::{RoleRow, fetch_roles};
 use crate::{
-    ColumnLevelGrantDiagnostic, InspectConfig, InspectError, InspectionDiagnostics,
-    InspectionResult, InspectionStats, SchemaRow, fetch_schemas,
+    ColumnLevelGrantDiagnostic, DefaultPrivScopePattern, InspectConfig, InspectError,
+    InspectionDiagnostics, InspectionResult, InspectionStats, SchemaRow, fetch_schemas,
     remove_redundant_schema_owner_grants,
 };
 
@@ -112,15 +114,18 @@ impl RawInspection {
             rows
         };
 
-        let (privileges, column_level_grants, default_privileges) =
-            if privilege_schema_refs.is_empty() {
+        // PUBLIC rows are scoped by the objects a manifest names instead of by
+        // managed schema, so a manifest whose only PUBLIC rule targets the
+        // database has PUBLIC state to read with no privilege schemas at all.
+        let (privileges, column_level_grants) =
+            if privilege_schema_refs.is_empty() && scope.public_object_scopes.is_empty() {
                 (
                     RawPrivilegeState {
                         acl_rows: Vec::new(),
                         inventory: BTreeMap::new(),
+                        public_acl_rows: Vec::new(),
                     },
                     Vec::new(),
-                    BTreeMap::new(),
                 )
             } else {
                 let wildcard_scopes = privileges::wildcard_scopes_of(&scope.wildcard_grants);
@@ -131,21 +136,40 @@ impl RawInspection {
                     &privilege_schema_refs,
                     &role_refs,
                     &wildcard_scopes,
+                    &scope.public_object_scopes,
                 )
                 .await?;
                 record("object_privileges", started);
 
-                let started = Instant::now();
-                let column_level_grants =
-                    fetch_column_level_grants(pool, &privilege_schema_refs).await?;
-                record("column_level_grants", started);
+                let column_level_grants = if privilege_schema_refs.is_empty() {
+                    Vec::new()
+                } else {
+                    let started = Instant::now();
+                    let rows = fetch_column_level_grants(pool, &privilege_schema_refs).await?;
+                    record("column_level_grants", started);
+                    rows
+                };
 
+                (privileges, column_level_grants)
+            };
+
+        // The global layer is keyed by declared (owner, object type) pairs
+        // instead of by schema, so a scope with no privilege schemas can still
+        // have default privileges to read.
+        let default_privileges =
+            if privilege_schema_refs.is_empty() && scope.default_priv_scopes.is_empty() {
+                BTreeMap::new()
+            } else {
                 let started = Instant::now();
-                let default_privileges =
-                    fetch_default_privileges(pool, &privilege_schema_refs, &role_refs).await?;
+                let default_privileges = fetch_default_privileges(
+                    pool,
+                    &privilege_schema_refs,
+                    &role_refs,
+                    &scope.default_priv_scopes,
+                )
+                .await?;
                 record("default_privileges", started);
-
-                (privileges, column_level_grants, default_privileges)
+                default_privileges
             };
 
         let database_grants = if scope.include_database_privileges {
@@ -213,6 +237,23 @@ impl RawInspection {
             .map(String::as_str)
             .collect();
         let wildcard_scopes = privileges::wildcard_scopes_of(&self.scope.wildcard_grants);
+        let default_priv_scopes: BTreeSet<&DefaultPrivScopePattern> =
+            self.scope.default_priv_scopes.iter().collect();
+        // Privileges play no part, exactly as with wildcards: the PUBLIC
+        // queries filter by object family and schema, and `derive` narrows to
+        // each config's own privileges afterwards.
+        let public_targets: BTreeSet<(ObjectType, Option<&str>, Option<&str>)> = self
+            .scope
+            .public_object_scopes
+            .iter()
+            .map(|public_scope| {
+                (
+                    public_scope.object_type,
+                    public_scope.schema.as_deref(),
+                    public_scope.name.as_deref(),
+                )
+            })
+            .collect();
 
         if config.include_database_privileges && !self.scope.include_database_privileges {
             return Some("database privileges were not read".to_string());
@@ -244,6 +285,32 @@ impl RawInspection {
         {
             return Some(format!(
                 "wildcard scope {object_type:?} in schema {schema:?} was not read"
+            ));
+        }
+        if let Some(public_scope) = config.public_object_scopes.iter().find(|public_scope| {
+            !public_targets.contains(&(
+                public_scope.object_type,
+                public_scope.schema.as_deref(),
+                public_scope.name.as_deref(),
+            ))
+        }) {
+            return Some(format!(
+                "PUBLIC scope {:?} {:?} in schema {:?} was not read",
+                public_scope.object_type, public_scope.name, public_scope.schema
+            ));
+        }
+        if let Some(pattern) = config
+            .default_priv_scopes
+            .iter()
+            .find(|pattern| !default_priv_scopes.contains(pattern))
+        {
+            let where_ = match &pattern.schema {
+                Some(schema) => format!("schema {schema:?}"),
+                None => "global scope".to_string(),
+            };
+            return Some(format!(
+                "default privileges for owner {:?} on {} in {where_} were not read",
+                pattern.owner, pattern.on_type
             ));
         }
         None
@@ -308,12 +375,15 @@ impl RawInspection {
         }
 
         // --- Object privileges (+ wildcard expansion and diagnostics) ---
-        if !privilege_schemas.is_empty() {
+        // A PUBLIC rule names its own target, so one aimed at the database
+        // carries no schema and must still be derived.
+        if !privilege_schemas.is_empty() || !config.public_object_scopes.is_empty() {
             let derived = privileges::derive_privileges(
                 &self.privileges,
                 &privilege_schemas,
                 &managed_roles,
                 &config.wildcard_grants,
+                &config.public_object_scopes,
             );
             let (grantability, read_performed) = if derived.unsatisfied.is_empty() {
                 (None, false)
@@ -344,7 +414,9 @@ impl RawInspection {
         // --- Database-level privileges ---
         if config.include_database_privileges {
             for (key, state) in &self.database_grants {
-                if managed_roles.contains(&key.role) {
+                if let Grantee::Role(role) = &key.role
+                    && managed_roles.contains(role)
+                {
                     graph.grants.insert(key.clone(), state.clone());
                 }
             }
@@ -352,14 +424,59 @@ impl RawInspection {
         }
 
         // --- Default privileges ---
-        if !privilege_schemas.is_empty() {
-            for (key, state) in &self.default_privileges {
-                if privilege_schemas.contains(&key.schema) && managed_roles.contains(&key.grantee) {
-                    graph.default_privileges.insert(key.clone(), state.clone());
+        // The two layers are scoped differently. A schema-layer row belongs to
+        // this config when the config reads that schema's privileges; a global
+        // row belongs to it only when the config declared that exact (owner,
+        // object type) pair, because the global layer is fetched by assertion
+        // rather than swept.
+        let global_scopes: BTreeSet<(&str, ObjectType)> = config
+            .default_priv_scopes
+            .iter()
+            .filter(|pattern| pattern.schema.is_none())
+            .map(|pattern| (pattern.owner.as_str(), pattern.on_type))
+            .collect();
+        for (key, state) in &self.default_privileges {
+            let in_scope = match &key.scope {
+                DefaultPrivilegeScope::Schema { schema } => privilege_schemas.contains(schema),
+                DefaultPrivilegeScope::Global => {
+                    global_scopes.contains(&(key.owner.as_str(), key.on_type))
+                }
+            };
+            if !in_scope {
+                continue;
+            }
+            match &key.grantee {
+                Grantee::Role(role) => {
+                    if managed_roles.contains(role) {
+                        graph.default_privileges.insert(key.clone(), state.clone());
+                    }
+                }
+                // A PUBLIC default is assertion-scoped down to the individual
+                // privilege. The shared read carries whatever any config in
+                // the union named, and keeping one this config never mentioned
+                // would let authoritative mode revoke it.
+                Grantee::Public => {
+                    let declared: BTreeSet<Privilege> = config
+                        .default_priv_scopes
+                        .iter()
+                        .filter(|pattern| {
+                            pattern.owner == key.owner
+                                && pattern.schema.as_deref() == key.scope.schema()
+                                && pattern.on_type == key.on_type
+                        })
+                        .flat_map(|pattern| pattern.public_privileges.iter().copied())
+                        .collect();
+                    let privileges: BTreeSet<Privilege> =
+                        state.privileges.intersection(&declared).copied().collect();
+                    if !privileges.is_empty() {
+                        graph
+                            .default_privileges
+                            .insert(key.clone(), DefaultPrivState { privileges });
+                    }
                 }
             }
-            stats.default_privileges = graph.default_privileges.len();
         }
+        stats.default_privileges = graph.default_privileges.len();
 
         stats.phase_durations.insert("derive", started.elapsed());
 
@@ -457,6 +574,29 @@ mod tests {
         }
     }
 
+    fn public_table_acl(schema: &str, table: &str, privilege: &str) -> AclRow {
+        AclRow {
+            grantee: None,
+            privilege_type: privilege.to_string(),
+            schema_name: Some(schema.to_string()),
+            object_name: table.to_string(),
+            obj_type: "table".to_string(),
+        }
+    }
+
+    fn public_scope(
+        schema: &str,
+        name: &str,
+        privileges: &[Privilege],
+    ) -> crate::PublicObjectScope {
+        crate::PublicObjectScope {
+            object_type: ObjectType::Table,
+            schema: Some(schema.to_string()),
+            name: Some(name.to_string()),
+            privileges: privileges.iter().copied().collect(),
+        }
+    }
+
     fn schema_acl(schema: &str, grantee: &str, privilege: &str) -> AclRow {
         AclRow {
             grantee: Some(grantee.to_string()),
@@ -464,6 +604,15 @@ mod tests {
             schema_name: None,
             object_name: schema.to_string(),
             obj_type: "schema".to_string(),
+        }
+    }
+
+    fn global_scope(owner: &str, on_type: ObjectType) -> DefaultPrivScopePattern {
+        DefaultPrivScopePattern {
+            owner: owner.to_string(),
+            schema: None,
+            on_type,
+            public_privileges: BTreeSet::new(),
         }
     }
 
@@ -479,6 +628,8 @@ mod tests {
             privilege_schemas: schemas.iter().map(|s| s.to_string()).collect(),
             include_database_privileges,
             wildcard_grants: wildcards,
+            default_priv_scopes: Vec::new(),
+            public_object_scopes: Vec::new(),
         }
     }
 
@@ -488,7 +639,7 @@ mod tests {
         let mut database_grants = BTreeMap::new();
         database_grants.insert(
             GrantKey {
-                role: "alice".to_string(),
+                role: Grantee::Role("alice".to_string()),
                 object_type: ObjectType::Database,
                 schema: None,
                 name: Some("mydb".to_string()),
@@ -499,7 +650,7 @@ mod tests {
         );
         database_grants.insert(
             GrantKey {
-                role: "bob".to_string(),
+                role: Grantee::Role("bob".to_string()),
                 object_type: ObjectType::Database,
                 schema: None,
                 name: Some("mydb".to_string()),
@@ -514,35 +665,56 @@ mod tests {
             default_privileges.insert(
                 DefaultPrivKey {
                     owner: "owner".to_string(),
-                    schema: schema.to_string(),
+                    scope: DefaultPrivilegeScope::Schema {
+                        schema: schema.to_string(),
+                    },
                     on_type: ObjectType::Table,
-                    grantee: grantee.to_string(),
+                    grantee: Grantee::Role(grantee.to_string()),
                 },
                 DefaultPrivState {
                     privileges: BTreeSet::from([Privilege::Select]),
                 },
             );
         }
+        default_privileges.insert(
+            DefaultPrivKey {
+                owner: "owner".to_string(),
+                scope: DefaultPrivilegeScope::Global,
+                on_type: ObjectType::Table,
+                grantee: Grantee::Role("alice".to_string()),
+            },
+            DefaultPrivState {
+                privileges: BTreeSet::from([Privilege::Select]),
+            },
+        );
+
+        let mut scope = config(
+            &["alice", "bob"],
+            &["app", "empty", "ops"],
+            true,
+            ["app", "empty", "ops"]
+                .into_iter()
+                .flat_map(|schema| {
+                    ["alice", "bob"]
+                        .into_iter()
+                        .map(move |role| WildcardGrantPattern {
+                            role: role.to_string(),
+                            object_type: ObjectType::Table,
+                            schema: schema.to_string(),
+                            privileges: BTreeSet::from([Privilege::Select]),
+                        })
+                })
+                .collect(),
+        );
+        scope.default_priv_scopes = vec![global_scope("owner", ObjectType::Table)];
+        scope.public_object_scopes = vec![public_scope(
+            "app",
+            "widgets",
+            &[Privilege::Select, Privilege::Update],
+        )];
 
         RawInspection {
-            scope: config(
-                &["alice", "bob"],
-                &["app", "empty", "ops"],
-                true,
-                ["app", "empty", "ops"]
-                    .into_iter()
-                    .flat_map(|schema| {
-                        ["alice", "bob"]
-                            .into_iter()
-                            .map(move |role| WildcardGrantPattern {
-                                role: role.to_string(),
-                                object_type: ObjectType::Table,
-                                schema: schema.to_string(),
-                                privileges: BTreeSet::from([Privilege::Select]),
-                            })
-                    })
-                    .collect(),
-            ),
+            scope,
             roles: vec![role_row("alice"), role_row("bob")],
             memberships: vec![
                 membership_row("alice", "bob"),
@@ -550,6 +722,10 @@ mod tests {
             ],
             schemas: vec![schema_row("app", "owner"), schema_row("ops", "owner")],
             privileges: RawPrivilegeState {
+                public_acl_rows: vec![
+                    public_table_acl("app", "widgets", "r"),
+                    public_table_acl("app", "widgets", "w"),
+                ],
                 acl_rows: vec![
                     table_acl("app", "widgets", "alice", "r"),
                     table_acl("app", "widgets", "bob", "r"),
@@ -717,10 +893,114 @@ mod tests {
                 .graph
                 .default_privileges
                 .keys()
-                .map(|key| key.schema.as_str())
+                .filter_map(|key| key.scope.schema())
                 .collect::<Vec<_>>(),
             vec!["app"],
             "default privileges are scoped by schema and grantee"
+        );
+    }
+
+    #[test]
+    fn derive_keeps_a_global_default_only_for_a_config_that_declared_it() {
+        let snapshot = snapshot();
+
+        let undeclared = derive_pure(&snapshot, &config(&["alice"], &["app"], false, vec![]));
+        assert!(
+            undeclared
+                .graph
+                .default_privileges
+                .keys()
+                .all(|key| key.scope != DefaultPrivilegeScope::Global),
+            "the global layer is read by assertion, so a config that declared \
+             no global scope must not inherit one from the shared read"
+        );
+
+        let mut declared = config(&["alice"], &["app"], false, vec![]);
+        declared.default_priv_scopes = vec![global_scope("owner", ObjectType::Table)];
+        let result = derive_pure(&snapshot, &declared);
+        assert!(
+            result
+                .graph
+                .default_privileges
+                .keys()
+                .any(|key| key.scope == DefaultPrivilegeScope::Global
+                    && key.owner == "owner"
+                    && key.grantee == Grantee::Role("alice".to_string())),
+            "a config declaring the (owner, type) pair gets the global row"
+        );
+    }
+
+    #[test]
+    fn derive_narrows_public_rows_to_each_configs_declared_privileges() {
+        let snapshot = snapshot();
+
+        let public_privileges = |config: &InspectConfig| {
+            derive_pure(&snapshot, config)
+                .graph
+                .grants
+                .into_iter()
+                .filter(|(key, _)| key.role == Grantee::Public)
+                .map(|(key, state)| (key.name.clone().unwrap(), state.privileges))
+                .collect::<Vec<_>>()
+        };
+
+        let mut selects_only = config(&["alice"], &["app"], false, vec![]);
+        selects_only.public_object_scopes =
+            vec![public_scope("app", "widgets", &[Privilege::Select])];
+        assert_eq!(
+            public_privileges(&selects_only),
+            vec![("widgets".to_string(), BTreeSet::from([Privilege::Select]))],
+            "UPDATE was read for another config, so this one must not see it"
+        );
+
+        let mut both = config(&["alice"], &["app"], false, vec![]);
+        both.public_object_scopes = vec![public_scope(
+            "app",
+            "widgets",
+            &[Privilege::Select, Privilege::Update],
+        )];
+        assert_eq!(
+            public_privileges(&both),
+            vec![(
+                "widgets".to_string(),
+                BTreeSet::from([Privilege::Select, Privilege::Update])
+            )]
+        );
+
+        let undeclared = config(&["alice"], &["app"], false, vec![]);
+        assert!(
+            public_privileges(&undeclared).is_empty(),
+            "a config declaring no PUBLIC rule gets no PUBLIC state"
+        );
+    }
+
+    #[test]
+    fn derive_refuses_a_public_scope_the_snapshot_never_read() {
+        let snapshot = snapshot();
+        let mut config = config(&["alice"], &["app"], false, vec![]);
+        config.public_object_scopes = vec![public_scope("app", "gizmos", &[Privilege::Select])];
+
+        let error = with_runtime(async { snapshot.derive(&unreachable_pool(), &config).await })
+            .expect_err("an unread PUBLIC scope is not derivable");
+        let message = error.to_string();
+        assert!(
+            message.contains("gizmos") && message.contains("PUBLIC scope"),
+            "the error names the scope that was missing, got: {message}"
+        );
+    }
+
+    #[test]
+    fn derive_refuses_a_global_scope_the_snapshot_never_read() {
+        let snapshot = snapshot();
+        let mut config = config(&["alice"], &["app"], false, vec![]);
+        config.default_priv_scopes = vec![global_scope("other_owner", ObjectType::Table)];
+
+        let error = with_runtime(async { snapshot.derive(&unreachable_pool(), &config).await })
+            .expect_err("an unread global scope is not derivable");
+        let message = error.to_string();
+        assert!(
+            message.contains("other_owner") && message.contains("global scope"),
+            "the error names the scope that was missing, got: {message}"
         );
     }
 
@@ -761,6 +1041,7 @@ mod tests {
             &BTreeSet::from(["ops".to_string()]),
             &BTreeSet::from(["bob".to_string()]),
             &wildcard("bob", "ops"),
+            &[],
         );
         assert_eq!(
             derived.unsatisfied.len(),
@@ -843,6 +1124,7 @@ mod tests {
             memberships: Vec::new(),
             schemas: Vec::new(),
             privileges: RawPrivilegeState {
+                public_acl_rows: Vec::new(),
                 acl_rows: Vec::new(),
                 inventory: BTreeMap::new(),
             },

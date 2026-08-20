@@ -1,0 +1,78 @@
+# Locking down a SECURITY DEFINER API schema.
+#
+# PostgreSQL grants EXECUTE on every new function to PUBLIC, and it does so
+# without writing an ACL entry. Granting EXECUTE to the roles you intend
+# therefore does not stop anyone else from calling the function, which matters
+# most for SECURITY DEFINER routines that run with their owner's rights.
+#
+# Removing that access takes three rules, because PostgreSQL keeps default
+# privileges in two layers: an owner-wide global layer, and per-schema
+# additions on top of it. A schema rule can add a privilege but never subtract
+# one the global layer grants.
+#
+# Apply this before the migration that creates the routines. Reconciliation is
+# not part of your migration transaction, so a routine created between two runs
+# carries the built-in PUBLIC EXECUTE until the next one.
+
+roles:
+  # Owns the API schema and its routines. Runs the SECURITY DEFINER bodies.
+  - name: function_owner
+    login: false
+
+  # The only role meant to call the API.
+  - name: allowed_executor
+    login: false
+
+grants:
+  # Existing routines must not be callable merely through PUBLIC.
+  - role: PUBLIC
+    ensure: absent
+    privileges: [EXECUTE]
+    object:
+      type: function
+      schema: privileged_api
+      name: "*"
+
+  # Callers still need to resolve names in the schema.
+  - role: allowed_executor
+    privileges: [USAGE]
+    object:
+      type: schema
+      name: privileged_api
+
+  # This assumes every routine in privileged_api is an intended API.
+  - role: allowed_executor
+    privileges: [EXECUTE]
+    object:
+      type: function
+      schema: privileged_api
+      name: "*"
+
+default_privileges:
+  # Remove PostgreSQL's built-in PUBLIC EXECUTE for every routine
+  # function_owner creates from now on, in any schema. Only the global layer
+  # can do this.
+  - owner: function_owner
+    scope:
+      type: global
+    grant:
+      - role: PUBLIC
+        ensure: absent
+        privileges: [EXECUTE]
+        on_type: function
+
+  # New routines in this schema go to the caller. The absent rule here does
+  # not remove the built-in default — the global rule above already did that.
+  # It removes a schema-scoped GRANT ... TO PUBLIC if someone adds one later.
+  - owner: function_owner
+    scope:
+      type: schema
+      schema: privileged_api
+    grant:
+      - role: PUBLIC
+        ensure: absent
+        privileges: [EXECUTE]
+        on_type: function
+      - role: allowed_executor
+        privileges: [EXECUTE]
+        on_type: function

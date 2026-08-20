@@ -128,6 +128,6 @@ export DATABASE_URL=postgres://postgres:testpassword@localhost:5432/pgroles_test
 
 - Do not grant broad runtime privileges just because schema changes need them. Split schema-owner and runtime credentials.
 - Do not keep permanent `GRANT` policy in old setup scripts and also manage the same grants with pgroles. Pick pgroles as the source of truth once adopted.
-- Do not depend on `PUBLIC` grants for application access. pgroles does not manage `PUBLIC`, so those privileges stay outside the manifest.
+- Do not depend on `PUBLIC` grants for application access. pgroles manages a `PUBLIC` privilege only where a rule names it, so anything you leave undeclared stays outside the manifest.
 - Do not give CI or code generation jobs superuser access when read-only catalog/schema access is sufficient.
 - Do not use one bundle fragment per file unless the scope boundary is real. Bundle files should reflect ownership, not just directory layout.
