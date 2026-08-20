@@ -1085,7 +1085,8 @@ fn gen_absence_pair(rng: &mut Rng) -> (RoleGraph, RoleGraph) {
             .extend(absent);
     }
 
-    // Default-privilege absences, in both scopes.
+    // Default-privilege absences, in both scopes and for both PostgreSQL
+    // object types that carry a built-in PUBLIC privilege.
     let dp_count = rng.usize(3);
     for _ in 0..dp_count {
         let grantee = grantees[rng.usize(grantees.len())].clone();
@@ -1096,24 +1097,26 @@ fn gen_absence_pair(rng: &mut Rng) -> (RoleGraph, RoleGraph) {
                 schema: format!("s{}", rng.usize(2)),
             }
         };
+        let (on_type, privilege) = if rng.bool() {
+            (ObjectType::Function, Privilege::Execute)
+        } else {
+            (ObjectType::Type, Privilege::Usage)
+        };
         let key = DefaultPrivKey {
             owner: format!("r{}", rng.usize(2)),
             scope,
-            on_type: ObjectType::Function,
+            on_type,
             grantee,
         };
         if desired.default_privileges.contains_key(&key) {
             continue;
         }
-        let privileges = gen_narrow_priv_set(rng);
-        if privileges.is_empty() {
-            continue;
-        }
+        let privileges = BTreeSet::from([privilege]);
         if rng.usize(2) == 0 {
             current.default_privileges.insert(
                 key.clone(),
                 DefaultPrivState {
-                    privileges: gen_narrow_priv_set(rng),
+                    privileges: BTreeSet::from([privilege]),
                 },
             );
         }

@@ -2692,6 +2692,7 @@ mod tests {
             managed_schemas: vec![],
             privilege_schemas: vec![schema.to_string()],
             include_database_privileges: false,
+            database_targets: Vec::new(),
             wildcard_grants: vec![],
             public_object_scopes: vec![],
             default_priv_scopes: vec![],

@@ -205,6 +205,17 @@ pub fn filter_changes(changes: Vec<Change>, mode: ReconciliationMode) -> Vec<Cha
     }
 }
 
+/// Whether additive reconciliation will ignore declarative absence assertions.
+///
+/// The desired graph retains absence assertions even though [`filter_changes`]
+/// removes their revocations in additive mode. Callers use this predicate to
+/// make that safety-relevant no-op visible before presenting or applying a
+/// filtered plan.
+pub fn additive_ignores_absence_assertions(desired: &RoleGraph, mode: ReconciliationMode) -> bool {
+    mode == ReconciliationMode::Additive
+        && (!desired.grant_absences.is_empty() || !desired.default_privilege_absences.is_empty())
+}
+
 /// Remove role-lifecycle and granted-role membership changes for external roles.
 ///
 /// External roles are still valid references for grants, schema ownership, and
@@ -905,21 +916,48 @@ fn diff_default_privileges(
     }
 
     // Absence assertions: revoke `absent ∩ current`. Keys here are exact —
-    // default privileges have no wildcard selector.
+    // default privileges have no wildcard selector. A role created by this
+    // plan is not present in the inspected graph yet, but PostgreSQL gives a
+    // new owner built-in global PUBLIC defaults. Model those defaults here so
+    // the CREATE and REVOKE land in the same transaction instead of leaving a
+    // one-reconcile exposure window.
     for (key, absent_privileges) in &desired.default_privilege_absences {
-        if let Some(current_state) = current.default_privileges.get(key) {
-            let to_revoke: BTreeSet<Privilege> = absent_privileges
-                .intersection(&current_state.privileges)
-                .copied()
-                .collect();
-            if !to_revoke.is_empty() {
-                revokes.entry(key.clone()).or_default().extend(to_revoke);
-            }
+        let current_privileges = current
+            .default_privileges
+            .get(key)
+            .map(|state| state.privileges.clone())
+            .unwrap_or_else(|| builtin_defaults_for_new_owner(current, desired, key));
+        let to_revoke: BTreeSet<Privilege> = absent_privileges
+            .intersection(&current_privileges)
+            .copied()
+            .collect();
+        if !to_revoke.is_empty() {
+            revokes.entry(key.clone()).or_default().extend(to_revoke);
         }
     }
 
     for (key, privileges) in &revokes {
         revoke_out.push(change_revoke_default(key, privileges));
+    }
+}
+
+fn builtin_defaults_for_new_owner(
+    current: &RoleGraph,
+    desired: &RoleGraph,
+    key: &DefaultPrivKey,
+) -> BTreeSet<Privilege> {
+    if current.roles.contains_key(&key.owner)
+        || !desired.roles.contains_key(&key.owner)
+        || key.scope != DefaultPrivilegeScope::Global
+        || !key.grantee.is_public()
+    {
+        return BTreeSet::new();
+    }
+
+    match key.on_type {
+        ObjectType::Function => BTreeSet::from([Privilege::Execute]),
+        ObjectType::Type => BTreeSet::from([Privilege::Usage]),
+        _ => BTreeSet::new(),
     }
 }
 
@@ -2912,6 +2950,100 @@ memberships:
     }
 
     #[test]
+    fn global_public_absence_revokes_builtin_for_owner_created_in_same_plan() {
+        let key = DefaultPrivKey {
+            owner: "new_owner".to_string(),
+            scope: DefaultPrivilegeScope::Global,
+            on_type: ObjectType::Function,
+            grantee: Grantee::Public,
+        };
+        let current = RoleGraph::default();
+        let mut desired = RoleGraph::default();
+        desired
+            .roles
+            .insert("new_owner".to_string(), RoleState::default());
+        desired
+            .default_privilege_absences
+            .insert(key, BTreeSet::from([Privilege::Execute]));
+
+        let changes = diff(&current, &desired);
+        assert_eq!(changes.len(), 2, "{changes:?}");
+        assert!(matches!(
+            &changes[0],
+            Change::CreateRole { name, .. } if name == "new_owner"
+        ));
+        assert!(matches!(
+            &changes[1],
+            Change::RevokeDefaultPrivilege {
+                owner,
+                scope: DefaultPrivilegeScope::Global,
+                on_type: ObjectType::Function,
+                grantee: Grantee::Public,
+                privileges,
+            } if owner == "new_owner" && privileges == &BTreeSet::from([Privilege::Execute])
+        ));
+    }
+
+    #[test]
+    fn global_public_type_absence_revokes_builtin_for_owner_created_in_same_plan() {
+        let key = DefaultPrivKey {
+            owner: "new_owner".to_string(),
+            scope: DefaultPrivilegeScope::Global,
+            on_type: ObjectType::Type,
+            grantee: Grantee::Public,
+        };
+        let current = RoleGraph::default();
+        let mut desired = RoleGraph::default();
+        desired
+            .roles
+            .insert("new_owner".to_string(), RoleState::default());
+        desired
+            .default_privilege_absences
+            .insert(key, BTreeSet::from([Privilege::Usage]));
+
+        let changes = diff(&current, &desired);
+        assert_eq!(changes.len(), 2, "{changes:?}");
+        assert!(matches!(
+            &changes[0],
+            Change::CreateRole { name, .. } if name == "new_owner"
+        ));
+        assert!(matches!(
+            &changes[1],
+            Change::RevokeDefaultPrivilege {
+                owner,
+                scope: DefaultPrivilegeScope::Global,
+                on_type: ObjectType::Type,
+                grantee: Grantee::Public,
+                privileges,
+            } if owner == "new_owner" && privileges == &BTreeSet::from([Privilege::Usage])
+        ));
+    }
+
+    #[test]
+    fn schema_public_absence_does_not_invent_a_builtin_for_new_owner() {
+        let key = DefaultPrivKey {
+            owner: "new_owner".to_string(),
+            scope: DefaultPrivilegeScope::Schema {
+                schema: "api".to_string(),
+            },
+            on_type: ObjectType::Function,
+            grantee: Grantee::Public,
+        };
+        let current = RoleGraph::default();
+        let mut desired = RoleGraph::default();
+        desired
+            .roles
+            .insert("new_owner".to_string(), RoleState::default());
+        desired
+            .default_privilege_absences
+            .insert(key, BTreeSet::from([Privilege::Execute]));
+
+        let changes = diff(&current, &desired);
+        assert_eq!(changes.len(), 1, "{changes:?}");
+        assert!(matches!(&changes[0], Change::CreateRole { .. }));
+    }
+
+    #[test]
     fn additive_mode_ignores_absence_while_adopt_and_authoritative_apply_it() {
         let current = graph_with_public_grant("api", "f()", &[Privilege::Execute]);
         let mut desired = RoleGraph::default();
@@ -2949,5 +3081,18 @@ memberships:
                 "{mode:?} must apply absence"
             );
         }
+
+        assert!(additive_ignores_absence_assertions(
+            &desired,
+            ReconciliationMode::Additive
+        ));
+        assert!(!additive_ignores_absence_assertions(
+            &desired,
+            ReconciliationMode::Adopt
+        ));
+        assert!(!additive_ignores_absence_assertions(
+            &RoleGraph::default(),
+            ReconciliationMode::Additive
+        ));
     }
 }

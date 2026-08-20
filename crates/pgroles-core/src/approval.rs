@@ -784,7 +784,7 @@ mod tests {
     /// object keys in declaration order by default, but its `preserve_order`
     /// feature switches to insertion order — and any dependency in the graph
     /// can enable it, silently changing every digest without changing
-    /// `APPROVAL_EFFECT_ENCODING_V2`. Pending approvals would then be
+    /// `APPROVAL_EFFECT_ENCODING_V3`. Pending approvals would then be
     /// superseded across an unrelated dependency bump.
     ///
     /// Note the object keys come out *alphabetically*, not in struct
@@ -806,9 +806,8 @@ mod tests {
         let bytes = canonical_change_set_bytes(&changes, &inputs(&versions)).expect("bytes");
         let encoded = String::from_utf8(bytes).expect("canonical bytes are UTF-8 JSON");
 
-        // The management-scope fields joined this encoding before v2 ever
-        // shipped in a release, so the constant keeps its name; from the
-        // first released v2 onward, any change here means a new constant.
+        // This fixture pins the released v3 form. Any semantic serialization
+        // change from here requires a new encoding constant.
         assert_eq!(
             encoded,
             r#"{"effect_encoding":"pgroles.io/approval-effect/v3","reconciliation_mode":"Authoritative","target":"default/postgres-credentials:url","target_physical_identity":"7412330000000000001","target_logical_fingerprint":"sha256:fingerprint","owned_roles":[],"owned_schemas":[],"effects":[{"Grant":{"name":"orders","object_type":"table","privileges":["SELECT"],"role":"reporting","schema":"inventory"}},{"SetPassword":{"name":"app","password_source":"role-passwords:app:7"}}]}"#,

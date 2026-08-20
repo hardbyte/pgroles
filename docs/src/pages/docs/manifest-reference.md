@@ -231,7 +231,7 @@ The `object` field specifies the grant target:
 |---|---|
 | `type` | Object type |
 | `schema` | Schema name; required for most types except `schema` and `database` |
-| `name` | Object name, `"*"` for all objects, or omit for schema-level grants |
+| `name` | Object name, `"*"` for all objects, or omit for schema-level grants. Required for `database`, where it must equal `current_database()` |
 
 Supported object `type` values: `table`, `view`, `materialized_view`, `sequence`, `function`, `schema`, `database`, `type`.
 
@@ -243,6 +243,9 @@ Each entry also accepts `ensure`:
 |---|---|---|
 | `role` | required | Grantee. The exact value `PUBLIC` means the PostgreSQL pseudo-role |
 | `ensure` | `present` | `present` grants the privileges; `absent` revokes them where held |
+
+In `additive` reconciliation, `absent` assertions are ignored with a warning
+because that mode never revokes. `adopt` and `authoritative` enforce them.
 
 ```yaml
 grants:

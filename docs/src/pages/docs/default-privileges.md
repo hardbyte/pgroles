@@ -134,6 +134,10 @@ default_privileges:
         on_type: function
 ```
 
+`additive` reconciliation never revokes, so it ignores default-privilege
+absence assertions and emits a warning. Use `adopt` or `authoritative` to
+enforce them.
+
 The global rule is what removes PostgreSQL's built-in default. The
 schema-scoped rule cannot do that on its own, because schema defaults add to
 the global layer instead of subtracting from it. Its job is to remove a
@@ -169,6 +173,13 @@ manifest is
 The `owner` field specifies which role's object creation triggers the default grant. This is typically the role that creates tables, such as `app_migrator` or `app_owner`.
 
 If `owner` is omitted on a default privilege entry, the top-level `default_owner` is used. If neither is set, it falls back to `postgres`.
+
+The executor must already be able to act as the owner. A non-superuser cannot
+gain that authority merely because the same plan creates the owner: PostgreSQL
+grants `ADMIN OPTION`, not membership, to a `CREATEROLE` role that creates
+another role. Pre-create the owner and grant the executor membership, use a
+two-stage bootstrap, or use a superuser for the atomic create-and-defaults
+bootstrap.
 
 ## Default privileges in profiles
 

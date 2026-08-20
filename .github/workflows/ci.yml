@@ -402,6 +402,47 @@ jobs:
           kubectl apply -f k8s/samples/invalid-policy.yaml
           wait_for_ready_reason invalid-policy InvalidSpec
 
+          echo "--- Test: database grants require the connected database ---"
+          if kubectl apply -f - <<'YAML'
+          apiVersion: pgroles.io/v1alpha1
+          kind: PostgresPolicy
+          metadata:
+            name: unnamed-database-target-policy
+          spec:
+            connection:
+              secretRef:
+                name: postgres-credentials
+            grants:
+              - role: PUBLIC
+                ensure: absent
+                privileges: [CONNECT]
+                object: {type: database}
+          YAML
+          then
+            echo "::error::CRD admission accepted a database grant without object.name"
+            exit 1
+          fi
+
+          kubectl apply -f - <<'YAML'
+          apiVersion: pgroles.io/v1alpha1
+          kind: PostgresPolicy
+          metadata:
+            name: invalid-database-target-policy
+          spec:
+            connection:
+              secretRef:
+                name: postgres-credentials
+            interval: "5m"
+            grants:
+              - role: PUBLIC
+                ensure: absent
+                privileges: [CONNECT]
+                object: {type: database, name: not_the_connected_database}
+          YAML
+          wait_for_ready_reason invalid-database-target-policy InvalidDatabaseTarget
+          wait_for_last_error_contains invalid-database-target-policy \
+            'does not match connected database "postgres"'
+
           kubectl apply -f k8s/samples/missing-secret-policy.yaml
           wait_for_ready_reason missing-secret-policy SecretFetchFailed
           wait_for_event_reason missing-secret-policy SecretFetchFailed

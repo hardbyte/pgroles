@@ -581,7 +581,8 @@ fn inspect_error_is_non_transient(error: &pgroles_inspect::InspectError) -> bool
         pgroles_inspect::InspectError::Database(error) => sqlx_error_is_non_transient(error),
         // A scope the shared snapshot never read: a programming error in the
         // caller, not something a retry can fix.
-        pgroles_inspect::InspectError::ScopeNotCovered(_) => true,
+        pgroles_inspect::InspectError::ScopeNotCovered(_)
+        | pgroles_inspect::InspectError::DatabaseTargetMismatch { .. } => true,
     }
 }
 
@@ -1313,6 +1314,17 @@ async fn apply_under_lock(
     let reconciliation_mode: pgroles_core::diff::ReconciliationMode =
         resource.spec.reconciliation_mode.into();
     tracing::info!(%reconciliation_mode, "reconciliation mode");
+    if pgroles_core::diff::additive_ignores_absence_assertions(
+        &effective_desired,
+        reconciliation_mode,
+    ) {
+        tracing::warn!(
+            name,
+            namespace,
+            "additive reconciliation ignores every `ensure: absent` assertion; \
+             use adopt or authoritative mode to enforce absence"
+        );
+    }
     let mut changes = pgroles_core::diff::filter_changes(
         pgroles_core::diff::apply_role_retirements(
             pgroles_core::diff::diff(&current, &effective_desired),
@@ -3154,6 +3166,7 @@ where
     // that no longer applies.
     apply_approval_deprecation_condition(&latest, &mut status);
     apply_mode_deprecation_condition(&latest, &mut status);
+    apply_additive_absence_condition(&latest, &mut status);
     clear_stale_approval_ignored_condition(&latest, &mut status);
 
     // A status write that changes nothing still bumps `resourceVersion`, and
@@ -3230,6 +3243,32 @@ fn apply_mode_deprecation_condition(resource: &PostgresPolicy, status: &mut Post
         return;
     }
     status.set_condition(crate::crd::mode_value_deprecated_condition());
+}
+
+/// Keep additive mode's ignored security assertions visible on every status
+/// written for the policy, and clear the condition as soon as the combination
+/// no longer applies.
+fn apply_additive_absence_condition(resource: &PostgresPolicy, status: &mut PostgresPolicyStatus) {
+    let declares_absence = resource
+        .spec
+        .grants
+        .iter()
+        .any(|grant| grant.ensure == pgroles_core::manifest::Ensure::Absent)
+        || resource.spec.default_privileges.iter().any(|defaults| {
+            defaults
+                .grant
+                .iter()
+                .any(|grant| grant.ensure == pgroles_core::manifest::Ensure::Absent)
+        });
+    if resource.spec.reconciliation_mode == crate::crd::CrdReconciliationMode::Additive
+        && declares_absence
+    {
+        status.set_condition(crate::crd::absence_assertions_ignored_condition());
+    } else {
+        status.conditions.retain(|condition| {
+            condition.condition_type != crate::crd::CONDITION_ABSENCE_ASSERTIONS_IGNORED
+        });
+    }
 }
 
 /// Clear `ApprovalIgnored` for any policy that is not in observe mode. The observe
@@ -3371,6 +3410,9 @@ impl ReconcileError {
                     }
                 }
                 pgroles_inspect::InspectError::ScopeNotCovered(_) => "DatabaseInspectionFailed",
+                pgroles_inspect::InspectError::DatabaseTargetMismatch { .. } => {
+                    "InvalidDatabaseTarget"
+                }
             },
             ReconcileError::SqlExec(error) => match classify_sqlx_error(error) {
                 SqlErrorKind::InsufficientPrivileges => "InsufficientPrivileges",
@@ -3719,6 +3761,45 @@ mod tests {
                 .iter()
                 .any(|c| c.condition_type == crate::crd::CONDITION_APPROVAL_IGNORED),
             "leaving observe mode must clear the stale warning"
+        );
+    }
+
+    #[test]
+    fn additive_absence_condition_is_set_and_cleared_with_the_unsafe_combination() {
+        let mut policy = valid_role_policy("p", "app", "s");
+        policy.spec.reconciliation_mode = crate::crd::CrdReconciliationMode::Additive;
+        policy.spec.grants.push(pgroles_core::manifest::Grant {
+            role: "PUBLIC".to_string(),
+            privileges: vec![pgroles_core::manifest::Privilege::Execute],
+            object: pgroles_core::manifest::ObjectTarget {
+                object_type: pgroles_core::manifest::ObjectType::Function,
+                schema: Some("api".to_string()),
+                name: Some("*".to_string()),
+            },
+            ensure: pgroles_core::manifest::Ensure::Absent,
+        });
+        let mut status = PostgresPolicyStatus::default();
+
+        apply_additive_absence_condition(&policy, &mut status);
+        let condition = status
+            .conditions
+            .iter()
+            .find(|condition| {
+                condition.condition_type == crate::crd::CONDITION_ABSENCE_ASSERTIONS_IGNORED
+            })
+            .expect("additive absence assertions should be visible on status");
+        assert_eq!(
+            condition.reason.as_deref(),
+            Some("AdditiveModeNeverRevokes")
+        );
+
+        policy.spec.reconciliation_mode = crate::crd::CrdReconciliationMode::Adopt;
+        apply_additive_absence_condition(&policy, &mut status);
+        assert!(
+            status.conditions.iter().all(|condition| {
+                condition.condition_type != crate::crd::CONDITION_ABSENCE_ASSERTIONS_IGNORED
+            }),
+            "leaving additive mode must clear the warning condition"
         );
     }
 
@@ -4606,6 +4687,21 @@ mod tests {
             insufficient_privilege_sqlx_error(),
         ));
         assert_eq!(err.reason(), "InsufficientPrivileges");
+    }
+
+    #[test]
+    fn database_target_mismatch_is_a_slow_invalid_target_error() {
+        let error = finalizer::Error::ApplyFailed(ReconcileError::Inspect(
+            pgroles_inspect::InspectError::DatabaseTargetMismatch {
+                target: "other".to_string(),
+                connected: "current".to_string(),
+            },
+        ));
+        assert_eq!(retry_class(&error), RetryClass::Slow);
+        let finalizer::Error::ApplyFailed(error) = error else {
+            unreachable!()
+        };
+        assert_eq!(error.reason(), "InvalidDatabaseTarget");
     }
 
     #[test]

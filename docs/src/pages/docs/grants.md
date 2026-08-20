@@ -64,6 +64,12 @@ grants:
 
 Generates: `GRANT CONNECT ON DATABASE "mydb" TO "analytics";`
 
+Database targets are deliberately concrete: `name` is required and must equal
+the database named by the current connection (`current_database()`). pgroles
+inspects and reconciles only that database's ACL. A different name fails before
+planning instead of emitting SQL against a database the connection did not
+inspect.
+
 ### Wildcard (all objects of a type in schema)
 
 Use `name: "*"` to grant on all existing objects of a type:
@@ -155,6 +161,10 @@ REVOKE EXECUTE ON ALL ROUTINES IN SCHEMA "privileged_api" FROM PUBLIC;
 Every grant entry carries `ensure`, which defaults to `present`. An absent rule
 revokes only the privileges it lists, and only where they are actually held. If
 nothing holds them, it plans nothing.
+
+`additive` reconciliation never revokes, so it ignores every `ensure: absent`
+assertion and emits a warning. Use `adopt` or `authoritative` when absence must
+be enforced.
 
 `ensure: absent` is not a PostgreSQL deny. It controls one ACL edge. A role that
 also reaches the object through membership or ownership still reaches it.

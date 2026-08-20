@@ -120,10 +120,11 @@ grants, memberships, ownership and default privileges, retirements — bound
 together with the reconciliation mode and the [target
 identity](#target-identity), physical and logical. The encoding in force is
 recorded on the plan as `status.changeDigestEncoding`, currently
-`pgroles.io/approval-effect/v2`; digests computed under different encodings are
+`pgroles.io/approval-effect/v3`; digests computed under different encodings are
 never comparable, so a plan carrying an older tag is superseded rather than
-matched. (Managed scope joins the binding once it becomes a first-class field;
-today a scope change shows up as a change in effects.)
+matched. The managed role and schema sets are also bound directly, so removing
+an item from management invalidates an approval even when that ownership change
+produces no SQL effect.
 
 The applied base is deliberately *not* a digest input. The plan records which
 base it was computed against as provenance, and that record advances whenever
@@ -158,7 +159,7 @@ The fields on `PostgresPolicyPlan.status` that a reviewer or a runbook reads:
 | `conditions` | `Computed`, `Applied`, and the terminal decision conditions `Approved` / `Denied` |
 | `decidedBy` | Kubernetes identity (`username`, `uid`, `groups`) that decided the plan. Write-once, and truthful only under the admission layer below |
 | `changeDigest` | **The approval identity.** Canonical semantic digest of the typed effects, bound to reconciliation mode and target identity |
-| `changeDigestEncoding` | Version tag the digest was computed under — `pgroles.io/approval-effect/v2`. Digests from different encodings never compare equal |
+| `changeDigestEncoding` | Version tag the digest was computed under — `pgroles.io/approval-effect/v3`. Digests from different encodings never compare equal |
 | `targetPhysicalIdentity` | `pg_control_system().system_identifier` read at plan time — the storage lineage the approval is bound to. Absent on engines that do not expose it |
 | `targetLogicalFingerprint` | Fingerprint of the resolved connection endpoint (host, port, database) the plan was computed against |
 | `physicalIdentityAvailable` | Whether the physical identity was *readable* at plan time. Recorded explicitly so "could not be read" is distinguishable from "this plan predates the field" — the difference is what makes a later downgrade fail closed |

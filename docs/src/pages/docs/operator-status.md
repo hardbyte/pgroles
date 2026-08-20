@@ -144,6 +144,7 @@ Status transitions:
 - `Reconciled`, `Recovered`
 - `DriftDetected`, `PlanClean`
 - `ApprovalUnset`, `ApprovalIgnored`
+- `AbsenceAssertionsIgnored`
 - `InvalidSpec`
 - `SecretFetchFailed`
 - `DatabaseConnectionFailed`
@@ -163,8 +164,8 @@ Ephemeral access requests carry their own Events, recorded on the
 `kubectl describe -n <namespace> ephemeralaccessrequest <name>` is where one
 request's history lives, not `kubectl describe pgr`.
 
-Not every failure becomes an Event. `MissingDatabaseObject`,
-`InvalidConnectionParams`, and `UnsatisfiableWildcardGrant` are condition
+Not every failure becomes an Event. `InvalidDatabaseTarget`,
+`MissingDatabaseObject`, `InvalidConnectionParams`, and `UnsatisfiableWildcardGrant` are condition
 *reasons* only — they appear in `status.conditions[].reason` and never as an
 Event, so alert on the condition rather than watching for an Event that will
 not arrive.

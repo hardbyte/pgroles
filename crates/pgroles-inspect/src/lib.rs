@@ -58,6 +58,11 @@ pub enum InspectError {
     /// this is a hard error, not a narrower answer.
     #[error("inspection scope not covered by the shared snapshot: {0}")]
     ScopeNotCovered(String),
+    #[error(
+        "database grant target {target:?} does not match connected database {connected:?}; \
+         pgroles reconciles database ACLs only for the connected database"
+    )]
+    DatabaseTargetMismatch { target: String, connected: String },
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -336,6 +341,11 @@ pub struct InspectConfig {
     /// Usually only needed if the manifest includes database-level grants.
     pub include_database_privileges: bool,
 
+    /// Concrete database names referenced by database-level grant rules.
+    /// Inspection rejects any name other than `current_database()` so the
+    /// per-database lock and ownership boundary cover every rendered change.
+    pub(crate) database_targets: Vec<String>,
+
     /// Wildcard grant selectors from the desired manifest (present-ensure
     /// only — absence assertions must stay per-object).
     pub(crate) wildcard_grants: Vec<WildcardGrantPattern>,
@@ -358,6 +368,7 @@ impl InspectConfig {
 
         let mut managed_roles: BTreeSet<String> = BTreeSet::new();
         let mut managed_schemas: BTreeSet<String> = BTreeSet::new();
+        let mut database_targets: BTreeSet<String> = BTreeSet::new();
         // Key for deduplicating wildcard grants: (role, object_type, schema).
         type WildcardKey = (String, ObjectType, String);
         let mut wildcard_map: BTreeMap<WildcardKey, BTreeSet<pgroles_core::manifest::Privilege>> =
@@ -382,6 +393,11 @@ impl InspectConfig {
 
         // Collect schema names from grants
         for grant in &expanded.grants {
+            if grant.object.object_type == ObjectType::Database
+                && let Some(name) = &grant.object.name
+            {
+                database_targets.insert(name.clone());
+            }
             if let Some(ref schema) = grant.object.schema {
                 managed_schemas.insert(schema.clone());
             }
@@ -454,6 +470,7 @@ impl InspectConfig {
             managed_schemas: managed_schemas.clone().into_iter().collect(),
             privilege_schemas: managed_schemas.into_iter().collect(),
             include_database_privileges,
+            database_targets: database_targets.into_iter().collect(),
             wildcard_grants: wildcard_map
                 .into_iter()
                 .map(
@@ -516,6 +533,7 @@ impl InspectConfig {
                 .filter_map(|(schema, managed)| managed.bindings.then_some(schema.clone()))
                 .collect(),
             include_database_privileges,
+            database_targets: base.database_targets,
             wildcard_grants: base
                 .wildcard_grants
                 .into_iter()
@@ -580,6 +598,7 @@ impl InspectConfig {
         let mut managed_schemas: BTreeSet<String> = BTreeSet::new();
         let mut privilege_schemas: BTreeSet<String> = BTreeSet::new();
         let mut include_database_privileges = false;
+        let mut database_targets: BTreeSet<String> = BTreeSet::new();
         type WildcardKey = (String, pgroles_core::manifest::ObjectType, String);
         let mut wildcard_map: BTreeMap<WildcardKey, BTreeSet<pgroles_core::manifest::Privilege>> =
             BTreeMap::new();
@@ -599,6 +618,7 @@ impl InspectConfig {
             managed_schemas.extend(config.managed_schemas.iter().cloned());
             privilege_schemas.extend(config.privilege_schemas.iter().cloned());
             include_database_privileges |= config.include_database_privileges;
+            database_targets.extend(config.database_targets.iter().cloned());
             for pattern in &config.wildcard_grants {
                 wildcard_map
                     .entry((
@@ -627,6 +647,7 @@ impl InspectConfig {
             managed_schemas: managed_schemas.into_iter().collect(),
             privilege_schemas: privilege_schemas.into_iter().collect(),
             include_database_privileges,
+            database_targets: database_targets.into_iter().collect(),
             wildcard_grants: wildcard_map
                 .into_iter()
                 .map(
@@ -941,6 +962,7 @@ grants:
         assert!(config.managed_schemas.contains(&"catalog".to_string()));
 
         assert!(config.include_database_privileges);
+        assert_eq!(config.database_targets, vec!["mydb"]);
         assert_eq!(config.privilege_schemas.len(), 2);
         assert_eq!(config.wildcard_grants.len(), 2);
     }

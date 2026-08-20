@@ -117,11 +117,13 @@ pub async fn preflight_authority_issues(
 ) -> Result<Vec<AuthorityIssue>, sqlx::Error> {
     let mut issues = Vec::new();
 
-    let executor = {
-        let (user,): (String,) = sqlx::query_as("SELECT current_user::text")
-            .fetch_one(pool)
-            .await?;
-        user
+    let (executor, executor_is_superuser) = {
+        let (user, is_superuser): (String, bool) = sqlx::query_as(
+            "SELECT r.rolname::text, r.rolsuper FROM pg_roles r WHERE r.rolname = current_user",
+        )
+        .fetch_one(pool)
+        .await?;
+        (user, is_superuser)
     };
 
     // --- Default-privilege owner authority ---
@@ -154,9 +156,11 @@ pub async fn preflight_authority_issues(
                 });
             }
         }
-        // An owner absent from pg_roles has no authority to check yet. That is
-        // expected when the same plan creates it, so only roles the plan does
-        // not create are reported.
+        // A non-superuser cannot act as a role merely because the same plan
+        // creates it. PostgreSQL's automatic CREATEROLE administration grant
+        // does not provide the USAGE authority ALTER DEFAULT PRIVILEGES
+        // requires. Reject before the transaction starts; superusers can
+        // safely create the owner and alter its defaults atomically.
         let created: BTreeSet<&str> = changes
             .iter()
             .filter_map(|change| match change {
@@ -165,7 +169,15 @@ pub async fn preflight_authority_issues(
             })
             .collect();
         for owner in &owners {
-            if !known.contains(owner) && !created.contains(owner.as_str()) {
+            if known.contains(owner) {
+                continue;
+            }
+            if created.contains(owner.as_str()) && !executor_is_superuser {
+                issues.push(AuthorityIssue::DefaultPrivilegeOwner {
+                    owner: owner.clone(),
+                    executor: executor.clone(),
+                });
+            } else if !created.contains(owner.as_str()) {
                 issues.push(AuthorityIssue::MissingDefaultPrivilegeOwner {
                     owner: owner.clone(),
                 });

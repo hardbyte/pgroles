@@ -683,6 +683,13 @@ async fn plan_against_target(
 
     let reconciliation_mode: pgroles_core::diff::ReconciliationMode =
         content.reconciliation_mode.into();
+    if pgroles_core::diff::additive_ignores_absence_assertions(desired, reconciliation_mode) {
+        tracing::warn!(
+            candidate = %candidate.name_any(),
+            "additive reconciliation ignores every `ensure: absent` assertion; \
+             use adopt or authoritative mode to enforce absence"
+        );
+    }
     let mut changes = pgroles_core::diff::filter_changes(
         pgroles_core::diff::apply_role_retirements(
             pgroles_core::diff::diff(&current, desired),
