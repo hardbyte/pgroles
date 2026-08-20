@@ -3,7 +3,7 @@ title: Grants & privileges
 description: How pgroles manages object privileges via GRANT and REVOKE statements.
 ---
 
-Grants define what privileges a role has on database objects. pgroles supports granting on specific objects, all objects of a type in a schema, schemas themselves, and databases. {% .lead %}
+Grants define direct ACL entries for roles on database objects. pgroles supports granting on specific objects, all objects of a type in a schema, schemas themselves, and databases. {% .lead %}
 
 ---
 
@@ -32,7 +32,7 @@ The preferred key is `object`. pgroles still accepts a quoted legacy `"on"` key 
 | `TRUNCATE` | tables |
 | `REFERENCES` | tables |
 | `TRIGGER` | tables |
-| `EXECUTE` | functions |
+| `EXECUTE` | functions and procedures (`function` targets render as PostgreSQL routines) |
 | `USAGE` | schemas, sequences, types |
 | `CREATE` | schemas, databases |
 | `CONNECT` | databases |
@@ -52,6 +52,8 @@ grants:
 ```
 
 Generates: `GRANT USAGE ON SCHEMA "public" TO "analytics";`
+
+Schema `USAGE` is a separate namespace gate. A table grant does not imply it, and putting a schema in `search_path` grants no access. The [PostgreSQL access guide](/docs/postgresql-access-model#database-schema-and-object-privileges-do-different-jobs) walks through the failure path.
 
 ### Database-level
 
@@ -210,3 +212,11 @@ between two pgroles runs carries the built-in `PUBLIC EXECUTE` until the next
 run. Apply the global default rule before the migration that creates the
 function, or revoke inside the migration itself.
 {% /callout %}
+
+This converges the managed direct ACL, not every way PostgreSQL can authorize a
+role. The role might still reach the privilege through membership, ownership,
+or `PUBLIC`. pgroles also does not model `WITH GRANT OPTION` for application
+grantees; the executor grantability check described above is a safety preflight,
+not desired-state management of those grant options. See
+[How PostgreSQL access works](/docs/postgresql-access-model#the-rule-to-remember)
+and [Limitations](/docs/limitations#grant-options-and-effective-access).

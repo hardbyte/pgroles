@@ -172,6 +172,8 @@ manifest is
 
 The `owner` field specifies which role's object creation triggers the default grant. This is typically the role that creates tables, such as `app_migrator` or `app_owner`.
 
+PostgreSQL uses the defaults of the **current role that creates the object**. It does not combine defaults from roles that creator merely belongs to. If migrations connect as `app_migrator` but the defaults belong to `app_owner`, the migration must `SET ROLE app_owner` before creating the object (or the defaults must be declared for `app_migrator`).
+
 If `owner` is omitted on a default privilege entry, the top-level `default_owner` is used. If neither is set, it falls back to `postgres`.
 
 The executor must already be able to act as the owner. A non-superuser cannot
@@ -208,4 +210,8 @@ It's good practice to pair wildcard grants (`name: "*"`) with matching default p
 
 {% callout title="Tables are not enough" %}
 If a role writes to tables created after pgroles runs, check whether it also needs sequence and function defaults. Identity/serial-backed inserts typically need sequence access, and trigger-driven schemas often need `EXECUTE` on functions too.
+{% /callout %}
+
+{% callout type="warning" title="Global and PUBLIC defaults are outside pgroles" %}
+pgroles manages schema-scoped default privileges granted to named roles. It does not manage global default ACLs or default privileges granted to `PUBLIC`. PostgreSQL adds schema-scoped defaults to global defaults, so a schema-only revoke cannot remove a globally supplied privilege such as the built-in `PUBLIC EXECUTE` default for routines. See [Existing objects and future objects](/docs/postgresql-access-model#existing-objects-and-future-objects-are-separate-problems).
 {% /callout %}

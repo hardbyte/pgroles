@@ -1,6 +1,7 @@
 import { Callout } from '@/components/Callout'
 import { OperatorArchitectureDiagram } from '@/components/OperatorArchitectureDiagram'
 import { OperatorReconciliationDiagram } from '@/components/OperatorReconciliationDiagram'
+import { PostgresPermissionLab } from '@/components/PostgresPermissionLab'
 import { QuickLink, QuickLinks } from '@/components/QuickLinks'
 import { RoleGraphDiagram } from '@/components/RoleGraphDiagram'
 import { WorkspaceDataFlowDiagram } from '@/components/WorkspaceDataFlowDiagram'
@@ -53,6 +54,10 @@ const tags = {
   'operator-reconciliation-diagram': {
     selfClosing: true,
     render: OperatorReconciliationDiagram,
+  },
+  'postgres-permission-lab': {
+    selfClosing: true,
+    render: PostgresPermissionLab,
   },
   'role-graph-diagram': {
     selfClosing: true,

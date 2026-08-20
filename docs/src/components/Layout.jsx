@@ -21,6 +21,12 @@ const navigation = [
         ],
     },
     {
+        title: 'Learn PostgreSQL',
+        links: [
+            {title: 'How access works', href: '/docs/postgresql-access-model'},
+        ],
+    },
+    {
         title: 'Kubernetes operator',
         links: [
             {title: 'Kubernetes operator', href: '/docs/operator'},
