@@ -1,7 +1,10 @@
 import { Callout } from '@/components/Callout'
 import { OperatorArchitectureDiagram } from '@/components/OperatorArchitectureDiagram'
 import { OperatorReconciliationDiagram } from '@/components/OperatorReconciliationDiagram'
-import { PostgresPermissionLab } from '@/components/PostgresPermissionLab'
+import {
+  PostgresPermissionLab,
+  PostgresRoleHierarchyLab,
+} from '@/components/PostgresPermissionLab'
 import { QuickLink, QuickLinks } from '@/components/QuickLinks'
 import { RoleGraphDiagram } from '@/components/RoleGraphDiagram'
 import { WorkspaceDataFlowDiagram } from '@/components/WorkspaceDataFlowDiagram'
@@ -59,6 +62,10 @@ const tags = {
     selfClosing: true,
     render: PostgresPermissionLab,
   },
+  'postgres-role-hierarchy-lab': {
+    selfClosing: true,
+    render: PostgresRoleHierarchyLab,
+  },
   'role-graph-diagram': {
     selfClosing: true,
     render: RoleGraphDiagram,
@@ -66,7 +73,7 @@ const tags = {
   'workspace-data-flow-diagram': {
     selfClosing: true,
     render: WorkspaceDataFlowDiagram,
-  }
+  },
 }
 
 export default tags

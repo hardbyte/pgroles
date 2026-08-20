@@ -43,7 +43,7 @@ Per-membership `INHERIT` requires PostgreSQL 16 or later. See
 [installation compatibility](/docs/installation#compatibility) for the
 currently supported server versions.
 
-PostgreSQL 16 also records a separate `SET` option on each membership. pgroles does not currently inspect or converge that option. A membership created by pgroles receives PostgreSQL's default `SET TRUE`. An existing `SET FALSE` edge may appear to match, but if pgroles changes `inherit` or `admin` it revokes and recreates the membership without a `SET` clause, restoring `SET TRUE`. Do not rely on `SET FALSE` remaining intact on a pgroles-managed edge. See [Membership is a directed edge](/docs/postgresql-access-model#membership-is-a-directed-edge).
+PostgreSQL 16 also records a separate `SET` option on each membership. pgroles does not currently inspect or converge that option. A membership created by pgroles receives PostgreSQL's default `SET TRUE`. An existing `SET FALSE` edge may appear to match, but if pgroles changes `inherit` or `admin` it revokes and recreates the membership without a `SET` clause, restoring `SET TRUE`. Do not rely on `SET FALSE` remaining intact on a pgroles-managed edge. See [Build and manage a role hierarchy](/docs/postgresql-role-hierarchy).
 
 Role attributes such as `CREATEDB`, `CREATEROLE`, and `BYPASSRLS` are not inherited like object privileges. A member must normally `SET ROLE` to use an attribute on the granted role.
 

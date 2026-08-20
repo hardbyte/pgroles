@@ -1,6 +1,6 @@
 ---
 title: How PostgreSQL access works
-description: Follow one query through PostgreSQL roles, memberships, schemas, object privileges, default privileges, PUBLIC, and row security in a real browser database.
+description: Repair one denied query in a real browser database, then use the PostgreSQL access model in production.
 ---
 
 PostgreSQL access is not one grant. It is a path from the identity that opened a connection, through role membership and namespace checks, to an object's privileges and any row policy. The fastest way to understand that path is to watch one query fail, repair it, and then change the rules around it. {% .lead %}
@@ -21,7 +21,7 @@ The guided story below keeps that cast and database state from beginning to end.
 
 ## Use the model outside the lab
 
-The seven checkpoints reduce to four ideas: **who PostgreSQL is checking, which gates the operation must pass, where the privilege came from, and whether another authorization layer narrows the result.**
+The two checkpoints establish the smallest useful model: **PostgreSQL must be able to reach the schema and authorize the table operation.** The rest of this guide expands that model for production without adding more steps to the first lesson.
 
 ### Separate identity, capability, and ownership
 
@@ -255,7 +255,7 @@ Read [Grants & privileges](/docs/grants), [Default privileges](/docs/default-pri
 The lesson runs an isolated PostgreSQL 18.3 database in WebAssembly. Nothing connects to your systems, and **Reset lesson** discards the entire database.
 
 {% callout type="note" title="Why this uses PGlite rather than pgrust today" %}
-We reviewed [pgrust](https://github.com/malisper/pgrust) first. A single-click lesson needs a callable browser API, but its hosted cross-origin terminal does not expose one to the parent page. Its current browser build also does not enforce separate login identities or RLS accurately enough for this complete story. The lab therefore uses [PGlite](https://pglite.dev/), which compiles upstream PostgreSQL to WebAssembly and exposes a same-page execution API.
+We reviewed [pgrust](https://github.com/malisper/pgrust) first. A single-click lesson needs a callable browser API, but its hosted cross-origin terminal does not expose one to the parent page. Vendoring a custom runtime would also add AGPL source-distribution and reproducible-build obligations, while its current browser session does not enforce authenticated login identity. The lab therefore uses [PGlite](https://pglite.dev/), which compiles upstream PostgreSQL to WebAssembly and exposes a same-page execution API.
 
 The browser has one bootstrap session as `postgres` and uses `SET ROLE` to demonstrate effective identities. It teaches authorization, not `pg_hba.conf`, login authentication, or concurrent sessions. Verify production decisions against a supported PostgreSQL server.
 {% /callout %}

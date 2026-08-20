@@ -24,6 +24,7 @@ const navigation = [
         title: 'Learn PostgreSQL',
         links: [
             {title: 'How access works', href: '/docs/postgresql-access-model'},
+            {title: 'Build a role hierarchy', href: '/docs/postgresql-role-hierarchy'},
         ],
     },
     {
