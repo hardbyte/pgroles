@@ -56,8 +56,8 @@ changes remain in the plan:
 - `additive`: creates and additions only. It filters revokes, membership
   removals, existing schema-owner transfers, existing-role rewrites, and role
   retirement. It also omits role comments. Configured password updates are a
-  deliberate exception. Because it never revokes, it silently ignores every
-  `ensure: absent` rule without failing the run.
+  deliberate exception. Because it never revokes, it ignores every
+  `ensure: absent` rule with a warning instead of failing the run.
 - `adopt`: authoritative convergence except role drops and their retirement
   steps. Revokes and membership removals still occur.
 - `authoritative`: retains every change computed within pgroles' managed
@@ -107,6 +107,10 @@ such objects, and declare the owner privileges that must survive it.
 
 Ownership rights such as altering or dropping an object, and the owner's
 implicit grant options, remain PostgreSQL behavior outside the object ACL model.
+
+Database grants must set `object.name` explicitly, and that name must match
+`current_database()` for the connection used by diff or apply. pgroles never
+inspects one database while rendering ACL changes for another.
 
 Default privileges are per creating role, scope, and object type, where a scope
 is one schema or the owner-wide global layer. A default owner declaration does

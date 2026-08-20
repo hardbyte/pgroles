@@ -20,7 +20,10 @@ use pgroles_cli::{
     format_validation_result, inject_password_changes, planned_role_drops, read_manifest_file,
     resolve_passwords, validate_bundle_file, validate_manifest,
 };
-use pgroles_core::diff::{ReconciliationMode, filter_changes, filter_external_role_changes};
+use pgroles_core::diff::{
+    ReconciliationMode, additive_ignores_absence_assertions, filter_changes,
+    filter_external_role_changes,
+};
 use pgroles_core::ownership::validate_changes_against_managed_surface;
 use pgroles_core::visual::{self, VisualManagedScope, VisualSource};
 use pgroles_inspect::{InspectConfig, inspect_drop_role_safety};
@@ -817,6 +820,7 @@ async fn cmd_diff(
         let inspect_config = inspect_config_for_bundle(&validated);
         let current = inspect_current_for_plan_with_config(&pool, &inspect_config).await?;
         info!(%mode, "reconciliation mode");
+        warn_additive_absence_assertions(&validated.composed.desired, mode);
         let changes = filter_external_role_changes(
             filter_changes(
                 apply_role_retirements(
@@ -881,6 +885,7 @@ async fn cmd_diff(
     let current = inspect_current_for_plan(&pool, &validated).await?;
 
     info!(%mode, "reconciliation mode");
+    warn_additive_absence_assertions(&validated.desired, mode);
     let changes = filter_external_role_changes(
         filter_changes(
             apply_role_retirements(
@@ -953,6 +958,7 @@ async fn cmd_apply(
         let current = inspect_current_for_plan_with_config(&pool, &inspect_config).await?;
 
         info!(%mode, "reconciliation mode");
+        warn_additive_absence_assertions(&validated.composed.desired, mode);
         let changes = filter_external_role_changes(
             filter_changes(
                 apply_role_retirements(
@@ -1042,6 +1048,7 @@ async fn cmd_apply(
     let current = inspect_current_for_plan(&pool, &validated).await?;
 
     info!(%mode, "reconciliation mode");
+    warn_additive_absence_assertions(&validated.desired, mode);
     let changes = filter_external_role_changes(
         filter_changes(
             apply_role_retirements(
@@ -1708,6 +1715,18 @@ async fn preflight_authority(
         eprintln!("Warning: {issue}");
     }
     Ok(())
+}
+
+fn warn_additive_absence_assertions(
+    desired: &pgroles_core::model::RoleGraph,
+    mode: ReconciliationMode,
+) {
+    if additive_ignores_absence_assertions(desired, mode) {
+        eprintln!(
+            "Warning: additive reconciliation ignores every `ensure: absent` assertion; \
+             use adopt or authoritative mode to enforce absence"
+        );
+    }
 }
 
 async fn inspect_drop_safety(

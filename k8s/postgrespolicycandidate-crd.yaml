@@ -214,7 +214,7 @@
                               "description": "Target object for a grant.",
                               "properties": {
                                 "name": {
-                                  "description": "Object name, or \"*\" for all objects. Omit for schema-level grants.",
+                                  "description": "Object name, or \"*\" for all objects. Omit for schema-level grants;\nrequired for database grants, where it names the connected database.",
                                   "maxLength": 256,
                                   "minLength": 1,
                                   "nullable": true,
@@ -245,7 +245,13 @@
                               "required": [
                                 "type"
                               ],
-                              "type": "object"
+                              "type": "object",
+                              "x-kubernetes-validations": [
+                                {
+                                  "message": "database grant targets must set `name`",
+                                  "rule": "self.type != 'database' || has(self.name)"
+                                }
+                              ]
                             },
                             "privileges": {
                               "items": {

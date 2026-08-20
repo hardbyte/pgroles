@@ -70,7 +70,8 @@ pub struct PostgresPolicySpec {
     ///
     /// - `authoritative` (default): full convergence — anything not in the
     ///   manifest is revoked/dropped.
-    /// - `additive`: only grant, never revoke — safe for incremental adoption.
+    /// - `additive`: only grant, never revoke — safe for incremental adoption;
+    ///   `ensure: absent` assertions are ignored with a warning condition.
     /// - `adopt`: manage declared roles fully, but never drop undeclared roles.
     #[serde(default)]
     pub reconciliation_mode: CrdReconciliationMode,
@@ -2255,7 +2256,7 @@ impl PostgresPolicySpec {
             .grants
             .iter()
             .filter(|g| g.object.object_type == ObjectType::Database && g.role == "PUBLIC")
-            .map(|g| g.object.name.clone().unwrap_or_default())
+            .filter_map(|g| g.object.name.clone())
             .collect();
 
         roles.extend(manifest.retirements.into_iter().map(|r| r.role));
@@ -2468,9 +2469,28 @@ pub const CONDITION_APPROVAL_UNSET: &str = "ApprovalUnset";
 /// Condition type for `spec.mode: plan`, the deprecated spelling of `observe`.
 pub const CONDITION_MODE_VALUE_DEPRECATED: &str = "ModeValueDeprecated";
 
+/// Condition type reporting that additive reconciliation cannot enforce
+/// declarative absence assertions present in the policy.
+pub const CONDITION_ABSENCE_ASSERTIONS_IGNORED: &str = "AbsenceAssertionsIgnored";
+
 /// Condition type reporting that a plan carries an approval annotation which
 /// cannot take effect, because `spec.mode: observe` never executes.
 pub const CONDITION_APPROVAL_IGNORED: &str = "ApprovalIgnored";
+
+/// Helper to create an `AbsenceAssertionsIgnored` condition.
+pub fn absence_assertions_ignored_condition() -> PolicyCondition {
+    PolicyCondition {
+        condition_type: CONDITION_ABSENCE_ASSERTIONS_IGNORED.to_string(),
+        status: "True".to_string(),
+        reason: Some("AdditiveModeNeverRevokes".to_string()),
+        message: Some(
+            "spec.reconciliation_mode is `additive`, so every `ensure: absent` assertion is \
+             ignored. Use `adopt` or `authoritative` to enforce absence."
+                .to_string(),
+        ),
+        last_transition_time: Some(now_rfc3339()),
+    }
+}
 
 /// Helper to create an "ApprovalIgnored" condition.
 ///

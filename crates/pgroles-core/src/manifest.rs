@@ -119,6 +119,9 @@ pub enum ManifestError {
         "profile \"{profile}\" declares an `ensure: absent` grant — profiles are additive templates and cannot assert absence"
     )]
     ProfileAbsentGrant { profile: String },
+
+    #[error("database grant targets must name the connected database explicitly")]
+    DatabaseGrantMissingName,
 }
 
 // ---------------------------------------------------------------------------
@@ -582,6 +585,10 @@ pub struct Grant {
 
 /// Target object for a grant.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[schemars(extend("x-kubernetes-validations" = [serde_json::json!({
+    "rule": "self.type != 'database' || has(self.name)",
+    "message": "database grant targets must set `name`"
+})]))]
 pub struct ObjectTarget {
     #[serde(rename = "type")]
     pub object_type: ObjectType,
@@ -591,7 +598,8 @@ pub struct ObjectTarget {
     #[schemars(length(min = 1, max = MAX_IDENTIFIER))]
     pub schema: Option<String>,
 
-    /// Object name, or "*" for all objects. Omit for schema-level grants.
+    /// Object name, or "*" for all objects. Omit for schema-level grants;
+    /// required for database grants, where it names the connected database.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(length(min = 1, max = MAX_OBJECT_NAME))]
     pub name: Option<String>,
@@ -1251,6 +1259,7 @@ pub fn expand_manifest(manifest: &PolicyManifest) -> Result<ExpandedManifest, Ma
         &default_privileges,
         &memberships,
     )?;
+    validate_database_grant_targets(&grants)?;
     validate_default_privilege_scopes(&default_privileges)?;
     validate_ensure_conflicts(
         manifest.default_owner.as_deref(),
@@ -1395,6 +1404,19 @@ fn validate_public_reservation(
             retirement.reassign_owned_to.as_deref(),
             "a retirement ownership target",
         )?;
+    }
+    Ok(())
+}
+
+/// Database ACLs are reconciled only for the database the connection targets.
+/// Requiring a name keeps desired state, inspection, SQL rendering, and
+/// operator ownership claims on one concrete identity; runtime inspection
+/// additionally verifies that this name is `current_database()`.
+fn validate_database_grant_targets(grants: &[Grant]) -> Result<(), ManifestError> {
+    if grants.iter().any(|grant| {
+        grant.object.object_type == ObjectType::Database && grant.object.name.is_none()
+    }) {
+        return Err(ManifestError::DatabaseGrantMissingName);
     }
     Ok(())
 }
@@ -2911,6 +2933,23 @@ grants:
 "#,
         )
         .unwrap();
+    }
+
+    #[test]
+    fn database_grants_require_an_explicit_name() {
+        let result = expand(
+            r#"
+grants:
+  - role: PUBLIC
+    ensure: absent
+    privileges: [CONNECT]
+    object: { type: database }
+"#,
+        );
+        assert!(matches!(
+            result,
+            Err(ManifestError::DatabaseGrantMissingName)
+        ));
     }
 
     #[test]

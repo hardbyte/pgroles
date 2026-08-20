@@ -85,6 +85,22 @@ impl RawInspection {
             phase_durations.insert(phase, started.elapsed());
         };
 
+        if !scope.database_targets.is_empty() {
+            let (connected,): (String,) = sqlx::query_as("SELECT current_database()::text")
+                .fetch_one(pool)
+                .await?;
+            if let Some(target) = scope
+                .database_targets
+                .iter()
+                .find(|target| target.as_str() != connected)
+            {
+                return Err(InspectError::DatabaseTargetMismatch {
+                    target: target.clone(),
+                    connected,
+                });
+            }
+        }
+
         let role_refs: Vec<&str> = scope.managed_roles.iter().map(String::as_str).collect();
         let schema_refs: Vec<&str> = scope.managed_schemas.iter().map(String::as_str).collect();
         let privilege_schema_refs: Vec<&str> =
@@ -257,6 +273,19 @@ impl RawInspection {
 
         if config.include_database_privileges && !self.scope.include_database_privileges {
             return Some("database privileges were not read".to_string());
+        }
+        let database_targets: BTreeSet<&str> = self
+            .scope
+            .database_targets
+            .iter()
+            .map(String::as_str)
+            .collect();
+        if let Some(target) = config
+            .database_targets
+            .iter()
+            .find(|target| !database_targets.contains(target.as_str()))
+        {
+            return Some(format!("database target {target:?} was not read"));
         }
         if let Some(role) = config
             .managed_roles
@@ -627,6 +656,7 @@ mod tests {
             managed_schemas: schemas.iter().map(|s| s.to_string()).collect(),
             privilege_schemas: schemas.iter().map(|s| s.to_string()).collect(),
             include_database_privileges,
+            database_targets: Vec::new(),
             wildcard_grants: wildcards,
             default_priv_scopes: Vec::new(),
             public_object_scopes: Vec::new(),

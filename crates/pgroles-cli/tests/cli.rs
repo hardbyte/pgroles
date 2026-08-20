@@ -56,7 +56,7 @@ roles:
 grants:
   - role: analytics
     privileges: [CONNECT]
-    object: { type: database, name: mydb }
+    object: { type: database, name: pgroles_test }
 "#;
 
 const VALID_PROFILES: &str = r#"
@@ -95,7 +95,7 @@ roles:
 grants:
   - role: app-service
     privileges: [CONNECT]
-    object: { type: database, name: mydb }
+    object: { type: database, name: pgroles_test }
 
 memberships:
   - role: inventory-editor
@@ -1972,6 +1972,38 @@ roles:
             .assert()
             .success()
             .stdout(predicate::str::contains("No changes needed"));
+    }
+
+    #[test]
+    #[ignore]
+    fn diff_rejects_database_grant_for_a_different_database() {
+        let other_database = unique_name("other_database");
+        let manifest = write_temp_manifest(&format!(
+            r#"
+grants:
+  - role: PUBLIC
+    ensure: absent
+    privileges: [CONNECT]
+    object: {{ type: database, name: {other_database} }}
+"#
+        ));
+
+        pgroles_cmd()
+            .args([
+                "diff",
+                "--file",
+                manifest.path().to_str().unwrap(),
+                "--database-url",
+                &database_url(),
+                "--no-exit-code",
+            ])
+            .assert()
+            .failure()
+            .stderr(predicate::str::contains(&other_database))
+            .stderr(predicate::str::contains("pgroles_test"))
+            .stderr(predicate::str::contains(
+                "reconciles database ACLs only for the connected database",
+            ));
     }
 
     #[test]
@@ -5229,6 +5261,111 @@ default_privileges:
 
     #[test]
     #[ignore]
+    fn global_public_builtin_absences_are_applied_when_the_owner_is_created() {
+        let owner = unique_name("pubnew_owner");
+        let _cleanup = TestDbCleanup::new(format!(
+            r#"DO $$ BEGIN
+                 IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = '{owner}') THEN
+                   EXECUTE 'DROP OWNED BY "{owner}" CASCADE';
+                 END IF;
+               END $$;
+               DROP ROLE IF EXISTS "{owner}";"#
+        ));
+        let manifest = write_temp_manifest(&format!(
+            r#"
+roles:
+  - name: {owner}
+default_privileges:
+  - owner: {owner}
+    scope: {{ type: global }}
+    grant:
+      - role: PUBLIC
+        ensure: absent
+        privileges: [EXECUTE]
+        on_type: function
+      - role: PUBLIC
+        ensure: absent
+        privileges: [USAGE]
+        on_type: type
+"#
+        ));
+
+        let plan = String::from_utf8_lossy(
+            &pgroles_cmd()
+                .args([
+                    "diff",
+                    "--file",
+                    manifest.path().to_str().unwrap(),
+                    "--database-url",
+                    &database_url(),
+                    "--format",
+                    "sql",
+                    "--no-exit-code",
+                ])
+                .assert()
+                .success()
+                .get_output()
+                .stdout,
+        )
+        .to_string();
+        assert!(
+            plan.contains(&format!(r#"CREATE ROLE "{owner}""#)),
+            "{plan}"
+        );
+        assert!(
+            plan.contains(&format!(
+                r#"ALTER DEFAULT PRIVILEGES FOR ROLE "{owner}" REVOKE EXECUTE ON ROUTINES FROM PUBLIC;"#
+            )),
+            "the first plan must revoke the new role's built-in PUBLIC default:\n{plan}"
+        );
+        assert!(
+            plan.contains(&format!(
+                r#"ALTER DEFAULT PRIVILEGES FOR ROLE "{owner}" REVOKE USAGE ON TYPES FROM PUBLIC;"#
+            )),
+            "the first plan must revoke the new role's built-in PUBLIC type default:\n{plan}"
+        );
+
+        pgroles_cmd()
+            .args([
+                "apply",
+                "--file",
+                manifest.path().to_str().unwrap(),
+                "--database-url",
+                &database_url(),
+            ])
+            .assert()
+            .success();
+
+        let acl = query_global_default_acl(&owner, "f")
+            .expect("the revoke should materialize a global default ACL row");
+        assert!(
+            !acl.contains("{=") && !acl.contains(",="),
+            "PUBLIC must not remain in the new owner's defaults: {acl}"
+        );
+        let type_acl = query_global_default_acl(&owner, "T")
+            .expect("the type revoke should materialize a global default ACL row");
+        assert!(
+            !type_acl.contains("{=") && !type_acl.contains(",="),
+            "PUBLIC must not retain USAGE in the new owner's type defaults: {type_acl}"
+        );
+        pgroles_cmd()
+            .args([
+                "diff",
+                "--file",
+                manifest.path().to_str().unwrap(),
+                "--database-url",
+                &database_url(),
+                "--format",
+                "summary",
+                "--no-exit-code",
+            ])
+            .assert()
+            .success()
+            .stdout(predicate::str::contains("No changes needed"));
+    }
+
+    #[test]
+    #[ignore]
     fn drifted_public_grant_is_revoked_again() {
         let (fixture, _cleanup) = PublicFixture::new("pubdrift");
         let manifest = write_temp_manifest(&fixture.manifest());
@@ -5274,7 +5411,10 @@ default_privileges:
                 "additive",
             ])
             .assert()
-            .success();
+            .success()
+            .stderr(predicate::str::contains(
+                "additive reconciliation ignores every `ensure: absent` assertion",
+            ));
         assert!(
             query_has_function_privilege(&fixture.bystander, &fixture.secret_signature()),
             "additive mode must not revoke PUBLIC EXECUTE"
@@ -5567,6 +5707,117 @@ default_privileges:
         assert!(
             query_has_function_privilege(&reporter, &fixture.secret_signature()),
             "the blocked apply must not have changed anything"
+        );
+    }
+
+    #[test]
+    #[ignore]
+    fn preflight_blocks_new_default_owner_for_a_non_superuser() {
+        let executor = unique_name("pfnew_executor");
+        let owner = unique_name("pfnew_owner");
+        let _cleanup = TestDbCleanup::new(format!(
+            r#"DO $$ BEGIN
+                 IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = '{owner}') THEN
+                   EXECUTE 'DROP OWNED BY "{owner}" CASCADE';
+                 END IF;
+                 IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = '{executor}') THEN
+                   EXECUTE 'DROP OWNED BY "{executor}" CASCADE';
+                 END IF;
+               END $$;
+               DROP ROLE IF EXISTS "{owner}";
+               DROP ROLE IF EXISTS "{executor}";"#
+        ));
+        execute_sql(&format!(
+            r#"CREATE ROLE "{executor}" LOGIN CREATEROLE PASSWORD 'testpassword';"#
+        ));
+        let manifest = write_temp_manifest(&format!(
+            r#"
+roles:
+  - name: {owner}
+default_privileges:
+  - owner: {owner}
+    scope: {{ type: global }}
+    grant:
+      - role: PUBLIC
+        ensure: absent
+        privileges: [EXECUTE]
+        on_type: function
+"#
+        ));
+        let executor_url = database_url_for_role(&executor, "testpassword");
+
+        pgroles_cmd()
+            .args([
+                "apply",
+                "--file",
+                manifest.path().to_str().unwrap(),
+                "--database-url",
+                &executor_url,
+            ])
+            .assert()
+            .failure()
+            .stderr(predicate::str::contains(
+                "UnsatisfiableDefaultPrivilegeChange",
+            ));
+        assert!(
+            !query_role_exists(&owner),
+            "preflight must reject before CREATE ROLE runs"
+        );
+    }
+
+    #[test]
+    #[ignore]
+    fn preflight_blocks_positive_defaults_for_a_new_owner_and_non_superuser() {
+        let executor = unique_name("pfnew_grant_executor");
+        let owner = unique_name("pfnew_grant_owner");
+        let _cleanup = TestDbCleanup::new(format!(
+            r#"DO $$ BEGIN
+                 IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = '{owner}') THEN
+                   EXECUTE 'DROP OWNED BY "{owner}" CASCADE';
+                 END IF;
+                 IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = '{executor}') THEN
+                   EXECUTE 'DROP OWNED BY "{executor}" CASCADE';
+                 END IF;
+               END $$;
+               DROP ROLE IF EXISTS "{owner}";
+               DROP ROLE IF EXISTS "{executor}";"#
+        ));
+        execute_sql(&format!(
+            r#"CREATE ROLE "{executor}" LOGIN CREATEROLE PASSWORD 'testpassword';"#
+        ));
+        let manifest = write_temp_manifest(&format!(
+            r#"
+roles:
+  - name: {owner}
+  - name: {executor}
+    external: true
+default_privileges:
+  - owner: {owner}
+    scope: {{ type: global }}
+    grant:
+      - role: {executor}
+        privileges: [SELECT]
+        on_type: table
+"#
+        ));
+        let executor_url = database_url_for_role(&executor, "testpassword");
+
+        pgroles_cmd()
+            .args([
+                "apply",
+                "--file",
+                manifest.path().to_str().unwrap(),
+                "--database-url",
+                &executor_url,
+            ])
+            .assert()
+            .failure()
+            .stderr(predicate::str::contains(
+                "UnsatisfiableDefaultPrivilegeChange",
+            ));
+        assert!(
+            !query_role_exists(&owner),
+            "preflight must reject a positive default before CREATE ROLE runs"
         );
     }
 }

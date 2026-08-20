@@ -34,7 +34,13 @@ PostgreSQL 16 changed `CREATEROLE` semantics: a role with `CREATEROLE` automatic
 - `CREATE` on the target database (to create schemas)
 - membership in the schema-owner role(s) it manages default privileges for
 
-The friction shows up in **brownfield** adoption. `CREATEROLE` does not retroactively grant `ADMIN OPTION` on roles that already existed before the executor was created. For every pre-existing role pgroles needs to alter, drop, or manage memberships on, a superuser or existing admin must explicitly grant the executor admin rights:
+There is one greenfield exception: `ADMIN OPTION` is not membership. A
+non-superuser cannot create a new owner role and run `ALTER DEFAULT PRIVILEGES
+FOR ROLE owner` in the same pgroles transaction. For owner-bound defaults,
+pre-create the owner and grant the executor membership, bootstrap in two stages,
+or use a superuser for the atomic first apply.
+
+The friction also shows up in **brownfield** adoption. `CREATEROLE` does not retroactively grant `ADMIN OPTION` on roles that already existed before the executor was created. For every pre-existing role pgroles needs to alter, drop, or manage memberships on, a superuser or existing admin must explicitly grant the executor admin rights:
 
 ```sql
 GRANT adopted_role TO executor WITH ADMIN TRUE;
@@ -64,7 +70,10 @@ GRANT app_owner TO pgroles_executor;
 GRANT some_preexisting_role TO pgroles_executor WITH ADMIN TRUE;
 ```
 
-Steps 1–2 cover a greenfield executor. Steps 3–4 are additive, per-role grants you add as you bring existing roles under pgroles management.
+Steps 1–2 cover a greenfield executor only when the first plan does not alter
+defaults for an owner it also creates. Step 3 is required for every existing
+default-privilege owner. For an owner created by the policy, use the two-stage
+or superuser bootstrap described above. Step 4 is brownfield-only.
 
 ## Cloud providers
 

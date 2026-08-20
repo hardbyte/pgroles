@@ -4,9 +4,10 @@
 //! TEMPORARY on databases, USAGE on the public schema). These grants are
 //! represented by NULL grantee entries in ACL arrays.
 //!
-//! This module provides read-only introspection of PUBLIC grants for
-//! informational display. pgroles does not manage PUBLIC grants — they are
-//! shown so users can understand the full effective privilege picture.
+//! This module provides the read-only database/schema PUBLIC summary used for
+//! informational display. Scoped PUBLIC reconciliation uses the ordinary
+//! privilege/default-privilege inspectors instead; this summary is not fed into
+//! the managed desired-state graph.
 
 use std::collections::BTreeSet;
 

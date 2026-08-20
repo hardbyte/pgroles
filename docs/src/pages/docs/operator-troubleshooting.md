@@ -58,8 +58,10 @@ release or namespace names.
 | `DatabaseConnectionFailed` | DNS, network, TLS, database, or PostgreSQL login failure. [Check the connection](#connection-and-authentication). |
 | `GcpAuthFailed`, `SetRoleFailed` | Workload Identity token or post-login role switch failed. [Check authentication](#connection-and-authentication). |
 | `InvalidSpec` | The object passed admission but is not a valid pgroles policy. [Check policy validation](#policy-validation). |
+| `AbsenceAssertionsIgnored=True` | The policy uses `ensure: absent` with additive reconciliation, which never revokes. Switch to `adopt` or `authoritative` to enforce it. |
+| `InvalidDatabaseTarget` | A database grant names a database other than the one the connection reaches. Set `object.name` to `current_database()`. [Check database objects](#missing-database-objects). |
 | `InsufficientPrivileges` | The executor can connect but cannot inspect or apply an operation. [Check executor privileges](#executor-privileges). |
-| `MissingDatabaseObject` | An external object is absent, or the policy targets the wrong database. [Check database objects](#missing-database-objects). |
+| `MissingDatabaseObject` | An external object referenced by the policy is absent. [Check database objects](#missing-database-objects). |
 | `UnsatisfiableWildcardGrant` | A wildcard matched objects the executor cannot grant on. [Check wildcard grants](#wildcard-grants). |
 | `ConflictingPolicy` | Two policies claim overlapping state on the same database. [Resolve the conflict](#policy-conflicts). |
 | `UnsafeRoleDrops` | A role drop is blocked by owned objects or other dependencies. [Plan a safe retirement](#unsafe-role-drops). |
@@ -162,6 +164,11 @@ default privileges need membership in their owner role. The complete matrix and
 bootstrap SQL are in [executor privileges](/docs/executor-privileges).
 
 ## Missing database objects
+
+`InvalidDatabaseTarget` is narrower than a missing object: a `type: database`
+grant explicitly names a database other than `current_database()`. Change the
+grant target or the connection so those names agree; the operator will not
+inspect one database and render ACL changes for another.
 
 Before issuing DDL, the operator checks external schema references. Schemas
 declared in `spec.schemas` are excluded because the operator can create them;
@@ -306,5 +313,5 @@ kubectl annotate pgr "$POLICY" --namespace "$NAMESPACE" \
 ```
 
 Then re-read conditions rather than relying only on Events. Several reasons,
-including `MissingDatabaseObject`, `InvalidConnectionParams`, and
+including `InvalidDatabaseTarget`, `MissingDatabaseObject`, `InvalidConnectionParams`, and
 `UnsatisfiableWildcardGrant`, do not emit dedicated Events.

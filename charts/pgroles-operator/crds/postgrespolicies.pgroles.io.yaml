@@ -478,7 +478,7 @@
                           "description": "Target object for a grant.",
                           "properties": {
                             "name": {
-                              "description": "Object name, or \"*\" for all objects. Omit for schema-level grants.",
+                              "description": "Object name, or \"*\" for all objects. Omit for schema-level grants;\nrequired for database grants, where it names the connected database.",
                               "maxLength": 256,
                               "minLength": 1,
                               "nullable": true,
@@ -509,7 +509,13 @@
                           "required": [
                             "type"
                           ],
-                          "type": "object"
+                          "type": "object",
+                          "x-kubernetes-validations": [
+                            {
+                              "message": "database grant targets must set `name`",
+                              "rule": "self.type != 'database' || has(self.name)"
+                            }
+                          ]
                         },
                         "privileges": {
                           "items": {
@@ -788,7 +794,7 @@
                   },
                   "reconciliation_mode": {
                     "default": "authoritative",
-                    "description": "Convergence strategy: how aggressively to converge the database.\n\n- `authoritative` (default): full convergence — anything not in the\n  manifest is revoked/dropped.\n- `additive`: only grant, never revoke — safe for incremental adoption.\n- `adopt`: manage declared roles fully, but never drop undeclared roles.",
+                    "description": "Convergence strategy: how aggressively to converge the database.\n\n- `authoritative` (default): full convergence — anything not in the\n  manifest is revoked/dropped.\n- `additive`: only grant, never revoke — safe for incremental adoption;\n  `ensure: absent` assertions are ignored with a warning condition.\n- `adopt`: manage declared roles fully, but never drop undeclared roles.",
                     "enum": [
                       "authoritative",
                       "additive",
