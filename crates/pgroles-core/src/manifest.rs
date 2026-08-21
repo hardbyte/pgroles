@@ -144,6 +144,31 @@ pub fn is_predefined_role(name: &str) -> bool {
     name.starts_with("pg_")
 }
 
+/// The PostgreSQL major version that introduced a known predefined role, if
+/// the name is one we recognize.
+///
+/// Used only for diagnostics: when a manifest references a predefined role
+/// the connected server does not have, the error can say "added in PostgreSQL
+/// 15" instead of surfacing PostgreSQL's bare `role does not exist`. Unknown
+/// `pg_*` names return `None` — future PostgreSQL versions add roles faster
+/// than this table is updated, so absence here is never an error by itself.
+pub fn predefined_role_min_version(name: &str) -> Option<u32> {
+    match name {
+        // The original default-role set (renamed to "predefined" in PG 14).
+        "pg_monitor"
+        | "pg_read_all_settings"
+        | "pg_read_all_stats"
+        | "pg_stat_scan_tables"
+        | "pg_signal_backend" => Some(10),
+        "pg_read_server_files" | "pg_write_server_files" | "pg_execute_server_program" => Some(11),
+        "pg_read_all_data" | "pg_write_all_data" | "pg_database_owner" => Some(14),
+        "pg_checkpoint" => Some(15),
+        "pg_use_reserved_connections" | "pg_create_subscription" => Some(16),
+        "pg_maintain" => Some(17),
+        _ => None,
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Enums
 // ---------------------------------------------------------------------------

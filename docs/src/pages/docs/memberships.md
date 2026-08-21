@@ -55,6 +55,26 @@ If a membership exists but the `inherit` or `admin` flags differ from the manife
 
 Memberships in the database that are not declared in the manifest will be revoked. Only declare memberships that pgroles should manage.
 
+Two kinds of granted role follow a gentler rule — see the next section.
+
+## Predefined and external granted roles
+
+A membership stanza may name one of PostgreSQL's predefined roles (`pg_read_all_data`, `pg_monitor`, ...) directly — no `roles:` entry is needed, and declaring one under `roles:` requires `external: true` because its lifecycle can never be managed. Memberships granted from predefined roles and from `external: true` roles converge differently from ordinary memberships:
+
+- **Declared members converge**: they are granted, and re-granted when their `inherit`/`admin` options change.
+- **Undeclared live members are left untouched by default**, so adopting pgroles never strips memberships a cloud platform granted to its own management roles (for example `pg_monitor` grants on RDS or Cloud SQL).
+- **`exclusive: true`** on the stanza asserts the member list is complete: any live member not listed is planned for `REVOKE`. It is rejected on ordinary managed roles, whose memberships are already reconciled exhaustively, and a bundle rejects an exclusive member list split across policy documents.
+
+```yaml
+memberships:
+  - role: pg_read_all_data
+    exclusive: true          # nobody else may hold the read-everything key
+    members:
+      - name: auditor
+```
+
+Granting or revoking a predefined role requires the executor to hold `ADMIN OPTION` on it — in PostgreSQL 16+ that effectively means a superuser executor or an explicit `GRANT pg_read_all_data TO executor WITH ADMIN OPTION`; `CREATEROLE` alone is not sufficient. The plan preflight warns (and apply blocks) when that authority is missing, and when a manifest references a predefined role the connected server does not have yet (naming the PostgreSQL version that introduced it).
+
 ## Common patterns
 
 ### Service account inherits a profile role

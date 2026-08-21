@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Memberships in predefined (`pg_*`) and external roles are now managed when declared.** (#200) A membership stanza may name a predefined role (`pg_read_all_data`, `pg_monitor`, ...) directly — no `roles:` entry needed — and declared members are granted and kept converged. Undeclared live members of predefined and `external: true` roles stay untouched by default, so adopting pgroles never strips provider-granted memberships; a new stanza-level `exclusive: true` asserts the member list is complete and plans a `REVOKE` for anyone else. Declaring a `pg_*` role under `roles:` without `external: true` is now a validation error, exclusive stanzas are rejected on ordinary managed roles, and bundle composition rejects an exclusive member list split across documents.
+- **`pgroles generate` exports predefined-role memberships and `pgroles inspect` reports them** ("master keys") even when no manifest declares them.
+- **Preflight checks for predefined-role grants.** Plans warn — and applies block — when the executor lacks `ADMIN OPTION` on a predefined role it must grant or revoke, and when a manifest references a predefined role the server does not have (with the PostgreSQL version that introduced it, e.g. `pg_maintain` → 17).
+
+### Changed
+
+- **Declared memberships granted from `external: true` roles now converge.** Previously such stanzas parsed but every resulting change was silently filtered out of plans. Manifests that declared them documentation-style will now start granting (and, under `exclusive: true`, revoking) those memberships — for example `GRANT rds_iam TO app_user` can now be policy.
+
 ## [0.10.0-alpha.1] - 2026-08-21
 
 ### Added

@@ -1236,7 +1236,7 @@ ${reportSql}`,
           row?.object_select &&
           !row?.acl_entry,
         observation:
-          "Neither contractor nor pg_read_all_data appears in any table ACL, yet every read check passes—PostgreSQL special-cases the predefined roles inside its permission logic, so this membership opens every schema and table, legacy included. Declare predefined roles as external in pgroles policy; memberships granted from them are outside the reconciled model, so audit these master keys explicitly.",
+          "Neither contractor nor pg_read_all_data appears in any table ACL, yet every read check passes—PostgreSQL special-cases the predefined roles inside its permission logic, so this membership opens every schema and table, legacy included. In pgroles policy, declare who may hold a predefined role and mark the stanza exclusive: declared members converge, and anyone else gets planned for revocation.",
       },
     ],
   },

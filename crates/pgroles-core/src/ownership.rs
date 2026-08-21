@@ -13,6 +13,13 @@ pub struct OwnershipIndex {
     pub grants: BTreeMap<GrantKey, String>,
     pub default_privileges: BTreeMap<DefaultPrivKey, String>,
     pub memberships: BTreeMap<MembershipKey, String>,
+    /// Granted role → (first declaring document, any stanza exclusive).
+    ///
+    /// An `exclusive: true` stanza asserts the complete member list of its
+    /// role, which is only coherent when a single document owns every stanza
+    /// for that role — composition rejects an exclusive assertion split
+    /// across documents.
+    pub membership_stanzas: BTreeMap<String, (String, bool)>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]

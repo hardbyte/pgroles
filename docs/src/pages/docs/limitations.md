@@ -23,7 +23,7 @@ More generally, pgroles converges managed direct ACLs; it does not claim that ab
 
 ## Predefined roles
 
-PostgreSQL’s predefined roles (`pg_read_all_data`, `pg_write_all_data`, `pg_monitor`, and friends) grant access through special-cased permission checks, not ACL entries, so they never appear in the grants pgroles diffs. Declare them `external: true` to reference them; memberships granted from an external role are filtered out of plans, so a `GRANT pg_read_all_data TO someone` is neither created nor revoked by pgroles. Audit `pg_*` role memberships explicitly — [the security review](/docs/postgresql-security-review#the-predefined-master-keys) shows why.
+PostgreSQL’s predefined roles (`pg_read_all_data`, `pg_write_all_data`, `pg_monitor`, and friends) grant access through special-cased permission checks, not ACL entries, so they never appear in the grants pgroles diffs. Their **memberships** are manageable, though: a membership stanza may name a `pg_*` role directly, declared members converge, and `exclusive: true` asserts the complete member list — see [memberships](/docs/memberships#predefined-and-external-granted-roles). What stays out of scope: the role objects themselves are never created, altered, or dropped, and undeclared members are never revoked without an explicit `exclusive` assertion, so provider-granted memberships survive adoption. `pgroles inspect` reports all `pg_*` memberships informationally, and `pgroles generate` exports them. [The security review](/docs/postgresql-security-review#the-predefined-master-keys) shows why they matter.
 
 ## PUBLIC inspection is deliberately scoped
 

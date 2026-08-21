@@ -32,7 +32,23 @@ The global default matters because PostgreSQL’s built-in function default is g
 
 ## The predefined master keys
 
-`pg_read_all_data`, `pg_write_all_data`, `pg_monitor`, and the other [predefined roles](https://www.postgresql.org/docs/current/predefined-roles.html) pass PostgreSQL’s permission checks for every matching object—current and future—without an ACL entry anywhere, so no table-level review will surface them. Auditing effective access therefore always includes one more query: who is a member of a `pg_*` role? In pgroles policy, declare predefined roles with `external: true` so they can be referenced safely; pgroles does not converge memberships granted from external roles, which makes those memberships a boundary to review explicitly rather than a rule the plan enforces.
+`pg_read_all_data`, `pg_write_all_data`, `pg_monitor`, and the other [predefined roles](https://www.postgresql.org/docs/current/predefined-roles.html) pass PostgreSQL’s permission checks for every matching object—current and future—without an ACL entry anywhere, so no table-level review will surface them. Auditing effective access therefore always includes one more query: who is a member of a `pg_*` role?
+
+pgroles can make the answer policy. A membership stanza may name a predefined role directly; declared members converge, and `exclusive: true` asserts that the member list is complete, revoking anyone else:
+
+```yaml {% schema="pgroles-manifest" %}
+roles:
+  - name: auditor
+    login: true
+
+memberships:
+  - role: pg_read_all_data
+    exclusive: true
+    members:
+      - name: auditor
+```
+
+Without `exclusive`, undeclared members are left untouched—cloud platforms grant `pg_*` memberships to their own management roles, and adopting pgroles must not strip them. `pgroles inspect` reports every `pg_*` membership informationally either way, so the master keys are visible before anyone opts into managing them.
 
 ## Keep the other two boundaries visible
 

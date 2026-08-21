@@ -1448,6 +1448,117 @@ memberships:
         assert_eq!(filtered, changes);
     }
 
+    /// Exhaustive model check of the unmanaged-role change filter.
+    ///
+    /// Enumerates every combination of granted-role kind (ordinary managed,
+    /// `external: true`, predefined `pg_*`), change shape (each lifecycle
+    /// variant, each retirement variant, membership add/remove, and an
+    /// unrelated change), declared-edge status, and stanza exclusivity, and
+    /// compares the filter against an independently written oracle of the
+    /// documented semantics table.
+    #[test]
+    fn unmanaged_role_filter_model_check() {
+        #[derive(Clone, Copy, Debug, PartialEq)]
+        enum RoleKind {
+            Managed,
+            External,
+            Predefined,
+        }
+        let role_name = |kind: RoleKind| match kind {
+            RoleKind::Managed => "managed_role",
+            RoleKind::External => "external_role",
+            RoleKind::Predefined => "pg_read_all_data",
+        };
+        let member = "some_member";
+
+        type ChangeShape = (&'static str, fn(&str) -> Change);
+        let change_shapes: Vec<ChangeShape> = vec![
+            ("create", |r| Change::CreateRole {
+                name: r.to_string(),
+                state: crate::model::RoleState::default(),
+            }),
+            ("alter", |r| Change::AlterRole {
+                name: r.to_string(),
+                attributes: vec![RoleAttribute::Login(true)],
+            }),
+            ("comment", |r| Change::SetComment {
+                name: r.to_string(),
+                comment: None,
+            }),
+            ("drop", |r| Change::DropRole {
+                name: r.to_string(),
+            }),
+            ("terminate", |r| Change::TerminateSessions {
+                role: r.to_string(),
+            }),
+            ("drop_owned", |r| Change::DropOwned {
+                role: r.to_string(),
+            }),
+            ("reassign", |r| Change::ReassignOwned {
+                from_role: r.to_string(),
+                to_role: "successor".to_string(),
+            }),
+            ("add_member", |r| Change::AddMember {
+                role: r.to_string(),
+                member: "some_member".to_string(),
+                inherit: true,
+                admin: false,
+            }),
+            ("remove_member", |r| Change::RemoveMember {
+                role: r.to_string(),
+                member: "some_member".to_string(),
+            }),
+            ("unrelated", |_| Change::CreateSchema {
+                name: "s".to_string(),
+                owner: None,
+            }),
+        ];
+
+        for kind in [RoleKind::Managed, RoleKind::External, RoleKind::Predefined] {
+            for (shape_name, make_change) in &change_shapes {
+                for declared in [false, true] {
+                    for exclusive in [false, true] {
+                        let role = role_name(kind);
+                        let change = make_change(role);
+                        let roles = match kind {
+                            RoleKind::External => vec![role_definition(role, true)],
+                            _ => vec![],
+                        };
+                        let memberships = if declared {
+                            vec![membership(role, &[member], exclusive)]
+                        } else if exclusive {
+                            vec![membership(role, &[], true)]
+                        } else {
+                            vec![]
+                        };
+
+                        // Independent oracle of the semantics table.
+                        let unmanaged = kind != RoleKind::Managed;
+                        let expected_kept = match *shape_name {
+                            "unrelated" => true,
+                            "add_member" => !unmanaged || declared,
+                            "remove_member" => !unmanaged || exclusive || declared,
+                            // Every lifecycle and retirement shape.
+                            _ => !unmanaged,
+                        };
+
+                        let kept = !filter_external_role_changes(
+                            vec![change.clone()],
+                            &roles,
+                            &memberships,
+                        )
+                        .is_empty();
+                        assert_eq!(
+                            kept, expected_kept,
+                            "kind={kind:?} shape={shape_name} declared={declared} \
+                             exclusive={exclusive} change={change:?}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
     #[test]
     fn predefined_role_lifecycle_is_always_filtered() {
         let changes = vec![

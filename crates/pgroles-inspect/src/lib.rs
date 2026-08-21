@@ -30,7 +30,9 @@ use pgroles_core::ownership::ManagedScope;
 // Re-export the sub-modules' public items for testing / advanced use.
 pub use cloud::{CloudProvider, PrivilegeLevel, detect_privilege_level};
 pub use identity::detect_system_identifier;
-pub use memberships::fetch_memberships;
+pub use memberships::{
+    MembershipRow, fetch_memberships, fetch_predefined_memberships, format_predefined_memberships,
+};
 pub use preflight::{AuthorityIssue, preflight_authority_issues};
 pub use privileges::{
     fetch_column_level_grants, fetch_database_privileges, fetch_object_inventory, fetch_privileges,

@@ -22,7 +22,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use sqlx::PgPool;
 
 use pgroles_core::diff::Change;
-use pgroles_core::manifest::ObjectType;
+use pgroles_core::manifest::{ObjectType, is_predefined_role, predefined_role_min_version};
 use pgroles_core::model::{GrantKey, Grantee, RoleGraph};
 
 /// Maximum number of objects named by an [`AuthorityIssue::PublicRevoke`].
@@ -37,6 +37,22 @@ pub enum AuthorityIssue {
     /// A planned `ALTER DEFAULT PRIVILEGES` names an owner that does not
     /// exist and that this plan does not create.
     MissingDefaultPrivilegeOwner { owner: String },
+
+    /// A planned membership change grants or revokes a predefined (`pg_*`)
+    /// role, and the executor lacks ADMIN OPTION on it. In PostgreSQL 16+
+    /// this effectively requires a superuser executor or an explicit
+    /// `GRANT <pg_role> TO executor WITH ADMIN OPTION`; `CREATEROLE` alone
+    /// is not sufficient.
+    PredefinedRoleGrant { role: String, executor: String },
+
+    /// A manifest membership names a predefined (`pg_*`) role the connected
+    /// server does not have. `min_version` carries the PostgreSQL major
+    /// version that introduced the role when it is one we recognize.
+    MissingPredefinedRole {
+        role: String,
+        server_major: u32,
+        min_version: Option<u32>,
+    },
 
     /// A planned `REVOKE ... FROM PUBLIC` covers objects whose owners the
     /// executor cannot act as, so the revoke would silently do nothing there.
@@ -65,6 +81,29 @@ impl std::fmt::Display for AuthorityIssue {
                 "UnsatisfiableDefaultPrivilegeChange: default privileges name owner \"{owner}\", \
                  which does not exist and is not created by this plan"
             ),
+            AuthorityIssue::PredefinedRoleGrant { role, executor } => write!(
+                f,
+                "UnsatisfiableMembershipChange: cannot GRANT/REVOKE predefined role \
+                 \"{role}\" as executor \"{executor}\"; requires ADMIN OPTION on it — \
+                 in PostgreSQL 16+ that means a superuser executor or an explicit \
+                 GRANT \"{role}\" TO \"{executor}\" WITH ADMIN OPTION (CREATEROLE is \
+                 not sufficient)"
+            ),
+            AuthorityIssue::MissingPredefinedRole {
+                role,
+                server_major,
+                min_version,
+            } => {
+                write!(
+                    f,
+                    "MissingPredefinedRole: manifest declares membership in \"{role}\", \
+                     which does not exist on this server (PostgreSQL {server_major})"
+                )?;
+                if let Some(min_version) = min_version {
+                    write!(f, "; it was added in PostgreSQL {min_version}")?;
+                }
+                Ok(())
+            }
             AuthorityIssue::PublicRevoke {
                 object_type,
                 schema,
@@ -125,6 +164,64 @@ pub async fn preflight_authority_issues(
         .await?;
         (user, is_superuser)
     };
+
+    // --- Predefined-role membership authority ---
+    // Granting or revoking membership in a predefined (`pg_*`) role requires
+    // ADMIN OPTION on it. `pg_has_role(..., 'MEMBER WITH ADMIN OPTION')`
+    // reports true for superusers, so this is exactly the authority the
+    // GRANT/REVOKE needs. A referenced predefined role the server does not
+    // have at all is reported with the version that introduced it.
+    let predefined_targets: BTreeSet<String> = changes
+        .iter()
+        .filter_map(|change| match change {
+            Change::AddMember { role, .. } | Change::RemoveMember { role, .. }
+                if is_predefined_role(role) =>
+            {
+                Some(role.clone())
+            }
+            _ => None,
+        })
+        .collect();
+    if !predefined_targets.is_empty() {
+        let target_list: Vec<String> = predefined_targets.iter().cloned().collect();
+        let rows: Vec<(String, bool)> = sqlx::query_as(
+            r#"
+            SELECT r.rolname::text, pg_has_role(current_user, r.oid, 'MEMBER WITH ADMIN OPTION')
+            FROM pg_roles r
+            WHERE r.rolname = ANY($1)
+            "#,
+        )
+        .bind(&target_list)
+        .fetch_all(pool)
+        .await?;
+        let known: BTreeSet<String> = rows.iter().map(|(role, _)| role.clone()).collect();
+        for (role, can_admin) in rows {
+            if !can_admin {
+                issues.push(AuthorityIssue::PredefinedRoleGrant {
+                    role,
+                    executor: executor.clone(),
+                });
+            }
+        }
+        let missing: Vec<&String> = predefined_targets
+            .iter()
+            .filter(|role| !known.contains(role.as_str()))
+            .collect();
+        if !missing.is_empty() {
+            let (server_version_num,): (i32,) =
+                sqlx::query_as("SELECT current_setting('server_version_num')::int")
+                    .fetch_one(pool)
+                    .await?;
+            let server_major = (server_version_num / 10_000) as u32;
+            for role in missing {
+                issues.push(AuthorityIssue::MissingPredefinedRole {
+                    role: role.clone(),
+                    server_major,
+                    min_version: predefined_role_min_version(role),
+                });
+            }
+        }
+    }
 
     // --- Default-privilege owner authority ---
     let owners: BTreeSet<String> = changes
