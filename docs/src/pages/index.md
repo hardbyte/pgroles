@@ -28,12 +28,12 @@ Built for platform teams, DBAs, and anyone managing more than a handful of Postg
 
 {% quick-links %}
 
+{% quick-link title="Learn PostgreSQL roles" icon="lightbulb" href="/docs/postgresql-access-model" description="Follow Acme from its first grant through roles, drift, ownership, defaults, offboarding, and a security review." /%}
+
 {% quick-link title="CLI quick start" icon="installation" href="/docs/quick-start" description="Install pgroles and run your first diff against a live database." /%}
 
 {% quick-link title="Manifest guide" icon="presets" href="/docs/manifest-format" description="Learn how manifest sections fit together when designing a policy." /%}
 
 {% quick-link title="Profiles & schemas" icon="plugins" href="/docs/profiles" description="Use profiles to define reusable privilege templates across schemas." /%}
-
-{% quick-link title="CLI reference" icon="theming" href="/docs/cli" description="All available commands: validate, diff, apply, and inspect." /%}
 
 {% /quick-links %}

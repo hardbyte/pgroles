@@ -1,4 +1,15 @@
 import { Callout } from '@/components/Callout'
+import {
+  PostgresAccessDriftLab,
+  PostgresAcmePlayground,
+  PostgresCapabilityRolesLab,
+  PostgresDefaultPrivilegesLab,
+  PostgresGatesLab,
+  PostgresMembershipMechanicsLab,
+  PostgresOffboardingLab,
+  PostgresOwnershipLab,
+  PostgresSecurityReviewLab,
+} from '@/components/AcmeStoryLabs'
 import { OperatorArchitectureDiagram } from '@/components/OperatorArchitectureDiagram'
 import { OperatorReconciliationDiagram } from '@/components/OperatorReconciliationDiagram'
 import { QuickLink, QuickLinks } from '@/components/QuickLinks'
@@ -54,6 +65,42 @@ const tags = {
     selfClosing: true,
     render: OperatorReconciliationDiagram,
   },
+  'postgres-permission-lab': {
+    selfClosing: true,
+    render: PostgresGatesLab,
+  },
+  'postgres-capability-roles-lab': {
+    selfClosing: true,
+    render: PostgresCapabilityRolesLab,
+  },
+  'postgres-access-drift-lab': {
+    selfClosing: true,
+    render: PostgresAccessDriftLab,
+  },
+  'postgres-ownership-lab': {
+    selfClosing: true,
+    render: PostgresOwnershipLab,
+  },
+  'postgres-default-privileges-lab': {
+    selfClosing: true,
+    render: PostgresDefaultPrivilegesLab,
+  },
+  'postgres-offboarding-lab': {
+    selfClosing: true,
+    render: PostgresOffboardingLab,
+  },
+  'postgres-security-review-lab': {
+    selfClosing: true,
+    render: PostgresSecurityReviewLab,
+  },
+  'postgres-acme-playground': {
+    selfClosing: true,
+    render: PostgresAcmePlayground,
+  },
+  'postgres-role-hierarchy-lab': {
+    selfClosing: true,
+    render: PostgresMembershipMechanicsLab,
+  },
   'role-graph-diagram': {
     selfClosing: true,
     render: RoleGraphDiagram,
@@ -61,7 +108,7 @@ const tags = {
   'workspace-data-flow-diagram': {
     selfClosing: true,
     render: WorkspaceDataFlowDiagram,
-  }
+  },
 }
 
 export default tags

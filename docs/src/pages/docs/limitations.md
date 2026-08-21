@@ -11,6 +11,22 @@ What pgroles does not cover, so you know where the edges of the declared-state m
 
 `GRANT SELECT (col) ON table` remains unmanaged by pgroles: column-level grants are not diffed, not revoked, and `pgroles generate` does not export them — manifests only describe table-level access. pgroles does, however, detect column-level grants during `diff` and `apply` — in schemas whose privileges it manages (schemas referenced by grants or default privileges in the manifest): if any are found, it prints a warning (schema, table, grantee, affected columns, and privileges) so the gap is visible instead of silent. The warning does not block `diff`/`apply` and the grants themselves are still not managed — you must review and, if needed, revoke them manually.
 
+## Membership SET option
+
+PostgreSQL 16 separates `INHERIT`, `SET`, and `ADMIN` on each role-membership edge. pgroles models and converges `inherit` and `admin`, but does not inspect or manage `pg_auth_members.set_option`. A membership created by pgroles gets PostgreSQL's default `SET TRUE`. An existing `SET FALSE` edge can appear to match, but converging a changed `inherit` or `admin` value revokes and recreates the edge without a `SET` clause, restoring `SET TRUE`. Do not place a `SET FALSE` security boundary on a pgroles-managed membership.
+
+## Grant options and effective access
+
+The manifest does not model `WITH GRANT OPTION` for application grantees. pgroles performs a separate executor-grantability preflight for wildcard safety, but it does not converge who may delegate an object privilege onward.
+
+More generally, pgroles converges managed direct ACLs; it does not claim that absence from a manifest means absence of effective access. Membership, ownership, `PUBLIC`, column grants, row security, or unmodeled object types may change the answer. Use PostgreSQL's `has_*_privilege` and `pg_has_role` functions to verify the effective path. Work through [The permission chain](/docs/postgresql-access-model) and [The security review](/docs/postgresql-security-review) to test those paths interactively.
+
+## PUBLIC inspection is deliberately scoped
+
+pgroles can reconcile a declared `PUBLIC` object or default-privilege rule, including `ensure: absent`, and it supports both schema and global default scopes. It does not treat every undeclared `PUBLIC` privilege as drift: only an explicit rule opts that target into desired-state management. `pgroles generate` does not emit `PUBLIC` or absence rules.
+
+`pgroles inspect` also reports `PUBLIC` grants on the current database and its non-system schemas as informational output. That report is useful evidence, but it is not a complete inventory of every object type or every effective-access path.
+
 ## Per-database role settings
 
 `ALTER ROLE ... IN DATABASE ... SET` entries are not managed. pgroles only manages the cluster-wide role settings in `pg_roles.rolconfig` via `roles[].config` — see [role configuration defaults](/docs/manifest-reference#role-configuration-defaults). A per-database `SET` is left untouched by diff and apply, silently, in every reconciliation mode. If you need per-database overrides, set them manually outside pgroles.

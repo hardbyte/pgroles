@@ -1,0 +1,57 @@
+---
+title: 1. The permission chain
+description: Alice's first query at Acme is denied. Follow PostgreSQL's error from gate to gate and open the smallest path that makes the report work.
+---
+
+Acme is a small startup with one application and one database. Priya, the founder, created the `app.orders` table herself in the early days, and the application has been reading and writing it ever since—connected, as early applications usually are, with the admin credentials Priya set up at the start. Today Alice joins as the first analyst, hired to answer the company’s favourite question: what did we sell? {% .lead %}
+
+Her report is a single query, and the application runs the same one constantly. But when Alice runs it, PostgreSQL refuses—and that refusal is the best introduction there is to how PostgreSQL decides who may do what.
+
+This course follows Acme’s database as the company grows, one incident per chapter:
+
+- **Priya**, the founder, created the original `app` schema and `orders` table by hand. That detail looks harmless today; it will not stay harmless.
+- **The application**, which still connects with the admin credentials from Acme’s first week—the decision that made everything work and hid every problem in this course.
+- **Alice**, the first analyst, needs to read orders.
+- **deploy**, Acme’s migration login, will matter once the schema starts changing.
+- **reporting_app**, an automated reporting service, arrives in the next chapter.
+
+Each chapter has the same rhythm: something happens at Acme, you reproduce it against a real PostgreSQL running in your browser, and then—below the lab—you write down what should stay true. Start where Alice starts:
+
+{% postgres-permission-lab /%}
+
+## Keep one rule
+
+**PostgreSQL must be able to reach the schema and authorize the object operation.**
+
+For a query that reads `app.orders`, schema `USAGE` makes the name reachable and table `SELECT` authorizes the read. `search_path` changes name lookup, not privileges. A table grant does not imply schema access, and schema access does not imply a table operation.
+
+The gates are evaluated in order, and the error names the first gate that failed—not everything that is missing. That is why the same query produced two different errors in the lab as each gate opened.
+
+Superusers and object owners skip these checks entirely. That is why the admin-connected application never noticed a single one of them—and why the first identity without those shortcuts is the first to see `permission denied`.
+
+## The policy so far
+
+The lab fixed today’s database, but the two `GRANT` statements you ran live only in PostgreSQL’s catalogs now—invisible history the moment your session ends. This is where **pgroles** enters the story: you describe the roles, grants, and memberships that *should* exist in a YAML policy, and `pgroles plan` compares that intent with the live database and proposes the exact SQL to converge them. Every chapter ends by recording its repair this way, and by chapter 3 the difference between “what the database accumulated” and “what the policy declares” becomes the whole plot.
+
+This first policy is the small team’s literal state: Alice receives both grants directly.
+
+```yaml {% schema="pgroles-manifest" %}
+roles:
+  - name: alice
+    login: true
+
+grants:
+  - role: alice
+    privileges: [USAGE]
+    object: { type: schema, name: app }
+  - role: alice
+    privileges: [SELECT]
+    object: { type: table, schema: app, name: orders }
+```
+
+It works, but every new reader would duplicate those ACL entries. The next chapter gives the permission bundle a reusable name.
+
+{% quick-links %}
+{% quick-link title="Continue: capability roles" description="Give Alice and an application the same access without copying grants." icon="presets" href="/docs/postgresql-capability-roles" /%}
+{% quick-link title="Grants reference" description="See every object type and privilege pgroles manages." icon="plugins" href="/docs/grants" /%}
+{% /quick-links %}

@@ -21,6 +21,21 @@ const navigation = [
         ],
     },
     {
+        title: 'Learn PostgreSQL Roles',
+        collapsible: true,
+        links: [
+            {title: '1. The permission chain', href: '/docs/postgresql-access-model'},
+            {title: '2. Capability roles', href: '/docs/postgresql-capability-roles'},
+            {title: '3. Access drift', href: '/docs/postgresql-access-drift'},
+            {title: '4. Ownership', href: '/docs/postgresql-ownership'},
+            {title: '5. Future objects', href: '/docs/postgresql-default-privileges'},
+            {title: '6. Offboarding an owner', href: '/docs/postgresql-offboarding'},
+            {title: '7. Membership mechanics', href: '/docs/postgresql-role-hierarchy'},
+            {title: '8. The security review', href: '/docs/postgresql-security-review'},
+            {title: 'The Acme playground', href: '/docs/postgresql-playground'},
+        ],
+    },
+    {
         title: 'Kubernetes operator',
         links: [
             {title: 'Kubernetes operator', href: '/docs/operator'},

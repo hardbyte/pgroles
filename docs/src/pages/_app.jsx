@@ -1,4 +1,5 @@
 import Head from 'next/head'
+import { useRouter } from 'next/router'
 import { IBM_Plex_Mono, IBM_Plex_Sans, Space_Grotesk } from 'next/font/google'
 import { slugifyWithCounter } from '@sindresorhus/slugify'
 
@@ -66,6 +67,7 @@ function collectHeadings(nodes, slugify = slugifyWithCounter()) {
 }
 
 export default function App({ Component, pageProps }) {
+  let { basePath = '' } = useRouter()
   let title = pageProps.markdoc?.frontmatter.title
 
   let pageTitle =
@@ -82,7 +84,7 @@ export default function App({ Component, pageProps }) {
     <div className={`${sans.variable} ${display.variable} ${mono.variable}`}>
       <Head>
         <title>{pageTitle}</title>
-        <link rel="icon" href="/logo.svg" type="image/svg+xml" />
+        <link rel="icon" href={`${basePath}/logo.svg`} type="image/svg+xml" />
         {description && <meta name="description" content={description} />}
       </Head>
       <Layout title={title} tableOfContents={tableOfContents}>

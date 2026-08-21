@@ -6,10 +6,12 @@
     "dev": "next dev",
     "build": "next build --webpack",
     "start": "next start",
-    "lint": "next lint"
+    "lint": "next lint",
+    "test:labs": "node tests/labs.test.mjs"
   },
   "browserslist": "defaults, not ie <= 11",
   "dependencies": {
+    "@electric-sql/pglite": "^0.5.5",
     "@headlessui/react": "^1.7.2",
     "@markdoc/markdoc": "^0.2.2",
     "@markdoc/next.js": "^0.2.2",
@@ -24,7 +26,8 @@
     "prism-react-renderer": "^1.3.5",
     "react": "18.2.0",
     "react-dom": "18.2.0",
-    "tailwindcss": "^3.2.1"
+    "tailwindcss": "^3.2.1",
+    "yaml": "^2.9.0"
   },
   "devDependencies": {
     "eslint": "8.26.0",

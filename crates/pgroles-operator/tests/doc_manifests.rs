@@ -16,6 +16,7 @@ use std::path::{Path, PathBuf};
 
 use jsonschema::Validator;
 use kube::CustomResourceExt;
+use pgroles_core::manifest::parse_manifest;
 use pgroles_operator::crd::{
     EphemeralAccessPolicy, EphemeralAccessRequest, PostgresPolicy, PostgresPolicyPlan,
     postgres_policy_candidate_crd,
@@ -219,6 +220,66 @@ fn yaml_blocks(markdown: &str) -> Vec<String> {
         }
     }
     blocks
+}
+
+/// Extract the bare policy fragments that opt in to the docs' schema-aware
+/// highlighter. Unlike CR examples, these blocks intentionally omit the
+/// Kubernetes wrapper, so validate them with the CLI parser directly.
+fn pgroles_policy_blocks(markdown: &str) -> Vec<String> {
+    let mut blocks = Vec::new();
+    let mut current: Option<String> = None;
+
+    for line in markdown.lines() {
+        match current {
+            None => {
+                let fence = line.trim_start();
+                if (fence.starts_with("```yaml") || fence.starts_with("```yml"))
+                    && fence.contains("schema=\"pgroles-manifest\"")
+                {
+                    current = Some(String::new());
+                }
+            }
+            Some(ref mut body) => {
+                if line.trim_start().starts_with("```") {
+                    blocks.push(current.take().expect("policy block is open"));
+                } else {
+                    body.push_str(line);
+                    body.push('\n');
+                }
+            }
+        }
+    }
+
+    blocks
+}
+
+#[test]
+fn schema_highlighted_policy_examples_parse_as_pgroles_manifests() {
+    let root = repo_root();
+    let mut checked = 0usize;
+    let mut failures = Vec::new();
+
+    for page in markdown_pages() {
+        let name = page.strip_prefix(&root).unwrap_or(&page).display();
+        let markdown = std::fs::read_to_string(&page).expect("page should be readable");
+
+        for block in pgroles_policy_blocks(&markdown) {
+            checked += 1;
+            if let Err(error) = parse_manifest(&block) {
+                failures.push(format!("{name}: {error}"));
+            }
+        }
+    }
+
+    assert!(
+        checked > 0,
+        "no schema-highlighted pgroles policy blocks found"
+    );
+    assert!(
+        failures.is_empty(),
+        "schema-highlighted pgroles policies do not parse:\n  {}",
+        failures.join("\n  ")
+    );
 }
 
 #[test]

@@ -28,6 +28,8 @@ memberships:
 
 Both `inherit` and `admin` can be omitted entirely — they default to `true` and `false` respectively. Omitting default values is recommended because it keeps the Kubernetes resource minimal and avoids perpetual diffs in GitOps tools like ArgoCD.
 
+PostgreSQL has one role primitive: `LOGIN` makes a role connectable, while a `NOLOGIN` role is commonly used as a capability group or owner. Read `role: inventory-editor` with `name: app-service` as “app-service is a member of inventory-editor”; privileges flow from the granted role to the member.
+
 ## Generated SQL
 
 On supported PostgreSQL versions, pgroles generates per-membership options:
@@ -40,6 +42,10 @@ GRANT "inventory-editor" TO "deploy@example.com" WITH INHERIT TRUE, ADMIN TRUE;
 Per-membership `INHERIT` requires PostgreSQL 16 or later. See
 [installation compatibility](/docs/installation#compatibility) for the
 currently supported server versions.
+
+PostgreSQL 16 also records a separate `SET` option on each membership. pgroles does not currently inspect or converge that option. A membership created by pgroles receives PostgreSQL's default `SET TRUE`. An existing `SET FALSE` edge may appear to match, but if pgroles changes `inherit` or `admin` it revokes and recreates the membership without a `SET` clause, restoring `SET TRUE`. Do not rely on `SET FALSE` remaining intact on a pgroles-managed edge. See [Membership mechanics](/docs/postgresql-role-hierarchy).
+
+Role attributes such as `CREATEDB`, `CREATEROLE`, and `BYPASSRLS` are not inherited like object privileges. A member must normally `SET ROLE` to use an attribute on the granted role.
 
 ## Flag changes
 

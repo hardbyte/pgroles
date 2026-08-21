@@ -172,6 +172,8 @@ manifest is
 
 The `owner` field specifies which role's object creation triggers the default grant. This is typically the role that creates tables, such as `app_migrator` or `app_owner`.
 
+PostgreSQL uses the defaults of the **current role that creates the object**. It does not combine defaults from roles that the creator merely belongs to. If migrations connect as `app_migrator` but the defaults belong to `app_owner`, the migration must `SET ROLE app_owner` before creating the object (or the defaults must be declared for `app_migrator`).
+
 If `owner` is omitted on a default privilege entry, the top-level `default_owner` is used. If neither is set, it falls back to `postgres`.
 
 The executor must already be able to act as the owner. A non-superuser cannot
@@ -208,4 +210,8 @@ It's good practice to pair wildcard grants (`name: "*"`) with matching default p
 
 {% callout title="Tables are not enough" %}
 If a role writes to tables created after pgroles runs, check whether it also needs sequence and function defaults. Identity/serial-backed inserts typically need sequence access, and trigger-driven schemas often need `EXECUTE` on functions too.
+{% /callout %}
+
+{% callout type="warning" title="Global defaults need an explicit owner" %}
+pgroles manages declared schema and global default privileges for named roles and `PUBLIC`. A global rule affects every schema where that owner creates objects, so only the policy document that owns the creating role may declare it. PostgreSQL adds schema-scoped defaults to global defaults; a schema rule cannot subtract a privilege supplied globally. Use a global `ensure: absent` rule to remove the built-in `PUBLIC EXECUTE` default for future routines.
 {% /callout %}

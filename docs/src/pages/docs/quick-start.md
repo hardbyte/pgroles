@@ -32,6 +32,8 @@ Before typing any YAML, here is the role graph the manifest below describes — 
 
 {% role-graph-diagram /%}
 
+If schema `USAGE`, table `SELECT`, and membership still feel like separate pieces, start with [The permission chain](/docs/postgresql-access-model), then return here to apply the model.
+
 Create a file called `pgroles.yaml`:
 
 ```yaml

@@ -173,6 +173,7 @@ docker run --rm ghcr.io/thepartly/pgroles --help
 
 Full documentation is published at [thepartly.github.io/pgroles](https://thepartly.github.io/pgroles/).
 
+- [PostgreSQL access course](https://thepartly.github.io/pgroles/docs/postgresql-access-model/) — interactive lessons on roles, drift, ownership, defaults, offboarding, and effective access
 - [Quick start](https://thepartly.github.io/pgroles/docs/quick-start/)
 - [Installation](https://thepartly.github.io/pgroles/docs/installation/)
 - [Manifest guide](https://thepartly.github.io/pgroles/docs/manifest-format/)
