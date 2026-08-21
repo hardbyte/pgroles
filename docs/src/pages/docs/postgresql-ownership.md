@@ -14,8 +14,10 @@ The capability role answers “who may read?” The owner role answers “who ma
 ```text
 Bob / reporting_app ──member of──> orders_reader ──USAGE + SELECT──> app.orders
 
-deploy ──may SET ROLE──> app_owner ──owns──> app schema and its objects
+deploy ──member of──> app_owner ──owns──> app schema and its objects
 ```
+
+Because the membership inherits, deploy already carries the owner’s authority for owner-only DDL. The migration recipe still uses `SET ROLE app_owner` before creating objects—not to pass the ownership check, but so that everything the migration **creates** belongs to the durable owner rather than to the deployment login.
 
 Add the durable owner and make schema ownership explicit:
 
@@ -40,7 +42,7 @@ pgroles converges the `app` schema owner. It does not change the owner of every 
 
 **Ownership is authority over the object, not another ACL entry. Give it to a durable role, not a person or deployment login.**
 
-The lesson used `SET ROLE app_owner` as a migration recipe. The advanced membership chapter later explains `INHERIT`, `SET`, and `ADMIN` separately.
+The lesson used `SET ROLE app_owner` as a migration recipe so new objects land on the durable owner. The membership-mechanics chapter later takes the edge itself apart: `INHERIT`, `SET`, and `ADMIN` are three separate facts.
 
 {% quick-links %}
 {% quick-link title="Continue: future objects" description="Create a new table and see why old wildcard grants do not follow it." icon="installation" href="/docs/postgresql-default-privileges" /%}

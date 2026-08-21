@@ -1,9 +1,9 @@
 ---
 title: 1. The permission chain
-description: Meet Acme, grant Alice the smallest working path to orders, and watch PostgreSQL evaluate schema and table privileges.
+description: Meet Acme, run the report before any grants exist, and watch PostgreSQL's error move from gate to gate as you open the smallest working path.
 ---
 
-Alice needs Acme’s first orders report. You are the database administrator who must make it work without opening anything else. {% .lead %}
+Alice needs Acme’s first orders report. Run her query before granting anything, let PostgreSQL name each closed gate, and open exactly the path the report needs—nothing more. {% .lead %}
 
 {% postgres-permission-lab /%}
 
@@ -19,6 +19,8 @@ Alice needs Acme’s first orders report. You are the database administrator who
 **PostgreSQL must be able to reach the schema and authorize the object operation.**
 
 For `SELECT * FROM app.orders`, schema `USAGE` makes the name reachable and table `SELECT` authorizes the read. `search_path` changes name lookup, not privileges. A table grant does not imply schema access, and schema access does not imply a table operation.
+
+The gates are evaluated in order, and the error names the first gate that failed—not everything that is missing. That is why the same query produced two different errors in the lab as each gate opened.
 
 ## The policy so far
 

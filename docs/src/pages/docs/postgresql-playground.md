@@ -3,7 +3,7 @@ title: The Acme playground
 description: Explore the complete Acme database with arbitrary SQL and challenge prompts.
 ---
 
-The whole Acme database is yours: durable ownership, capability roles, defaults, application logins, and the security-review function. There is no scripted finish. Choose a role, change the query, and follow the evidence. {% .lead %}
+The whole Acme database is yours: durable ownership, capability roles, defaults, the nested analyst hierarchy with its delegated administration, Priya’s reassigned legacy objects, and the security-review function. There is no scripted finish. Choose a role, change the query, and follow the evidence. {% .lead %}
 
 {% postgres-acme-playground /%}
 

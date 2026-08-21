@@ -54,6 +54,9 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
+      - name: Run lab exercises against PGlite
+        run: npm run test:labs
+
       - name: Build static export
         env:
           DOCS_BASE_PATH: >-

@@ -5,14 +5,13 @@ import {
   PostgresCapabilityRolesLab,
   PostgresDefaultPrivilegesLab,
   PostgresGatesLab,
+  PostgresMembershipMechanicsLab,
   PostgresOffboardingLab,
   PostgresOwnershipLab,
   PostgresSecurityReviewLab,
 } from '@/components/AcmeStoryLabs'
 import { OperatorArchitectureDiagram } from '@/components/OperatorArchitectureDiagram'
 import { OperatorReconciliationDiagram } from '@/components/OperatorReconciliationDiagram'
-import { PostgresRoleHierarchyLab } from '@/components/PostgresPermissionLab'
-import { ProductionRoleShapeDiagram } from '@/components/ProductionRoleShapeDiagram'
 import { QuickLink, QuickLinks } from '@/components/QuickLinks'
 import { RoleGraphDiagram } from '@/components/RoleGraphDiagram'
 import { WorkspaceDataFlowDiagram } from '@/components/WorkspaceDataFlowDiagram'
@@ -100,11 +99,7 @@ const tags = {
   },
   'postgres-role-hierarchy-lab': {
     selfClosing: true,
-    render: PostgresRoleHierarchyLab,
-  },
-  'production-role-shape-diagram': {
-    selfClosing: true,
-    render: ProductionRoleShapeDiagram,
+    render: PostgresMembershipMechanicsLab,
   },
   'role-graph-diagram': {
     selfClosing: true,
