@@ -41,7 +41,7 @@ An authoritative `pgroles plan` compares that graph with PostgreSQL. Alice’s o
 **Revoking one edge proves only that the edge is gone. Test the operation to prove effective access is gone.**
 
 {% callout type="note" title="Negative tests belong in offboarding" %}
-PGlite can prove the authorization result, but it does not model passwords, `pg_hba.conf`, concurrent sessions, or session termination. In production, revoke durable authorization, terminate sessions when required, and verify both.
+PGlite can prove the authorization result, but it does not model passwords, `pg_hba.conf`, concurrent sessions, or session termination. In production, revoke durable authorization, terminate sessions when required, and verify both. [Netchecks](https://netchecks.io/docs/postgres) can run exactly these positive and negative access assertions continuously from inside your cluster.
 {% /callout %}
 
 {% quick-links %}
