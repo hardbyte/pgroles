@@ -11,7 +11,7 @@ this file is out of date.
 ## Install
 
 ```shell
-helm install pgroles-operator oci://ghcr.io/hardbyte/charts/pgroles-operator
+helm install pgroles-operator oci://ghcr.io/thepartly/charts/pgroles-operator
 ```
 
 The chart installs CRDs from `crds/` on `helm install`. Helm does **not** update
@@ -22,9 +22,9 @@ The Deployment runs a single replica with a `Recreate` strategy and the chart
 exposes no replica count. Per-database advisory locks make the operator safe to
 run with more than one replica, but doing so requires patching the Deployment.
 
-See [the operator documentation](https://hardbyte.github.io/pgroles/docs/operator/)
+See [the operator documentation](https://thepartly.github.io/pgroles/docs/operator/)
 for what the operator does and
-[RBAC and security](https://hardbyte.github.io/pgroles/docs/operator-security/)
+[RBAC and security](https://thepartly.github.io/pgroles/docs/operator-security/)
 for the permissions it needs.
 
 ## Admission policies
@@ -34,13 +34,13 @@ only authenticated when the Kyverno admission policies are installed. Without
 them `decidedBy` is whatever the client wrote, and anyone able to patch
 `.../status` can approve — `approval.mode: Required` is not an approval
 boundary. See
-[securing ephemeral access](https://hardbyte.github.io/pgroles/docs/ephemeral-access-security/).
+[securing ephemeral access](https://thepartly.github.io/pgroles/docs/ephemeral-access-security/).
 
 The chart renders them, with the operator's own exemption generated from
 `operator.serviceAccount.name` and the release namespace so it cannot drift:
 
 ```shell
-helm install pgroles-operator oci://ghcr.io/hardbyte/charts/pgroles-operator \
+helm install pgroles-operator oci://ghcr.io/thepartly/charts/pgroles-operator \
   --namespace pgroles-system --create-namespace \
   --set admissionPolicies.enabled=true
 ```
@@ -84,7 +84,7 @@ kubectl apply -f k8s/security/plan-decision-kyverno.yaml
 | operator.env | list | `[{"name":"RUST_LOG","value":"info,pgroles_operator=debug"}]` | Additional environment variables for the operator container. This is also where operator-wide settings live, since the operator is configured by environment rather than by flags. Notable variables: `OTEL_EXPORTER_OTLP_ENDPOINT` enables OTLP metrics and logs, including structured ephemeral-access audit events; `OTEL_LOGS_EXPORTER=none` disables the log half when another agent already ships container logs off-cluster; `EPHEMERAL_ACCESS_MAXIMUM_DURATION` (default `24h`) and `EPHEMERAL_ACCESS_MAX_PENDING_TTL` (default `1h`) are the only cluster-wide ceilings on ephemeral access, and an access policy exceeding either is rejected with `Accepted=False`; the `PLAN_RETENTION_*` variables bound how many terminal plans are kept per policy — `PLAN_RETENTION_APPLIED` (default `25`), `PLAN_RETENTION_APPLIED_MIN_AGE` (default `720h`), `PLAN_RETENTION_APPLIED_CEILING` (default `200`), `PLAN_RETENTION_DECIDED` (default `10`, Failed and Rejected shared) and `PLAN_RETENTION_SUPERSEDED` (default `3`) — and an invalid value refuses operator startup with the variable named. |
 | operator.http.port | int | `8080` | Port serving the `/livez` and `/readyz` probes. |
 | operator.image.pullPolicy | string | `"IfNotPresent"` | Image pull policy for the operator container. |
-| operator.image.repository | string | `"ghcr.io/hardbyte/pgroles-operator"` | Operator container image repository. |
+| operator.image.repository | string | `"ghcr.io/thepartly/pgroles-operator"` | Operator container image repository. |
 | operator.image.tag | string | `""` | Overrides the image tag whose default is the chart appVersion. |
 | operator.imagePullSecrets | list | `[]` | Image pull secrets for private registries. |
 | operator.nodeSelector | object | `{}` | Node selector for operator pod scheduling. |

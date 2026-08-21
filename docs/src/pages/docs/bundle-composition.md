@@ -144,7 +144,7 @@ jobs:
       - name: Verify rendered manifest is up-to-date
         run: |
           docker run --rm -v "${{ github.workspace }}:/work" \
-            ghcr.io/hardbyte/pgroles:latest \
+            ghcr.io/thepartly/pgroles:latest \
             render-bundle --bundle /work/bundle.yaml --check /work/pgroles.yaml
 ```
 

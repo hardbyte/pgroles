@@ -14,7 +14,7 @@ additive policy, SQL review, and manual approval, use the
 ## Helm
 
 ```shell
-helm install pgroles-operator oci://ghcr.io/hardbyte/charts/pgroles-operator
+helm install pgroles-operator oci://ghcr.io/thepartly/charts/pgroles-operator
 ```
 
 ## Embed the Rust library
@@ -31,7 +31,7 @@ To depend on the current repository source instead:
 
 ```toml
 [dependencies]
-pgroles-operator = { git = "https://github.com/hardbyte/pgroles" }
+pgroles-operator = { git = "https://github.com/thepartly/pgroles" }
 ```
 
 ## Configuration
@@ -45,7 +45,7 @@ operator:
   watchNamespace: ""
 
   image:
-    repository: ghcr.io/hardbyte/pgroles-operator
+    repository: ghcr.io/thepartly/pgroles-operator
     tag: ""  # defaults to Chart.appVersion
 
   env:

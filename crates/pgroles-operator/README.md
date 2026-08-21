@@ -26,7 +26,7 @@ Library from source:
 
 ```toml
 [dependencies]
-pgroles-operator = { git = "https://github.com/hardbyte/pgroles" }
+pgroles-operator = { git = "https://github.com/thepartly/pgroles" }
 ```
 
 ## Intended Audience
@@ -34,4 +34,4 @@ pgroles-operator = { git = "https://github.com/hardbyte/pgroles" }
 - Contributors working on the operator implementation
 - Platform teams evaluating the Kubernetes reconciliation model
 
-Operator docs: <https://hardbyte.github.io/pgroles/docs/operator>
+Operator docs: <https://thepartly.github.io/pgroles/docs/operator>

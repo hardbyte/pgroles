@@ -87,7 +87,7 @@ memberships:
       - name: green
 ```
 
-Without the membership, PostgreSQL would reject the `role` setting at login — pgroles validates the pair at manifest-validation time. See [examples/zero-downtime-password-rotation.yaml](https://github.com/hardbyte/pgroles/blob/main/examples/zero-downtime-password-rotation.yaml) for a complete manifest.
+Without the membership, PostgreSQL would reject the `role` setting at login — pgroles validates the pair at manifest-validation time. See [examples/zero-downtime-password-rotation.yaml](https://github.com/thepartly/pgroles/blob/main/examples/zero-downtime-password-rotation.yaml) for a complete manifest.
 
 ### Email-based roles (e.g. IAM authentication)
 

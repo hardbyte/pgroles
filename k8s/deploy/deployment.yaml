@@ -21,7 +21,7 @@ spec:
       serviceAccountName: pgroles-operator
       containers:
         - name: operator
-          image: ghcr.io/hardbyte/pgroles-operator:latest
+          image: ghcr.io/thepartly/pgroles-operator:latest
           ports:
             - name: http
               containerPort: 8080

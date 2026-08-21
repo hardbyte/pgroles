@@ -213,7 +213,7 @@ impl std::fmt::Display for ColumnLevelGrantDiagnostic {
             "ColumnLevelGrant: \"{}\".\"{}\" has column-level grant(s) [{privileges}] to \"{}\" \
              on column(s) [{columns}]; pgroles does not manage column-level privileges — they are \
              not diffed, revoked, or included in `generate` output. See \
-             https://hardbyte.github.io/pgroles/docs/limitations/ for details.",
+             https://thepartly.github.io/pgroles/docs/limitations/ for details.",
             self.schema, self.relation, self.grantee
         )
     }
@@ -1095,7 +1095,7 @@ roles:
         assert!(rendered.contains("SELECT"));
         assert!(rendered.contains("secret"));
         assert!(rendered.contains("does not manage column-level privileges"));
-        assert!(rendered.contains("https://hardbyte.github.io/pgroles/docs/limitations/"));
+        assert!(rendered.contains("https://thepartly.github.io/pgroles/docs/limitations/"));
     }
 
     #[test]

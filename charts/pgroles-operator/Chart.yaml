@@ -7,9 +7,9 @@ description: >-
 type: application
 version: 0.9.0
 appVersion: "0.9.0"
-icon: https://raw.githubusercontent.com/hardbyte/pgroles/main/docs/public/logo.svg
+icon: https://raw.githubusercontent.com/thepartly/pgroles/main/docs/public/logo.svg
 sources:
-  - https://github.com/hardbyte/pgroles
+  - https://github.com/thepartly/pgroles
 maintainers:
   - name: Brian Thorne
     email: brian@hardbyte.nz
@@ -33,7 +33,7 @@ annotations:
   artifacthub.io/license: MIT
   artifacthub.io/links: |
     - name: Source
-      url: https://github.com/hardbyte/pgroles
+      url: https://github.com/thepartly/pgroles
   artifacthub.io/crds: |
     - kind: PostgresPolicy
       version: v1alpha1
