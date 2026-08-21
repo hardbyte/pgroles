@@ -26,7 +26,7 @@ const hierarchySetupStatements = [
   'CREATE ROLE bob LOGIN',
   'CREATE ROLE team_lead',
   'CREATE ROLE analyst',
-  'CREATE ROLE orders_read',
+  'CREATE ROLE orders_reader',
   'CREATE ROLE app_owner',
   'GRANT CREATE ON DATABASE postgres TO app_owner',
   'SET ROLE app_owner',
@@ -39,8 +39,8 @@ const hierarchySetupStatements = [
   `INSERT INTO app.orders (customer, total_cents)
 VALUES ('Acme', 4200), ('Globex', 9900)`,
   'RESET ROLE',
-  'GRANT USAGE ON SCHEMA app TO orders_read',
-  'GRANT SELECT ON app.orders TO orders_read',
+  'GRANT USAGE ON SCHEMA app TO orders_reader',
+  'GRANT SELECT ON app.orders TO orders_reader',
 ]
 
 const hierarchyExperiments = [
@@ -48,18 +48,18 @@ const hierarchyExperiments = [
     id: 'build-hierarchy',
     title: 'Build a reusable role chain',
     intro:
-      'If Alice inherits analyst, and analyst inherits orders_read, do the privileges travel through both edges?',
+      'If Alice inherits analyst, and analyst inherits orders_reader, do the privileges travel through both edges?',
     explanation:
-      'Yes. PostgreSQL follows the nested membership path from Alice to analyst to orders_read. The leaf capability owns the schema and table grants; the intermediate role groups that capability for a job.',
+      'Yes. PostgreSQL follows the nested membership path from Alice to analyst to orders_reader. The leaf capability owns the schema and table grants; the intermediate role groups that capability for a job.',
     takeaway:
-      'Read GRANT orders_read TO analyst as a directed edge: analyst may use orders_read.',
+      'Read GRANT orders_reader TO analyst as a directed edge: analyst may use orders_reader.',
     actionLabel: 'Build the hierarchy',
     path: [
       ['Identity', 'Alice', 'pass'],
       ['Edge 1', 'INHERIT on', 'pass'],
       ['Bundle', 'analyst', 'focus'],
       ['Edge 2', 'INHERIT on', 'pass'],
-      ['Capability', 'orders_read', 'pass'],
+      ['Capability', 'orders_reader', 'pass'],
     ],
     expectedResults: [{ index: 0, rowCount: 2 }],
     highlightStatements: [0, 1],
@@ -68,7 +68,7 @@ const hierarchyExperiments = [
         actor: 'postgres',
         actorLabel: 'Lab administrator',
         purpose: 'Grant the leaf capability',
-        sql: `GRANT orders_read TO analyst
+        sql: `GRANT orders_reader TO analyst
   WITH INHERIT TRUE, SET TRUE`,
       },
       {
@@ -82,6 +82,48 @@ const hierarchyExperiments = [
         actor: 'alice',
         actorLabel: 'Alice',
         purpose: 'Follow both membership edges',
+        sql: 'SELECT * FROM app.orders ORDER BY id',
+      },
+    ],
+  },
+  {
+    id: 'reverse-edge',
+    title: 'Grant the role in the wrong direction',
+    intro:
+      'What happens if the same two role names are reversed in GRANT? Create the mistake instead of only reading about it.',
+    explanation:
+      'The hierarchy no longer carries orders_reader toward Alice. GRANT analyst TO orders_reader makes orders_reader a member of analyst—the opposite relationship—so Alice loses the object privileges.',
+    takeaway:
+      'GRANT capability TO member points privilege flow toward the member. Reversing the names reverses the graph.',
+    actionLabel: 'Reverse the edge',
+    path: [
+      ['Identity', 'Alice', 'pass'],
+      ['Bundle', 'analyst', 'pass'],
+      ['Edge', 'reversed', 'blocked'],
+      ['Capability', 'orders_reader', 'muted'],
+      ['Result', 'denied', 'blocked'],
+    ],
+    expectedError: 'permission denied for schema app',
+    expectedErrorCode: '42501',
+    expectedErrorIndex: 2,
+    highlightStatements: [0, 1],
+    statements: [
+      {
+        actor: 'postgres',
+        actorLabel: 'Lab administrator',
+        purpose: 'Remove the correct edge',
+        sql: 'REVOKE orders_reader FROM analyst',
+      },
+      {
+        actor: 'postgres',
+        actorLabel: 'Lab administrator',
+        purpose: 'Grant it backwards',
+        sql: 'GRANT analyst TO orders_reader',
+      },
+      {
+        actor: 'alice',
+        actorLabel: 'Alice',
+        purpose: 'Test the reversed graph',
         sql: 'SELECT * FROM app.orders ORDER BY id',
       },
     ],
@@ -101,16 +143,28 @@ const hierarchyExperiments = [
       ['Edge 1', 'INHERIT off', 'focus'],
       ['Bundle', 'analyst', 'pass'],
       ['Edge 2', 'INHERIT on', 'pass'],
-      ['Capability', 'orders_read', 'pass'],
+      ['Capability', 'orders_reader', 'pass'],
     ],
     expectedError: 'permission denied for schema app',
     expectedErrorCode: '42501',
-    expectedErrorIndex: 3,
+    expectedErrorIndex: 5,
     expectedResults: [
       { index: 0, rows: [{ member: true, inherits: false, can_set: true }] },
     ],
-    highlightStatements: [0, 1],
+    highlightStatements: [0, 1, 2, 3],
     statements: [
+      {
+        actor: 'postgres',
+        actorLabel: 'Lab administrator',
+        purpose: 'Remove the reversed edge',
+        sql: 'REVOKE analyst FROM orders_reader',
+      },
+      {
+        actor: 'postgres',
+        actorLabel: 'Lab administrator',
+        purpose: 'Restore the capability edge',
+        sql: 'GRANT orders_reader TO analyst WITH INHERIT TRUE, SET TRUE',
+      },
       {
         actor: 'postgres',
         actorLabel: 'Lab administrator',
@@ -145,9 +199,9 @@ const hierarchyExperiments = [
     id: 'use-role',
     title: 'Become the bundle deliberately',
     intro:
-      'What changes when the effective identity becomes analyst, which still inherits orders_read?',
+      'What changes when the effective identity becomes analyst, which still inherits orders_reader?',
     explanation:
-      'current_user becomes analyst, so PostgreSQL evaluates the analyst hierarchy. Its inherited orders_read privileges make the query succeed even though Alice did not inherit them automatically.',
+      'current_user becomes analyst, so PostgreSQL evaluates the analyst hierarchy. Its inherited orders_reader privileges make the query succeed even though Alice did not inherit them automatically.',
     takeaway:
       'SET ROLE changes the effective identity; it does not copy grants onto the login role.',
     actionLabel: 'Run as Alice, then SET ROLE',
@@ -156,7 +210,7 @@ const hierarchyExperiments = [
       ['Membership', 'SET reported true', 'pass'],
       ['Bundle', 'analyst', 'pass'],
       ['Edge', 'INHERIT on', 'pass'],
-      ['Capability', 'orders_read', 'pass'],
+      ['Capability', 'orders_reader', 'pass'],
     ],
     expectedResults: [
       {
@@ -202,7 +256,7 @@ const hierarchyExperiments = [
       ['Edge', 'ADMIN on', 'pass'],
       ['New member', 'Bob', 'pass'],
       ['Bundle', 'analyst', 'pass'],
-      ['Capability', 'orders_read', 'pass'],
+      ['Capability', 'orders_reader', 'pass'],
     ],
     expectedResults: [
       {
@@ -260,7 +314,7 @@ const hierarchyLesson = {
     'Build a nested capability graph, control inheritance, switch effective identity, and delegate membership administration.',
   setupStatements: hierarchySetupStatements,
   setupSummary:
-    'six roles, a schema, the orders table, and object privileges held only by orders_read',
+    'six roles, a schema, the orders table, and object privileges held only by orders_reader',
   pathLabel: 'What this step tests',
   playgroundRoles: [
     { value: 'alice', label: 'Alice' },

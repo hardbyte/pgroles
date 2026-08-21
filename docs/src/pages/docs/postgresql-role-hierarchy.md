@@ -1,54 +1,39 @@
 ---
-title: Build and manage a role hierarchy
-description: Follow PostgreSQL privileges through nested roles, then control inheritance, SET ROLE, and membership administration.
+title: 7. Membership mechanics
+description: Explore nested role membership, automatic inheritance, SET ROLE, and delegated membership administration.
 ---
 
-A role hierarchy separates **who connects**, **which job they perform**, and **where object privileges live**. Build one edge at a time, observe what PostgreSQL makes effective, and then translate the graph into pgroles policy. {% .lead %}
+The core Acme story needed only one membership edge and one migration recipe. Now inspect the machinery underneath: nested roles, automatic privilege flow, deliberate role switching, and delegation. {% .lead %}
 
-## Follow one hierarchy
-
-This lesson keeps object privileges at the leaf and composes them into a job role:
+## Follow one directed graph
 
 ```text
 alice (LOGIN)
-      |
-      | member of
-      v
+      │ member of
+      ▼
 analyst (NOLOGIN)
-      |
-      | member of
-      v
-orders_read (NOLOGIN) ──> schema USAGE + table SELECT
+      │ member of
+      ▼
+orders_reader (NOLOGIN) ──> schema USAGE + table SELECT
 ```
 
-Read each edge from the granted role to its member: `GRANT orders_read TO analyst` means **analyst is a member of orders_read**. When inheritance is enabled, privileges flow back toward Alice along that path.
+Read `GRANT orders_reader TO analyst` as **analyst becomes a member of orders_reader**. Reversing the names reverses the privilege flow.
 
 {% postgres-role-hierarchy-lab /%}
 
-## Declare the graph in pgroles
-
-The first step corresponds to two membership edges:
+## Declare the edges
 
 ```yaml {% schema="pgroles-manifest" %}
 roles:
   - name: alice
     login: true
   - name: analyst
-  - name: orders_read
+  - name: orders_reader
 
 memberships:
-  - role: orders_read
+  - role: orders_reader
     members:
       - name: analyst
-  - role: analyst
-    members:
-      - name: alice
-```
-
-The defaults are `inherit: true` and `admin: false`. Make a different edge explicit when the hierarchy needs it:
-
-```yaml {% schema="pgroles-manifest" %}
-memberships:
   - role: analyst
     members:
       - name: alice
@@ -58,16 +43,15 @@ memberships:
         admin: true
 ```
 
-`role` is the capability being granted; each entry under `members` receives that capability. Reversing those names reverses the privilege flow.
+`INHERIT` answers whether ordinary privileges flow automatically. `SET` answers whether the member may become the granted role. `ADMIN` answers whether the member may grant or revoke that membership for others. These are three separate facts.
 
-## Delegation and reconciliation answer different questions
-
-PostgreSQL `ADMIN TRUE` lets a member grant or revoke membership in the granted role. It does not grant table access, `CREATEROLE`, or ownership.
-
-pgroles then applies a second rule: the declared graph is authoritative. If `team_lead` grants `analyst` to Bob but Bob is absent from the manifest, the next pgroles plan treats that edge as drift and revokes it. Durable delegation therefore needs a workflow that writes the approved membership back to policy.
-
-{% callout type="warning" title="SET is a PostgreSQL boundary outside the pgroles model" %}
-PostgreSQL 16 and later stores `INHERIT`, `SET`, and `ADMIN` independently on each membership. pgroles manages `inherit` and `admin`, but does not currently inspect or converge `SET`. Edges created by pgroles receive PostgreSQL's default `SET TRUE`; changing a managed edge can recreate it and restore that default. Do not rely on `SET FALSE` as a security boundary for a pgroles-managed membership.
+{% callout type="warning" title="SET is outside the pgroles model" %}
+PostgreSQL 16 and later stores `INHERIT`, `SET`, and `ADMIN` per membership. pgroles manages `inherit` and `admin`, but does not inspect or converge `SET`. A managed edge receives PostgreSQL’s default `SET TRUE`; do not rely on `SET FALSE` remaining a security boundary on that edge.
 {% /callout %}
 
-For the full policy syntax and reconciliation behavior, continue to [Memberships](/docs/memberships). To revisit schema and table gates, return to [How PostgreSQL access works](/docs/postgresql-access-model).
+Delegated administration and desired-state reconciliation also answer different questions. A team lead may grant a membership in PostgreSQL; if that edge is absent from policy, the next authoritative pgroles plan treats it as drift.
+
+{% quick-links %}
+{% quick-link title="Continue: security review" description="Audit PUBLIC, SECURITY DEFINER, and delegated grant options." icon="lightbulb" href="/docs/postgresql-security-review" /%}
+{% quick-link title="Memberships reference" description="See the complete policy and version behavior." icon="presets" href="/docs/memberships" /%}
+{% /quick-links %}

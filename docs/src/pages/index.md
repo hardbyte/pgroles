@@ -28,7 +28,7 @@ Built for platform teams, DBAs, and anyone managing more than a handful of Postg
 
 {% quick-links %}
 
-{% quick-link title="Learn PostgreSQL access" icon="lightbulb" href="/docs/postgresql-access-model" description="Trace a query through roles, memberships, schemas, ACLs, defaults, PUBLIC, and row security." /%}
+{% quick-link title="Learn PostgreSQL access" icon="lightbulb" href="/docs/postgresql-access-model" description="Follow Acme from its first grant through roles, drift, ownership, defaults, offboarding, and a security review." /%}
 
 {% quick-link title="CLI quick start" icon="installation" href="/docs/quick-start" description="Install pgroles and run your first diff against a live database." /%}
 

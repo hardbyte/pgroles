@@ -45,11 +45,15 @@ const fieldsByPath = new Map([
     ]),
   ],
   ['roles.*.password', new Set(['from_env'])],
-  ['grants.*', new Set(['role', 'privileges', 'object', 'on'])],
+  ['grants.*', new Set(['role', 'ensure', 'privileges', 'object', 'on'])],
   ['grants.*.object', new Set(['type', 'schema', 'name'])],
   ['grants.*.on', new Set(['type', 'schema', 'name'])],
-  ['default_privileges.*', new Set(['owner', 'schema', 'grant'])],
-  ['default_privileges.*.grant.*', new Set(['role', 'privileges', 'on_type'])],
+  ['default_privileges.*', new Set(['owner', 'schema', 'scope', 'grant'])],
+  ['default_privileges.*.scope', new Set(['type', 'schema'])],
+  [
+    'default_privileges.*.grant.*',
+    new Set(['role', 'ensure', 'privileges', 'on_type']),
+  ],
   ['memberships.*', new Set(['role', 'members'])],
   ['memberships.*.members.*', new Set(['name', 'inherit', 'admin'])],
   [
@@ -82,6 +86,8 @@ const fieldHelp = {
   role: 'The role receiving privileges or being granted to members.',
   members: 'Roles that become members of the granted role.',
   privileges: 'PostgreSQL privileges applied to the target object.',
+  ensure: 'Whether this privilege must be present or absent.',
+  scope: 'The schema or global scope for a default privilege.',
   object: 'The database object targeted by this grant.',
   login: 'Whether PostgreSQL allows this role to log in.',
   inherit: 'Whether ordinary privileges flow automatically across this edge.',
@@ -178,7 +184,7 @@ function valueDecoration(key, path) {
       title: 'PostgreSQL privilege managed by this policy.',
     }
   }
-  if (key === 'type' || key === 'on_type') {
+  if (key === 'type' || key === 'on_type' || key === 'ensure') {
     return {
       className: 'pgroles-enum',
       title: 'pgroles object or provider type.',

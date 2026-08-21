@@ -53,7 +53,7 @@ grants:
 
 Generates: `GRANT USAGE ON SCHEMA "public" TO "analytics";`
 
-Schema `USAGE` is a separate namespace gate. A table grant does not imply it, and putting a schema in `search_path` grants no access. The [PostgreSQL access guide](/docs/postgresql-access-model#database-schema-and-object-privileges-do-different-jobs) walks through the failure path.
+Schema `USAGE` is a separate namespace gate. A table grant does not imply it, and putting a schema in `search_path` grants no access. The [PostgreSQL access course](/docs/postgresql-access-model#keep-one-rule) makes both gates runnable.
 
 ### Database-level
 
@@ -218,5 +218,5 @@ role. The role might still reach the privilege through membership, ownership,
 or `PUBLIC`. pgroles also does not model `WITH GRANT OPTION` for application
 grantees; the executor grantability check described above is a safety preflight,
 not desired-state management of those grant options. See
-[How PostgreSQL access works](/docs/postgresql-access-model#the-rule-to-remember)
+[The permission chain](/docs/postgresql-access-model#keep-one-rule)
 and [Limitations](/docs/limitations#grant-options-and-effective-access).

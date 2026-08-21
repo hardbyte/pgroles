@@ -212,6 +212,6 @@ It's good practice to pair wildcard grants (`name: "*"`) with matching default p
 If a role writes to tables created after pgroles runs, check whether it also needs sequence and function defaults. Identity/serial-backed inserts typically need sequence access, and trigger-driven schemas often need `EXECUTE` on functions too.
 {% /callout %}
 
-{% callout type="warning" title="Global and PUBLIC defaults are outside pgroles" %}
-pgroles manages schema-scoped default privileges granted to named roles. It does not manage global default ACLs or default privileges granted to `PUBLIC`. PostgreSQL adds schema-scoped defaults to global defaults, so a schema-only revoke cannot remove a globally supplied privilege such as the built-in `PUBLIC EXECUTE` default for routines. See [Existing objects and future objects](/docs/postgresql-access-model#existing-objects-and-future-objects-are-separate-problems).
+{% callout type="warning" title="Global defaults need an explicit owner" %}
+pgroles manages declared schema and global default privileges for named roles and `PUBLIC`. A global rule affects every schema where that owner creates objects, so only the policy document that owns the creating role may declare it. PostgreSQL adds schema-scoped defaults to global defaults; a schema rule cannot subtract a privilege supplied globally. Use a global `ensure: absent` rule to remove the built-in `PUBLIC EXECUTE` default for future routines.
 {% /callout %}

@@ -19,13 +19,13 @@ PostgreSQL 16 separates `INHERIT`, `SET`, and `ADMIN` on each role-membership ed
 
 The manifest does not model `WITH GRANT OPTION` for application grantees. pgroles performs a separate executor-grantability preflight for wildcard safety, but it does not converge who may delegate an object privilege onward.
 
-More generally, pgroles converges managed direct ACLs; it does not claim that absence from a manifest means absence of effective access. Membership, ownership, `PUBLIC`, column grants, row security, or unmodeled object types may change the answer. Use PostgreSQL's `has_*_privilege` and `pg_has_role` functions to verify the effective path. See [How PostgreSQL access works](/docs/postgresql-access-model).
+More generally, pgroles converges managed direct ACLs; it does not claim that absence from a manifest means absence of effective access. Membership, ownership, `PUBLIC`, column grants, row security, or unmodeled object types may change the answer. Use PostgreSQL's `has_*_privilege` and `pg_has_role` functions to verify the effective path. Work through [The permission chain](/docs/postgresql-access-model) and [The security review](/docs/postgresql-security-review) to test those paths interactively.
 
-## Global and PUBLIC default privileges
+## PUBLIC inspection is deliberately scoped
 
-pgroles manages schema-scoped default privileges granted to named roles. It does not inspect or reconcile global default ACL entries (`pg_default_acl.defaclnamespace = 0`) or defaults granted to the `PUBLIC` pseudo-role. Because PostgreSQL layers per-schema defaults on top of global defaults, a schema-scoped revoke cannot subtract a privilege granted globally.
+pgroles can reconcile a declared `PUBLIC` object or default-privilege rule, including `ensure: absent`, and it supports both schema and global default scopes. It does not treat every undeclared `PUBLIC` privilege as drift: only an explicit rule opts that target into desired-state management. `pgroles generate` does not emit `PUBLIC` or absence rules.
 
-`pgroles inspect` does report `PUBLIC` grants on the current database and its non-system schemas as informational output. This is not a complete `PUBLIC` inventory and is not desired-state management.
+`pgroles inspect` also reports `PUBLIC` grants on the current database and its non-system schemas as informational output. That report is useful evidence, but it is not a complete inventory of every object type or every effective-access path.
 
 ## Per-database role settings
 
