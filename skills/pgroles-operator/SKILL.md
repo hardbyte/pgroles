@@ -17,10 +17,10 @@ Install or upgrade with the Helm instructions for the target release. Always
 inspect chart values and rendered resources before applying an upgrade:
 
 ```bash
-helm show values oci://ghcr.io/hardbyte/charts/pgroles-operator \
+helm show values oci://ghcr.io/thepartly/charts/pgroles-operator \
   --version <version>
 helm template pgroles-operator \
-  oci://ghcr.io/hardbyte/charts/pgroles-operator \
+  oci://ghcr.io/thepartly/charts/pgroles-operator \
   --version <version> --namespace pgroles-system --include-crds \
   --values values.yaml > pgroles-operator-rendered.yaml
 ```
@@ -30,12 +30,12 @@ version-matched CRDs explicitly before upgrading the controller:
 
 ```bash
 set -euo pipefail
-helm show crds oci://ghcr.io/hardbyte/charts/pgroles-operator \
+helm show crds oci://ghcr.io/thepartly/charts/pgroles-operator \
   --version <version> > pgroles-operator-crds.yaml
 test -s pgroles-operator-crds.yaml
 kubectl apply --server-side -f pgroles-operator-crds.yaml
 helm upgrade --install pgroles-operator \
-  oci://ghcr.io/hardbyte/charts/pgroles-operator \
+  oci://ghcr.io/thepartly/charts/pgroles-operator \
   --version <version> --namespace pgroles-system --create-namespace \
   --values values.yaml
 ```

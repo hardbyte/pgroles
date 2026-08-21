@@ -9,7 +9,7 @@ Start with the operator quick start. It creates a connection Secret without
 putting the password in shell history, previews a safe additive policy, and
 requires manual approval before executing SQL:
 
-  https://hardbyte.github.io/pgroles/docs/operator-quick-start/
+  https://thepartly.github.io/pgroles/docs/operator-quick-start/
 
 Important: a PostgresPolicy defaults to apply mode with authoritative
 reconciliation. Do not point a default policy at an existing database. Set the
@@ -38,9 +38,9 @@ Install Kyverno, then upgrade with:
 
   --set admissionPolicies.enabled=true
 
-  https://hardbyte.github.io/pgroles/docs/ephemeral-access-security/
+  https://thepartly.github.io/pgroles/docs/ephemeral-access-security/
 {{- end }}
 
 Operator documentation:
 
-  https://hardbyte.github.io/pgroles/docs/operator/
+  https://thepartly.github.io/pgroles/docs/operator/

@@ -9,7 +9,7 @@ fullnameOverride: ""
 # them, `decidedBy` on a plan or an ephemeral request is a client-supplied
 # assertion and anyone with patch on `.../status` can approve: decisions are
 # unattributed and `approval.mode: Required` is not a real approval boundary.
-# See https://hardbyte.github.io/pgroles/docs/ephemeral-access-security/
+# See https://thepartly.github.io/pgroles/docs/ephemeral-access-security/
 #
 # Default off because the resources need Kyverno's CRDs to exist in the
 # cluster; enabling this without Kyverno installed fails the install. Turn it
@@ -41,7 +41,7 @@ operator:
 
   image:
     # -- Operator container image repository.
-    repository: ghcr.io/hardbyte/pgroles-operator
+    repository: ghcr.io/thepartly/pgroles-operator
     # -- Image pull policy for the operator container.
     pullPolicy: IfNotPresent
     # -- Overrides the image tag whose default is the chart appVersion.

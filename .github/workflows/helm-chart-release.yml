@@ -101,4 +101,4 @@ jobs:
         run: helm package charts/pgroles-operator
 
       - name: Push chart to GHCR
-        run: helm push "pgroles-operator-${GITHUB_REF_NAME#v}.tgz" oci://ghcr.io/hardbyte/charts
+        run: helm push "pgroles-operator-${GITHUB_REF_NAME#v}.tgz" oci://ghcr.io/thepartly/charts

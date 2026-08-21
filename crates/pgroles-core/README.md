@@ -52,4 +52,4 @@ assert!(sql.contains("CREATE ROLE"));
 - [`pgroles-inspect`](https://crates.io/crates/pgroles-inspect): build the current `RoleGraph` from a live database
 - [`pgroles-cli`](https://crates.io/crates/pgroles-cli): end-user CLI built on this crate
 
-Full project documentation: <https://github.com/hardbyte/pgroles>
+Full project documentation: <https://github.com/thepartly/pgroles>

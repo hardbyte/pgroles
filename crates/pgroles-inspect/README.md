@@ -42,4 +42,4 @@ println!("Privilege level: {privilege_level}");
 - [`pgroles-core`](https://crates.io/crates/pgroles-core): desired-state model and SQL renderer
 - [`pgroles-cli`](https://crates.io/crates/pgroles-cli): CLI built on this crate
 
-Full project documentation: <https://github.com/hardbyte/pgroles>
+Full project documentation: <https://github.com/thepartly/pgroles>

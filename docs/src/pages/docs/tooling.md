@@ -94,7 +94,7 @@ Use bundle fragments for ownership boundaries such as:
 
 ## Multi-service example
 
-The repository includes an executable [multi-service bundle example](https://github.com/hardbyte/pgroles/tree/main/examples/microservices) for a shared database with separate `billing` and `shipping` services.
+The repository includes an executable [multi-service bundle example](https://github.com/thepartly/pgroles/tree/main/examples/microservices) for a shared database with separate `billing` and `shipping` services.
 
 It demonstrates the recommended split:
 

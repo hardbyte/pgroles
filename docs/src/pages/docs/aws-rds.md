@@ -33,10 +33,10 @@ Pass it as `DATABASE_URL`. How you get it to your workload — Secrets Manager, 
 
 ## Docker image
 
-The published image (`ghcr.io/hardbyte/pgroles:latest`) has `WORKDIR /work` and `ENTRYPOINT ["pgroles"]`. This means:
+The published image (`ghcr.io/thepartly/pgroles:latest`) has `WORKDIR /work` and `ENTRYPOINT ["pgroles"]`. This means:
 
-- **Volume mount:** `docker run -v ./:/work ghcr.io/hardbyte/pgroles:latest diff -f pgroles.yaml`
-- **Derived image:** `FROM ghcr.io/hardbyte/pgroles:latest` then `COPY pgroles.yaml .`
+- **Volume mount:** `docker run -v ./:/work ghcr.io/thepartly/pgroles:latest diff -f pgroles.yaml`
+- **Derived image:** `FROM ghcr.io/thepartly/pgroles:latest` then `COPY pgroles.yaml .`
 - **S3 sidecar:** fetch the manifest into a shared `/work` volume before pgroles starts
 
 For ECS, Lambda, Step Functions, or any other compute — use whichever pattern fits your infrastructure. The container needs `DATABASE_URL` set and the manifest file available at the path you pass to `-f`.
@@ -58,7 +58,7 @@ auth_providers:
 ## Kubernetes operator on EKS
 
 ```shell
-helm install pgroles-operator oci://ghcr.io/hardbyte/charts/pgroles-operator
+helm install pgroles-operator oci://ghcr.io/thepartly/charts/pgroles-operator
 
 kubectl create secret generic mydb-credentials \
   --from-literal=DATABASE_URL='postgres://postgres:PASSWORD@my-instance.abc123.us-east-1.rds.amazonaws.com:5432/mydb'

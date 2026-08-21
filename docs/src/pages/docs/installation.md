@@ -13,7 +13,7 @@ description: How to install the pgroles CLI tool.
 pgroles is written in Rust. Build and install with Cargo:
 
 ```shell
-cargo install --git https://github.com/hardbyte/pgroles pgroles-cli
+cargo install --git https://github.com/thepartly/pgroles pgroles-cli
 ```
 
 This compiles the `pgroles` binary and places it in your Cargo bin directory (usually `~/.cargo/bin/`).
@@ -27,7 +27,7 @@ cargo install pgroles-cli
 ## From a local clone
 
 ```shell
-git clone https://github.com/hardbyte/pgroles.git pgroles
+git clone https://github.com/thepartly/pgroles.git pgroles
 cd pgroles
 cargo build --release
 ```
@@ -36,12 +36,12 @@ The binary will be at `target/release/pgroles`.
 
 ## From GitHub Releases
 
-Download pre-built binaries from the [releases page](https://github.com/hardbyte/pgroles/releases).
+Download pre-built binaries from the [releases page](https://github.com/thepartly/pgroles/releases).
 
 ## Docker
 
 ```shell
-docker run --rm ghcr.io/hardbyte/pgroles --help
+docker run --rm ghcr.io/thepartly/pgroles --help
 ```
 
 Published container images are multi-arch for `linux/amd64` and `linux/arm64`.

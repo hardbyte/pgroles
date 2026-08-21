@@ -17,7 +17,7 @@ Get up and running with pgroles in a few minutes. {% .lead %}
 Build from source using Cargo:
 
 ```shell
-cargo install --git https://github.com/hardbyte/pgroles pgroles-cli
+cargo install --git https://github.com/thepartly/pgroles pgroles-cli
 ```
 
 This installs the `pgroles` binary.

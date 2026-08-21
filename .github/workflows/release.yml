@@ -123,7 +123,7 @@ jobs:
     env:
       IMAGE_NAME: pgroles-operator
       IMAGE_REGISTRY: ghcr.io
-      IMAGE_REPOSITORY: hardbyte
+      IMAGE_REPOSITORY: thepartly
     steps:
       - uses: actions/checkout@v6
 
@@ -196,7 +196,7 @@ jobs:
     env:
       IMAGE_NAME: pgroles
       IMAGE_REGISTRY: ghcr.io
-      IMAGE_REPOSITORY: hardbyte
+      IMAGE_REPOSITORY: thepartly
     steps:
       - uses: actions/checkout@v6
 

@@ -39,10 +39,10 @@ export DATABASE_URL='postgres://postgres:PASSWORD@/mydb?host=/cloudsql/PROJECT:R
 
 ## Docker image
 
-The published image (`ghcr.io/hardbyte/pgroles:latest`) has `WORKDIR /work` and `ENTRYPOINT ["pgroles"]`. This means:
+The published image (`ghcr.io/thepartly/pgroles:latest`) has `WORKDIR /work` and `ENTRYPOINT ["pgroles"]`. This means:
 
-- **Volume mount:** `docker run -v ./:/work ghcr.io/hardbyte/pgroles:latest diff -f pgroles.yaml`
-- **Derived image:** `FROM ghcr.io/hardbyte/pgroles:latest` then `COPY pgroles.yaml .`
+- **Volume mount:** `docker run -v ./:/work ghcr.io/thepartly/pgroles:latest diff -f pgroles.yaml`
+- **Derived image:** `FROM ghcr.io/thepartly/pgroles:latest` then `COPY pgroles.yaml .`
 - **Secret Manager mount:** use `--set-secrets /work/pgroles.yaml=secret-name:latest` in Cloud Run to mount the manifest directly — no custom image needed
 
 For Cloud Run, Cloud Build, GKE, or any other compute — use whichever pattern fits. The container needs `DATABASE_URL` set and the manifest file available at the path you pass to `-f`.
@@ -104,7 +104,7 @@ Changes to Cloud Identity group membership take about 15 minutes to propagate. H
 ## Kubernetes operator on GKE
 
 ```shell
-helm install pgroles-operator oci://ghcr.io/hardbyte/charts/pgroles-operator
+helm install pgroles-operator oci://ghcr.io/thepartly/charts/pgroles-operator
 
 kubectl create secret generic mydb-credentials \
   --from-literal=DATABASE_URL='postgres://postgres:PASSWORD@127.0.0.1:5432/mydb'

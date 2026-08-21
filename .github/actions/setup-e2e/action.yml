@@ -126,7 +126,7 @@ runs:
         kubectl apply -f k8s/dev/otel-collector.yaml
         kubectl -n pgroles-system rollout status deployment/otel-collector --timeout=120s
 
-        sed 's|ghcr.io/hardbyte/pgroles-operator:latest|pgroles-operator:e2e|' \
+        sed 's|ghcr.io/thepartly/pgroles-operator:latest|pgroles-operator:e2e|' \
           k8s/deploy/deployment.yaml | \
           sed 's|imagePullPolicy:.*|imagePullPolicy: Never|' | \
           kubectl apply -f -

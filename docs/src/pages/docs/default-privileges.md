@@ -166,7 +166,7 @@ default_privileges:
 Read [Grants](/docs/grants) for `ensure: absent` on existing objects, and for
 what pgroles does and does not manage about `PUBLIC`. The complete worked
 manifest is
-[examples/security-definer-api.yaml](https://github.com/hardbyte/pgroles/blob/main/examples/security-definer-api.yaml).
+[examples/security-definer-api.yaml](https://github.com/thepartly/pgroles/blob/main/examples/security-definer-api.yaml).
 
 ## Owner context
 

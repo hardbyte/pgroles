@@ -37,7 +37,7 @@ jobs:
           docker run --rm \
             -e DATABASE_URL="${{ secrets.DATABASE_URL }}" \
             -v "${{ github.workspace }}:/work" \
-            ghcr.io/hardbyte/pgroles:latest \
+            ghcr.io/thepartly/pgroles:latest \
             diff -f /work/pgroles.yaml --exit-code
 ```
 
@@ -56,7 +56,7 @@ jobs:
         run: |
           docker run --rm \
             -v "${{ github.workspace }}:/work" \
-            ghcr.io/hardbyte/pgroles:latest \
+            ghcr.io/thepartly/pgroles:latest \
             render-bundle --bundle /work/bundle.yaml --check /work/pgroles.yaml
 ```
 
@@ -77,7 +77,7 @@ jobs:
           docker run --rm \
             -e DATABASE_URL="${{ secrets.DATABASE_URL }}" \
             -v "${{ github.workspace }}:/work" \
-            ghcr.io/hardbyte/pgroles:latest \
+            ghcr.io/thepartly/pgroles:latest \
             apply -f /work/pgroles.yaml
 ```
 
@@ -92,7 +92,7 @@ Post the planned SQL changes as a PR comment for review:
           OUTPUT=$(docker run --rm \
             -e DATABASE_URL="${{ secrets.DATABASE_URL }}" \
             -v "${{ github.workspace }}:/work" \
-            ghcr.io/hardbyte/pgroles:latest \
+            ghcr.io/thepartly/pgroles:latest \
             diff -f /work/pgroles.yaml 2>&1) || true
           echo "diff<<EOF" >> "$GITHUB_OUTPUT"
           echo "$OUTPUT" >> "$GITHUB_OUTPUT"

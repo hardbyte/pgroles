@@ -1,15 +1,15 @@
 <p align="center">
-  <img alt="pgroles logo" src="https://raw.githubusercontent.com/hardbyte/pgroles/main/docs/public/logo.svg" width="140" />
+  <img alt="pgroles logo" src="https://raw.githubusercontent.com/thepartly/pgroles/main/docs/public/logo.svg" width="140" />
 </p>
 
 # pgroles
 
 <div align="center">
 
-[![CI](https://github.com/hardbyte/pgroles/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/hardbyte/pgroles/actions/workflows/ci.yml)
-[![Release](https://img.shields.io/github/v/release/hardbyte/pgroles?sort=semver)](https://github.com/hardbyte/pgroles/releases)
-[![Docs](https://img.shields.io/badge/docs-github_pages-blue)](https://hardbyte.github.io/pgroles/)
-[![Helm Chart OCI](https://img.shields.io/badge/helm-ghcr.io%2Fhardbyte%2Fcharts-informational)](https://github.com/hardbyte/pgroles/pkgs/container/charts%2Fpgroles-operator)
+[![CI](https://github.com/thepartly/pgroles/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/thepartly/pgroles/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/thepartly/pgroles?sort=semver)](https://github.com/thepartly/pgroles/releases)
+[![Docs](https://img.shields.io/badge/docs-github_pages-blue)](https://thepartly.github.io/pgroles/)
+[![Helm Chart OCI](https://img.shields.io/badge/helm-ghcr.io%2Fthepartly%2Fcharts-informational)](https://github.com/thepartly/pgroles/pkgs/container/charts%2Fpgroles-operator)
 
 </div>
 
@@ -127,7 +127,7 @@ pgroles generate --database-url postgres://... --output pgroles.yaml
 
 ## Install
 
-**Pre-built binaries** from [GitHub Releases](https://github.com/hardbyte/pgroles/releases) (Linux x86_64/aarch64, macOS x86_64/aarch64).
+**Pre-built binaries** from [GitHub Releases](https://github.com/thepartly/pgroles/releases) (Linux x86_64/aarch64, macOS x86_64/aarch64).
 
 **Cargo CLI:**
 ```bash
@@ -142,7 +142,7 @@ cargo install pgroles-cli
 
 **Docker:**
 ```bash
-docker run --rm ghcr.io/hardbyte/pgroles --help
+docker run --rm ghcr.io/thepartly/pgroles --help
 ```
 
 ## Features
@@ -161,7 +161,7 @@ docker run --rm ghcr.io/hardbyte/pgroles --help
 - **Managed PostgreSQL** — works with RDS, Aurora, Cloud SQL, AlloyDB, and Azure Database for PostgreSQL. Detects provider-specific reserved roles and warns about privilege limitations.
 - **Kubernetes operator** — reconcile `PostgresPolicy` custom resources continuously. Install via Helm:
   ```bash
-  helm install pgroles-operator oci://ghcr.io/hardbyte/charts/pgroles-operator
+  helm install pgroles-operator oci://ghcr.io/thepartly/charts/pgroles-operator
   ```
   Use `spec.mode: observe` to inspect drift without executing SQL.
 - **Ephemeral access** — define GitOps-managed membership bundles and request,
@@ -171,17 +171,17 @@ docker run --rm ghcr.io/hardbyte/pgroles --help
 
 ## Documentation
 
-Full documentation is published at [hardbyte.github.io/pgroles](https://hardbyte.github.io/pgroles/).
+Full documentation is published at [thepartly.github.io/pgroles](https://thepartly.github.io/pgroles/).
 
-- [Quick start](https://hardbyte.github.io/pgroles/docs/quick-start/)
-- [Installation](https://hardbyte.github.io/pgroles/docs/installation/)
-- [Manifest guide](https://hardbyte.github.io/pgroles/docs/manifest-format/)
-- [CLI reference](https://hardbyte.github.io/pgroles/docs/cli/)
-- [Kubernetes operator](https://hardbyte.github.io/pgroles/docs/operator/)
-- [Operator quick start](https://hardbyte.github.io/pgroles/docs/operator-quick-start/)
-- [Operator architecture](https://hardbyte.github.io/pgroles/docs/operator-architecture/)
-- [Ephemeral access](https://hardbyte.github.io/pgroles/docs/ephemeral-access/)
-- [Securing ephemeral access](https://hardbyte.github.io/pgroles/docs/ephemeral-access-security/)
+- [Quick start](https://thepartly.github.io/pgroles/docs/quick-start/)
+- [Installation](https://thepartly.github.io/pgroles/docs/installation/)
+- [Manifest guide](https://thepartly.github.io/pgroles/docs/manifest-format/)
+- [CLI reference](https://thepartly.github.io/pgroles/docs/cli/)
+- [Kubernetes operator](https://thepartly.github.io/pgroles/docs/operator/)
+- [Operator quick start](https://thepartly.github.io/pgroles/docs/operator-quick-start/)
+- [Operator architecture](https://thepartly.github.io/pgroles/docs/operator-architecture/)
+- [Ephemeral access](https://thepartly.github.io/pgroles/docs/ephemeral-access/)
+- [Securing ephemeral access](https://thepartly.github.io/pgroles/docs/ephemeral-access-security/)
 
 ## Agent Skills
 
@@ -197,7 +197,7 @@ Install them from the first release that includes skills, or pin an exact commit
 SHA before that release:
 
 ```bash
-gh skill install hardbyte/pgroles --all --pin <release-tag-or-commit-sha>
+gh skill install thepartly/pgroles --all --pin <release-tag-or-commit-sha>
 ```
 
 After the first release containing skills, omit `--pin` to resolve the latest

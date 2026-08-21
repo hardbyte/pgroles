@@ -39,7 +39,7 @@ Install the chart into its own namespace and wait for the Deployment:
 
 ```bash
 helm install pgroles-operator \
-  oci://ghcr.io/hardbyte/charts/pgroles-operator \
+  oci://ghcr.io/thepartly/charts/pgroles-operator \
   --namespace pgroles-system \
   --create-namespace \
   --wait
@@ -212,7 +212,7 @@ verb its role grants, not by ServiceAccount name, so a custom name or namespace
 stays correct:
 
 ```shell
-helm upgrade pgroles-operator oci://ghcr.io/hardbyte/charts/pgroles-operator \
+helm upgrade pgroles-operator oci://ghcr.io/thepartly/charts/pgroles-operator \
   --namespace pgroles-system --reuse-values \
   --set admissionPolicies.enabled=true
 ```
