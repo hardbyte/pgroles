@@ -215,6 +215,9 @@ function AcmeStoryLab({ chapter }) {
   const [outputs, setOutputs] = useState({});
   const [running, setRunning] = useState(false);
   const liveRef = useRef(true);
+  // Render-scoped `running` cannot stop two clicks in the same tick, so the
+  // in-flight guard lives in a ref.
+  const runningRef = useRef(false);
   const step = lesson.steps[index];
   const output = outputs[index];
   const draft = drafts[index];
@@ -234,7 +237,8 @@ function AcmeStoryLab({ chapter }) {
   );
 
   async function run() {
-    if (running || !draft.trim()) return;
+    if (runningRef.current || !draft.trim()) return;
+    runningRef.current = true;
     setRunning(true);
     let database;
     try {
@@ -281,6 +285,7 @@ function AcmeStoryLab({ chapter }) {
         }));
     } finally {
       if (database) await database.close().catch(() => {});
+      runningRef.current = false;
       if (liveRef.current) setRunning(false);
     }
   }

@@ -1063,7 +1063,7 @@ WHERE granted.rolname = 'analyst' AND member.rolname = 'team_lead';`,
         expect: (output, row) =>
           !output.error &&
           row?.can_execute &&
-          output.results[0]?.rows[0]?.total_cents === 14100,
+          Number(output.results[0]?.rows[0]?.total_cents) === 14100,
         observation:
           "The access is real and comes from PUBLIC. Desired policy must remove the existing privilege and the owner’s default for future functions.",
       },
@@ -1084,7 +1084,7 @@ WHERE granted.rolname = 'analyst' AND member.rolname = 'team_lead';`,
           ],
           [
             "Definer function",
-            output.results[0]?.rows[0]?.total_cents === 14100
+            Number(output.results[0]?.rows[0]?.total_cents) === 14100
               ? "returned total"
               : "missing",
             "focus",
@@ -1096,7 +1096,7 @@ WHERE granted.rolname = 'analyst' AND member.rolname = 'team_lead';`,
           ],
         ],
         expect: (output, row) =>
-          output.results[0]?.rows[0]?.total_cents === 14100 &&
+          Number(output.results[0]?.rows[0]?.total_cents) === 14100 &&
           !output.error &&
           !row?.object_select,
         observation:

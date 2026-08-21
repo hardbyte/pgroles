@@ -138,7 +138,13 @@ export function Fence({ children, language, schema }) {
   const isPgrolesPolicy = schema === 'pgroles-manifest'
 
   function onCopyCode() {
-    navigator.clipboard.writeText(children).then(() => setCopied(true))
+    // Copy the rendered (trimmed) code, and tolerate non-secure contexts or a
+    // denied clipboard permission instead of throwing in the handler.
+    if (!navigator.clipboard?.writeText) return
+    navigator.clipboard.writeText(code).then(
+      () => setCopied(true),
+      () => setCopied(false)
+    )
   }
 
   useEffect(() => {

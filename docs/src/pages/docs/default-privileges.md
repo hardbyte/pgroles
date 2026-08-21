@@ -172,7 +172,7 @@ manifest is
 
 The `owner` field specifies which role's object creation triggers the default grant. This is typically the role that creates tables, such as `app_migrator` or `app_owner`.
 
-PostgreSQL uses the defaults of the **current role that creates the object**. It does not combine defaults from roles that creator merely belongs to. If migrations connect as `app_migrator` but the defaults belong to `app_owner`, the migration must `SET ROLE app_owner` before creating the object (or the defaults must be declared for `app_migrator`).
+PostgreSQL uses the defaults of the **current role that creates the object**. It does not combine defaults from roles that the creator merely belongs to. If migrations connect as `app_migrator` but the defaults belong to `app_owner`, the migration must `SET ROLE app_owner` before creating the object (or the defaults must be declared for `app_migrator`).
 
 If `owner` is omitted on a default privilege entry, the top-level `default_owner` is used. If neither is set, it falls back to `postgres`.
 

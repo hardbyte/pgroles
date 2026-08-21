@@ -144,12 +144,13 @@ function keyDecoration(key, path, parent) {
   }
 
   if (isDynamicKey(path)) {
+    // `profiles.$profile.config` keys are configuration parameters too, so
+    // decide by the `.config` suffix rather than the first path segment.
     return {
       className: 'pgroles-identifier',
-      title:
-        path[0] === 'profiles'
-          ? 'Reusable pgroles profile name.'
-          : 'PostgreSQL configuration parameter.',
+      title: normalizedPath(path).endsWith('.config')
+        ? 'PostgreSQL configuration parameter.'
+        : 'Reusable pgroles profile name.',
       recognized: true,
     }
   }
