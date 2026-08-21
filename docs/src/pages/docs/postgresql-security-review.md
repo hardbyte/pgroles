@@ -1,6 +1,6 @@
 ---
 title: 8. The security review
-description: "Audit three effective-access surprises: PUBLIC function execution, SECURITY DEFINER, and grant-option delegation."
+description: "Audit four effective-access surprises: PUBLIC function execution, SECURITY DEFINER, grant-option delegation, and the predefined master-key roles."
 ---
 
 An auditor asks a harder question than “what grants are in our YAML?”: **can this role actually perform the operation?** Acme’s role graph is tidy, but PostgreSQL has access paths outside ordinary named ACLs. {% .lead %}
@@ -29,6 +29,10 @@ default_privileges:
 ```
 
 The global default matters because PostgreSQL’s built-in function default is global. A schema-scoped revoke cannot subtract a global grant.
+
+## The predefined master keys
+
+`pg_read_all_data`, `pg_write_all_data`, `pg_monitor`, and the other [predefined roles](https://www.postgresql.org/docs/current/predefined-roles.html) pass PostgreSQL’s permission checks for every matching object—current and future—without an ACL entry anywhere, so no table-level review will surface them. Auditing effective access therefore always includes one more query: who is a member of a `pg_*` role? In pgroles policy, declare predefined roles with `external: true` so they can be referenced safely; pgroles does not converge memberships granted from external roles, which makes those memberships a boundary to review explicitly rather than a rule the plan enforces.
 
 ## Keep the other two boundaries visible
 

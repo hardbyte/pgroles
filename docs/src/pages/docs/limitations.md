@@ -21,6 +21,10 @@ The manifest does not model `WITH GRANT OPTION` for application grantees. pgrole
 
 More generally, pgroles converges managed direct ACLs; it does not claim that absence from a manifest means absence of effective access. Membership, ownership, `PUBLIC`, column grants, row security, or unmodeled object types may change the answer. Use PostgreSQL's `has_*_privilege` and `pg_has_role` functions to verify the effective path. Work through [The permission chain](/docs/postgresql-access-model) and [The security review](/docs/postgresql-security-review) to test those paths interactively.
 
+## Predefined roles
+
+PostgreSQL’s predefined roles (`pg_read_all_data`, `pg_write_all_data`, `pg_monitor`, and friends) grant access through special-cased permission checks, not ACL entries, so they never appear in the grants pgroles diffs. Declare them `external: true` to reference them; memberships granted from an external role are filtered out of plans, so a `GRANT pg_read_all_data TO someone` is neither created nor revoked by pgroles. Audit `pg_*` role memberships explicitly — [the security review](/docs/postgresql-security-review#the-predefined-master-keys) shows why.
+
 ## PUBLIC inspection is deliberately scoped
 
 pgroles can reconcile a declared `PUBLIC` object or default-privilege rule, including `ensure: absent`, and it supports both schema and global default scopes. It does not treat every undeclared `PUBLIC` privilege as drift: only an explicit rule opts that target into desired-state management. `pgroles generate` does not emit `PUBLIC` or absence rules.

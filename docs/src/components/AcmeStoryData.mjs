@@ -1076,7 +1076,7 @@ WHERE granted.rolname = 'analyst' AND member.rolname = 'team_lead';`,
     eyebrow: "Chapter 8 · Security review",
     title: "The auditor asks: “Who can really do this?”",
     description:
-      "Effective access hides outside ordinary direct ACLs. Investigate three surprises: PUBLIC, SECURITY DEFINER, and delegated grant options.",
+      "Effective access hides outside ordinary direct ACLs. Investigate four surprises: PUBLIC, SECURITY DEFINER, delegated grant options, and the predefined master keys.",
     next: {
       href: "/docs/postgresql-playground",
       title: "Audit the complete Acme database",
@@ -1187,6 +1187,57 @@ SET SESSION AUTHORIZATION postgres;`,
         observation:
           "Contractor can now read through a grant made by team_lead. pgroles does not model application grant options, so this boundary needs a separate review.",
       },
+      {
+        title: "Surprise 4: the predefined master keys",
+        why: "PostgreSQL ships predefined capability roles—pg_read_all_data, pg_write_all_data, pg_monitor, and friends. They look like ordinary memberships, but they pass permission checks for every matching object in the database, current and future, without an ACL entry anywhere.",
+        prompt:
+          "Hand contractor the read-everything key, then run the report as contractor.",
+        setup: completeSeed,
+        role: "postgres",
+        sql: `GRANT pg_read_all_data TO contractor;
+SET ROLE contractor;
+${reportSql}`,
+        inspect: `SELECT
+  pg_has_role('contractor', 'pg_read_all_data', 'USAGE') AS via_predefined,
+  has_schema_privilege('contractor', 'app', 'USAGE') AS schema_usage,
+  has_table_privilege('contractor', 'app.orders', 'SELECT') AS object_select,
+  EXISTS (
+    SELECT 1 FROM information_schema.table_privileges
+    WHERE grantee IN ('contractor', 'pg_read_all_data')
+      AND table_schema = 'app' AND table_name = 'orders'
+  ) AS acl_entry;`,
+        cards: (row, output) => [
+          [
+            "Table ACL entries",
+            row?.acl_entry ? "found" : "none anywhere",
+            row?.acl_entry ? "blocked" : "focus",
+          ],
+          [
+            "pg_read_all_data",
+            row?.via_predefined ? "member" : "not granted",
+            row?.via_predefined ? "focus" : "blocked",
+          ],
+          [
+            "Every read check",
+            row?.schema_usage && row?.object_select ? "passes" : "blocked",
+            row?.schema_usage && row?.object_select ? "pass" : "blocked",
+          ],
+          [
+            "Result",
+            output.error ? "denied" : "2 rows",
+            output.error ? "blocked" : "pass",
+          ],
+        ],
+        expect: (output, row) =>
+          !output.error &&
+          output.results[0]?.rows.length === 2 &&
+          row?.via_predefined &&
+          row?.schema_usage &&
+          row?.object_select &&
+          !row?.acl_entry,
+        observation:
+          "Neither contractor nor pg_read_all_data appears in any table ACL, yet every read check passes—PostgreSQL special-cases the predefined roles inside its permission logic, so this membership opens every schema and table, legacy included. Declare predefined roles as external in pgroles policy; memberships granted from them are outside the reconciled model, so audit these master keys explicitly.",
+      },
     ],
   },
   playground: {
@@ -1254,6 +1305,11 @@ SET SESSION AUTHORIZATION postgres;`,
           [
             "Who belongs to analyst?",
             `SELECT member.rolname FROM pg_auth_members m JOIN pg_roles granted ON granted.oid = m.roleid JOIN pg_roles member ON member.oid = m.member WHERE granted.rolname = 'analyst';`,
+            "postgres",
+          ],
+          [
+            "Does anyone hold a predefined master key?",
+            `SELECT member.rolname, granted.rolname AS predefined_role FROM pg_auth_members m JOIN pg_roles granted ON granted.oid = m.roleid JOIN pg_roles member ON member.oid = m.member WHERE granted.rolname LIKE 'pg\\_%';`,
             "postgres",
           ],
         ],
