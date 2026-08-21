@@ -697,7 +697,11 @@ async fn plan_against_target(
         ),
         reconciliation_mode,
     );
-    changes = pgroles_core::diff::filter_external_role_changes(changes, &expanded.roles);
+    changes = pgroles_core::diff::filter_external_role_changes(
+        changes,
+        &expanded.roles,
+        &expanded.memberships,
+    );
 
     // Read-only password resolution. Generated Secrets are named for the
     // parent policy because that is what promotion would create; nothing is

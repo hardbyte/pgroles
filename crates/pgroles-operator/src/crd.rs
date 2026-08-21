@@ -2147,6 +2147,7 @@ fn build_policy_manifest<'a>(
                     admin: ms.admin,
                 })
                 .collect(),
+            exclusive: m.exclusive,
         })
         .collect();
 

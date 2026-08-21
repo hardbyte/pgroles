@@ -830,6 +830,7 @@ async fn cmd_diff(
                 mode,
             ),
             &validated.composed.expanded.roles,
+            &validated.composed.expanded.memberships,
         );
         let resolved_passwords = resolve_passwords(&validated.composed.expanded)
             .context("failed to resolve role passwords")?;
@@ -895,6 +896,7 @@ async fn cmd_diff(
             mode,
         ),
         &validated.expanded.roles,
+        &validated.expanded.memberships,
     );
     let resolved_passwords =
         resolve_passwords(&validated.expanded).context("failed to resolve role passwords")?;
@@ -968,6 +970,7 @@ async fn cmd_apply(
                 mode,
             ),
             &validated.composed.expanded.roles,
+            &validated.composed.expanded.memberships,
         );
         let resolved_passwords = resolve_passwords(&validated.composed.expanded)
             .context("failed to resolve role passwords")?;
@@ -1058,6 +1061,7 @@ async fn cmd_apply(
             mode,
         ),
         &validated.expanded.roles,
+        &validated.expanded.memberships,
     );
     let resolved_passwords =
         resolve_passwords(&validated.expanded).context("failed to resolve role passwords")?;

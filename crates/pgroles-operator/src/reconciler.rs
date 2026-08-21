@@ -1332,7 +1332,11 @@ async fn apply_under_lock(
         ),
         reconciliation_mode,
     );
-    changes = pgroles_core::diff::filter_external_role_changes(changes, &expanded.roles);
+    changes = pgroles_core::diff::filter_external_role_changes(
+        changes,
+        &expanded.roles,
+        &expanded.memberships,
+    );
 
     let resolved_passwords = resolve_passwords_from_secrets(ctx, resource, namespace).await?;
     let (password_changes, mut applied_password_source_versions) =

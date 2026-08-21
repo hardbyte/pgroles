@@ -122,6 +122,26 @@ pub enum ManifestError {
 
     #[error("database grant targets must name the connected database explicitly")]
     DatabaseGrantMissingName,
+
+    #[error(
+        "role \"{role}\" uses PostgreSQL's reserved `pg_` prefix — predefined roles cannot be lifecycle-managed; declare it with `external: true` (or omit it and reference it directly in `memberships`)"
+    )]
+    PredefinedRoleNotExternal { role: String },
+
+    #[error(
+        "membership for \"{role}\" sets `exclusive: true`, but exclusive membership is only supported for predefined (`pg_*`) and `external: true` roles — ordinary managed roles are already reconciled exhaustively"
+    )]
+    ExclusiveMembershipOnManagedRole { role: String },
+}
+
+/// Whether a role name belongs to PostgreSQL's predefined (built-in) roles.
+///
+/// PostgreSQL reserves the `pg_` prefix for its own roles (`pg_read_all_data`,
+/// `pg_monitor`, ...), so no user role can collide with this check. Predefined
+/// roles are never lifecycle-managed by pgroles, but memberships granted from
+/// them can be declared and reconciled.
+pub fn is_predefined_role(name: &str) -> bool {
+    name.starts_with("pg_")
 }
 
 // ---------------------------------------------------------------------------
@@ -726,6 +746,17 @@ pub struct Membership {
     pub role: String,
     #[schemars(length(max = MAX_MEMBERS))]
     pub members: Vec<MemberSpec>,
+
+    /// Assert that `members` is the complete membership of `role`: plan a
+    /// REVOKE for any live member not listed here. Only meaningful for
+    /// predefined (`pg_*`) and `external: true` roles, whose undeclared
+    /// members are otherwise left untouched — memberships of ordinary managed
+    /// roles are already reconciled exhaustively. Defaults to `false` so that
+    /// adopting pgroles never strips provider-granted memberships (for
+    /// example `pg_monitor` grants made by a cloud platform) without an
+    /// explicit assertion.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub exclusive: bool,
 }
 
 /// A single member of a role.
@@ -1066,6 +1097,35 @@ pub fn parse_manifest(yaml: &str) -> Result<PolicyManifest, ManifestError> {
 /// Validates no duplicate role names.
 pub fn expand_manifest(manifest: &PolicyManifest) -> Result<ExpandedManifest, ManifestError> {
     validate_bounds(manifest)?;
+
+    // Predefined (`pg_*`) roles can be referenced but never lifecycle-managed:
+    // a declaration is only allowed as a documentation-of-reference with
+    // `external: true`. Exclusive membership is an assertion about roles whose
+    // members are otherwise untouched, so it is rejected on ordinary managed
+    // roles where reconciliation is already exhaustive.
+    for role in &manifest.roles {
+        if is_predefined_role(&role.name) && !role.external {
+            return Err(ManifestError::PredefinedRoleNotExternal {
+                role: role.name.clone(),
+            });
+        }
+    }
+    let external_names: HashSet<&str> = manifest
+        .roles
+        .iter()
+        .filter(|role| role.external)
+        .map(|role| role.name.as_str())
+        .collect();
+    for membership in &manifest.memberships {
+        if membership.exclusive
+            && !is_predefined_role(&membership.role)
+            && !external_names.contains(membership.role.as_str())
+        {
+            return Err(ManifestError::ExclusiveMembershipOnManagedRole {
+                role: membership.role.clone(),
+            });
+        }
+    }
 
     let mut seen_schemas: HashSet<String> = HashSet::new();
     for schema_binding in &manifest.schemas {
@@ -1867,6 +1927,59 @@ memberships:
 "#;
         let manifest = parse_manifest(yaml).unwrap();
         assert!(expand_manifest(&manifest).is_ok());
+    }
+
+    #[test]
+    fn expand_rejects_predefined_role_declaration_without_external() {
+        let yaml = r#"
+roles:
+  - name: pg_read_all_data
+"#;
+        let manifest = parse_manifest(yaml).unwrap();
+        assert!(matches!(
+            expand_manifest(&manifest),
+            Err(ManifestError::PredefinedRoleNotExternal { role }) if role == "pg_read_all_data"
+        ));
+    }
+
+    #[test]
+    fn expand_accepts_predefined_role_membership_without_declaration() {
+        let yaml = r#"
+roles:
+  - name: auditor
+    login: true
+
+memberships:
+  - role: pg_read_all_data
+    exclusive: true
+    members:
+      - name: auditor
+"#;
+        let manifest = parse_manifest(yaml).unwrap();
+        let expanded = expand_manifest(&manifest).unwrap();
+        assert_eq!(expanded.memberships.len(), 1);
+        assert!(expanded.memberships[0].exclusive);
+    }
+
+    #[test]
+    fn expand_rejects_exclusive_membership_on_managed_role() {
+        let yaml = r#"
+roles:
+  - name: analyst
+  - name: bob
+    login: true
+
+memberships:
+  - role: analyst
+    exclusive: true
+    members:
+      - name: bob
+"#;
+        let manifest = parse_manifest(yaml).unwrap();
+        assert!(matches!(
+            expand_manifest(&manifest),
+            Err(ManifestError::ExclusiveMembershipOnManagedRole { role }) if role == "analyst"
+        ));
     }
 
     #[test]

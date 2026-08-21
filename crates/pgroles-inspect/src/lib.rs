@@ -391,6 +391,17 @@ impl InspectConfig {
             managed_roles.insert(role_def.name.clone());
         }
 
+        // Predefined (`pg_*`) roles referenced as membership grantors need to
+        // be in the inspection scope so their live members appear in the
+        // current graph and declared edges converge idempotently. Their
+        // lifecycle stays unmanaged: the diff layer filters any role-object
+        // change for predefined roles.
+        for membership in &expanded.memberships {
+            if pgroles_core::manifest::is_predefined_role(&membership.role) {
+                managed_roles.insert(membership.role.clone());
+            }
+        }
+
         // Collect schema names from grants
         for grant in &expanded.grants {
             if grant.object.object_type == ObjectType::Database

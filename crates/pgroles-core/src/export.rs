@@ -180,7 +180,11 @@ pub fn role_graph_to_manifest(graph: &RoleGraph) -> PolicyManifest {
     }
     let memberships: Vec<Membership> = membership_map
         .into_iter()
-        .map(|(role, members)| Membership { role, members })
+        .map(|(role, members)| Membership {
+            role,
+            members,
+            exclusive: false,
+        })
         .collect();
 
     PolicyManifest {

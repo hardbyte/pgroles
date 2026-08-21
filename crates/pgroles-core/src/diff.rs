@@ -10,7 +10,9 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use crate::manifest::{ObjectType, Privilege, RoleDefinition, RoleRetirement};
+use crate::manifest::{
+    Membership, ObjectType, Privilege, RoleDefinition, RoleRetirement, is_predefined_role,
+};
 use crate::model::{
     DefaultPrivKey, DefaultPrivilegeScope, GrantKey, Grantee, MembershipEdge, RoleAttribute,
     RoleGraph, RoleState, default_schema_owner_privileges,
@@ -216,45 +218,73 @@ pub fn additive_ignores_absence_assertions(desired: &RoleGraph, mode: Reconcilia
         && (!desired.grant_absences.is_empty() || !desired.default_privilege_absences.is_empty())
 }
 
-/// Remove role-lifecycle and granted-role membership changes for external roles.
+/// Remove changes pgroles must not own for external and predefined roles.
 ///
-/// External roles are still valid references for grants, schema ownership, and
-/// as members of managed roles. pgroles simply avoids taking ownership of the
-/// external role object itself or of memberships granted from that role.
-pub fn filter_external_role_changes(changes: Vec<Change>, roles: &[RoleDefinition]) -> Vec<Change> {
+/// External (`external: true`) and predefined (`pg_*`) roles are valid
+/// references for grants, schema ownership, and memberships, but their role
+/// object is owned elsewhere: lifecycle changes (create/alter/drop, comments,
+/// passwords, retirement operations) are always filtered.
+///
+/// Memberships granted *from* such a role follow declared intent:
+///
+/// - An edge declared in the manifest converges — grants, and the
+///   revoke-and-regrant pair when its `inherit`/`admin` options change.
+/// - An undeclared live member is left untouched by default, so adopting
+///   pgroles never strips provider-granted memberships (for example
+///   `pg_monitor` grants made by a cloud platform).
+/// - A membership stanza with `exclusive: true` asserts its member list is
+///   complete, opting undeclared members into revocation.
+pub fn filter_external_role_changes(
+    changes: Vec<Change>,
+    roles: &[RoleDefinition],
+    memberships: &[Membership],
+) -> Vec<Change> {
     let external_roles: BTreeSet<&str> = roles
         .iter()
         .filter(|role| role.external)
         .map(|role| role.name.as_str())
         .collect();
+    let exclusive_roles: BTreeSet<&str> = memberships
+        .iter()
+        .filter(|membership| membership.exclusive)
+        .map(|membership| membership.role.as_str())
+        .collect();
+    let declared_edges: BTreeSet<(&str, &str)> = memberships
+        .iter()
+        .flat_map(|membership| {
+            membership
+                .members
+                .iter()
+                .map(move |member| (membership.role.as_str(), member.name.as_str()))
+        })
+        .collect();
 
-    if external_roles.is_empty() {
-        return changes;
-    }
+    let unmanaged = |name: &str| external_roles.contains(name) || is_predefined_role(name);
 
     changes
         .into_iter()
-        .filter(|change| !is_external_role_change(change, &external_roles))
+        .filter(|change| match change {
+            Change::CreateRole { name, .. }
+            | Change::AlterRole { name, .. }
+            | Change::SetComment { name, .. }
+            | Change::SetPassword { name, .. }
+            | Change::DropRole { name } => !unmanaged(name),
+            Change::TerminateSessions { role }
+            | Change::DropOwned { role }
+            | Change::ReassignOwned {
+                from_role: role, ..
+            } => !unmanaged(role),
+            Change::AddMember { role, member, .. } => {
+                !unmanaged(role) || declared_edges.contains(&(role.as_str(), member.as_str()))
+            }
+            Change::RemoveMember { role, member } => {
+                !unmanaged(role)
+                    || exclusive_roles.contains(role.as_str())
+                    || declared_edges.contains(&(role.as_str(), member.as_str()))
+            }
+            _ => true,
+        })
         .collect()
-}
-
-fn is_external_role_change(change: &Change, external_roles: &BTreeSet<&str>) -> bool {
-    match change {
-        Change::CreateRole { name, .. }
-        | Change::AlterRole { name, .. }
-        | Change::SetComment { name, .. }
-        | Change::SetPassword { name, .. }
-        | Change::DropRole { name } => external_roles.contains(name.as_str()),
-        Change::AddMember { role, .. } | Change::RemoveMember { role, .. } => {
-            external_roles.contains(role.as_str())
-        }
-        Change::TerminateSessions { role }
-        | Change::DropOwned { role }
-        | Change::ReassignOwned {
-            from_role: role, ..
-        } => external_roles.contains(role.as_str()),
-        _ => false,
-    }
 }
 
 fn filter_additive_changes(changes: Vec<Change>) -> Vec<Change> {
@@ -1315,7 +1345,8 @@ memberships:
             )
         }));
 
-        let filtered = filter_external_role_changes(changes, &[role_definition(external, true)]);
+        let filtered =
+            filter_external_role_changes(changes, &[role_definition(external, true)], &[]);
         assert!(filtered.is_empty());
     }
 
@@ -1328,8 +1359,112 @@ memberships:
         }];
 
         let filtered =
-            filter_external_role_changes(changes.clone(), &[role_definition(external, true)]);
+            filter_external_role_changes(changes.clone(), &[role_definition(external, true)], &[]);
         assert_eq!(filtered, changes);
+    }
+
+    fn membership(role: &str, members: &[&str], exclusive: bool) -> Membership {
+        Membership {
+            role: role.to_string(),
+            members: members
+                .iter()
+                .map(|name| crate::manifest::MemberSpec {
+                    name: name.to_string(),
+                    inherit: None,
+                    admin: None,
+                })
+                .collect(),
+            exclusive,
+        }
+    }
+
+    #[test]
+    fn declared_membership_in_external_role_converges() {
+        // GRANT rds_iam-style edges: declared members of an external role are
+        // granted (and re-granted on option changes), not filtered.
+        let changes = vec![
+            Change::AddMember {
+                role: "rds_iam".to_string(),
+                member: "app_user".to_string(),
+                inherit: true,
+                admin: false,
+            },
+            Change::RemoveMember {
+                role: "rds_iam".to_string(),
+                member: "app_user".to_string(),
+            },
+        ];
+        let filtered = filter_external_role_changes(
+            changes.clone(),
+            &[role_definition("rds_iam", true)],
+            &[membership("rds_iam", &["app_user"], false)],
+        );
+        assert_eq!(filtered, changes);
+    }
+
+    #[test]
+    fn predefined_role_memberships_follow_declared_intent_without_declaration() {
+        // pg_* roles need no roles: entry at all. Declared member converges;
+        // the undeclared provider-granted member is left untouched.
+        let changes = vec![
+            Change::AddMember {
+                role: "pg_read_all_data".to_string(),
+                member: "auditor".to_string(),
+                inherit: true,
+                admin: false,
+            },
+            Change::RemoveMember {
+                role: "pg_read_all_data".to_string(),
+                member: "rds_superuser".to_string(),
+            },
+        ];
+        let filtered = filter_external_role_changes(
+            changes,
+            &[],
+            &[membership("pg_read_all_data", &["auditor"], false)],
+        );
+        assert_eq!(
+            filtered,
+            vec![Change::AddMember {
+                role: "pg_read_all_data".to_string(),
+                member: "auditor".to_string(),
+                inherit: true,
+                admin: false,
+            }]
+        );
+    }
+
+    #[test]
+    fn exclusive_membership_revokes_undeclared_predefined_members() {
+        let changes = vec![Change::RemoveMember {
+            role: "pg_read_all_data".to_string(),
+            member: "forgotten_contractor".to_string(),
+        }];
+        let filtered = filter_external_role_changes(
+            changes.clone(),
+            &[],
+            &[membership("pg_read_all_data", &["auditor"], true)],
+        );
+        assert_eq!(filtered, changes);
+    }
+
+    #[test]
+    fn predefined_role_lifecycle_is_always_filtered() {
+        let changes = vec![
+            Change::DropRole {
+                name: "pg_read_all_data".to_string(),
+            },
+            Change::AlterRole {
+                name: "pg_monitor".to_string(),
+                attributes: vec![RoleAttribute::Login(true)],
+            },
+        ];
+        let filtered = filter_external_role_changes(
+            changes,
+            &[],
+            &[membership("pg_read_all_data", &["auditor"], true)],
+        );
+        assert!(filtered.is_empty());
     }
 
     #[test]
