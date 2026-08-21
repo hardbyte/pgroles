@@ -184,7 +184,7 @@ const chapters = {
     eyebrow: "Chapter 1 · The permission chain",
     title: "Alice gets the first report working",
     description:
-      "Acme needs an orders report today. Run the query first, let PostgreSQL name each closed gate, and open exactly the path the report needs.",
+      "The application reads orders all day; Alice, hired to build the first report, cannot. Find where PostgreSQL says no—then open only what the report needs.",
     next: {
       href: "/docs/postgresql-capability-roles",
       title: "Replace direct grants with a capability role",
@@ -196,7 +196,7 @@ const chapters = {
     steps: [
       {
         title: "Run the report as Alice",
-        why: "The application already reads orders, but nobody has granted Alice anything. PostgreSQL evaluates the query against the current role, gate by gate, and reports the first gate that fails.",
+        why: "This is the exact query the application runs successfully all day. The only thing that changes is who is asking: PostgreSQL evaluates every query against the current role's privileges, and nobody has granted Alice anything yet.",
         prompt: "Run the report query as Alice.",
         setup: founderSeed,
         role: "alice",

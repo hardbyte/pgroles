@@ -1,18 +1,22 @@
 ---
 title: 1. The permission chain
-description: Meet Acme, run the report before any grants exist, and watch PostgreSQL's error move from gate to gate as you open the smallest working path.
+description: Alice's first query at Acme is denied. Follow PostgreSQL's error from gate to gate and open the smallest path that makes the report work.
 ---
 
-Alice needs Acme’s first orders report. Run her query before granting anything, let PostgreSQL name each closed gate, and open exactly the path the report needs—nothing more. {% .lead %}
+Acme is a small startup with one application and one database. Priya, the founder, created the `app.orders` table herself in the early days, and the application has been reading and writing it ever since. Today Alice joins as the first analyst, hired to answer the company’s favourite question: what did we sell? {% .lead %}
+
+Her report is a single query, and the application runs the same one constantly. But when Alice runs it, PostgreSQL refuses—and that refusal is the best introduction there is to how PostgreSQL decides who may do what. Run it yourself:
 
 {% postgres-permission-lab /%}
 
 ## Meet the cast
 
-- **Priya**, Acme’s founder, owns the original `app` schema and `orders` table.
+This course follows Acme’s database as the company grows. You have already met two of the people who shape it:
+
+- **Priya**, the founder, created the original `app` schema and `orders` table by hand. That detail looks harmless today; it will not stay harmless.
 - **Alice**, the first analyst, needs to read orders.
-- **deploy**, Acme’s migration login, will matter when the schema starts changing.
-- **reporting_app** will arrive in the next chapter.
+- **deploy**, Acme’s migration login, will matter once the schema starts changing.
+- **reporting_app**, an automated reporting service, arrives in the next chapter.
 
 ## Keep one rule
 
