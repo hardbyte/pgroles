@@ -45,3 +45,41 @@ pre[class*='language-'] {
 .token.combinator {
   color: theme('colors.slate.400');
 }
+
+.language-yaml .token.pgroles-section {
+  color: theme('colors.amber.300');
+  font-weight: 700;
+}
+
+.language-yaml .token.pgroles-field {
+  color: theme('colors.sky.300');
+}
+
+.language-yaml .token.pgroles-role-ref,
+.language-yaml .token.pgroles-profile-ref,
+.language-yaml .token.pgroles-identifier {
+  color: theme('colors.teal.200');
+}
+
+.language-yaml .token.pgroles-schema-ref,
+.language-yaml .token.pgroles-object-ref {
+  color: theme('colors.cyan.200');
+}
+
+.language-yaml .token.pgroles-privilege,
+.language-yaml .token.pgroles-enum {
+  color: theme('colors.pink.300');
+  font-weight: 600;
+}
+
+.language-yaml .token.pgroles-deprecated {
+  color: theme('colors.amber.300');
+  text-decoration: underline wavy theme('colors.amber.500');
+  text-underline-offset: 0.2em;
+}
+
+.language-yaml .token.pgroles-unrecognized {
+  color: theme('colors.rose.300');
+  text-decoration: underline wavy theme('colors.rose.500');
+  text-underline-offset: 0.2em;
+}

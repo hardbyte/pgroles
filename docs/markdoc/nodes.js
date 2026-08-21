@@ -38,6 +38,10 @@ const nodes = {
       language: {
         type: String,
       },
+      schema: {
+        type: String,
+        matches: ['pgroles-manifest'],
+      },
     },
   },
   link: {

@@ -29,7 +29,7 @@ Read each edge from the granted role to its member: `GRANT orders_read TO analys
 
 The first step corresponds to two membership edges:
 
-```yaml
+```yaml {% schema="pgroles-manifest" %}
 roles:
   - name: alice
     login: true
@@ -47,7 +47,7 @@ memberships:
 
 The defaults are `inherit: true` and `admin: false`. Make a different edge explicit when the hierarchy needs it:
 
-```yaml
+```yaml {% schema="pgroles-manifest" %}
 memberships:
   - role: analyst
     members:

@@ -1,9 +1,9 @@
 ---
 title: How PostgreSQL access works
-description: Run the same table query as Alice and Mallory, then watch one schema grant change PostgreSQL's decision.
+description: Run one query as Alice and Mallory, observe PostgreSQL's permission path, and turn the intended access into policy.
 ---
 
-Alice and Mallory run the same query. One gets rows; the other gets an error. {% .lead %}
+Alice is supposed to read orders. Mallory is not—but the database has drifted. Run the same query as both roles and watch where PostgreSQL stops. {% .lead %}
 
 {% postgres-permission-lab /%}
 
@@ -11,19 +11,17 @@ Alice and Mallory run the same query. One gets rows; the other gets an error. {%
 
 **PostgreSQL must be able to reach the schema and authorize the table operation.**
 
-The login role changes who PostgreSQL evaluates. Schema `USAGE` makes `app.orders` reachable; table `SELECT` authorizes reading its rows. Neither grant implies the other.
+PostgreSQL evaluates privileges for the current effective role. Schema `USAGE` makes `app.orders` reachable; table `SELECT` authorizes reading its rows. Neither grant implies the other.
 
 ## Make the access path durable
 
-Direct grants make the first lesson easy to see. In production, repeating them for every person and workload becomes difficult to review and easy to drift. A capability role gives the permissions one name, then membership decides who receives them.
+The experiment exposed two facts scattered across PostgreSQL's ACLs: Alice has a complete path, while Mallory has an undeclared table grant that happens to be incomplete. That is difficult to review and dangerous to leave behind. A capability role gives the intended permissions one name; membership declares who receives them.
 
 {% production-role-shape-diagram /%}
 
-The reader path and owner are explicit in pgroles policy:
+The reader path and schema owner are explicit in pgroles policy:
 
-```yaml
-default_owner: app_owner
-
+```yaml {% schema="pgroles-manifest" %}
 roles:
   - name: alice
     login: true
@@ -31,6 +29,10 @@ roles:
     login: true
   - name: orders_reader
   - name: app_owner
+
+schemas:
+  - name: app
+    owner: app_owner
 
 grants:
   - role: orders_reader
@@ -46,7 +48,7 @@ memberships:
       - name: alice
 ```
 
-This policy replaces the direct teaching grants from the lesson. Alice moves behind `orders_reader`; Mallory's direct `SELECT` becomes undeclared drift. pgroles can show the exact SQL needed to converge that intent and keep the reusable access path intact.
+This policy replaces the direct teaching grants from the lesson. Alice moves behind `orders_reader`; Mallory's direct `SELECT` becomes undeclared drift. pgroles can show the exact SQL needed to converge that intent and keep the reusable access path intact. It also converges ownership of the `app` schema. Migrations must create tables as `app_owner`; pgroles does not change the owners of tables inside that schema.
 
 ## Continue from here
 

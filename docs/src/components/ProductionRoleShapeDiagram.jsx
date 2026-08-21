@@ -175,7 +175,7 @@ export function ProductionRoleShapeDiagram() {
           <Node
             eyebrow="Database objects"
             name="app → orders"
-            detail="Ownership stays separate from day-to-day application access."
+            detail="pgroles owns the schema; migrations as app_owner create its tables."
           />
         </div>
       </div>
@@ -184,8 +184,8 @@ export function ProductionRoleShapeDiagram() {
         Alice reaches <span className="font-mono">app.orders</span> through the{' '}
         <span className="font-mono">orders_reader</span> capability. Mallory has
         no path. Controlled migrations use the separate{' '}
-        <span className="font-mono">app_owner</span> role, which owns the schema
-        and table without becoming an application login.
+        <span className="font-mono">app_owner</span> role. pgroles converges the
+        schema owner; migrations running as that role create the tables it owns.
       </figcaption>
     </figure>
   )

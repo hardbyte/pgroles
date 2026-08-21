@@ -21,147 +21,6 @@ VALUES ('Acme', 4200), ('Globex', 9900)`,
   'GRANT USAGE ON SCHEMA app TO alice',
 ]
 
-const accessExperiments = [
-  {
-    id: 'alice-reads',
-    title: 'Alice reads the orders table',
-    intro: 'Alice runs the application query and receives two rows.',
-    explanation:
-      'Alice can reach the app schema and has SELECT on orders, so PostgreSQL returns the rows.',
-    takeaway:
-      'A successful read passes both the schema gate and the table gate.',
-    actionLabel: 'Run as Alice',
-    path: [
-      ['Run as', 'Alice', 'focus'],
-      ['Schema', 'USAGE granted', 'pass'],
-      ['Table', 'SELECT granted', 'pass'],
-      ['Result', '2 rows', 'pass'],
-    ],
-    expectedResults: [
-      {
-        index: 0,
-        rows: [
-          { id: 1, customer: 'Acme', total_cents: 4200 },
-          { id: 2, customer: 'Globex', total_cents: 9900 },
-        ],
-      },
-    ],
-    highlightStatements: [0],
-    statements: [
-      {
-        actor: 'alice',
-        actorLabel: 'Alice',
-        purpose: 'Application query',
-        sql: 'SELECT * FROM app.orders ORDER BY id',
-      },
-    ],
-  },
-  {
-    id: 'mallory-denied',
-    title: 'Mallory runs the same query',
-    intro:
-      'Nothing about the SQL changes. Only the role changes, and Mallory is missing part of the access path.',
-    explanation:
-      'PostgreSQL stops at the schema gate. Mallory has SELECT on the table, but cannot reach objects inside app.',
-    takeaway:
-      'The same SQL can succeed or fail because PostgreSQL evaluates it for the current identity.',
-    actionLabel: 'Run as Mallory',
-    path: [
-      ['Run as', 'Mallory', 'focus'],
-      ['Schema', 'USAGE missing', 'blocked'],
-      ['Table', 'SELECT granted', 'pass'],
-      ['Result', 'Blocked', 'blocked'],
-    ],
-    expectedError: 'permission denied for schema app',
-    expectedErrorCode: '42501',
-    expectedErrorIndex: 0,
-    highlightStatements: [0],
-    statements: [
-      {
-        actor: 'mallory',
-        actorLabel: 'Mallory',
-        purpose: 'The same application query',
-        sql: 'SELECT * FROM app.orders ORDER BY id',
-      },
-    ],
-  },
-  {
-    id: 'remove-schema',
-    title: 'Remove one grant from Alice',
-    intro:
-      'Now remove Alice’s schema access while leaving her table SELECT untouched, then retry the original query.',
-    explanation:
-      'Alice still has SELECT on orders, but PostgreSQL can no longer resolve the table through the app schema.',
-    takeaway: 'A table grant cannot bypass a missing schema grant.',
-    actionLabel: 'Remove access and retry',
-    path: [
-      ['Run as', 'Alice', 'pass'],
-      ['Schema', 'USAGE removed', 'focus'],
-      ['Table', 'SELECT unchanged', 'pass'],
-      ['Result', 'Blocked', 'blocked'],
-    ],
-    expectedError: 'permission denied for schema app',
-    expectedErrorCode: '42501',
-    expectedErrorIndex: 1,
-    highlightStatements: [0],
-    statements: [
-      {
-        actor: 'app_owner',
-        actorLabel: 'App owner',
-        purpose: 'Change under test',
-        sql: 'REVOKE USAGE ON SCHEMA app FROM alice',
-      },
-      {
-        actor: 'alice',
-        actorLabel: 'Alice',
-        purpose: 'Retry the unchanged query',
-        sql: 'SELECT * FROM app.orders ORDER BY id',
-      },
-    ],
-  },
-  {
-    id: 'restore-schema',
-    title: 'Restore the missing gate',
-    intro:
-      'Put schema USAGE back and run the same SELECT once more. The table privilege never changed.',
-    explanation:
-      'Schema USAGE makes app.orders reachable again; the existing SELECT grant authorizes the read.',
-    takeaway:
-      'Schema USAGE and table SELECT answer different questions, and a reader normally needs both.',
-    actionLabel: 'Restore access and retry',
-    path: [
-      ['Run as', 'Alice', 'pass'],
-      ['Schema', 'USAGE restored', 'focus'],
-      ['Table', 'SELECT unchanged', 'pass'],
-      ['Result', '2 rows', 'pass'],
-    ],
-    expectedResults: [
-      {
-        index: 0,
-        rows: [
-          { id: 1, customer: 'Acme', total_cents: 4200 },
-          { id: 2, customer: 'Globex', total_cents: 9900 },
-        ],
-      },
-    ],
-    highlightStatements: [0],
-    statements: [
-      {
-        actor: 'app_owner',
-        actorLabel: 'App owner',
-        purpose: 'Repair the missing gate',
-        sql: 'GRANT USAGE ON SCHEMA app TO alice',
-      },
-      {
-        actor: 'alice',
-        actorLabel: 'Alice',
-        purpose: 'Retry the unchanged query',
-        sql: 'SELECT * FROM app.orders ORDER BY id',
-      },
-    ],
-  },
-]
-
 const hierarchySetupStatements = [
   'CREATE ROLE alice LOGIN',
   'CREATE ROLE bob LOGIN',
@@ -392,48 +251,31 @@ WHERE granted.rolname = 'analyst'
   },
 ]
 
-const lessons = [
-  {
-    id: 'access-path',
-    eyebrow: 'Lesson 1 · The permission chain',
-    navTitle: 'Follow one table read',
-    title: 'Same SQL. Different role. Different result.',
-    description:
-      'Start with success, compare Alice with Mallory, then remove and restore one permission gate.',
-    setupStatements: accessSetupStatements,
-    setupSummary:
-      'two login roles, an owner, the app schema, the orders table, and two rows',
-    pathLabel: 'What this step tests',
-    playgroundRoles: [
-      { value: 'alice', label: 'Alice' },
-      { value: 'mallory', label: 'Mallory' },
-    ],
-    experiments: accessExperiments,
-  },
-  {
-    id: 'role-hierarchy',
-    eyebrow: 'Lesson 2 · Role hierarchy',
-    navTitle: 'Build a role hierarchy',
-    title: 'How do privileges travel through roles?',
-    description:
-      'Build a nested capability graph, control inheritance, switch effective identity, and delegate membership administration.',
-    setupStatements: hierarchySetupStatements,
-    setupSummary:
-      'six roles, a schema, the orders table, and object privileges held only by orders_read',
-    pathLabel: 'What this step tests',
-    playgroundRoles: [
-      { value: 'alice', label: 'Alice' },
-      { value: 'bob', label: 'Bob' },
-      { value: 'analyst', label: 'Analyst' },
-      { value: 'team_lead', label: 'Team lead' },
-    ],
-    experiments: hierarchyExperiments,
-  },
-]
+const hierarchyLesson = {
+  id: 'role-hierarchy',
+  eyebrow: 'Lesson 2 · Role hierarchy',
+  navTitle: 'Build a role hierarchy',
+  title: 'How do privileges travel through roles?',
+  description:
+    'Build a nested capability graph, control inheritance, switch effective identity, and delegate membership administration.',
+  setupStatements: hierarchySetupStatements,
+  setupSummary:
+    'six roles, a schema, the orders table, and object privileges held only by orders_read',
+  pathLabel: 'What this step tests',
+  playgroundRoles: [
+    { value: 'alice', label: 'Alice' },
+    { value: 'bob', label: 'Bob' },
+    { value: 'analyst', label: 'Analyst' },
+    { value: 'team_lead', label: 'Team lead' },
+  ],
+  experiments: hierarchyExperiments,
+}
 const starterSql = `SELECT
   session_user,
   current_user,
   current_database();`
+
+const accessQuery = 'SELECT * FROM app.orders ORDER BY id;'
 
 const pathStyles = {
   pass: 'border-emerald-400 bg-emerald-50/70 dark:border-emerald-700 dark:bg-emerald-950/20',
@@ -570,7 +412,13 @@ function SqlSource({
   )
 }
 
-function SqlEditor({ value, onChange, disabled }) {
+function SqlEditor({
+  value,
+  onChange,
+  disabled,
+  ariaLabel = 'SQL playground',
+  minHeight = 'min-h-[11rem]',
+}) {
   const highlightRef = useRef(null)
 
   function syncScroll(event) {
@@ -580,25 +428,27 @@ function SqlEditor({ value, onChange, disabled }) {
   }
 
   return (
-    <div className="relative min-h-[11rem] overflow-hidden rounded-xl border border-stone-700 bg-[#0c0e12] focus-within:border-amber-400 focus-within:ring-2 focus-within:ring-amber-400/20">
+    <div
+      className={`relative ${minHeight} overflow-hidden rounded-xl border border-stone-700 bg-[#0c0e12] focus-within:border-amber-400 focus-within:ring-2 focus-within:ring-amber-400/20`}
+    >
       <pre
         ref={highlightRef}
         aria-hidden="true"
-        className="pointer-events-none absolute inset-0 m-0 min-h-[11rem] overflow-hidden whitespace-pre p-4 font-mono text-xs leading-6 text-stone-200"
+        className={`pointer-events-none absolute inset-0 m-0 ${minHeight} overflow-hidden whitespace-pre p-4 font-mono text-xs leading-6 text-stone-200`}
       >
         <code>
           <SqlTokens code={value || ' '} />
         </code>
       </pre>
       <textarea
-        aria-label="SQL playground"
+        aria-label={ariaLabel}
         value={value}
         onChange={(event) => onChange(event.target.value)}
         onScroll={syncScroll}
         disabled={disabled}
         wrap="off"
         spellCheck="false"
-        className="relative z-10 m-0 min-h-[11rem] w-full resize-y overflow-auto border-0 bg-transparent p-4 font-mono text-xs leading-6 text-transparent outline-none selection:bg-amber-300/30 disabled:cursor-wait"
+        className={`relative z-10 m-0 ${minHeight} w-full resize-y overflow-auto border-0 bg-transparent p-4 font-mono text-xs leading-6 text-transparent outline-none selection:bg-amber-300/30 disabled:cursor-wait`}
         style={{ caretColor: '#f5f5f4', WebkitTextFillColor: 'transparent' }}
       />
     </div>
@@ -739,8 +589,7 @@ function SqlOutput({
               : 'border-red-800 bg-red-950/40 text-red-200'
           }`}
         >
-          <span className="mr-2 font-semibold">ERROR</span>
-          {output.error}
+          <span className="font-semibold">ERROR:</span> {output.error}
         </div>
       )}
       {kind !== 'lesson' && !output.error ? (
@@ -897,6 +746,390 @@ async function executeSetupStatements(database, statements) {
   }
 
   return output
+}
+
+function normalizeSql(sql) {
+  return sql
+    .trim()
+    .replace(/;+\s*$/, '')
+    .replace(/\s+/g, ' ')
+    .toLowerCase()
+}
+
+function AccessStoryLab() {
+  const databaseRef = useRef(null)
+  const databasePromiseRef = useRef(null)
+  const lessonPreparedRef = useRef(false)
+  const operationLockRef = useRef(false)
+  const [actor, setActor] = useState('alice')
+  const [sql, setSql] = useState(accessQuery)
+  const [output, setOutput] = useState(null)
+  const [operation, setOperation] = useState('idle')
+  const [observed, setObserved] = useState({ alice: false, mallory: false })
+  const running = operation !== 'idle'
+  const exampleRestored = normalizeSql(sql) === normalizeSql(accessQuery)
+
+  useEffect(
+    () => () => {
+      databaseRef.current?.close().catch(() => {})
+    },
+    []
+  )
+
+  async function ensureDatabase() {
+    if (databaseRef.current) return databaseRef.current
+    if (databasePromiseRef.current) return databasePromiseRef.current
+
+    setOperation('booting')
+    databasePromiseRef.current = import('@electric-sql/pglite')
+      .then(({ PGlite }) => PGlite.create())
+      .then((database) => {
+        databaseRef.current = database
+        return database
+      })
+      .finally(() => {
+        databasePromiseRef.current = null
+      })
+
+    return databasePromiseRef.current
+  }
+
+  async function ensureLessonPrepared() {
+    const database = await ensureDatabase()
+    if (lessonPreparedRef.current) return database
+
+    setOperation('preparing')
+    const setupOutput = await executeSetupStatements(
+      database,
+      accessSetupStatements
+    )
+    if (setupOutput.error) {
+      throw new Error(`Lesson setup failed: ${setupOutput.error}`)
+    }
+    lessonPreparedRef.current = true
+    return database
+  }
+
+  async function runQuery() {
+    if (operationLockRef.current || running) return
+
+    const selectedActor = actor
+    const selectedSql = sql
+    if (selectedSql.trim() === '') return
+
+    setOutput(null)
+    operationLockRef.current = true
+    let sandbox = null
+
+    try {
+      const database = await ensureLessonPrepared()
+      setOperation('query')
+      sandbox = await database.clone()
+      await sandbox.exec(
+        `SET SESSION AUTHORIZATION "${selectedActor.replaceAll('"', '""')}";`
+      )
+
+      const result = { commands: [], results: [], error: null }
+      try {
+        const statementResults = await sandbox.exec(selectedSql)
+        appendStatementResults(result, statementResults)
+      } catch (error) {
+        result.error = error.message
+        result.errorCode = error.code
+      }
+
+      const canonical = normalizeSql(selectedSql) === normalizeSql(accessQuery)
+      const returnedOrders =
+        selectedActor === 'alice' &&
+        canonical &&
+        !result.error &&
+        result.results[0]?.rows?.length === 2
+      const exposedSchemaGate =
+        selectedActor === 'mallory' &&
+        canonical &&
+        result.errorCode === '42501' &&
+        result.error?.includes('permission denied for schema app')
+      const guidedOutcome = returnedOrders
+        ? 'alice-success'
+        : exposedSchemaGate
+        ? 'mallory-denied'
+        : null
+
+      setOutput({
+        ...result,
+        actor: selectedActor,
+        sql: selectedSql,
+        canonical,
+        guidedOutcome,
+      })
+
+      if (returnedOrders) {
+        setObserved((current) => ({ ...current, alice: true }))
+      }
+      if (exposedSchemaGate) {
+        setObserved((current) => ({ ...current, mallory: true }))
+      }
+    } catch (error) {
+      setOutput({
+        commands: [],
+        results: [],
+        error: error.message,
+        actor: selectedActor,
+        sql: selectedSql,
+        canonical: false,
+        guidedOutcome: null,
+      })
+    } finally {
+      if (sandbox) await sandbox.close().catch(() => {})
+      setOperation('idle')
+      operationLockRef.current = false
+    }
+  }
+
+  function restoreExample() {
+    if (running) return
+    setSql(accessQuery)
+    setOutput(null)
+  }
+
+  const decisionPath =
+    output?.guidedOutcome === 'alice-success'
+      ? [
+          ['Schema', 'USAGE granted', 'pass'],
+          ['Table', 'SELECT granted', 'pass'],
+          ['Decision', '2 rows returned', 'pass'],
+        ]
+      : output?.guidedOutcome === 'mallory-denied'
+      ? [
+          ['Schema', 'USAGE missing', 'blocked'],
+          ['Table · not reached', 'SELECT present', 'muted'],
+          ['Decision', 'Access denied', 'blocked'],
+        ]
+      : null
+
+  return (
+    <div className="not-prose my-10 overflow-hidden rounded-[2rem] border border-stone-300/90 bg-white shadow-[0_30px_80px_-52px_rgba(28,25,23,0.5)] dark:border-stone-700 dark:bg-stone-900 dark:shadow-none">
+      <div className="hidden border-b border-stone-300/80 bg-[linear-gradient(135deg,rgba(254,243,199,0.75),rgba(240,253,250,0.8))] px-5 py-6 dark:border-stone-700 dark:bg-[linear-gradient(135deg,rgba(120,53,15,0.2),rgba(19,78,74,0.2))] sm:block sm:px-7">
+        <div className="flex flex-wrap items-center justify-between gap-3">
+          <p className="m-0 text-[11px] font-semibold uppercase tracking-[0.22em] text-amber-800 dark:text-amber-300">
+            Live PostgreSQL · The orders report
+          </p>
+          <a
+            href="https://pglite.dev/"
+            className="rounded-full border border-stone-300 bg-white/75 px-3 py-1 font-mono text-[10px] font-semibold text-stone-700 no-underline shadow-none dark:border-stone-700 dark:bg-stone-900/70 dark:text-stone-300"
+          >
+            PostgreSQL 18.3 · PGlite ↗
+          </a>
+        </div>
+        <h2 className="mt-3 font-display text-2xl tracking-[-0.02em] text-stone-950 dark:text-white">
+          One query, two permission paths
+        </h2>
+        <p className="mb-0 mt-2 max-w-3xl text-sm leading-6 text-stone-700 dark:text-stone-300">
+          Alice is an approved reader. Mallory is not—but the database has
+          picked up one direct grant outside policy.
+        </p>
+      </div>
+
+      <div className="flex items-center justify-between gap-3 border-b border-stone-300/80 bg-[linear-gradient(135deg,rgba(254,243,199,0.75),rgba(240,253,250,0.8))] px-5 py-4 dark:border-stone-700 dark:bg-[linear-gradient(135deg,rgba(120,53,15,0.2),rgba(19,78,74,0.2))] sm:hidden">
+        <h2 className="m-0 text-[10px] font-semibold uppercase tracking-[0.18em] text-amber-800 dark:text-amber-300">
+          Live PostgreSQL · orders report
+        </h2>
+        <span className="shrink-0 rounded-full border border-stone-300 bg-white/75 px-2.5 py-1 font-mono text-[9px] font-semibold text-stone-700 dark:border-stone-700 dark:bg-stone-900/70 dark:text-stone-300">
+          PG 18.3
+        </span>
+      </div>
+
+      <section className="grid gap-5 p-5 sm:p-7" aria-labelledby="query-lab">
+        <div>
+          <p className="m-0 font-mono text-[10px] font-semibold uppercase tracking-[0.16em] text-amber-700 dark:text-amber-300">
+            Establish the baseline
+          </p>
+          <h3
+            id="query-lab"
+            className="mt-2 font-display text-2xl tracking-[-0.02em] text-stone-950 dark:text-white"
+          >
+            Start with the report working
+          </h3>
+          <p className="mb-0 mt-3 max-w-3xl text-base leading-7 text-stone-700 dark:text-stone-300">
+            Alice has the complete access path. Send the application query and
+            watch PostgreSQL return the orders.
+          </p>
+        </div>
+
+        <div className="overflow-hidden rounded-2xl border border-stone-700 bg-[#0c0e12]">
+          <div className="flex items-end justify-between gap-2 border-b border-stone-700 bg-stone-900 px-4 py-3">
+            <label className="grid min-w-0 flex-1 gap-1.5 font-mono text-[10px] font-semibold uppercase tracking-[0.14em] text-stone-400 sm:flex-none">
+              Query as
+              <select
+                value={actor}
+                onChange={(event) => {
+                  setActor(event.target.value)
+                  setOutput(null)
+                }}
+                disabled={running}
+                className="w-full min-w-0 rounded-lg border border-stone-600 bg-stone-950 px-3 py-2 font-mono text-sm normal-case tracking-normal text-white sm:min-w-40"
+              >
+                <option value="alice">Alice</option>
+                <option value="mallory">Mallory</option>
+              </select>
+            </label>
+            <div className="flex flex-wrap gap-2">
+              {!exampleRestored && (
+                <button
+                  type="button"
+                  onClick={restoreExample}
+                  disabled={running}
+                  className="rounded-lg border border-stone-600 px-3 py-2 text-xs font-semibold text-stone-300 hover:border-amber-400 hover:text-white disabled:cursor-wait"
+                >
+                  Restore query
+                </button>
+              )}
+              <button
+                type="button"
+                onClick={() => runQuery()}
+                disabled={running || sql.trim() === ''}
+                className="rounded-xl border border-amber-300 bg-amber-300 px-5 py-2.5 font-mono text-xs font-bold text-stone-950 transition hover:bg-amber-200 focus:outline-none focus-visible:ring-2 focus-visible:ring-amber-300 focus-visible:ring-offset-2 focus-visible:ring-offset-stone-900 disabled:cursor-wait disabled:border-stone-600 disabled:bg-stone-700 disabled:text-stone-400"
+              >
+                {operation === 'booting'
+                  ? 'Starting PostgreSQL…'
+                  : operation === 'preparing'
+                  ? 'Preparing database…'
+                  : operation === 'query'
+                  ? 'Running query…'
+                  : 'Run query'}
+              </button>
+            </div>
+          </div>
+
+          <div className="p-3 sm:p-4">
+            <SqlEditor
+              value={sql}
+              onChange={(value) => {
+                setSql(value)
+                setOutput(null)
+              }}
+              disabled={running}
+              ariaLabel="Orders report SQL"
+              minHeight="min-h-[6rem]"
+            />
+          </div>
+
+          <div className="border-t border-stone-800 bg-stone-950 px-4 py-3">
+            <p className="m-0 text-xs leading-5 text-stone-400">
+              Temporary database copy · changes are discarded after each run
+            </p>
+          </div>
+
+          <div
+            className="border-t border-stone-800 bg-stone-950 px-4 py-5 text-stone-200"
+            aria-live="polite"
+            aria-busy={running}
+          >
+            <p className="mb-4 mt-0 font-mono text-[10px] font-semibold uppercase tracking-[0.16em] text-stone-500">
+              PostgreSQL output
+            </p>
+            <SqlOutput
+              output={output}
+              operation={operation}
+              kind="query"
+              expectedError={output?.guidedOutcome === 'mallory-denied'}
+            />
+          </div>
+        </div>
+
+        {decisionPath && (
+          <AccessPath path={decisionPath} label="Why PostgreSQL decided this" />
+        )}
+
+        {output && !output.guidedOutcome && (
+          <p className="m-0 rounded-xl border border-stone-200 bg-stone-50 px-4 py-3 text-sm leading-6 text-stone-600 dark:border-stone-700 dark:bg-stone-950/30 dark:text-stone-300">
+            That is PostgreSQL’s real response to your SQL. Restore the example
+            query to continue the guided comparison.
+          </p>
+        )}
+
+        {!observed.alice && (
+          <p className="m-0 border-l-2 border-amber-400 pl-4 text-sm leading-6 text-stone-700 dark:text-stone-300">
+            Begin with Alice so the successful access path has a baseline.
+          </p>
+        )}
+
+        {observed.alice && !observed.mallory && (
+          <div className="rounded-2xl border border-amber-200 bg-amber-50/70 p-5 dark:border-amber-900/70 dark:bg-amber-950/25">
+            <p className="m-0 font-mono text-[10px] font-semibold uppercase tracking-[0.16em] text-amber-800 dark:text-amber-300">
+              Now change one variable
+            </p>
+            <h3 className="mb-0 mt-2 font-display text-xl text-stone-950 dark:text-white">
+              Mallory has a stray table grant
+            </h3>
+            <p className="mb-0 mt-3 text-sm leading-6 text-stone-700 dark:text-stone-300">
+              Someone granted Mallory <code>SELECT</code> directly on{' '}
+              <code>app.orders</code>, even though she is not an approved
+              reader. Keep the database and query unchanged; change only who is
+              asking.
+            </p>
+            <p className="mb-0 mt-3 text-sm font-semibold leading-6 text-stone-900 dark:text-white">
+              Choose Mallory under Query as, then run the unchanged query again.
+            </p>
+          </div>
+        )}
+
+        {observed.alice && observed.mallory && (
+          <div className="rounded-2xl border border-emerald-200 bg-emerald-50/70 p-5 dark:border-emerald-900 dark:bg-emerald-950/25">
+            <p className="m-0 font-mono text-[10px] font-semibold uppercase tracking-[0.16em] text-emerald-700 dark:text-emerald-300">
+              What the comparison revealed
+            </p>
+            <p className="mb-0 mt-2 text-sm leading-6 text-stone-800 dark:text-stone-200">
+              Mallory’s table grant is real, but PostgreSQL stops first at the
+              missing schema permission. That partial grant is still dangerous
+              drift: another membership or <code>PUBLIC</code> grant could
+              complete the path later.
+            </p>
+            <p className="mb-0 mt-3 border-l-2 border-emerald-500 pl-3 text-sm font-semibold leading-6 text-stone-900 dark:text-white">
+              The production fix is to remove Mallory’s undeclared grant and
+              declare the complete reader path once.
+            </p>
+            <Link
+              href="#make-the-access-path-durable"
+              className="mt-4 inline-flex rounded-lg border border-emerald-700 px-4 py-2 text-sm font-semibold text-emerald-800 no-underline hover:bg-emerald-100 dark:border-emerald-600 dark:text-emerald-200 dark:hover:bg-emerald-950"
+            >
+              See the pgroles policy ↓
+            </Link>
+          </div>
+        )}
+      </section>
+
+      <details className="border-t border-stone-200 px-5 py-4 dark:border-stone-800 sm:px-7">
+        <summary className="cursor-pointer text-sm font-semibold text-stone-600 hover:text-stone-950 dark:text-stone-300 dark:hover:text-white">
+          How role selection works in the browser
+        </summary>
+        <p className="mb-0 mt-3 text-sm leading-6 text-stone-500 dark:text-stone-400">
+          The selector sets the starting session authorization inside an
+          isolated browser database. Each query runs in a disposable copy, so
+          arbitrary SQL cannot alter the guided scenario. It is not an
+          authentication test and does not exercise passwords,{' '}
+          <code>CONNECT</code>, <code>LOGIN</code>, or <code>pg_hba.conf</code>.
+        </p>
+      </details>
+
+      <details className="border-t border-stone-200 px-5 py-4 dark:border-stone-800 sm:px-7">
+        <summary className="cursor-pointer text-sm font-semibold text-stone-600 hover:text-stone-950 dark:text-stone-300 dark:hover:text-white">
+          Show the database setup SQL
+        </summary>
+        <p className="mb-4 mt-3 text-sm leading-6 text-stone-500 dark:text-stone-400">
+          The setup deliberately gives Mallory a table grant without schema
+          access so the comparison changes only the session identity.
+        </p>
+        <div className="overflow-hidden rounded-2xl border border-stone-700">
+          <SqlSource
+            statements={accessSetupStatements}
+            label="Lesson setup SQL"
+            maxHeight="max-h-[24rem]"
+          />
+        </div>
+      </details>
+    </div>
+  )
 }
 
 function PostgresLesson({ lesson, nextLesson }) {
@@ -1417,17 +1650,9 @@ function PostgresLesson({ lesson, nextLesson }) {
 }
 
 export function PostgresPermissionLab() {
-  return (
-    <PostgresLesson
-      lesson={lessons[0]}
-      nextLesson={{
-        href: '/docs/postgresql-role-hierarchy',
-        title: 'Build a role hierarchy',
-      }}
-    />
-  )
+  return <AccessStoryLab />
 }
 
 export function PostgresRoleHierarchyLab() {
-  return <PostgresLesson lesson={lessons[1]} />
+  return <PostgresLesson lesson={hierarchyLesson} />
 }
