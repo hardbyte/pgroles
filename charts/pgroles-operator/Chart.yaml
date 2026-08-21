@@ -5,8 +5,8 @@ description: >-
   Define roles, memberships, grants, and default privileges in YAML
   and let the operator converge your database to the desired state.
 type: application
-version: 0.9.0
-appVersion: "0.9.0"
+version: 0.10.0-alpha.1
+appVersion: "0.10.0-alpha.1"
 icon: https://raw.githubusercontent.com/thepartly/pgroles/main/docs/public/logo.svg
 sources:
   - https://github.com/thepartly/pgroles

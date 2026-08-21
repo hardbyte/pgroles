@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.10.0-alpha.1] - 2026-08-21
+
 ### Added
 
 - **`PostgresPolicyCandidate`: propose and review policy content without touching the live policy.** A candidate points at an existing `PostgresPolicy` and carries only proposed content — roles, grants, memberships. Everything about execution (interval, mode, approval and, unless `spec.target` overrides it for a preview, the connection) comes from the policy it points at. Once created, a candidate cannot be edited — the API server rejects the write — so the version reviewed is exactly the version approved. To revise a proposal, file a successor:
