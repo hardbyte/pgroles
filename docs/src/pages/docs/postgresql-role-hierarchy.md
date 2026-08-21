@@ -27,7 +27,7 @@ Read each edge from the granted role to its member: `GRANT orders_read TO analys
 
 ## Declare the graph in pgroles
 
-The first checkpoint corresponds to two membership edges:
+The first step corresponds to two membership edges:
 
 ```yaml
 roles:
