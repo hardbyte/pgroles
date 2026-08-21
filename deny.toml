@@ -1,5 +1,10 @@
 [advisories]
-ignore = []
+ignore = [
+    # RUSTSEC-2023-0071 (rsa: Marvin timing sidechannel): rsa is only in the
+    # lockfile via sqlx-mysql, which is never enabled or compiled — we build
+    # sqlx with the "postgres" feature only. No fixed rsa release exists yet.
+    "RUSTSEC-2023-0071",
+]
 
 [licenses]
 allow = [
