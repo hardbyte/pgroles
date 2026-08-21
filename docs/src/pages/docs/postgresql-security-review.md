@@ -36,6 +36,8 @@ A `SECURITY DEFINER` function is an intentional privilege boundary. Review its o
 
 `WITH GRANT OPTION` lets an application grantee delegate an object privilege. pgroles checks whether its executor can grant wildcard privileges safely, but it does not model or converge grant options held by application roles. Audit and manage that boundary separately.
 
+One more finding costs nothing to write down: Acme’s application still connects with the founder-era admin credentials, and a superuser bypasses every check in this chapter. No grant, policy, or RLS rule constrains that connection—pgroles cannot manage it away. Moving the application onto a scoped login, the way `reporting_app` was built in chapter 2, is the remediation an auditor will ask for first.
+
 **Desired ACLs are necessary; effective-access tests tell you whether every other path agrees with them.**
 
 {% quick-links %}

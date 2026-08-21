@@ -119,6 +119,14 @@ AS 'SELECT sum(total_cents)::bigint FROM app.orders';
 RESET ROLE;
 GRANT EXECUTE ON FUNCTION billing_api.order_total() TO auditor;`;
 
+// The report Alice was hired to build: revenue by customer. Every chapter
+// reuses it, so a permission change is always tested against the same real
+// operation. Two customers exist in the seed, so it returns two rows.
+const reportSql = `SELECT customer, round(sum(total_cents) / 100.0, 2) AS revenue
+FROM app.orders
+GROUP BY customer
+ORDER BY revenue DESC;`;
+
 function privilegeInspection(role, object = "app.orders") {
   return `SELECT
   has_schema_privilege('${role}', 'app', 'USAGE') AS schema_usage,
@@ -190,17 +198,45 @@ const chapters = {
       title: "Replace direct grants with a capability role",
     },
     actors: [
-      ["postgres", "Database admin"],
+      ["postgres", "Admin (the app’s connection)"],
       ["alice", "Alice"],
     ],
     steps: [
+      {
+        title: "Run the report the way the application does",
+        why: "Acme’s application has read and written orders since day one, connected with the admin credentials Priya configured at the start. Watch what that means: PostgreSQL does not check a single privilege for a superuser.",
+        prompt: "Run the revenue report on the application’s admin connection.",
+        setup: founderSeed,
+        role: "postgres",
+        sql: reportSql,
+        inspect: `SELECT rolsuper AS is_superuser FROM pg_roles WHERE rolname = 'postgres';`,
+        cards: (row, output) => [
+          ["Connection", "postgres (admin)", "focus"],
+          [
+            "Privilege gates",
+            row?.is_superuser ? "bypassed by superuser" : "checked",
+            "focus",
+          ],
+          [
+            "Result",
+            output.error ? "denied" : "revenue by customer",
+            output.error ? "blocked" : "pass",
+          ],
+        ],
+        expect: (output, row) =>
+          !output.error &&
+          output.results[0]?.rows.length === 2 &&
+          row?.is_superuser === true,
+        observation:
+          "Two rows of revenue. It works not because anyone designed this access, but because the superuser bypasses every gate. Nobody at Acme has ever been denied anything — until Alice runs the same query.",
+      },
       {
         title: "Run the report as Alice",
         why: "This is the exact query the application runs successfully all day. The only thing that changes is who is asking: PostgreSQL evaluates every query against the current role's privileges, and nobody has granted Alice anything yet.",
         prompt: "Run the report query as Alice.",
         setup: founderSeed,
         role: "alice",
-        sql: "SELECT * FROM app.orders ORDER BY id;",
+        sql: reportSql,
         inspect: privilegeInspection("alice"),
         cards: gateCards("Alice", "rows"),
         expect: (output) =>
@@ -228,7 +264,7 @@ const chapters = {
         prompt: "Run the identical report query as Alice again.",
         setup: schemaOnlySeed,
         role: "alice",
-        sql: "SELECT * FROM app.orders ORDER BY id;",
+        sql: reportSql,
         inspect: privilegeInspection("alice"),
         cards: gateCards("Alice", "rows"),
         expect: (output) =>
@@ -256,7 +292,7 @@ const chapters = {
         prompt: "Query orders as Alice.",
         setup: directAccessSeed,
         role: "alice",
-        sql: "SELECT * FROM app.orders ORDER BY id;",
+        sql: reportSql,
         inspect: privilegeInspection("alice"),
         cards: gateCards("Alice", "2 rows"),
         expect: (output) =>
@@ -308,7 +344,7 @@ GRANT orders_reader TO alice, reporting_app;`,
         prompt: "Run the report as reporting_app.",
         setup: capabilitySeed,
         role: "reporting_app",
-        sql: "SELECT * FROM app.orders ORDER BY id;",
+        sql: reportSql,
         inspect: privilegeInspection("reporting_app"),
         cards: basicCards("Reporting app", "2 rows"),
         expect: (output) =>
@@ -406,7 +442,7 @@ REVOKE orders_reader FROM alice;`,
         prompt: "Run the report as Alice after her membership was removed.",
         setup: `${capabilitySeed}\nGRANT orders_reader TO bob;\nREVOKE orders_reader FROM alice;`,
         role: "alice",
-        sql: "SELECT * FROM app.orders ORDER BY id;",
+        sql: reportSql,
         inspect: privilegeInspection("alice"),
         cards: basicCards("Alice", "still 2 rows"),
         expect: (output) =>
@@ -438,7 +474,7 @@ REVOKE USAGE ON SCHEMA app FROM alice;`,
         prompt: "Try the report as Alice. Then switch to Bob and run it again.",
         setup: postDriftSeed,
         role: "alice",
-        sql: "SELECT * FROM app.orders ORDER BY id;",
+        sql: reportSql,
         inspect: privilegeInspection("alice"),
         cards: basicCards("Alice", "denied"),
         expect: (output) =>
@@ -616,7 +652,7 @@ INSERT INTO app.refunds VALUES (1, 1, 500);`,
         prompt: "Read refunds as reporting_app.",
         setup: defaultsSeed,
         role: "reporting_app",
-        sql: "SELECT * FROM app.refunds ORDER BY id;",
+        sql: "SELECT round(sum(total_cents) / 100.0, 2) AS refunded FROM app.refunds;",
         inspect: privilegeInspection("reporting_app", "app.refunds"),
         cards: basicCards("Reporting app", "denied"),
         expect: (output) =>
@@ -832,7 +868,7 @@ REVOKE orders_reader FROM bob;`,
         prompt: "Run the report as Bob.",
         setup: nestedSeed,
         role: "bob",
-        sql: "SELECT * FROM app.orders ORDER BY id;",
+        sql: reportSql,
         inspect: privilegeInspection("bob"),
         cards: basicCards("Bob", "2 rows"),
         expect: (output) =>
@@ -918,7 +954,7 @@ GRANT analyst TO bob WITH INHERIT FALSE, SET TRUE;`,
         prompt: "Run the report as Bob on the INHERIT FALSE edge.",
         setup: dormantSeed,
         role: "bob",
-        sql: "SELECT * FROM app.orders ORDER BY id;",
+        sql: reportSql,
         inspect: privilegeInspection("bob"),
         cards: basicCards("Bob", "denied"),
         expect: (output) =>
@@ -934,7 +970,7 @@ GRANT analyst TO bob WITH INHERIT FALSE, SET TRUE;`,
         role: "bob",
         sql: `SET ROLE analyst;
 SELECT session_user, current_user;
-SELECT * FROM app.orders ORDER BY id;`,
+${reportSql}`,
         inspect: `SELECT
   pg_has_role('bob', 'analyst', 'SET') AS can_set,
   has_table_privilege('analyst', 'app.orders', 'SELECT') AS analyst_select;`,
@@ -1178,13 +1214,13 @@ SET SESSION AUTHORIZATION postgres;`,
           "There is no completion test here. Use the prompts below as an open-ended security review.",
         challenges: [
           [
-            "Can Bob read orders?",
-            "SELECT * FROM app.orders ORDER BY id;",
+            "Can Bob run the report?",
+            reportSql,
             "bob",
           ],
           [
             "Did Alice’s offboarding hold?",
-            "SELECT * FROM app.orders ORDER BY id;",
+            reportSql,
             "alice",
           ],
           [

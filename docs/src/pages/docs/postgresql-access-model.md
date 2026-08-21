@@ -3,7 +3,7 @@ title: 1. The permission chain
 description: Alice's first query at Acme is denied. Follow PostgreSQL's error from gate to gate and open the smallest path that makes the report work.
 ---
 
-Acme is a small startup with one application and one database. Priya, the founder, created the `app.orders` table herself in the early days, and the application has been reading and writing it ever since. Today Alice joins as the first analyst, hired to answer the company’s favourite question: what did we sell? {% .lead %}
+Acme is a small startup with one application and one database. Priya, the founder, created the `app.orders` table herself in the early days, and the application has been reading and writing it ever since—connected, as early applications usually are, with the admin credentials Priya set up at the start. Today Alice joins as the first analyst, hired to answer the company’s favourite question: what did we sell? {% .lead %}
 
 Her report is a single query, and the application runs the same one constantly. But when Alice runs it, PostgreSQL refuses—and that refusal is the best introduction there is to how PostgreSQL decides who may do what. Run it yourself:
 
@@ -14,6 +14,7 @@ Her report is a single query, and the application runs the same one constantly. 
 This course follows Acme’s database as the company grows. You have already met two of the people who shape it:
 
 - **Priya**, the founder, created the original `app` schema and `orders` table by hand. That detail looks harmless today; it will not stay harmless.
+- **The application**, which still connects with the admin credentials from Acme’s first week—the decision that made everything work and hid every problem in this course.
 - **Alice**, the first analyst, needs to read orders.
 - **deploy**, Acme’s migration login, will matter once the schema starts changing.
 - **reporting_app**, an automated reporting service, arrives in the next chapter.
@@ -22,9 +23,11 @@ This course follows Acme’s database as the company grows. You have already met
 
 **PostgreSQL must be able to reach the schema and authorize the object operation.**
 
-For `SELECT * FROM app.orders`, schema `USAGE` makes the name reachable and table `SELECT` authorizes the read. `search_path` changes name lookup, not privileges. A table grant does not imply schema access, and schema access does not imply a table operation.
+For a query that reads `app.orders`, schema `USAGE` makes the name reachable and table `SELECT` authorizes the read. `search_path` changes name lookup, not privileges. A table grant does not imply schema access, and schema access does not imply a table operation.
 
 The gates are evaluated in order, and the error names the first gate that failed—not everything that is missing. That is why the same query produced two different errors in the lab as each gate opened.
+
+Superusers and object owners skip these checks entirely. That is why the admin-connected application never noticed a single one of them—and why the first identity without those shortcuts is the first to see `permission denied`.
 
 ## The policy so far
 

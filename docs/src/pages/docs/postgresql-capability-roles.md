@@ -3,7 +3,7 @@ title: 2. Capability roles
 description: Replace copied grants with an orders_reader capability role and expose Alice's duplicate access path.
 ---
 
-Acme launches an automated reporting service. It needs exactly the access Alice already has, but copying Alice’s grants onto another login will make every team change harder to audit. {% .lead %}
+Acme launches an automated reporting service. It needs exactly the access Alice already has, but copying Alice’s grants onto another login will make every team change harder to audit. And this time nobody suggests reusing the admin credentials—`reporting_app` becomes the first login at Acme whose access is actually designed. {% .lead %}
 
 {% postgres-capability-roles-lab /%}
 
