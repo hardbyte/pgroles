@@ -5,19 +5,19 @@ description: Alice's first query at Acme is denied. Follow PostgreSQL's error fr
 
 Acme is a small startup with one application and one database. Priya, the founder, created the `app.orders` table herself in the early days, and the application has been reading and writing it ever since—connected, as early applications usually are, with the admin credentials Priya set up at the start. Today Alice joins as the first analyst, hired to answer the company’s favourite question: what did we sell? {% .lead %}
 
-Her report is a single query, and the application runs the same one constantly. But when Alice runs it, PostgreSQL refuses—and that refusal is the best introduction there is to how PostgreSQL decides who may do what. Run it yourself:
+Her report is a single query, and the application runs the same one constantly. But when Alice runs it, PostgreSQL refuses—and that refusal is the best introduction there is to how PostgreSQL decides who may do what.
 
-{% postgres-permission-lab /%}
-
-## Meet the cast
-
-This course follows Acme’s database as the company grows. You have already met two of the people who shape it:
+This course follows Acme’s database as the company grows, one incident per chapter:
 
 - **Priya**, the founder, created the original `app` schema and `orders` table by hand. That detail looks harmless today; it will not stay harmless.
 - **The application**, which still connects with the admin credentials from Acme’s first week—the decision that made everything work and hid every problem in this course.
 - **Alice**, the first analyst, needs to read orders.
 - **deploy**, Acme’s migration login, will matter once the schema starts changing.
 - **reporting_app**, an automated reporting service, arrives in the next chapter.
+
+Each chapter has the same rhythm: something happens at Acme, you reproduce it against a real PostgreSQL running in your browser, and then—below the lab—you write down what should stay true. Start where Alice starts:
+
+{% postgres-permission-lab /%}
 
 ## Keep one rule
 
@@ -31,7 +31,9 @@ Superusers and object owners skip these checks entirely. That is why the admin-c
 
 ## The policy so far
 
-This is the small team’s literal state: Alice receives both grants directly.
+The lab fixed today’s database, but the two `GRANT` statements you ran live only in PostgreSQL’s catalogs now—invisible history the moment your session ends. This is where **pgroles** enters the story: you describe the roles, grants, and memberships that *should* exist in a YAML policy, and `pgroles plan` compares that intent with the live database and proposes the exact SQL to converge them. Every chapter ends by recording its repair this way, and by chapter 3 the difference between “what the database accumulated” and “what the policy declares” becomes the whole plot.
+
+This first policy is the small team’s literal state: Alice receives both grants directly.
 
 ```yaml {% schema="pgroles-manifest" %}
 roles:

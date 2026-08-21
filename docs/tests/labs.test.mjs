@@ -11,6 +11,7 @@ import {
   chapters,
   acmeChapterSeeds,
 } from "../src/components/AcmeStoryData.mjs";
+import { runSql } from "../src/components/sqlStatements.mjs";
 
 let failures = 0;
 
@@ -21,18 +22,6 @@ function fail(message) {
 
 function pass(message) {
   console.log(`PASS  ${message}`);
-}
-
-function appendResults(target, values) {
-  for (const value of values) {
-    if (value.command) target.commands.push(value.command);
-    if (value.fields?.length) {
-      target.results.push({
-        fields: value.fields.map((field) => field.name),
-        rows: value.rows,
-      });
-    }
-  }
 }
 
 async function withDatabase(callback) {
@@ -56,17 +45,9 @@ for (const [chapterKey, lesson] of Object.entries(chapters)) {
           `SET SESSION AUTHORIZATION "${step.role.replaceAll('"', '""')}";`
         );
         const output = {
-          commands: [],
-          results: [],
-          error: null,
           inspection: null,
+          ...(await runSql(database, step.sql)),
         };
-        try {
-          appendResults(output, await database.exec(step.sql));
-        } catch (error) {
-          output.error = error.message;
-          output.errorCode = error.code;
-        }
         await database.exec("SET SESSION AUTHORIZATION postgres;");
         const inspection = await database.query(step.inspect);
         output.inspection = inspection.rows[0] || {};

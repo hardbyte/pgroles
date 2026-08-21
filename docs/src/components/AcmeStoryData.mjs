@@ -189,6 +189,10 @@ const gateCards = (role, resultLabel) => (row, output) =>
 
 const chapters = {
   gates: {
+    debrief: {
+      href: "#keep-one-rule",
+      title: "Keep one rule — and write it down",
+    },
     eyebrow: "Chapter 1 · The permission chain",
     title: "Alice gets the first report working",
     description:
@@ -245,64 +249,49 @@ const chapters = {
           "PostgreSQL stopped at the first closed gate and named it: the schema. It never reached the table check — the error identifies where evaluation stopped, not everything that is missing.",
       },
       {
-        title: "Open the schema gate",
-        why: "Schema USAGE makes names inside app reachable. It says nothing about what Alice may do to the objects she can now reach.",
-        prompt: "Grant Alice USAGE on the app schema.",
+        title: "Open the schema gate — and watch the error move",
+        why: "Schema USAGE makes names inside app reachable, and nothing more. Statements run one at a time here, like psql, so a single run can grant the gate, become Alice with SET ROLE — the same switch the role selector uses — and immediately retest the report through her eyes.",
+        prompt: "Grant USAGE, become Alice, and run the report again.",
         setup: founderSeed,
         role: "postgres",
-        sql: "GRANT USAGE ON SCHEMA app TO alice;",
-        inspect: privilegeInspection("alice"),
-        cards: gateCards("Alice", "USAGE granted"),
-        expect: (output, row) =>
-          !output.error && row?.schema_usage && !row?.object_select,
-        observation:
-          "The schema gate is open, but the diagram shows the table gate is still closed. Predict the next error before you run the query again.",
-      },
-      {
-        title: "Watch the error move",
-        why: "The same query now gets past the schema. If PostgreSQL evaluates gates in order, the error should move to the next one.",
-        prompt: "Run the identical report query as Alice again.",
-        setup: schemaOnlySeed,
-        role: "alice",
-        sql: reportSql,
+        sql: `GRANT USAGE ON SCHEMA app TO alice;
+SET ROLE alice;
+${reportSql}`,
         inspect: privilegeInspection("alice"),
         cards: gateCards("Alice", "rows"),
-        expect: (output) =>
-          output.error?.includes("permission denied for table orders"),
+        expect: (output, row) =>
+          output.error?.includes("permission denied for table orders") &&
+          row?.schema_usage &&
+          !row?.object_select,
         observation:
-          "Same query, new error. The failure moved from the schema to the table, which proves the gates are separate: USAGE did not imply SELECT.",
+          "Same query, new error. The failure moved from the schema to the table, which proves the gates are separate: USAGE opened name resolution but says nothing about reading.",
       },
       {
-        title: "Authorize the table read",
-        why: "Table SELECT is the last gate between Alice and the rows. Together with schema USAGE it completes the path.",
-        prompt: "Grant Alice SELECT on the orders table.",
+        title: "Open the table gate — and get the rows",
+        why: "Table SELECT is the last gate between Alice and the revenue. The same grant-then-retest run should now clear the whole path.",
+        prompt: "Grant SELECT, become Alice, and run the report once more.",
         setup: schemaOnlySeed,
         role: "postgres",
-        sql: "GRANT SELECT ON app.orders TO alice;",
-        inspect: privilegeInspection("alice"),
-        cards: gateCards("Alice", "path ready"),
-        expect: (output, row) =>
-          !output.error && row?.schema_usage && row?.object_select,
-        observation:
-          "Alice now has a complete path: PostgreSQL can resolve app.orders, then authorize SELECT.",
-      },
-      {
-        title: "Run the real report",
-        why: "Permissions matter only when the application operation succeeds. Run the same SELECT the report will send.",
-        prompt: "Query orders as Alice.",
-        setup: directAccessSeed,
-        role: "alice",
-        sql: reportSql,
+        sql: `GRANT SELECT ON app.orders TO alice;
+SET ROLE alice;
+${reportSql}`,
         inspect: privilegeInspection("alice"),
         cards: gateCards("Alice", "2 rows"),
-        expect: (output) =>
-          !output.error && output.results[0]?.rows.length === 2,
+        expect: (output, row) =>
+          !output.error &&
+          output.results[0]?.rows.length === 2 &&
+          row?.schema_usage &&
+          row?.object_select,
         observation:
-          "The report works. Remember that these convenient direct grants will survive until someone explicitly removes them.",
+          "Two rows of revenue through Alice's own privileges this time, not the superuser's. Switch the role selector to Alice and run just the report to prove it without SET ROLE — and remember these convenient direct grants: nothing removes them until someone does so explicitly.",
       },
     ],
   },
   capabilities: {
+    debrief: {
+      href: "#put-privileges-on-jobs-not-people",
+      title: "Name the capability in policy",
+    },
     eyebrow: "Chapter 2 · Capability roles",
     title: "A reporting application joins Alice",
     description:
@@ -319,9 +308,9 @@ const chapters = {
     steps: [
       {
         title: "Create orders_reader",
-        why: "The permission bundle is a job, not a person. A NOLOGIN role gives that job a durable name and keeps object ACLs independent from staff changes.",
+        why: "The permission bundle is a job, not a person. A NOLOGIN role gives that job a durable name and keeps object ACLs independent from staff changes. Notice what this migration does not do: nobody thinks to revoke Alice’s Chapter 1 grants — teams rarely do.",
         prompt:
-          "Move the reusable grants onto orders_reader and make both consumers members. Deliberately leave Alice’s Chapter 1 grants in place.",
+          "Move the reusable grants onto orders_reader and make both consumers members.",
         setup: directAccessSeed,
         role: "postgres",
         sql: `CREATE ROLE orders_reader;
@@ -388,6 +377,10 @@ GRANT orders_reader TO alice, reporting_app;`,
     ],
   },
   drift: {
+    debrief: {
+      href: "#desired-state-turns-the-surprise-into-a-plan",
+      title: "Turn the surprise into a plan",
+    },
     eyebrow: "Chapter 3 · Drift",
     title: "Bob joins the team; Alice leaves it",
     description:
@@ -485,6 +478,10 @@ REVOKE USAGE ON SCHEMA app FROM alice;`,
     ],
   },
   ownership: {
+    debrief: {
+      href: "#a-durable-production-shape",
+      title: "Encode the durable owner",
+    },
     eyebrow: "Chapter 4 · Ownership",
     title: "The migration runner hits Priya’s old table",
     description:
@@ -595,6 +592,10 @@ FROM pg_tables WHERE schemaname = 'app' AND tablename = 'orders';`,
     ],
   },
   defaults: {
+    debrief: {
+      href: "#existing-objects-and-future-objects-are-separate-problems",
+      title: "Pair the wildcard with the default",
+    },
     eyebrow: "Chapter 5 · Future objects",
     title: "A new refunds table breaks the report",
     description:
@@ -734,6 +735,10 @@ RESET ROLE;`,
     ],
   },
   offboarding: {
+    debrief: {
+      href: "#encode-the-retirement-not-just-the-absence",
+      title: "Encode the retirement",
+    },
     eyebrow: "Chapter 6 · Offboarding",
     title: "Priya is leaving Acme",
     description:
@@ -808,6 +813,10 @@ DROP ROLE priya;`,
     ],
   },
   mechanics: {
+    debrief: {
+      href: "#declare-the-edges",
+      title: "Declare the edges in policy",
+    },
     eyebrow: "Chapter 7 · Membership mechanics",
     title: "Inside the membership edge",
     description:
@@ -1060,6 +1069,10 @@ WHERE granted.rolname = 'analyst' AND member.rolname = 'team_lead';`,
     ],
   },
   security: {
+    debrief: {
+      href: "#close-the-public-path-explicitly",
+      title: "Close the PUBLIC path in policy",
+    },
     eyebrow: "Chapter 8 · Security review",
     title: "The auditor asks: “Who can really do this?”",
     description:

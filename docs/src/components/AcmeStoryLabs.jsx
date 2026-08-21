@@ -3,6 +3,7 @@ import Link from "next/link";
 import Highlight, { defaultProps } from "prism-react-renderer";
 
 import { chapters } from "./AcmeStoryData.mjs";
+import { runSql } from "./sqlStatements.mjs";
 
 const statusStyles = {
   pass: "border-emerald-400 bg-emerald-50 dark:border-emerald-700 dark:bg-emerald-950/25",
@@ -20,18 +21,6 @@ function normalizeSql(sql) {
     .replace(/;+\s*$/, "")
     .replace(/\s+/g, " ")
     .toLowerCase();
-}
-
-function appendResults(target, values) {
-  for (const value of values) {
-    if (value.command) target.commands.push(value.command);
-    if (value.fields?.length) {
-      target.results.push({
-        fields: value.fields.map((field) => field.name),
-        rows: value.rows,
-      });
-    }
-  }
 }
 
 function SqlEditor({ value, onChange, disabled }) {
@@ -249,18 +238,10 @@ function AcmeStoryLab({ chapter }) {
         `SET SESSION AUTHORIZATION "${role.replaceAll('"', '""')}";`
       );
       const next = {
-        commands: [],
-        results: [],
-        error: null,
         passed: false,
         inspection: null,
+        ...(await runSql(database, draft)),
       };
-      try {
-        appendResults(next, await database.exec(draft));
-      } catch (error) {
-        next.error = error.message;
-        next.errorCode = error.code;
-      }
       try {
         await database.exec("SET SESSION AUTHORIZATION postgres;");
         const inspection = await database.query(step.inspect);
@@ -530,6 +511,13 @@ function AcmeStoryLab({ chapter }) {
             >
               Continue: {lesson.steps[index + 1].title} →
             </button>
+          ) : lesson.debrief ? (
+            <a
+              href={lesson.debrief.href}
+              className="rounded-lg border border-stone-900 bg-stone-900 px-4 py-2 text-sm font-semibold text-white no-underline dark:border-white dark:bg-white dark:text-stone-900"
+            >
+              {lesson.debrief.title} ↓
+            </a>
           ) : lesson.next ? (
             <Link
               href={lesson.next.href}
@@ -548,7 +536,9 @@ function AcmeStoryLab({ chapter }) {
         </summary>
         <p className="mb-0 mt-3 text-sm leading-6 text-stone-500 dark:text-stone-400">
           The selector sets session authorization inside an isolated PGlite
-          database. PostgreSQL performs ordinary role, ownership, schema, and
+          database. Statements run one at a time and autocommit, like psql:
+          execution stops at the first error, and earlier statements keep their
+          effect. PostgreSQL performs ordinary role, ownership, schema, and
           object checks; the diagram comes from catalog privilege queries after
           your SQL. This is not a password, CONNECT, pg_hba.conf, or
           concurrent-session test.
