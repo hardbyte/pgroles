@@ -21,7 +21,8 @@ const navigation = [
         ],
     },
     {
-        title: 'Learn PostgreSQL',
+        title: 'Learn PostgreSQL Roles',
+        collapsible: true,
         links: [
             {title: '1. The permission chain', href: '/docs/postgresql-access-model'},
             {title: '2. Capability roles', href: '/docs/postgresql-capability-roles'},
