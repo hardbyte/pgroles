@@ -112,6 +112,13 @@ predefined role the server does not have, with the version that introduced it.
 `pgroles inspect` lists all `pg_*` memberships informationally; `pgroles
 generate` exports them.
 
+For brownfield roles whose full grant surface is not yet declared,
+`preserve_undeclared_grants: true` keeps out-of-band access through
+convergence; explicit `ensure: absent` assertions still revoke. Remove the
+flag once the manifest declares the role's real grants. Adopt mode refuses to
+transfer schema ownership away from the live owner unless apply passes
+`--allow-schema-owner-transfers`.
+
 ## Ownership And ACLs
 
 Schema ownership is modeled specially: pgroles converges the declared owner and

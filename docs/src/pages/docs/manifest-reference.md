@@ -144,6 +144,7 @@ roles:
 |---|---|---|---|
 | `name` | string | *required* | Role name |
 | `external` | bool | `false` | Role lifecycle is managed outside pgroles |
+| `preserve_undeclared_grants` | bool | `false` | Keep the role's undeclared in-scope grants during convergence |
 | `login` | bool | `false` | Can the role log in? |
 | `superuser` | bool | `false` | Superuser privileges |
 | `createdb` | bool | `false` | Can create databases |
@@ -164,6 +165,19 @@ Only `login: true` roles may have a password. Declaring a password on a non-logi
 Use `external: true` for roles whose lifecycle is owned by another system, such as Cloud SQL IAM users or groups created by Terraform or the cloud provider API. pgroles may still reference external roles in grants, schema ownership, default privileges, and as members of managed roles, but it will not create, alter, drop, or password-manage the role itself.
 
 Memberships granted **from** an external role follow declared intent: members listed in a `memberships` stanza converge, undeclared live members are left untouched, and a stanza-level `exclusive: true` opts undeclared members into revocation. PostgreSQL's predefined `pg_*` roles get the same treatment without any declaration — see [memberships](/docs/memberships#predefined-and-external-granted-roles). A `roles:` entry for a `pg_*` name must set `external: true`.
+
+### Preserving undeclared grants
+
+By default, adopt and authoritative modes revoke every privilege a declared role holds that the manifest does not declare. During brownfield adoption that is often premature: the role may hold out-of-band access (granted by migrations or manual SQL) that production still relies on.
+
+```yaml
+roles:
+  - name: app_owner
+    external: true
+    preserve_undeclared_grants: true
+```
+
+With `preserve_undeclared_grants: true`, convergence trims and adds declared privileges but skips revokes against everything else the role holds in scope. Explicit `ensure: absent` assertions still revoke — an asserted absence is a declaration, not drift discovery — and owner-inherent privileges are unaffected either way. Once the role's real grant surface is declared, remove the flag so convergence is complete again.
 
 {% callout type="note" title="Passwords and drift detection" %}
 Because PostgreSQL does not expose password hashes for comparison, password changes always appear in the plan. The `diff --exit-code` flag treats password-only changes as non-structural; they do not trigger exit code 2.
