@@ -1428,11 +1428,14 @@ mod live_db {
     }
 
     fn unique_name(prefix: &str) -> String {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .expect("system clock before unix epoch")
             .as_nanos();
-        format!("{prefix}_{nanos}")
+        let seq = COUNTER.fetch_add(1, Ordering::Relaxed);
+        format!("{prefix}_{nanos}_{seq}")
     }
 
     fn execute_sql(sql: &str) {
@@ -5017,6 +5020,98 @@ grants:
             r#"
             DROP SCHEMA IF EXISTS "{schema}" CASCADE;
             DROP ROLE IF EXISTS "{role}";
+            "#
+        ));
+    }
+
+    /// Mixed-ownership schema with a wildcard grant to the owner: inherent
+    /// privileges on the owned table must survive convergence even though
+    /// normalization folds both tables into one `name: "*"` key (issue #201
+    /// review: the fold previously leaked inherent bits into a revocable key).
+    #[test]
+    #[ignore]
+    fn mixed_ownership_wildcard_does_not_revoke_owner_inherent_privileges() {
+        let schema = unique_name("mix_schema");
+        let owner = unique_name("mix_owner");
+
+        execute_sql(&format!(
+            r#"
+            DROP SCHEMA IF EXISTS "{schema}" CASCADE;
+            DROP ROLE IF EXISTS "{owner}";
+            CREATE ROLE "{owner}" NOLOGIN;
+            CREATE SCHEMA "{schema}" AUTHORIZATION postgres;
+            CREATE TABLE "{schema}".t_own (id integer);
+            CREATE TABLE "{schema}".t_other (id integer);
+            ALTER TABLE "{schema}".t_own OWNER TO "{owner}";
+            -- Explicit grants on the other role's table materialize t_own's ACL.
+            GRANT SELECT, INSERT, UPDATE ON ALL TABLES IN SCHEMA "{schema}" TO "{owner}";
+            "#
+        ));
+
+        let manifest_file = write_temp_manifest(&format!(
+            r#"
+roles:
+  - name: {owner}
+    nologin: true
+
+grants:
+  - role: {owner}
+    privileges: [SELECT, INSERT]
+    object: {{ type: table, schema: {schema}, name: "*" }}
+"#
+        ));
+
+        let diff_output = pgroles_cmd()
+            .args([
+                "diff",
+                "--file",
+                manifest_file.path().to_str().unwrap(),
+                "--database-url",
+                &database_url(),
+                "--mode",
+                "adopt",
+            ])
+            .output()
+            .expect("failed to run diff");
+        let diff_stdout = String::from_utf8_lossy(&diff_output.stdout);
+        assert!(
+            !diff_stdout.contains(".\"t_own\""),
+            "no statement may target the owned table's drift; got:\n{diff_stdout}"
+        );
+        assert!(
+            diff_stdout.contains("REVOKE UPDATE ON TABLE"),
+            "undeclared UPDATE on the non-owned table should be revoked; got:\n{diff_stdout}"
+        );
+
+        pgroles_cmd()
+            .args([
+                "apply",
+                "--file",
+                manifest_file.path().to_str().unwrap(),
+                "--database-url",
+                &database_url(),
+                "--mode",
+                "adopt",
+            ])
+            .assert()
+            .success();
+
+        // The owner keeps its inherent UPDATE on its own table...
+        assert!(
+            query_has_relation_privilege(&owner, &format!("{schema}.t_own"), "UPDATE"),
+            "owner-inherent UPDATE must survive a mixed-ownership wildcard"
+        );
+        // ...while the explicit drift on the other table is revoked.
+        assert!(
+            !query_has_relation_privilege(&owner, &format!("{schema}.t_other"), "UPDATE"),
+            "undeclared UPDATE on the non-owned table should be revoked"
+        );
+
+        // Cleanup
+        execute_sql(&format!(
+            r#"
+            DROP SCHEMA IF EXISTS "{schema}" CASCADE;
+            DROP ROLE IF EXISTS "{owner}";
             "#
         ));
     }

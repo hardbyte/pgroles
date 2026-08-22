@@ -24,6 +24,14 @@
 //! reporting it would make authoritative mode revoke the owner's own default
 //! on the next reconcile. The accepted blind spot is that an intentional
 //! owner-self default change is invisible to pgroles.
+//!
+//! This is the same underlying fact as the grant-level owner guard (see
+//! `privileges::AclRow::owner_name` and `SqlContext::owned_relations`): an
+//! ACL entry whose grantee is the object's owner carries inherent privileges,
+//! not granted state. Default privileges use SQL-level exclusion because the
+//! desired side keys on the owner explicitly; grants tag the entries instead
+//! so declared owner grants still converge. The two mechanisms should
+//! eventually be unified on tagging.
 
 use std::collections::BTreeMap;
 
