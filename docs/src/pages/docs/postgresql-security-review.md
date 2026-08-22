@@ -48,7 +48,7 @@ memberships:
       - name: auditor
 ```
 
-Without `exclusive`, undeclared members are left untouched—cloud platforms grant `pg_*` memberships to their own management roles, and adopting pgroles must not strip them. `pgroles inspect` reports every `pg_*` membership informationally either way, so the master keys are visible before anyone opts into managing them.
+Without `exclusive`, undeclared members are left untouched—cloud platforms grant `pg_*` memberships to their own management roles, and adopting pgroles must not strip them. Even with `exclusive`, members that are themselves predefined roles are never revoked, so PostgreSQL’s built-in `pg_*` hierarchy stays intact. `pgroles inspect` reports every `pg_*` membership informationally either way, so the master keys are visible before anyone opts into managing them.
 
 ## Keep the other two boundaries visible
 
