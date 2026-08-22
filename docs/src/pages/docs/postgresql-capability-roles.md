@@ -11,6 +11,8 @@ Acme launches an automated reporting service. It needs exactly the access Alice 
 
 `orders_reader` cannot log in. It names one capability: reach `app`, then read `app.orders`. Alice and `reporting_app` receive that capability through membership.
 
+PostgreSQL ships predefined capability roles built on the same mechanism—`pg_read_all_data`, `pg_write_all_data`, `pg_monitor`, and friends—whose reach covers every matching object in the database, current and future. They are the maximum-blast-radius version of `orders_reader`: one membership instead of designed access. The [security review](/docs/postgresql-security-review) meets them again.
+
 ```yaml {% schema="pgroles-manifest" %}
 roles:
   - name: alice

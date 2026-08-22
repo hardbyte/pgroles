@@ -81,13 +81,36 @@ access match the manifest.
 ## External Roles
 
 `external: true` is a lifecycle filter, not provisioning or validation. pgroles
-will not create, alter, drop, password-manage, or manage memberships granted
-from that role. It may still grant privileges to it, use it as a schema/default
-privilege owner, or add it as a member of a managed group.
+will not create, alter, drop, or password-manage that role. It may still grant
+privileges to it, use it as a schema/default privilege owner, or add it as a
+member of a managed group.
+
+Memberships granted **from** an external role follow declared intent: members
+listed in a `memberships` stanza converge (e.g. `GRANT rds_iam TO app_user`
+can be policy); undeclared live members are left untouched; a stanza-level
+`exclusive: true` asserts the member list is complete and plans a REVOKE for
+anyone else.
 
 The external role must already exist whenever retained SQL references it. Ensure
-the provider or IaC rollout completes before pgroles apply. Treat PostgreSQL
-predefined roles as external; do not attempt to manage system-role lifecycle.
+the provider or IaC rollout completes before pgroles apply.
+
+## Predefined (pg_*) Roles
+
+PostgreSQL's predefined roles (`pg_read_all_data`, `pg_monitor`, ...) may be
+named directly as a membership grantor with no `roles:` entry; declaring one
+under `roles:` requires `external: true`, and its lifecycle is never managed.
+Declared members converge; `exclusive: true` revokes undeclared members —
+except members that are themselves `pg_*` roles, so PostgreSQL's built-in
+hierarchy is never modified. Like every absence assertion, `exclusive`
+revocations are skipped (with a warning) under additive reconciliation —
+use adopt or authoritative mode to enforce them. Exclusive revocation does
+apply to provider management roles such as `rds_superuser`, so account for
+every member the platform needs before asserting exclusivity. Granting a predefined role requires the executor
+to hold ADMIN OPTION on it (PG16+; CREATEROLE alone is not sufficient) — the
+preflight warns at plan and blocks at apply, and also reports a referenced
+predefined role the server does not have, with the version that introduced it.
+`pgroles inspect` lists all `pg_*` memberships informationally; `pgroles
+generate` exports them.
 
 ## Ownership And ACLs
 

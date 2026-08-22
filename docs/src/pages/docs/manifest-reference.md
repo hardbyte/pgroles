@@ -157,7 +157,9 @@ Roles with `login: true` can declare a password source. The password value is ne
 
 Only `login: true` roles may have a password. Declaring a password on a non-login role is a validation error.
 
-Use `external: true` for roles whose lifecycle is owned by another system, such as Cloud SQL IAM users or groups created by Terraform or the cloud provider API. pgroles may still reference external roles in grants, schema ownership, default privileges, and as members of managed roles, but it will not create, alter, drop, password-manage, or manage memberships granted from the external role.
+Use `external: true` for roles whose lifecycle is owned by another system, such as Cloud SQL IAM users or groups created by Terraform or the cloud provider API. pgroles may still reference external roles in grants, schema ownership, default privileges, and as members of managed roles, but it will not create, alter, drop, or password-manage the role itself.
+
+Memberships granted **from** an external role follow declared intent: members listed in a `memberships` stanza converge, undeclared live members are left untouched, and a stanza-level `exclusive: true` opts undeclared members into revocation. PostgreSQL's predefined `pg_*` roles get the same treatment without any declaration — see [memberships](/docs/memberships#predefined-and-external-granted-roles). A `roles:` entry for a `pg_*` name must set `external: true`.
 
 {% callout type="note" title="Passwords and drift detection" %}
 Because PostgreSQL does not expose password hashes for comparison, password changes always appear in the plan. The `diff --exit-code` flag treats password-only changes as non-structural; they do not trigger exit code 2.
@@ -321,6 +323,12 @@ memberships:
 |---|---|---|
 | `inherit` | `true` | Member inherits the role's privileges; omit for PostgreSQL default behavior |
 | `admin` | `false` | Member can administer the role |
+
+Each stanza also accepts one option beside `role` and `members`:
+
+| Field | Default | Description |
+|---|---|---|
+| `exclusive` | `false` | Assert that `members` is the complete membership of `role`, revoking anyone else — except members that are themselves predefined `pg_*` roles, which preserves PostgreSQL's built-in role hierarchy. Only valid for predefined (`pg_*`) and `external: true` granted roles — see [memberships](/docs/memberships#predefined-and-external-granted-roles) |
 
 ## retirements
 

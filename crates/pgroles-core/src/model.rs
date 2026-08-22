@@ -366,6 +366,10 @@ pub struct RoleGraph {
     /// Privileges asserted absent per default-privilege rule.
     /// Only the desired graph populates this; inspection leaves it empty.
     pub default_privilege_absences: BTreeMap<DefaultPrivKey, BTreeSet<Privilege>>,
+    /// Granted roles whose membership stanza asserts `exclusive: true` — a
+    /// declarative absence assertion ("nobody else holds this role").
+    /// Only the desired graph populates this; inspection leaves it empty.
+    pub exclusive_membership_roles: BTreeSet<String>,
 }
 
 impl RoleGraph {
@@ -464,6 +468,11 @@ impl RoleGraph {
 
         // --- Memberships ---
         for membership in &expanded.memberships {
+            if membership.exclusive {
+                graph
+                    .exclusive_membership_roles
+                    .insert(membership.role.clone());
+            }
             for member_spec in &membership.members {
                 graph.memberships.insert(MembershipEdge {
                     role: membership.role.clone(),

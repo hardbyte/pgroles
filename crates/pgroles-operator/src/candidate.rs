@@ -686,7 +686,8 @@ async fn plan_against_target(
     if pgroles_core::diff::additive_ignores_absence_assertions(desired, reconciliation_mode) {
         tracing::warn!(
             candidate = %candidate.name_any(),
-            "additive reconciliation ignores every `ensure: absent` assertion; \
+            "additive reconciliation ignores every absence assertion \
+             (`ensure: absent` and `exclusive: true` memberships); \
              use adopt or authoritative mode to enforce absence"
         );
     }
@@ -697,7 +698,11 @@ async fn plan_against_target(
         ),
         reconciliation_mode,
     );
-    changes = pgroles_core::diff::filter_external_role_changes(changes, &expanded.roles);
+    changes = pgroles_core::diff::filter_external_role_changes(
+        changes,
+        &expanded.roles,
+        &expanded.memberships,
+    );
 
     // Read-only password resolution. Generated Secrets are named for the
     // parent policy because that is what promotion would create; nothing is

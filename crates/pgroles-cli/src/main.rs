@@ -830,6 +830,7 @@ async fn cmd_diff(
                 mode,
             ),
             &validated.composed.expanded.roles,
+            &validated.composed.expanded.memberships,
         );
         let resolved_passwords = resolve_passwords(&validated.composed.expanded)
             .context("failed to resolve role passwords")?;
@@ -895,6 +896,7 @@ async fn cmd_diff(
             mode,
         ),
         &validated.expanded.roles,
+        &validated.expanded.memberships,
     );
     let resolved_passwords =
         resolve_passwords(&validated.expanded).context("failed to resolve role passwords")?;
@@ -968,6 +970,7 @@ async fn cmd_apply(
                 mode,
             ),
             &validated.composed.expanded.roles,
+            &validated.composed.expanded.memberships,
         );
         let resolved_passwords = resolve_passwords(&validated.composed.expanded)
             .context("failed to resolve role passwords")?;
@@ -1058,6 +1061,7 @@ async fn cmd_apply(
             mode,
         ),
         &validated.expanded.roles,
+        &validated.expanded.memberships,
     );
     let resolved_passwords =
         resolve_passwords(&validated.expanded).context("failed to resolve role passwords")?;
@@ -1168,6 +1172,17 @@ async fn cmd_inspect(file: Option<&Path>, bundle: Option<&Path>, database_url: &
         print!("{public_output}");
     }
 
+    // Query and display predefined-role memberships (informational). These
+    // grants pass permission checks without any ACL entry, so an audit needs
+    // them surfaced even when no manifest declares them.
+    let predefined = pgroles_inspect::fetch_predefined_memberships(&pool)
+        .await
+        .context("failed to query predefined-role memberships")?;
+    let predefined_output = pgroles_inspect::format_predefined_memberships(&predefined);
+    if !predefined_output.is_empty() {
+        print!("{predefined_output}");
+    }
+
     Ok(())
 }
 
@@ -1189,6 +1204,20 @@ async fn cmd_generate(
     )
     .await
     .context("failed to introspect database for generation")?;
+
+    // Include memberships granted from predefined (`pg_*`) roles, so the
+    // generated manifest starts from the truth: these master-key grants pass
+    // permission checks without any ACL entry, and leaving them out would
+    // hide them from the very policy meant to account for access. They export
+    // as ordinary membership stanzas (never `exclusive`), which pgroles
+    // converges once declared.
+    let mut graph = graph;
+    let predefined_memberships = pgroles_inspect::fetch_predefined_memberships(&pool)
+        .await
+        .context("failed to query predefined-role memberships for generation")?;
+    for row in &predefined_memberships {
+        graph.memberships.insert(row.to_membership_edge());
+    }
 
     let mut manifest = pgroles_core::export::role_graph_to_manifest(&graph);
 
@@ -1723,7 +1752,8 @@ fn warn_additive_absence_assertions(
 ) {
     if additive_ignores_absence_assertions(desired, mode) {
         eprintln!(
-            "Warning: additive reconciliation ignores every `ensure: absent` assertion; \
+            "Warning: additive reconciliation ignores every absence assertion \
+             (`ensure: absent` and `exclusive: true` memberships); \
              use adopt or authoritative mode to enforce absence"
         );
     }

@@ -81,6 +81,15 @@ pub enum CompositionError {
         second: String,
     },
 
+    #[error(
+        "membership \"{role}\" is declared exclusive, but policy documents \"{first}\" and \"{second}\" both declare members for it — an exclusive member list must live in one document"
+    )]
+    ExclusiveMembershipSplit {
+        role: String,
+        first: String,
+        second: String,
+    },
+
     #[error("policy document \"{document}\" failed validation: {error}")]
     InvalidDocument {
         document: String,
@@ -472,6 +481,32 @@ fn register_document_ownership(
             },
             &label,
         )?;
+    }
+
+    // An exclusive member list is an assertion about the whole role, so a
+    // second document declaring members for the same role would silently
+    // widen (or fight over) the asserted list. Non-exclusive stanzas may
+    // still be split across documents; per-edge collisions are already
+    // caught by `register_membership_owner`.
+    for membership in &document.fragment.memberships {
+        match ownership.membership_stanzas.get_mut(&membership.role) {
+            None => {
+                ownership.membership_stanzas.insert(
+                    membership.role.clone(),
+                    (label.clone(), membership.exclusive),
+                );
+            }
+            Some((first, any_exclusive)) => {
+                if *first != label && (*any_exclusive || membership.exclusive) {
+                    return Err(CompositionError::ExclusiveMembershipSplit {
+                        role: membership.role.clone(),
+                        first: first.clone(),
+                        second: label.clone(),
+                    });
+                }
+                *any_exclusive = *any_exclusive || membership.exclusive;
+            }
+        }
     }
 
     Ok(())
@@ -883,6 +918,104 @@ grants:
             CompositionError::DuplicateManagedDefaultPrivilege { first, second, .. }
                 if first == "first" && second == "second"
         ));
+    }
+
+    #[test]
+    fn compose_bundle_rejects_split_exclusive_membership() {
+        let bundle = PolicyBundle {
+            shared: SharedPolicy::default(),
+            sources: vec![
+                BundleSource {
+                    file: "a.yaml".to_string(),
+                },
+                BundleSource {
+                    file: "b.yaml".to_string(),
+                },
+            ],
+        };
+        let first = PolicyDocument {
+            source: "a.yaml".to_string(),
+            fragment: parse_policy_fragment(
+                r#"
+policy:
+  name: first
+memberships:
+  - role: pg_read_all_data
+    exclusive: true
+    members:
+      - name: auditor
+"#,
+            )
+            .expect("first fragment should parse"),
+        };
+        let second = PolicyDocument {
+            source: "b.yaml".to_string(),
+            fragment: parse_policy_fragment(
+                r#"
+policy:
+  name: second
+memberships:
+  - role: pg_read_all_data
+    members:
+      - name: analyst_service
+"#,
+            )
+            .expect("second fragment should parse"),
+        };
+
+        let error = compose_bundle(&bundle, &[first, second])
+            .expect_err("split exclusive membership should conflict");
+        assert!(matches!(
+            error,
+            CompositionError::ExclusiveMembershipSplit { role, .. }
+                if role == "pg_read_all_data"
+        ));
+    }
+
+    #[test]
+    fn compose_bundle_accepts_non_exclusive_membership_split() {
+        let bundle = PolicyBundle {
+            shared: SharedPolicy::default(),
+            sources: vec![
+                BundleSource {
+                    file: "a.yaml".to_string(),
+                },
+                BundleSource {
+                    file: "b.yaml".to_string(),
+                },
+            ],
+        };
+        let first = PolicyDocument {
+            source: "a.yaml".to_string(),
+            fragment: parse_policy_fragment(
+                r#"
+policy:
+  name: first
+memberships:
+  - role: pg_read_all_data
+    members:
+      - name: auditor
+"#,
+            )
+            .expect("first fragment should parse"),
+        };
+        let second = PolicyDocument {
+            source: "b.yaml".to_string(),
+            fragment: parse_policy_fragment(
+                r#"
+policy:
+  name: second
+memberships:
+  - role: pg_read_all_data
+    members:
+      - name: analyst_service
+"#,
+            )
+            .expect("second fragment should parse"),
+        };
+
+        compose_bundle(&bundle, &[first, second])
+            .expect("disjoint non-exclusive stanzas should compose");
     }
 
     #[test]

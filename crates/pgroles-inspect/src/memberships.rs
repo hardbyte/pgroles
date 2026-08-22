@@ -52,6 +52,83 @@ pub async fn fetch_memberships(
     }
 }
 
+/// Fetch memberships granted from PostgreSQL's predefined (`pg_*`) roles to
+/// ordinary roles.
+///
+/// These grants pass permission checks without appearing in any object ACL,
+/// so they are reported informationally by `pgroles inspect` and exported by
+/// `pgroles generate` even when no manifest declares them. Members that are
+/// themselves system roles (other `pg_*` roles, `postgres`) are excluded to
+/// match generate's non-system scope.
+pub async fn fetch_predefined_memberships(
+    pool: &PgPool,
+) -> Result<Vec<MembershipRow>, sqlx::Error> {
+    let has_inherit_option = check_pg16_inherit_option(pool).await?;
+    if has_inherit_option {
+        sqlx::query_as::<_, MembershipRow>(
+            r#"
+            SELECT
+                gr.rolname AS role_name,
+                mr.rolname AS member_name,
+                m.admin_option,
+                m.inherit_option
+            FROM pg_auth_members m
+            JOIN pg_roles gr ON gr.oid = m.roleid
+            JOIN pg_roles mr ON mr.oid = m.member
+            WHERE gr.rolname LIKE 'pg\_%'
+              AND mr.rolname NOT LIKE 'pg\_%'
+              AND mr.rolname <> 'postgres'
+            ORDER BY gr.rolname, mr.rolname
+            "#,
+        )
+        .fetch_all(pool)
+        .await
+    } else {
+        sqlx::query_as::<_, MembershipRow>(
+            r#"
+            SELECT
+                gr.rolname AS role_name,
+                mr.rolname AS member_name,
+                m.admin_option,
+                mr.rolinherit AS inherit_option
+            FROM pg_auth_members m
+            JOIN pg_roles gr ON gr.oid = m.roleid
+            JOIN pg_roles mr ON mr.oid = m.member
+            WHERE gr.rolname LIKE 'pg\_%'
+              AND mr.rolname NOT LIKE 'pg\_%'
+              AND mr.rolname <> 'postgres'
+            ORDER BY gr.rolname, mr.rolname
+            "#,
+        )
+        .fetch_all(pool)
+        .await
+    }
+}
+
+/// Render predefined-role memberships for `pgroles inspect` output.
+///
+/// Empty input renders nothing, matching [`crate::format_public_grants`].
+pub fn format_predefined_memberships(rows: &[MembershipRow]) -> String {
+    if rows.is_empty() {
+        return String::new();
+    }
+    let mut output = String::new();
+    output.push_str("\nPredefined-role memberships (master keys; managed only when declared):\n");
+    for row in rows {
+        output.push_str(&format!(
+            "  \"{}\" member of \"{}\"{}\n",
+            row.member_name,
+            row.role_name,
+            if row.admin_option {
+                " (with admin)"
+            } else {
+                ""
+            },
+        ));
+    }
+    output
+}
+
 /// Check whether the `pg_auth_members.inherit_option` column exists (PG16+).
 async fn check_pg16_inherit_option(pool: &PgPool) -> Result<bool, sqlx::Error> {
     let row: (bool,) = sqlx::query_as(

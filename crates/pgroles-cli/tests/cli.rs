@@ -5413,7 +5413,7 @@ default_privileges:
             .assert()
             .success()
             .stderr(predicate::str::contains(
-                "additive reconciliation ignores every `ensure: absent` assertion",
+                "additive reconciliation ignores every absence assertion",
             ));
         assert!(
             query_has_function_privilege(&fixture.bystander, &fixture.secret_signature()),

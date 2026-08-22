@@ -55,6 +55,29 @@ If a membership exists but the `inherit` or `admin` flags differ from the manife
 
 Memberships in the database that are not declared in the manifest will be revoked. Only declare memberships that pgroles should manage.
 
+Two kinds of granted role follow a gentler rule — see the next section.
+
+## Predefined and external granted roles
+
+A membership stanza may name one of PostgreSQL's predefined roles (`pg_read_all_data`, `pg_monitor`, ...) directly — no `roles:` entry is needed, and declaring one under `roles:` requires `external: true` because its lifecycle can never be managed. Memberships granted from predefined roles and from `external: true` roles converge differently from ordinary memberships:
+
+- **Declared members converge**: they are granted, and re-granted when their `inherit`/`admin` options change.
+- **Undeclared live members are left untouched by default**, so adopting pgroles never strips memberships a cloud platform granted to its own management roles (for example `pg_monitor` grants on RDS or Cloud SQL).
+- **`exclusive: true`** on the stanza asserts the member list is complete: any live member not listed is planned for `REVOKE` — including cloud-provider management roles such as `rds_superuser`, so only assert exclusivity once you have accounted for every member the platform needs. It is rejected on ordinary managed roles, whose memberships are already reconciled exhaustively, and a bundle rejects an exclusive member list split across policy documents.
+- **Exception: members that are themselves predefined roles are never revoked**, even under `exclusive: true`. PostgreSQL ships built-in `pg_*` → `pg_*` edges (for example `pg_monitor` is a member of `pg_read_all_stats`), and revoking those would break the built-in hierarchy cluster-wide. An exclusive stanza therefore asserts the complete list of *ordinary* members; the built-in hierarchy stays intact and is not planned for revocation.
+
+```yaml
+memberships:
+  - role: pg_read_all_data
+    exclusive: true          # nobody else may hold the read-everything key
+    members:
+      - name: auditor
+```
+
+Like every absence assertion (`ensure: absent` included), `exclusive: true` revocations are skipped under additive reconciliation — the plan prints a warning when that happens; use adopt or authoritative mode to enforce the assertion.
+
+Granting or revoking a predefined role requires the executor to hold `ADMIN OPTION` on it — in PostgreSQL 16+ that effectively means a superuser executor or an explicit `GRANT pg_read_all_data TO executor WITH ADMIN OPTION`; `CREATEROLE` alone is not sufficient. The plan preflight warns (and apply blocks) when that authority is missing, and when a manifest references a predefined role the connected server does not have yet (naming the PostgreSQL version that introduced it).
+
 ## Common patterns
 
 ### Service account inherits a profile role
