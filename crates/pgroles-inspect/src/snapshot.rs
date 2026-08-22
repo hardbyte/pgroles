@@ -66,6 +66,8 @@ pub struct RawInspection {
     privileges: RawPrivilegeState,
     column_level_grants: Vec<ColumnLevelGrantDiagnostic>,
     database_grants: BTreeMap<GrantKey, GrantState>,
+    /// Owner-grantee keys among `database_grants` (see `AclRow::owner_name`).
+    database_inherent_grants: BTreeSet<GrantKey>,
     default_privileges: BTreeMap<DefaultPrivKey, DefaultPrivState>,
     /// Durations of the shared read's phases, copied into every derived
     /// [`InspectionStats`]: they describe the one read all derivations share.
@@ -195,13 +197,13 @@ impl RawInspection {
                 default_privileges
             };
 
-        let database_grants = if scope.include_database_privileges {
+        let (database_grants, database_inherent_grants) = if scope.include_database_privileges {
             let started = Instant::now();
-            let grants = fetch_database_privileges(pool, &role_refs).await?;
+            let (grants, inherent) = fetch_database_privileges(pool, &role_refs).await?;
             record("database_privileges", started);
-            grants
+            (grants, inherent)
         } else {
-            BTreeMap::new()
+            (BTreeMap::new(), BTreeSet::new())
         };
 
         Ok(Self {
@@ -212,6 +214,7 @@ impl RawInspection {
             privileges,
             column_level_grants,
             database_grants,
+            database_inherent_grants,
             default_privileges,
             phase_durations,
             grantability: Mutex::new(None),
@@ -451,6 +454,7 @@ impl RawInspection {
             for (key, state) in result.grants {
                 graph.grants.insert(key, state);
             }
+            graph.inherent_grants.extend(result.inherent);
             remove_redundant_schema_owner_grants(&mut graph);
             stats.grants = graph.grants.len();
 
@@ -469,6 +473,9 @@ impl RawInspection {
                     && managed_roles.contains(role)
                 {
                     graph.grants.insert(key.clone(), state.clone());
+                    if self.database_inherent_grants.contains(key) {
+                        graph.inherent_grants.insert(key.clone());
+                    }
                 }
             }
             stats.grants = graph.grants.len();
@@ -622,6 +629,7 @@ mod tests {
             schema_name: Some(schema.to_string()),
             object_name: table.to_string(),
             obj_type: "table".to_string(),
+            owner_name: None,
         }
     }
 
@@ -632,6 +640,7 @@ mod tests {
             schema_name: Some(schema.to_string()),
             object_name: table.to_string(),
             obj_type: "table".to_string(),
+            owner_name: None,
         }
     }
 
@@ -655,6 +664,7 @@ mod tests {
             schema_name: None,
             object_name: schema.to_string(),
             obj_type: "schema".to_string(),
+            owner_name: None,
         }
     }
 
@@ -816,6 +826,7 @@ mod tests {
                 },
             ],
             database_grants,
+            database_inherent_grants: BTreeSet::new(),
             default_privileges,
             phase_durations: BTreeMap::new(),
             grantability: Mutex::new(None),
@@ -1183,6 +1194,7 @@ mod tests {
             },
             column_level_grants: Vec::new(),
             database_grants: BTreeMap::new(),
+            database_inherent_grants: BTreeSet::new(),
             default_privileges: BTreeMap::new(),
             phase_durations: BTreeMap::new(),
             grantability: Mutex::new(None),
