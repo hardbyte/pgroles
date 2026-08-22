@@ -600,6 +600,47 @@ pub async fn fetch_relation_inventory(
         .collect())
 }
 
+/// Which managed role owns which relation, for the wildcard-REVOKE owner
+/// guard rendered by `SqlContext`. Complements the ACL-level inherent tag:
+/// ownership is known even where per-object ACL entries were folded into a
+/// `name: "*"` key.
+pub async fn fetch_owned_relations(
+    pool: &PgPool,
+    managed_schemas: &[&str],
+) -> Result<BTreeSet<(String, ObjectType, String, String)>, sqlx::Error> {
+    let rows: Vec<(String, String, String, String)> = sqlx::query_as(
+        r#"
+        SELECT
+            pg_get_userbyid(c.relowner) AS owner_name,
+            CASE c.relkind
+                WHEN 'r' THEN 'table'
+                WHEN 'p' THEN 'table'
+                WHEN 'v' THEN 'view'
+                WHEN 'm' THEN 'materialized_view'
+                WHEN 'S' THEN 'sequence'
+            END AS obj_type,
+            n.nspname AS schema_name,
+            c.relname::text AS object_name
+        FROM pg_class c
+        JOIN pg_namespace n ON n.oid = c.relnamespace
+        WHERE n.nspname = ANY($1)
+          AND c.relkind IN ('r', 'p', 'v', 'm', 'S')
+        ORDER BY 1, 3, 4
+        "#,
+    )
+    .bind(managed_schemas)
+    .fetch_all(pool)
+    .await?;
+
+    Ok(rows
+        .into_iter()
+        .filter_map(|(owner, obj_type, schema, name)| {
+            let object_type = obj_type_str_to_object_type(&obj_type)?;
+            Some((owner, object_type, schema, name))
+        })
+        .collect())
+}
+
 /// Every privilege row and wildcard-inventory entry inside one scope, exactly
 /// as the server returned it.
 ///
@@ -2749,11 +2790,14 @@ mod tests {
     }
 
     fn unique_name(prefix: &str) -> String {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .expect("system clock before unix epoch")
             .as_nanos();
-        format!("{prefix}_{nanos}")
+        let seq = COUNTER.fetch_add(1, Ordering::Relaxed);
+        format!("{prefix}_{nanos}_{seq}")
     }
 
     fn execute_sql(sql: &str) {

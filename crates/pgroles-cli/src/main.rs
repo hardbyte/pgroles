@@ -839,6 +839,7 @@ async fn cmd_diff(
         let current = inspect_current_for_plan_with_config(&pool, &inspect_config).await?;
         info!(%mode, "reconciliation mode");
         warn_additive_absence_assertions(&validated.composed.desired, mode);
+        warn_unenforceable_absence_assertions(&current, &validated.composed.desired);
         let changes = filter_preserved_grant_revokes(
             filter_external_role_changes(
                 filter_changes(
@@ -914,6 +915,7 @@ async fn cmd_diff(
 
     info!(%mode, "reconciliation mode");
     warn_additive_absence_assertions(&validated.desired, mode);
+    warn_unenforceable_absence_assertions(&current, &validated.desired);
     let changes = filter_preserved_grant_revokes(
         filter_external_role_changes(
             filter_changes(
@@ -998,6 +1000,7 @@ async fn cmd_apply(
 
         info!(%mode, "reconciliation mode");
         warn_additive_absence_assertions(&validated.composed.desired, mode);
+        warn_unenforceable_absence_assertions(&current, &validated.composed.desired);
         let changes = filter_preserved_grant_revokes(
             filter_external_role_changes(
                 filter_changes(
@@ -1099,6 +1102,7 @@ async fn cmd_apply(
 
     info!(%mode, "reconciliation mode");
     warn_additive_absence_assertions(&validated.desired, mode);
+    warn_unenforceable_absence_assertions(&current, &validated.desired);
     let changes = filter_preserved_grant_revokes(
         filter_external_role_changes(
             filter_changes(
@@ -1665,13 +1669,17 @@ async fn detect_sql_context_with_config(
     let relation_inventory = pgroles_inspect::fetch_relation_inventory(pool, &privilege_schemas)
         .await
         .context("failed to inspect relation inventory")?;
+    let owned_relations = pgroles_inspect::fetch_owned_relations(pool, &privilege_schemas)
+        .await
+        .context("failed to inspect relation ownership")?;
     info!(
         pg_major = pg_version.major(),
         "detected PostgreSQL server version"
     );
     Ok(
         pgroles_core::sql::SqlContext::from_version_num(pg_version.version_num)
-            .with_relation_inventory(relation_inventory),
+            .with_relation_inventory(relation_inventory)
+            .with_owned_relations(owned_relations),
     )
 }
 
@@ -1849,6 +1857,28 @@ fn enforce_adopt_owner_transfer_guard(
         transfers.len(),
         transfers.join(", ")
     );
+}
+
+/// Warn when an `ensure: absent` assertion can never converge because the
+/// asserted-against role owns the object — its privileges are inherent, so
+/// the assertion stays permanently unsatisfiable rather than drifting.
+fn warn_unenforceable_absence_assertions(
+    current: &pgroles_core::model::RoleGraph,
+    desired: &pgroles_core::model::RoleGraph,
+) {
+    for key in desired.grant_absences.keys() {
+        if current.inherent_grants.contains(key)
+            && let Some(absent) = desired.grant_absences.get(key)
+        {
+            eprintln!(
+                "Warning: ensure: absent of {:?} on {} for \"{}\" cannot be enforced — the \\
+                 grantee owns the object, so those privileges are inherent",
+                absent,
+                key.object_type,
+                key.role.as_str()
+            );
+        }
+    }
 }
 
 /// Warn when adopt mode transfers schema ownership.

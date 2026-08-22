@@ -3015,9 +3015,11 @@ pub(crate) async fn detect_sql_context(
         .collect();
     let relation_inventory =
         pgroles_inspect::fetch_relation_inventory(pool, &privilege_schemas).await?;
+    let owned_relations = pgroles_inspect::fetch_owned_relations(pool, &privilege_schemas).await?;
     Ok(
         pgroles_core::sql::SqlContext::from_version_num(pg_version.version_num)
-            .with_relation_inventory(relation_inventory),
+            .with_relation_inventory(relation_inventory)
+            .with_owned_relations(owned_relations),
     )
 }
 

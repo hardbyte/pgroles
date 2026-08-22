@@ -40,6 +40,15 @@ pub struct SqlContext {
     /// Optional schema-scoped catalog inventory used to safely expand wildcard
     /// relation statements without leaking across relation subtypes.
     pub relation_inventory: BTreeMap<(ObjectType, String), Vec<String>>,
+    /// Relations owned by each managed role, as
+    /// `(role, object_type, schema, object_name)`. Wildcard REVOKEs skip
+    /// objects the grantee owns: an owner's privileges are inherent (an ACL
+    /// entry records them once any grant materializes it), and revoking them
+    /// breaks owner DML and foreign-key key-share checks. This makes the
+    /// never-revoke-owner-privileges invariant hold by construction even when
+    /// inspection-side tagging cannot see per-object ownership — e.g. a
+    /// mixed-ownership schema folded into a `name: "*"` key.
+    pub owned_relations: BTreeSet<(String, ObjectType, String, String)>,
 }
 
 impl SqlContext {
@@ -48,6 +57,7 @@ impl SqlContext {
         Self {
             pg_major_version: version_num / 10000,
             relation_inventory: BTreeMap::new(),
+            owned_relations: BTreeSet::new(),
         }
     }
 
@@ -58,6 +68,34 @@ impl SqlContext {
     ) -> Self {
         self.relation_inventory = relation_inventory;
         self
+    }
+
+    /// Attach relation ownership for the owner-guard on wildcard REVOKEs.
+    pub fn with_owned_relations(
+        mut self,
+        owned_relations: BTreeSet<(String, ObjectType, String, String)>,
+    ) -> Self {
+        self.owned_relations = owned_relations;
+        self
+    }
+
+    /// Whether the grantee owns this relation. `PUBLIC` owns nothing.
+    pub fn grantee_owns_relation(
+        &self,
+        role: &Grantee,
+        object_type: ObjectType,
+        schema: &str,
+        name: &str,
+    ) -> bool {
+        match role {
+            Grantee::Role(role_name) => self.owned_relations.contains(&(
+                role_name.clone(),
+                object_type,
+                schema.to_string(),
+                name.to_string(),
+            )),
+            Grantee::Public => false,
+        }
     }
 
     /// Whether PG supports `GRANT ... WITH INHERIT TRUE/FALSE` (PG 16+).
@@ -71,6 +109,7 @@ impl Default for SqlContext {
         Self {
             pg_major_version: 16, // Default to PG 16+ (current minimum)
             relation_inventory: BTreeMap::new(),
+            owned_relations: BTreeSet::new(),
         }
     }
 }
@@ -475,6 +514,9 @@ fn render_relation_wildcard(
     ctx: &SqlContext,
 ) -> Vec<String> {
     let schema_name = schema.unwrap_or("public");
+    // Owner guard: a REVOKE must never touch objects the grantee owns. The
+    // owner's privileges are inherent — see `SqlContext::owned_relations`.
+    let skip_owned = action == "REVOKE";
 
     if let Some(object_names) = ctx
         .relation_inventory
@@ -482,6 +524,10 @@ fn render_relation_wildcard(
     {
         return object_names
             .iter()
+            .filter(|object_name| {
+                !skip_owned
+                    || !ctx.grantee_owns_relation(role, object_type, schema_name, object_name)
+            })
             .map(|object_name| {
                 format!(
                     "{action} {privilege_list} ON TABLE {}.{} {subject_preposition} {};",
@@ -501,10 +547,21 @@ fn render_relation_wildcard(
         Grantee::Role(name) => ("%I".to_string(), format!(", {}", quote_literal(name))),
     };
 
+    // The owner guard survives the fallback too: exclude relations owned by
+    // the grantee from the loop when revoking.
+    let owner_filter = match (skip_owned, role) {
+        (true, Grantee::Role(role_name)) => format!(
+            "AND pg_get_userbyid(c.relowner) <> {}",
+            quote_literal(role_name)
+        ),
+        _ => String::new(),
+    };
+
     vec![format!(
-        "DO $pgroles$\nDECLARE obj record;\nBEGIN\n  FOR obj IN\n    SELECT n.nspname AS schema_name, c.relname AS object_name\n    FROM pg_class c\n    JOIN pg_namespace n ON n.oid = c.relnamespace\n    WHERE c.relkind IN ({})\n      AND n.nspname = {}\n    ORDER BY c.relname\n  LOOP\n    EXECUTE format('{} {} ON TABLE %I.%I {} {};', obj.schema_name, obj.object_name{});\n  END LOOP;\nEND\n$pgroles$;",
+        "DO $pgroles$\nDECLARE obj record;\nBEGIN\n  FOR obj IN\n    SELECT n.nspname AS schema_name, c.relname AS object_name\n    FROM pg_class c\n    JOIN pg_namespace n ON n.oid = c.relnamespace\n    WHERE c.relkind IN ({})\n      AND n.nspname = {}\n      {}\n    ORDER BY c.relname\n  LOOP\n    EXECUTE format('{} {} ON TABLE %I.%I {} {};', obj.schema_name, obj.object_name{});\n  END LOOP;\nEND\n$pgroles$;",
         relation_relkinds_sql(object_type),
         quote_literal(schema_name),
+        owner_filter,
         action,
         privilege_list,
         subject_preposition,
@@ -1078,6 +1135,62 @@ mod tests {
         assert_eq!(
             sql,
             "GRANT INSERT, SELECT ON TABLE \"inventory\".\"orders\" TO \"inventory-editor\";\nGRANT INSERT, SELECT ON TABLE \"inventory\".\"widgets\" TO \"inventory-editor\";"
+        );
+    }
+
+    #[test]
+    fn render_wildcard_revoke_skips_objects_the_grantee_owns() {
+        let change = Change::Revoke {
+            role: "app_owner".into(),
+            privileges: BTreeSet::from([Privilege::Update]),
+            object_type: ObjectType::Table,
+            schema: Some("mix".to_string()),
+            name: Some("*".to_string()),
+        };
+        let inventory = BTreeMap::from([(
+            (ObjectType::Table, "mix".to_string()),
+            vec!["t_own".to_string(), "t_other".to_string()],
+        )]);
+        let owned = BTreeSet::from([(
+            "app_owner".to_string(),
+            ObjectType::Table,
+            "mix".to_string(),
+            "t_own".to_string(),
+        )]);
+        let ctx = SqlContext::default()
+            .with_relation_inventory(inventory)
+            .with_owned_relations(owned);
+
+        // The owned table is skipped; the other table's explicit drift revokes.
+        assert_eq!(
+            render_statements_with_context(&change, &ctx).join("\n"),
+            "REVOKE UPDATE ON TABLE \"mix\".\"t_other\" FROM \"app_owner\";"
+        );
+
+        // GRANTs are not filtered — granting to an owner is a harmless no-op.
+        let grant = Change::Grant {
+            role: "app_owner".into(),
+            privileges: BTreeSet::from([Privilege::Select]),
+            object_type: ObjectType::Table,
+            schema: Some("mix".to_string()),
+            name: Some("*".to_string()),
+        };
+        assert_eq!(render_statements_with_context(&grant, &ctx).len(), 2);
+    }
+
+    #[test]
+    fn render_wildcard_revoke_do_block_excludes_owner() {
+        let change = Change::Revoke {
+            role: "app_owner".into(),
+            privileges: BTreeSet::from([Privilege::Update]),
+            object_type: ObjectType::Table,
+            schema: Some("mix".to_string()),
+            name: Some("*".to_string()),
+        };
+        let sql = render_statements_with_context(&change, &SqlContext::default()).join("\n");
+        assert!(
+            sql.contains("pg_get_userbyid(c.relowner) <> 'app_owner'"),
+            "DO-block fallback must exclude owner-owned relations: {sql}"
         );
     }
 
