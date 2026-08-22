@@ -167,6 +167,92 @@ fn predefined_membership_lifecycle_end_to_end() {
     });
 }
 
+/// An exclusive stanza must not touch PostgreSQL's built-in `pg_*` → `pg_*`
+/// hierarchy (initdb makes `pg_monitor` a member of `pg_read_all_stats`), and
+/// referencing a predefined role as a membership grantor must not widen
+/// privilege management onto it: an ACL grant made *to* `pg_monitor` in a
+/// managed schema stays untouched.
+#[test]
+#[ignore]
+fn exclusive_preserves_builtin_hierarchy_and_unrelated_grants() {
+    struct Cleanup;
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            with_runtime(async {
+                if let Ok(pool) = PgPool::connect(&database_url()).await {
+                    let _ = pool
+                        .execute("DROP SCHEMA IF EXISTS predef_app CASCADE")
+                        .await;
+                    let _ = pool.execute("DROP ROLE IF EXISTS predef_metrics").await;
+                }
+            });
+        }
+    }
+    let _cleanup = Cleanup;
+
+    const MANIFEST: &str = r#"
+roles:
+  - name: predef_metrics
+    login: true
+
+schemas:
+  - name: predef_app
+
+grants:
+  - role: predef_metrics
+    privileges: [USAGE]
+    object: { type: schema, name: predef_app }
+
+memberships:
+  - role: pg_read_all_stats
+    exclusive: true
+    members:
+      - name: predef_metrics
+"#;
+
+    with_runtime(async {
+        let pool = PgPool::connect(&database_url())
+            .await
+            .expect("failed to connect");
+        let _ = pool
+            .execute("DROP SCHEMA IF EXISTS predef_app CASCADE")
+            .await;
+        let _ = pool.execute("DROP ROLE IF EXISTS predef_metrics").await;
+        pool.execute(
+            "CREATE ROLE predef_metrics LOGIN; CREATE SCHEMA predef_app; \
+             GRANT USAGE ON SCHEMA predef_app TO pg_monitor;",
+        )
+        .await
+        .expect("seed should run");
+
+        let (changes, _) = plan(&pool, MANIFEST).await;
+        assert!(
+            !changes.iter().any(|change| matches!(
+                change,
+                Change::RemoveMember { member, .. } if member.starts_with("pg_")
+            )),
+            "exclusive must never revoke built-in pg_* hierarchy edges, got {changes:?}"
+        );
+        assert!(
+            !changes.iter().any(|change| matches!(
+                change,
+                Change::Revoke { role, .. }
+                    if matches!(role, pgroles_core::model::Grantee::Role(name) if name == "pg_monitor")
+            )),
+            "grants made to a predefined role must stay unmanaged, got {changes:?}"
+        );
+        // The declared member still converges alongside.
+        assert!(
+            changes.iter().any(|change| matches!(
+                change,
+                Change::AddMember { role, member, .. }
+                    if role == "pg_read_all_stats" && member == "predef_metrics"
+            )),
+            "declared member should still be granted, got {changes:?}"
+        );
+    });
+}
+
 #[test]
 #[ignore]
 fn preflight_reports_missing_predefined_role() {

@@ -118,7 +118,14 @@ impl RawInspection {
         record("roles", started);
 
         let started = Instant::now();
-        let memberships = fetch_memberships(pool, Some(&role_refs)).await?;
+        // Membership inspection alone is widened by predefined grantors; the
+        // role and privilege reads above stay scoped to managed roles.
+        let membership_scope: Vec<&str> = role_refs
+            .iter()
+            .copied()
+            .chain(scope.membership_grantors.iter().map(String::as_str))
+            .collect();
+        let memberships = fetch_memberships(pool, Some(&membership_scope)).await?;
         record("memberships", started);
 
         let schemas = if schema_refs.is_empty() {
@@ -294,6 +301,17 @@ impl RawInspection {
         {
             return Some(format!("managed role {role:?} was not read"));
         }
+        let membership_grantors: BTreeSet<&str> = self
+            .scope
+            .membership_grantors
+            .iter()
+            .map(String::as_str)
+            .collect();
+        if let Some(role) = config.membership_grantors.iter().find(|role| {
+            !membership_grantors.contains(role.as_str()) && !roles.contains(role.as_str())
+        }) {
+            return Some(format!("membership grantor {role:?} was not read"));
+        }
         if let Some(schema) = config
             .managed_schemas
             .iter()
@@ -380,8 +398,12 @@ impl RawInspection {
         stats.roles = graph.roles.len();
 
         // --- Memberships ---
+        let membership_grantors: BTreeSet<String> =
+            config.membership_grantors.iter().cloned().collect();
         for row in &self.memberships {
-            if managed_roles.contains(&row.role_name) {
+            if managed_roles.contains(&row.role_name)
+                || membership_grantors.contains(&row.role_name)
+            {
                 graph.memberships.insert(row.to_membership_edge());
             }
         }
@@ -653,6 +675,7 @@ mod tests {
     ) -> InspectConfig {
         InspectConfig {
             managed_roles: roles.iter().map(|r| r.to_string()).collect(),
+            membership_grantors: Vec::new(),
             managed_schemas: schemas.iter().map(|s| s.to_string()).collect(),
             privilege_schemas: schemas.iter().map(|s| s.to_string()).collect(),
             include_database_privileges,

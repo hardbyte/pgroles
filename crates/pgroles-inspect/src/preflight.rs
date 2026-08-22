@@ -156,13 +156,14 @@ pub async fn preflight_authority_issues(
 ) -> Result<Vec<AuthorityIssue>, sqlx::Error> {
     let mut issues = Vec::new();
 
-    let (executor, executor_is_superuser) = {
-        let (user, is_superuser): (String, bool) = sqlx::query_as(
-            "SELECT r.rolname::text, r.rolsuper FROM pg_roles r WHERE r.rolname = current_user",
+    let (executor, executor_is_superuser, executor_has_createrole) = {
+        let (user, is_superuser, has_createrole): (String, bool, bool) = sqlx::query_as(
+            "SELECT r.rolname::text, r.rolsuper, r.rolcreaterole \
+             FROM pg_roles r WHERE r.rolname = current_user",
         )
         .fetch_one(pool)
         .await?;
-        (user, is_superuser)
+        (user, is_superuser, has_createrole)
     };
 
     // --- Predefined-role membership authority ---
@@ -183,6 +184,12 @@ pub async fn preflight_authority_issues(
         })
         .collect();
     if !predefined_targets.is_empty() {
+        let (server_version_num,): (i32,) =
+            sqlx::query_as("SELECT current_setting('server_version_num')::int")
+                .fetch_one(pool)
+                .await?;
+        let server_major = (server_version_num / 10_000) as u32;
+
         let target_list: Vec<String> = predefined_targets.iter().cloned().collect();
         let rows: Vec<(String, bool)> = sqlx::query_as(
             r#"
@@ -195,31 +202,29 @@ pub async fn preflight_authority_issues(
         .fetch_all(pool)
         .await?;
         let known: BTreeSet<String> = rows.iter().map(|(role, _)| role.clone()).collect();
+        // Before PostgreSQL 16, CREATEROLE alone allowed granting and
+        // revoking any non-superuser role, predefined roles included — the
+        // ADMIN OPTION requirement is the PG16 semantics change. Requiring it
+        // unconditionally would hard-block executors that work fine on 14/15.
+        let admin_required = server_major >= 16;
         for (role, can_admin) in rows {
-            if !can_admin {
+            if !can_admin && (admin_required || !(executor_is_superuser || executor_has_createrole))
+            {
                 issues.push(AuthorityIssue::PredefinedRoleGrant {
                     role,
                     executor: executor.clone(),
                 });
             }
         }
-        let missing: Vec<&String> = predefined_targets
+        for role in predefined_targets
             .iter()
             .filter(|role| !known.contains(role.as_str()))
-            .collect();
-        if !missing.is_empty() {
-            let (server_version_num,): (i32,) =
-                sqlx::query_as("SELECT current_setting('server_version_num')::int")
-                    .fetch_one(pool)
-                    .await?;
-            let server_major = (server_version_num / 10_000) as u32;
-            for role in missing {
-                issues.push(AuthorityIssue::MissingPredefinedRole {
-                    role: role.clone(),
-                    server_major,
-                    min_version: predefined_role_min_version(role),
-                });
-            }
+        {
+            issues.push(AuthorityIssue::MissingPredefinedRole {
+                role: role.clone(),
+                server_major,
+                min_version: predefined_role_min_version(role),
+            });
         }
     }
 

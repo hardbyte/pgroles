@@ -333,6 +333,15 @@ pub struct InspectConfig {
     /// Privileges and memberships are filtered to only include these roles.
     pub managed_roles: Vec<String>,
 
+    /// Predefined (`pg_*`) roles referenced as membership grantors.
+    ///
+    /// This widens membership inspection only — their live members must be
+    /// visible for declared edges to converge idempotently — and deliberately
+    /// nothing else: no role-lifecycle inspection and no privilege scope, so
+    /// an undeclared ACL grant made *to* a predefined role is never surfaced
+    /// or revoked just because a membership names that role.
+    pub membership_grantors: Vec<String>,
+
     /// The schema names that the manifest manages for schema-owner inspection.
     pub managed_schemas: Vec<String>,
 
@@ -393,14 +402,14 @@ impl InspectConfig {
             managed_roles.insert(role_def.name.clone());
         }
 
-        // Predefined (`pg_*`) roles referenced as membership grantors need to
-        // be in the inspection scope so their live members appear in the
-        // current graph and declared edges converge idempotently. Their
-        // lifecycle stays unmanaged: the diff layer filters any role-object
-        // change for predefined roles.
+        // Predefined (`pg_*`) roles referenced as membership grantors get a
+        // dedicated scope so their live members appear in the current graph
+        // and declared edges converge idempotently, without dragging the
+        // role into lifecycle or privilege management.
+        let mut membership_grantors: BTreeSet<String> = BTreeSet::new();
         for membership in &expanded.memberships {
             if pgroles_core::manifest::is_predefined_role(&membership.role) {
-                managed_roles.insert(membership.role.clone());
+                membership_grantors.insert(membership.role.clone());
             }
         }
 
@@ -480,6 +489,7 @@ impl InspectConfig {
 
         Self {
             managed_roles: managed_roles.into_iter().collect(),
+            membership_grantors: membership_grantors.into_iter().collect(),
             managed_schemas: managed_schemas.clone().into_iter().collect(),
             privilege_schemas: managed_schemas.into_iter().collect(),
             include_database_privileges,
@@ -539,6 +549,7 @@ impl InspectConfig {
 
         Self {
             managed_roles: scope.roles.iter().cloned().collect(),
+            membership_grantors: base.membership_grantors.clone(),
             managed_schemas: scope.schemas.keys().cloned().collect(),
             privilege_schemas: scope
                 .schemas
@@ -610,6 +621,7 @@ impl InspectConfig {
         let mut managed_roles: BTreeSet<String> = BTreeSet::new();
         let mut managed_schemas: BTreeSet<String> = BTreeSet::new();
         let mut privilege_schemas: BTreeSet<String> = BTreeSet::new();
+        let mut membership_grantors: BTreeSet<String> = BTreeSet::new();
         let mut include_database_privileges = false;
         let mut database_targets: BTreeSet<String> = BTreeSet::new();
         type WildcardKey = (String, pgroles_core::manifest::ObjectType, String);
@@ -628,6 +640,7 @@ impl InspectConfig {
 
         for config in configs {
             managed_roles.extend(config.managed_roles.iter().cloned());
+            membership_grantors.extend(config.membership_grantors.iter().cloned());
             managed_schemas.extend(config.managed_schemas.iter().cloned());
             privilege_schemas.extend(config.privilege_schemas.iter().cloned());
             include_database_privileges |= config.include_database_privileges;
@@ -657,6 +670,7 @@ impl InspectConfig {
 
         Self {
             managed_roles: managed_roles.into_iter().collect(),
+            membership_grantors: membership_grantors.into_iter().collect(),
             managed_schemas: managed_schemas.into_iter().collect(),
             privilege_schemas: privilege_schemas.into_iter().collect(),
             include_database_privileges,
@@ -923,6 +937,36 @@ mod tests {
     use super::*;
     use pgroles_core::manifest::{expand_manifest, parse_manifest};
     use pgroles_core::ownership::ManagedSchemaScope;
+
+    #[test]
+    fn predefined_membership_grantors_do_not_widen_managed_roles() {
+        let yaml = r#"
+roles:
+  - name: auditor
+    login: true
+
+memberships:
+  - role: pg_read_all_data
+    members:
+      - name: auditor
+"#;
+        let manifest = parse_manifest(yaml).expect("manifest should parse");
+        let expanded = expand_manifest(&manifest).expect("manifest should expand");
+        let config = InspectConfig::from_expanded(&expanded, false);
+        // The predefined grantor widens membership inspection only: putting it
+        // in managed_roles would drag it into role-lifecycle and privilege
+        // scope, planning revocations of ACL grants made TO the pg_* role.
+        assert_eq!(config.membership_grantors, vec!["pg_read_all_data"]);
+        assert!(
+            !config
+                .managed_roles
+                .iter()
+                .any(|role| role == "pg_read_all_data"),
+            "pg_* grantors must not join managed_roles: {:?}",
+            config.managed_roles
+        );
+        assert_eq!(config.managed_roles, vec!["auditor"]);
+    }
 
     #[test]
     fn inspect_config_from_expanded_manifest() {

@@ -233,7 +233,11 @@ pub fn additive_ignores_absence_assertions(desired: &RoleGraph, mode: Reconcilia
 ///   pgroles never strips provider-granted memberships (for example
 ///   `pg_monitor` grants made by a cloud platform).
 /// - A membership stanza with `exclusive: true` asserts its member list is
-///   complete, opting undeclared members into revocation.
+///   complete, opting undeclared members into revocation — except members
+///   that are themselves predefined roles: PostgreSQL ships built-in
+///   `pg_*` → `pg_*` edges (for example `pg_monitor`'s membership in
+///   `pg_read_all_stats`), and revoking those would break the built-in
+///   hierarchy cluster-wide.
 pub fn filter_external_role_changes(
     changes: Vec<Change>,
     roles: &[RoleDefinition],
@@ -279,8 +283,8 @@ pub fn filter_external_role_changes(
             }
             Change::RemoveMember { role, member } => {
                 !unmanaged(role)
-                    || exclusive_roles.contains(role.as_str())
                     || declared_edges.contains(&(role.as_str(), member.as_str()))
+                    || (exclusive_roles.contains(role.as_str()) && !is_predefined_role(member))
             }
             _ => true,
         })
@@ -1469,90 +1473,95 @@ memberships:
             RoleKind::External => "external_role",
             RoleKind::Predefined => "pg_read_all_data",
         };
-        let member = "some_member";
-
-        type ChangeShape = (&'static str, fn(&str) -> Change);
+        type ChangeShape = (&'static str, fn(&str, &str) -> Change);
         let change_shapes: Vec<ChangeShape> = vec![
-            ("create", |r| Change::CreateRole {
+            ("create", |r, _| Change::CreateRole {
                 name: r.to_string(),
                 state: crate::model::RoleState::default(),
             }),
-            ("alter", |r| Change::AlterRole {
+            ("alter", |r, _| Change::AlterRole {
                 name: r.to_string(),
                 attributes: vec![RoleAttribute::Login(true)],
             }),
-            ("comment", |r| Change::SetComment {
+            ("comment", |r, _| Change::SetComment {
                 name: r.to_string(),
                 comment: None,
             }),
-            ("drop", |r| Change::DropRole {
+            ("drop", |r, _| Change::DropRole {
                 name: r.to_string(),
             }),
-            ("terminate", |r| Change::TerminateSessions {
+            ("terminate", |r, _| Change::TerminateSessions {
                 role: r.to_string(),
             }),
-            ("drop_owned", |r| Change::DropOwned {
+            ("drop_owned", |r, _| Change::DropOwned {
                 role: r.to_string(),
             }),
-            ("reassign", |r| Change::ReassignOwned {
+            ("reassign", |r, _| Change::ReassignOwned {
                 from_role: r.to_string(),
                 to_role: "successor".to_string(),
             }),
-            ("add_member", |r| Change::AddMember {
+            ("add_member", |r, m| Change::AddMember {
                 role: r.to_string(),
-                member: "some_member".to_string(),
+                member: m.to_string(),
                 inherit: true,
                 admin: false,
             }),
-            ("remove_member", |r| Change::RemoveMember {
+            ("remove_member", |r, m| Change::RemoveMember {
                 role: r.to_string(),
-                member: "some_member".to_string(),
+                member: m.to_string(),
             }),
-            ("unrelated", |_| Change::CreateSchema {
+            ("unrelated", |_, _| Change::CreateSchema {
                 name: "s".to_string(),
                 owner: None,
             }),
         ];
 
+        // The member's own kind matters for exclusive revocation: PostgreSQL's
+        // built-in pg_* -> pg_* hierarchy edges must never be revoked.
         for kind in [RoleKind::Managed, RoleKind::External, RoleKind::Predefined] {
             for (shape_name, make_change) in &change_shapes {
-                for declared in [false, true] {
-                    for exclusive in [false, true] {
-                        let role = role_name(kind);
-                        let change = make_change(role);
-                        let roles = match kind {
-                            RoleKind::External => vec![role_definition(role, true)],
-                            _ => vec![],
-                        };
-                        let memberships = if declared {
-                            vec![membership(role, &[member], exclusive)]
-                        } else if exclusive {
-                            vec![membership(role, &[], true)]
-                        } else {
-                            vec![]
-                        };
+                for member in ["some_member", "pg_monitor"] {
+                    for declared in [false, true] {
+                        for exclusive in [false, true] {
+                            let role = role_name(kind);
+                            let change = make_change(role, member);
+                            let roles = match kind {
+                                RoleKind::External => vec![role_definition(role, true)],
+                                _ => vec![],
+                            };
+                            let memberships = if declared {
+                                vec![membership(role, &[member], exclusive)]
+                            } else if exclusive {
+                                vec![membership(role, &[], true)]
+                            } else {
+                                vec![]
+                            };
 
-                        // Independent oracle of the semantics table.
-                        let unmanaged = kind != RoleKind::Managed;
-                        let expected_kept = match *shape_name {
-                            "unrelated" => true,
-                            "add_member" => !unmanaged || declared,
-                            "remove_member" => !unmanaged || exclusive || declared,
-                            // Every lifecycle and retirement shape.
-                            _ => !unmanaged,
-                        };
+                            // Independent oracle of the semantics table.
+                            let unmanaged = kind != RoleKind::Managed;
+                            let member_is_predefined = member.starts_with("pg_");
+                            let expected_kept = match *shape_name {
+                                "unrelated" => true,
+                                "add_member" => !unmanaged || declared,
+                                "remove_member" => {
+                                    !unmanaged || declared || (exclusive && !member_is_predefined)
+                                }
+                                // Every lifecycle and retirement shape.
+                                _ => !unmanaged,
+                            };
 
-                        let kept = !filter_external_role_changes(
-                            vec![change.clone()],
-                            &roles,
-                            &memberships,
-                        )
-                        .is_empty();
-                        assert_eq!(
-                            kept, expected_kept,
-                            "kind={kind:?} shape={shape_name} declared={declared} \
-                             exclusive={exclusive} change={change:?}"
-                        );
+                            let kept = !filter_external_role_changes(
+                                vec![change.clone()],
+                                &roles,
+                                &memberships,
+                            )
+                            .is_empty();
+                            assert_eq!(
+                                kept, expected_kept,
+                                "kind={kind:?} shape={shape_name} member={member} \
+                                 declared={declared} exclusive={exclusive} change={change:?}"
+                            );
+                        }
                     }
                 }
             }

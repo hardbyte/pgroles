@@ -2688,6 +2688,7 @@ mod tests {
 
     fn live_config(schema: &str, role: &str) -> crate::InspectConfig {
         crate::InspectConfig {
+            membership_grantors: Vec::new(),
             managed_roles: vec![role.to_string()],
             managed_schemas: vec![],
             privilege_schemas: vec![schema.to_string()],
