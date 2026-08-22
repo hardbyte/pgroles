@@ -164,7 +164,7 @@ pub fn predefined_role_min_version(name: &str) -> Option<u32> {
         "pg_read_all_data" | "pg_write_all_data" | "pg_database_owner" => Some(14),
         "pg_checkpoint" => Some(15),
         "pg_use_reserved_connections" | "pg_create_subscription" => Some(16),
-        "pg_maintain" => Some(17),
+        "pg_maintain" | "pg_signal_autovacuum_worker" => Some(17),
         _ => None,
     }
 }

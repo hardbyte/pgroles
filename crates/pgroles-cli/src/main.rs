@@ -1752,7 +1752,8 @@ fn warn_additive_absence_assertions(
 ) {
     if additive_ignores_absence_assertions(desired, mode) {
         eprintln!(
-            "Warning: additive reconciliation ignores every `ensure: absent` assertion; \
+            "Warning: additive reconciliation ignores every absence assertion \
+             (`ensure: absent` and `exclusive: true` memberships); \
              use adopt or authoritative mode to enforce absence"
         );
     }

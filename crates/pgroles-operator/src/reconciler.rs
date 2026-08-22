@@ -1321,7 +1321,8 @@ async fn apply_under_lock(
         tracing::warn!(
             name,
             namespace,
-            "additive reconciliation ignores every `ensure: absent` assertion; \
+            "additive reconciliation ignores every absence assertion \
+             (`ensure: absent` and `exclusive: true` memberships); \
              use adopt or authoritative mode to enforce absence"
         );
     }

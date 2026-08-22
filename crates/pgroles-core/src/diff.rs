@@ -209,13 +209,16 @@ pub fn filter_changes(changes: Vec<Change>, mode: ReconciliationMode) -> Vec<Cha
 
 /// Whether additive reconciliation will ignore declarative absence assertions.
 ///
-/// The desired graph retains absence assertions even though [`filter_changes`]
-/// removes their revocations in additive mode. Callers use this predicate to
-/// make that safety-relevant no-op visible before presenting or applying a
-/// filtered plan.
+/// The desired graph retains absence assertions — `ensure: absent` grants and
+/// default privileges, and `exclusive: true` membership stanzas — even though
+/// [`filter_changes`] removes their revocations in additive mode. Callers use
+/// this predicate to make that safety-relevant no-op visible before presenting
+/// or applying a filtered plan.
 pub fn additive_ignores_absence_assertions(desired: &RoleGraph, mode: ReconciliationMode) -> bool {
     mode == ReconciliationMode::Additive
-        && (!desired.grant_absences.is_empty() || !desired.default_privilege_absences.is_empty())
+        && (!desired.grant_absences.is_empty()
+            || !desired.default_privilege_absences.is_empty()
+            || !desired.exclusive_membership_roles.is_empty())
 }
 
 /// Remove changes pgroles must not own for external and predefined roles.
@@ -3349,5 +3352,72 @@ memberships:
             &RoleGraph::default(),
             ReconciliationMode::Additive
         ));
+    }
+
+    #[test]
+    fn additive_mode_ignores_exclusive_membership_but_warns() {
+        // `exclusive: true` is a declarative absence assertion: its revokes
+        // are stripped in additive mode like every RemoveMember, and the
+        // warning predicate must surface that safety-relevant no-op.
+        let mut desired = empty_graph();
+        desired
+            .exclusive_membership_roles
+            .insert("pg_read_all_data".to_string());
+        desired.memberships.insert(MembershipEdge {
+            role: "pg_read_all_data".to_string(),
+            member: "auditor".to_string(),
+            inherit: true,
+            admin: false,
+        });
+
+        let changes = vec![Change::RemoveMember {
+            role: "pg_read_all_data".to_string(),
+            member: "forgotten_contractor".to_string(),
+        }];
+        // The exclusive filter keeps the revoke...
+        let kept = filter_external_role_changes(
+            changes.clone(),
+            &[],
+            &[membership("pg_read_all_data", &["auditor"], true)],
+        );
+        assert_eq!(kept, changes);
+        // ...but additive mode strips it before that filter ever runs.
+        let additive = filter_changes(changes, ReconciliationMode::Additive);
+        assert!(additive.is_empty());
+
+        assert!(additive_ignores_absence_assertions(
+            &desired,
+            ReconciliationMode::Additive
+        ));
+        assert!(!additive_ignores_absence_assertions(
+            &desired,
+            ReconciliationMode::Authoritative
+        ));
+    }
+
+    #[test]
+    fn exclusive_membership_populates_graph_assertion_set() {
+        use crate::manifest::{expand_manifest, parse_manifest};
+        let manifest = parse_manifest(
+            r#"
+roles:
+  - name: auditor
+    login: true
+
+memberships:
+  - role: pg_read_all_data
+    exclusive: true
+    members:
+      - name: auditor
+"#,
+        )
+        .unwrap();
+        let expanded = expand_manifest(&manifest).unwrap();
+        let desired = RoleGraph::from_expanded(&expanded, None).unwrap();
+        assert!(
+            desired
+                .exclusive_membership_roles
+                .contains("pg_read_all_data")
+        );
     }
 }

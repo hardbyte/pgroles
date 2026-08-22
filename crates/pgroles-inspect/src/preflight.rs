@@ -85,9 +85,9 @@ impl std::fmt::Display for AuthorityIssue {
                 f,
                 "UnsatisfiableMembershipChange: cannot GRANT/REVOKE predefined role \
                  \"{role}\" as executor \"{executor}\"; requires ADMIN OPTION on it — \
-                 in PostgreSQL 16+ that means a superuser executor or an explicit \
-                 GRANT \"{role}\" TO \"{executor}\" WITH ADMIN OPTION (CREATEROLE is \
-                 not sufficient)"
+                 use a superuser executor or an explicit \
+                 GRANT \"{role}\" TO \"{executor}\" WITH ADMIN OPTION (since \
+                 PostgreSQL 16, CREATEROLE alone is not sufficient)"
             ),
             AuthorityIssue::MissingPredefinedRole {
                 role,

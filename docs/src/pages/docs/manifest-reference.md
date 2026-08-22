@@ -328,7 +328,7 @@ Each stanza also accepts one option beside `role` and `members`:
 
 | Field | Default | Description |
 |---|---|---|
-| `exclusive` | `false` | Assert that `members` is the complete membership of `role`, revoking anyone else. Only valid for predefined (`pg_*`) and `external: true` granted roles — see [memberships](/docs/memberships#predefined-and-external-granted-roles) |
+| `exclusive` | `false` | Assert that `members` is the complete membership of `role`, revoking anyone else — except members that are themselves predefined `pg_*` roles, which preserves PostgreSQL's built-in role hierarchy. Only valid for predefined (`pg_*`) and `external: true` granted roles — see [memberships](/docs/memberships#predefined-and-external-granted-roles) |
 
 ## retirements
 
