@@ -5022,7 +5022,6 @@ grants:
         );
 
         // Without the flag, the undeclared grant would have been revoked in
-        // the first apply — sanity-check that baseline behavior still holds.        // Without the flag, the undeclared grant would have been revoked in
         // the first apply — sanity-check that baseline behavior still holds.
         execute_sql(&format!(
             "GRANT SELECT ON \"{schema}\".widgets TO \"{role}\";"
