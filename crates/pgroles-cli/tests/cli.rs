@@ -5064,6 +5064,91 @@ grants:
         ));
     }
 
+    /// Live regression for wildcard normalization interacting with an exact
+    /// absence assertion on a preserved role. When every table holds DELETE,
+    /// inspection folds it into one wildcard key; apply must split that key
+    /// and revoke only the explicitly named table.
+    #[test]
+    #[ignore]
+    fn preserve_flag_narrows_normalized_wildcard_to_exact_absence() {
+        let schema = unique_name("preserve_exact_schema");
+        let role = unique_name("preserve_exact_role");
+
+        execute_sql(&format!(
+            r#"
+            DROP SCHEMA IF EXISTS "{schema}" CASCADE;
+            DROP ROLE IF EXISTS "{role}";
+            CREATE ROLE "{role}" NOLOGIN;
+            CREATE SCHEMA "{schema}";
+            CREATE TABLE "{schema}".widgets (id integer);
+            CREATE TABLE "{schema}".gadgets (id integer);
+            GRANT DELETE ON ALL TABLES IN SCHEMA "{schema}" TO "{role}";
+            "#
+        ));
+
+        let manifest = write_temp_manifest(&format!(
+            r#"
+roles:
+  - name: {role}
+    nologin: true
+    preserve_undeclared_grants: true
+
+grants:
+  - role: {role}
+    privileges: [SELECT]
+    object: {{ type: table, schema: {schema}, name: "*" }}
+  - role: {role}
+    ensure: absent
+    privileges: [DELETE]
+    object: {{ type: table, schema: {schema}, name: widgets }}
+"#
+        ));
+
+        pgroles_cmd()
+            .args([
+                "apply",
+                "--file",
+                manifest.path().to_str().unwrap(),
+                "--database-url",
+                &database_url(),
+                "--mode",
+                "authoritative",
+            ])
+            .assert()
+            .success();
+
+        assert!(
+            !query_has_relation_privilege(&role, &format!("{schema}.widgets"), "DELETE"),
+            "exact ensure: absent must revoke the normalized privilege"
+        );
+        assert!(
+            query_has_relation_privilege(&role, &format!("{schema}.gadgets"), "DELETE"),
+            "preservation must keep the privilege on other wildcard objects"
+        );
+        pgroles_cmd()
+            .args([
+                "diff",
+                "--file",
+                manifest.path().to_str().unwrap(),
+                "--database-url",
+                &database_url(),
+                "--mode",
+                "authoritative",
+                "--format",
+                "summary",
+            ])
+            .assert()
+            .success()
+            .stdout(predicate::str::contains("No changes needed"));
+
+        execute_sql(&format!(
+            r#"
+            DROP SCHEMA IF EXISTS "{schema}" CASCADE;
+            DROP ROLE IF EXISTS "{role}";
+            "#
+        ));
+    }
+
     /// Mixed-ownership schema with a wildcard grant to the owner: inherent
     /// privileges on the owned table must survive convergence even though
     /// normalization folds both tables into one `name: "*"` key (issue #201

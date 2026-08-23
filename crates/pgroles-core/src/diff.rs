@@ -319,7 +319,7 @@ pub fn filter_preserved_grant_revokes(
 
     changes
         .into_iter()
-        .filter_map(|change| {
+        .flat_map(|change| {
             let Change::Revoke {
                 role,
                 privileges,
@@ -328,10 +328,10 @@ pub fn filter_preserved_grant_revokes(
                 name,
             } = &change
             else {
-                return Some(change);
+                return vec![change];
             };
             if !preserved.contains(role.as_str()) {
-                return Some(change);
+                return vec![change];
             }
             let key = crate::model::GrantKey {
                 role: role.clone(),
@@ -339,27 +339,78 @@ pub fn filter_preserved_grant_revokes(
                 schema: schema.clone(),
                 name: name.clone(),
             };
-            let enforced = match desired.grant_absences.get(&key) {
-                // Asserted absences are declarations, not drift discovery:
-                // trim the revoke to exactly the asserted privileges.
-                Some(absent) => privileges
-                    .intersection(absent)
-                    .copied()
-                    .collect::<BTreeSet<Privilege>>(),
-                // Everything else about the role's grant surface is undeclared.
-                None => BTreeSet::new(),
+
+            let wildcard_key = crate::model::GrantKey {
+                name: Some("*".to_string()),
+                ..key.clone()
             };
-            if enforced.is_empty() {
-                None
-            } else {
-                Some(Change::Revoke {
+            let wildcard_enforced = desired
+                .grant_absences
+                .get(&wildcard_key)
+                .map(|absent| {
+                    privileges
+                        .intersection(absent)
+                        .copied()
+                        .collect::<BTreeSet<Privilege>>()
+                })
+                .unwrap_or_default();
+
+            if name.as_deref() != Some("*") {
+                let mut enforced = wildcard_enforced;
+                if let Some(absent) = desired.grant_absences.get(&key) {
+                    enforced.extend(privileges.intersection(absent).copied());
+                }
+                return (!enforced.is_empty())
+                    .then(|| Change::Revoke {
+                        role: role.clone(),
+                        privileges: enforced,
+                        object_type: *object_type,
+                        schema: schema.clone(),
+                        name: name.clone(),
+                    })
+                    .into_iter()
+                    .collect();
+            }
+
+            // Inspection can normalize privileges held on every object into
+            // one wildcard key, while an absence assertion still names one
+            // object. Keep a wildcard revoke only for wildcard assertions;
+            // split exact assertions back into exact revokes so preservation
+            // neither discards them nor broadens them to the whole schema.
+            let mut enforced = Vec::new();
+            if !wildcard_enforced.is_empty() {
+                enforced.push(Change::Revoke {
                     role: role.clone(),
-                    privileges: enforced,
+                    privileges: wildcard_enforced.clone(),
                     object_type: *object_type,
                     schema: schema.clone(),
                     name: name.clone(),
-                })
+                });
             }
+            for (absence_key, absent) in &desired.grant_absences {
+                if absence_key.role != *role
+                    || absence_key.object_type != *object_type
+                    || absence_key.schema != *schema
+                    || absence_key.name.as_deref().is_none_or(|value| value == "*")
+                {
+                    continue;
+                }
+                let exact: BTreeSet<Privilege> = privileges
+                    .intersection(absent)
+                    .copied()
+                    .filter(|privilege| !wildcard_enforced.contains(privilege))
+                    .collect();
+                if !exact.is_empty() {
+                    enforced.push(Change::Revoke {
+                        role: role.clone(),
+                        privileges: exact,
+                        object_type: *object_type,
+                        schema: schema.clone(),
+                        name: absence_key.name.clone(),
+                    });
+                }
+            }
+            enforced
         })
         .collect()
 }
@@ -1995,6 +2046,86 @@ memberships:
             }
             other => panic!("expected Revoke, got: {other:?}"),
         }
+    }
+
+    #[test]
+    fn preserve_flag_splits_normalized_wildcard_revoke_for_exact_absence() {
+        let mut preserved_role = role_definition("brownfield", false);
+        preserved_role.preserve_undeclared_grants = true;
+
+        let mut desired = empty_graph();
+        desired.grant_absences.insert(
+            GrantKey {
+                role: "brownfield".into(),
+                object_type: ObjectType::Table,
+                schema: Some("app".to_string()),
+                name: Some("widgets".to_string()),
+            },
+            BTreeSet::from([Privilege::Delete]),
+        );
+
+        let changes = filter_preserved_grant_revokes(
+            vec![Change::Revoke {
+                role: "brownfield".into(),
+                privileges: BTreeSet::from([Privilege::Select, Privilege::Delete]),
+                object_type: ObjectType::Table,
+                schema: Some("app".to_string()),
+                name: Some("*".to_string()),
+            }],
+            &[preserved_role],
+            &desired,
+        );
+
+        assert_eq!(
+            changes,
+            vec![Change::Revoke {
+                role: "brownfield".into(),
+                privileges: BTreeSet::from([Privilege::Delete]),
+                object_type: ObjectType::Table,
+                schema: Some("app".to_string()),
+                name: Some("widgets".to_string()),
+            }]
+        );
+    }
+
+    #[test]
+    fn preserve_flag_applies_wildcard_absence_to_exact_revoke() {
+        let mut preserved_role = role_definition("brownfield", false);
+        preserved_role.preserve_undeclared_grants = true;
+
+        let mut desired = empty_graph();
+        desired.grant_absences.insert(
+            GrantKey {
+                role: "brownfield".into(),
+                object_type: ObjectType::Table,
+                schema: Some("app".to_string()),
+                name: Some("*".to_string()),
+            },
+            BTreeSet::from([Privilege::Delete]),
+        );
+
+        let changes = filter_preserved_grant_revokes(
+            vec![Change::Revoke {
+                role: "brownfield".into(),
+                privileges: BTreeSet::from([Privilege::Select, Privilege::Delete]),
+                object_type: ObjectType::Table,
+                schema: Some("app".to_string()),
+                name: Some("widgets".to_string()),
+            }],
+            &[preserved_role],
+            &desired,
+        );
+
+        assert_eq!(
+            changes,
+            vec![Change::Revoke {
+                role: "brownfield".into(),
+                privileges: BTreeSet::from([Privilege::Delete]),
+                object_type: ObjectType::Table,
+                schema: Some("app".to_string()),
+                name: Some("widgets".to_string()),
+            }]
+        );
     }
 
     #[test]
