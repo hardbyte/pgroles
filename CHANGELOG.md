@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.10.0-alpha.2] - 2026-08-24
+
 ### Changed
 
 - **Breaking for adopt-mode users: schema-ownership transfers now require an explicit opt-in.** `apply --mode adopt` fails a plan containing `ALTER SCHEMA ... OWNER TO ...` on a schema whose live owner differs unless `--allow-schema-owner-transfers` is passed, and apply-mode operator policies fail with an `OwnerTransferBlocked` condition unless `spec.allow_schema_owner_transfers: true` is set. Previously both executed the transfer. Add the flag/field if your policy intentionally re-homes schemas, or declare each schema's current owner. (#201)
