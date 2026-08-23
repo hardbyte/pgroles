@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **Breaking for adopt-mode users: schema-ownership transfers now require an explicit opt-in.** `apply --mode adopt` fails a plan containing `ALTER SCHEMA ... OWNER TO ...` on a schema whose live owner differs unless `--allow-schema-owner-transfers` is passed, and apply-mode operator policies fail with an `OwnerTransferBlocked` condition unless `spec.allow_schema_owner_transfers: true` is set. Previously both executed the transfer. Add the flag/field if your policy intentionally re-homes schemas, or declare each schema's current owner. (#201)
+
 ### Added
 
 - **Memberships in predefined (`pg_*`) and external roles are now managed when declared.** (#200) A membership stanza may name a predefined role (`pg_read_all_data`, `pg_monitor`, ...) directly — no `roles:` entry needed — and declared members are granted and kept converged. Undeclared live members of predefined and `external: true` roles stay untouched by default, so adopting pgroles never strips provider-granted memberships; a new stanza-level `exclusive: true` asserts the member list is complete and plans a `REVOKE` for anyone else (never for members that are themselves `pg_*` roles — PostgreSQL's built-in hierarchy is not modified). Declaring a `pg_*` role under `roles:` without `external: true` is now a validation error, exclusive stanzas are rejected on ordinary managed roles, and bundle composition rejects an exclusive member list split across documents.
@@ -23,7 +27,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- **`preserve_undeclared_grants` per-role adoption assertion.** A role marked with the flag keeps its undeclared in-scope grants through adopt and authoritative convergence — brownfield access survives while declared privileges still converge. Explicit `ensure: absent` assertions revoke regardless, so the flag is a reviewable stepping stone, not an escape hatch: remove it once the manifest declares the role's real grant surface. Available on both manifest roles and the operator's `RoleSpec`. (#201)
+- **`preserve_undeclared_grants` per-role adoption assertion.** A role marked with the flag keeps its undeclared in-scope grants through adopt and authoritative convergence — brownfield access survives, missing declared privileges are still granted, and nothing is trimmed until the flag is removed. Explicit `ensure: absent` assertions revoke regardless, so the flag is a reviewable stepping stone, not an escape hatch: remove it once the manifest declares the role's real grant surface. Available on both manifest roles and the operator's `RoleSpec`. (#201)
 - **Adopt mode refuses schema-ownership transfers without an explicit opt-in — in the CLI and the operator.** Adopt filters role drops, not ownership convergence; `apply --mode adopt` now fails a plan containing `ALTER SCHEMA ... OWNER TO ...` on a schema whose live owner differs, naming the schemas and the flag, and apply-mode operator policies fail with an `OwnerTransferBlocked` condition unless `spec.allow_schema_owner_transfers: true` is set. `diff` and observe-mode policies warn/record instead of refusing so drift review keeps working. (#201)
 - **Operator surfaces plan warnings in policy status.** `status.plan_warnings` records advisory warnings from the last reconciliation — undeclared `default_owner`, adopt-mode ownership transfers — so they outlive the reconcile log window. (#201)
 - **Plan-time CLI warnings for silently-destructive policy shapes.** `diff`/`apply` warn when adopt mode transfers schema ownership away from the live owner (adopt filters role drops, not ownership convergence), and both the CLI and the operator warn when `default_owner` names a role the policy never declares, since every un-owned schema binding silently resolves to it while the role's own privileges stay uninspected. (#201)

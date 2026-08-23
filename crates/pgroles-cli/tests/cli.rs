@@ -4981,7 +4981,48 @@ grants:
             "ensure: absent must revoke despite preserve_undeclared_grants"
         );
 
+        // Declared keys are not trimmed either: with only SELECT declared,
+        // a held INSERT survives until the flag comes off (issue #201 review,
+        // second pass — pinning actual semantics).
+        execute_sql(&format!(
+            "GRANT INSERT ON \"{schema}\".widgets TO \"{role}\";"
+        ));
+        let declaring_select = write_temp_manifest(&format!(
+            r#"
+roles:
+  - name: {role}
+    nologin: true
+    preserve_undeclared_grants: true
+
+grants:
+  - role: {role}
+    privileges: [SELECT]
+    object: {{ type: table, schema: {schema}, name: widgets }}
+"#
+        ));
+        pgroles_cmd()
+            .args([
+                "apply",
+                "--file",
+                declaring_select.path().to_str().unwrap(),
+                "--database-url",
+                &database_url(),
+                "--mode",
+                "authoritative",
+            ])
+            .assert()
+            .success();
+        assert!(
+            query_has_relation_privilege(&role, &format!("{schema}.widgets"), "INSERT"),
+            "preserve flag must not trim excess on declared grant targets"
+        );
+        assert!(
+            query_has_relation_privilege(&role, &format!("{schema}.widgets"), "SELECT"),
+            "declared privilege should be granted/retained"
+        );
+
         // Without the flag, the undeclared grant would have been revoked in
+        // the first apply — sanity-check that baseline behavior still holds.        // Without the flag, the undeclared grant would have been revoked in
         // the first apply — sanity-check that baseline behavior still holds.
         execute_sql(&format!(
             "GRANT SELECT ON \"{schema}\".widgets TO \"{role}\";"

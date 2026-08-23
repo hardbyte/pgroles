@@ -177,7 +177,7 @@ roles:
     preserve_undeclared_grants: true
 ```
 
-With `preserve_undeclared_grants: true`, convergence trims and adds declared privileges but skips revokes against everything else the role holds in scope. Explicit `ensure: absent` assertions still revoke — an asserted absence is a declaration, not drift discovery — and owner-inherent privileges are unaffected either way. Once the role's real grant surface is declared, remove the flag so convergence is complete again.
+With `preserve_undeclared_grants: true`, convergence grants any declared privileges the role lacks but never revokes anything else it holds in scope — including excess privileges on grant targets the manifest does declare. Once the full surface is declared, remove the flag to restore trimming. Explicit `ensure: absent` assertions still revoke — an asserted absence is a declaration, not drift discovery — and owner-inherent privileges are unaffected either way. Once the role's real grant surface is declared, remove the flag so convergence is complete again.
 
 {% callout type="note" title="Passwords and drift detection" %}
 Because PostgreSQL does not expose password hashes for comparison, password changes always appear in the plan. The `diff --exit-code` flag treats password-only changes as non-structural; they do not trigger exit code 2.

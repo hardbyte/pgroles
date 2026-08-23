@@ -1016,8 +1016,8 @@ async fn cmd_apply(
             &validated.composed.expanded.roles,
             &validated.composed.desired,
         );
-        warn_adopt_schema_owner_transfers(mode, &changes);
         enforce_adopt_owner_transfer_guard(mode, allow_schema_owner_transfers, &changes)?;
+        warn_adopt_schema_owner_transfers(mode, &changes);
         warn_undeclared_default_owner(
             validated.composed.manifest.default_owner.as_deref(),
             &validated.composed.expanded.roles,
@@ -1118,8 +1118,8 @@ async fn cmd_apply(
         &validated.expanded.roles,
         &validated.desired,
     );
-    warn_adopt_schema_owner_transfers(mode, &changes);
     enforce_adopt_owner_transfer_guard(mode, allow_schema_owner_transfers, &changes)?;
+    warn_adopt_schema_owner_transfers(mode, &changes);
     warn_undeclared_default_owner(
         validated.manifest.default_owner.as_deref(),
         &validated.expanded.roles,

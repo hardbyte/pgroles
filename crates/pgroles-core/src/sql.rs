@@ -729,7 +729,7 @@ fn sql_object_type_plural(object_type: ObjectType) -> &'static str {
 }
 
 /// Format a privilege set as a comma-separated string.
-fn format_privileges(privileges: &BTreeSet<Privilege>) -> String {
+pub(crate) fn format_privileges(privileges: &BTreeSet<Privilege>) -> String {
     privileges
         .iter()
         .map(|p| p.to_string())

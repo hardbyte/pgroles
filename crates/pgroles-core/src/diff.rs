@@ -297,10 +297,11 @@ pub fn filter_external_role_changes(
 /// Drop revokes against roles that declare `preserve_undeclared_grants`.
 ///
 /// The flag marks a brownfield role whose grant surface pgroles should adopt
-/// before it is fully declared: convergence trims and adds declared
-/// privileges but leaves anything else the role holds in scope alone.
-/// Explicit `ensure: absent` assertions still apply — an asserted absence is
-/// a declaration, not drift discovery.
+/// before it is fully declared: missing declared privileges are granted, and
+/// nothing else the role holds in scope is revoked — including excess
+/// privileges on grant targets the manifest does declare. Explicit
+/// `ensure: absent` assertions still apply — an asserted absence is a
+/// declaration, not drift discovery.
 pub fn filter_preserved_grant_revokes(
     changes: Vec<Change>,
     roles: &[RoleDefinition],
@@ -387,10 +388,8 @@ pub fn unenforceable_absence_warnings(current: &RoleGraph, desired: &RoleGraph) 
                         .any(|privilege| absent.contains(privilege))
                 {
                     out.push(format!(
-                        "ensure: absent of {:?} on {} \"{}\".\"*\" for \"{}\" cannot be fully \\
-                         enforced — the grantee owns some covered objects, so those \\
-                         privileges are inherent",
-                        absent,
+                        "ensure: absent of {} on {} \"{}\".\"*\" for \"{}\" cannot be fully enforced — the grantee owns some covered objects, so those privileges are inherent",
+                        crate::sql::format_privileges(absent),
                         key.object_type,
                         key.schema.as_deref().unwrap_or(""),
                         key.role.as_str()
@@ -407,9 +406,8 @@ pub fn unenforceable_absence_warnings(current: &RoleGraph, desired: &RoleGraph) 
             })
         {
             out.push(format!(
-                "ensure: absent of {:?} on {} for \"{}\" cannot be enforced — the grantee \\
-                 owns the object, so those privileges are inherent",
-                absent,
+                "ensure: absent of {} on {} for \"{}\" cannot be enforced — the grantee owns the object, so those privileges are inherent",
+                crate::sql::format_privileges(absent),
                 key.object_type,
                 key.role.as_str()
             ));
@@ -1915,7 +1913,13 @@ memberships:
         desired
             .grant_absences
             .insert(key.clone(), BTreeSet::from([Privilege::Select]));
-        assert_eq!(unenforceable_absence_warnings(&current, &desired).len(), 1);
+        let warnings = unenforceable_absence_warnings(&current, &desired);
+        assert_eq!(warnings.len(), 1);
+        // Message renders the privilege set readably and carries no literal
+        // backslash from a botched line continuation — it ships into k8s
+        // status objects verbatim.
+        assert!(warnings[0].contains("SELECT"), "got: {}", warnings[0]);
+        assert!(!warnings[0].contains('\\'), "got: {}", warnings[0]);
 
         // Asserting a privilege the entry does not carry stays silent.
         let mut satisfied = empty_graph();
