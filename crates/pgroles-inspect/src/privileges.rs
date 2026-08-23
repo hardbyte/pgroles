@@ -51,6 +51,11 @@ pub(crate) struct AclRow {
     pub(crate) object_name: String,
     /// The object type discriminator we embed in the query.
     pub(crate) obj_type: String,
+    /// The owning role's name (`pg_get_userbyid` of the catalog owner column).
+    /// An entry whose grantee equals the owner carries the owner's inherent
+    /// privileges — inspection tags those keys so the diff engine never plans
+    /// revokes against them and `generate` never exports them.
+    pub(crate) owner_name: Option<String>,
 }
 
 impl AclRow {
@@ -124,6 +129,10 @@ impl GrantabilityRow {
 
 pub(crate) struct PrivilegeInspectionResult {
     pub grants: BTreeMap<GrantKey, GrantState>,
+    /// Grant targets whose ACL entry belongs to the object's owner. The diff
+    /// engine never revokes these and treats them as covering any declared
+    /// grant on the same target.
+    pub inherent: BTreeSet<GrantKey>,
     pub diagnostics: Vec<UnsatisfiableWildcardGrant>,
     pub wildcard_stats: WildcardInspectionStats,
 }
@@ -349,7 +358,8 @@ pub async fn fetch_object_inventory(
                 WHEN 'p' THEN 'table'
                 WHEN 'v' THEN 'view'
                 WHEN 'm' THEN 'materialized_view'
-            END AS obj_type
+            END AS obj_type,
+            NULL::text AS owner_name
         FROM pg_class c
         JOIN pg_namespace n ON n.oid = c.relnamespace
         WHERE n.nspname = ANY($1)
@@ -362,7 +372,8 @@ pub async fn fetch_object_inventory(
             '' AS privilege_type,
             n.nspname AS schema_name,
             c.relname::text AS object_name,
-            'sequence' AS obj_type
+            'sequence' AS obj_type,
+            NULL::text AS owner_name
         FROM pg_class c
         JOIN pg_namespace n ON n.oid = c.relnamespace
         WHERE n.nspname = ANY($1)
@@ -375,7 +386,8 @@ pub async fn fetch_object_inventory(
             '' AS privilege_type,
             n.nspname AS schema_name,
             p.proname || '(' || pg_catalog.pg_get_function_identity_arguments(p.oid) || ')' AS object_name,
-            'function' AS obj_type
+            'function' AS obj_type,
+            NULL::text AS owner_name
         FROM pg_proc p
         JOIN pg_namespace n ON n.oid = p.pronamespace
         WHERE n.nspname = ANY($1)
@@ -387,7 +399,8 @@ pub async fn fetch_object_inventory(
             '' AS privilege_type,
             n.nspname AS schema_name,
             t.typname::text AS object_name,
-            'type' AS obj_type
+            'type' AS obj_type,
+            NULL::text AS owner_name
         FROM pg_type t
         JOIN pg_namespace n ON n.oid = t.typnamespace
         WHERE n.nspname = ANY($1)
@@ -468,7 +481,8 @@ async fn fetch_object_inventory_for_wildcards(
                 WHEN 'p' THEN 'table'
                 WHEN 'v' THEN 'view'
                 WHEN 'm' THEN 'materialized_view'
-            END AS obj_type
+            END AS obj_type,
+            NULL::text AS owner_name
         FROM pg_class c
         JOIN pg_namespace n ON n.oid = c.relnamespace
         JOIN wildcard_scope scope
@@ -489,7 +503,8 @@ async fn fetch_object_inventory_for_wildcards(
             '' AS privilege_type,
             n.nspname AS schema_name,
             c.relname::text AS object_name,
-            'sequence' AS obj_type
+            'sequence' AS obj_type,
+            NULL::text AS owner_name
         FROM pg_class c
         JOIN pg_namespace n ON n.oid = c.relnamespace
         JOIN wildcard_scope scope
@@ -505,7 +520,8 @@ async fn fetch_object_inventory_for_wildcards(
             '' AS privilege_type,
             n.nspname AS schema_name,
             p.proname || '(' || pg_catalog.pg_get_function_identity_arguments(p.oid) || ')' AS object_name,
-            'function' AS obj_type
+            'function' AS obj_type,
+            NULL::text AS owner_name
         FROM pg_proc p
         JOIN pg_namespace n ON n.oid = p.pronamespace
         JOIN wildcard_scope scope
@@ -520,7 +536,8 @@ async fn fetch_object_inventory_for_wildcards(
             '' AS privilege_type,
             n.nspname AS schema_name,
             t.typname::text AS object_name,
-            'type' AS obj_type
+            'type' AS obj_type,
+            NULL::text AS owner_name
         FROM pg_type t
         JOIN pg_namespace n ON n.oid = t.typnamespace
         JOIN wildcard_scope scope
@@ -577,8 +594,70 @@ pub async fn fetch_relation_inventory(
         .filter(|((object_type, _), _)| {
             matches!(
                 object_type,
-                ObjectType::Table | ObjectType::View | ObjectType::MaterializedView
+                ObjectType::Table
+                    | ObjectType::View
+                    | ObjectType::MaterializedView
+                    | ObjectType::Sequence
+                    | ObjectType::Function
             )
+        })
+        .collect())
+}
+
+/// Which managed role owns which object, for the wildcard-REVOKE owner
+/// guard rendered by `SqlContext`. Complements the ACL-level inherent tag:
+/// ownership is known even where per-object ACL entries were folded into a
+/// `name: "*"` key. Covers relations, sequences, and routines (with identity
+/// arguments in the name, matching how ACL rows and the inventory spell them).
+pub async fn fetch_owned_relations(
+    pool: &PgPool,
+    managed_schemas: &[&str],
+) -> Result<BTreeSet<(String, ObjectType, String, String)>, sqlx::Error> {
+    let rows: Vec<(String, String, String, Option<String>)> = sqlx::query_as(
+        r#"
+        SELECT owner_name, obj_type, schema_name, object_name FROM (
+            SELECT
+                pg_get_userbyid(c.relowner) AS owner_name,
+                CASE c.relkind
+                    WHEN 'r' THEN 'table'
+                    WHEN 'p' THEN 'table'
+                    WHEN 'v' THEN 'view'
+                    WHEN 'm' THEN 'materialized_view'
+                    WHEN 'S' THEN 'sequence'
+                END AS obj_type,
+                n.nspname AS schema_name,
+                c.relname::text AS object_name,
+                1 AS sort_key
+            FROM pg_class c
+            JOIN pg_namespace n ON n.oid = c.relnamespace
+            WHERE n.nspname = ANY($1)
+              AND c.relkind IN ('r', 'p', 'v', 'm', 'S')
+            UNION ALL
+            SELECT DISTINCT
+                pg_get_userbyid(p.proowner) AS owner_name,
+                'function' AS obj_type,
+                n.nspname AS schema_name,
+                p.proname || '(' ||
+                    pg_catalog.pg_get_function_identity_arguments(p.oid) || ')'
+                    AS object_name,
+                2 AS sort_key
+            FROM pg_proc p
+            JOIN pg_namespace n ON n.oid = p.pronamespace
+            WHERE n.nspname = ANY($1)
+        ) owned
+        ORDER BY sort_key, owner_name, schema_name, object_name
+        "#,
+    )
+    .bind(managed_schemas)
+    .fetch_all(pool)
+    .await?;
+
+    Ok(rows
+        .into_iter()
+        .filter_map(|(owner, obj_type, schema, name)| {
+            let object_type = obj_type_str_to_object_type(&obj_type)?;
+            let name = name?;
+            Some((owner, object_type, schema, name))
         })
         .collect())
 }
@@ -727,6 +806,12 @@ pub(crate) fn wildcard_scopes_of(
 /// need a grantability read, which the caller performs between the two halves.
 pub(crate) struct DerivedPrivileges {
     grants: BTreeMap<GrantKey, GrantState>,
+    inherent: BTreeSet<GrantKey>,
+    /// Objects each role owns, keyed by (role, object type, schema). Wildcard
+    /// normalization replaces per-name entries with `name: "*"` keys, so the
+    /// inherent tags are remapped onto the wildcard key when every object the
+    /// pattern covers is owned by the grantee.
+    owned_objects: BTreeMap<(String, ObjectType, String), BTreeSet<String>>,
     inventory: BTreeMap<(ObjectType, String), BTreeSet<String>>,
     wildcard_grants: Vec<WildcardGrantPattern>,
     /// Wildcards with at least one matching object missing a desired
@@ -744,6 +829,9 @@ pub(crate) fn derive_privileges(
     public_scopes: &[PublicObjectScope],
 ) -> DerivedPrivileges {
     let mut grants: BTreeMap<GrantKey, GrantState> = BTreeMap::new();
+    let mut inherent: BTreeSet<GrantKey> = BTreeSet::new();
+    let mut owned_objects: BTreeMap<(String, ObjectType, String), BTreeSet<String>> =
+        BTreeMap::new();
     let has_wildcards = !wildcard_grants.is_empty();
     let wildcard_scope_filter = WildcardScopeFilter::from_wildcards(wildcard_grants);
     let mut wildcard_stats = WildcardInspectionStats {
@@ -814,6 +902,16 @@ pub(crate) fn derive_privileges(
             name,
         };
 
+        if row.owner_name.as_deref() == Some(grantee.as_str()) {
+            inherent.insert(key.clone());
+            if let Some(schema) = &row.schema_name {
+                owned_objects
+                    .entry((grantee.clone(), object_type, schema.clone()))
+                    .or_default()
+                    .insert(row.object_name.clone());
+            }
+        }
+
         let entry = grants.entry(key).or_insert_with(|| GrantState {
             privileges: BTreeSet::new(),
         });
@@ -840,6 +938,8 @@ pub(crate) fn derive_privileges(
 
     DerivedPrivileges {
         grants,
+        inherent,
+        owned_objects,
         inventory,
         wildcard_grants: wildcard_grants.to_vec(),
         unsatisfied,
@@ -897,8 +997,42 @@ impl DerivedPrivileges {
             normalize_wildcard_grants(self.grants, &self.inventory, &self.wildcard_grants)
         };
 
+        // Wildcard normalization folds per-name entries into `name: "*"` keys.
+        // When every object a pattern covers is owned by the grantee, the
+        // wildcard key inherits the inherent tag — otherwise a manifest that
+        // declares a wildcard grant for an owner on its own schema would plan
+        // revokes of the owner's inherent privileges.
+        let mut inherent = self.inherent;
+        if !self.wildcard_grants.is_empty() {
+            for wildcard in &self.wildcard_grants {
+                let Some(object_names) = self
+                    .inventory
+                    .get(&(wildcard.object_type, wildcard.schema.clone()))
+                else {
+                    continue;
+                };
+                let owned = self
+                    .owned_objects
+                    .get(&(
+                        wildcard.role.clone(),
+                        wildcard.object_type,
+                        wildcard.schema.clone(),
+                    ))
+                    .is_some_and(|owned| object_names.iter().all(|name| owned.contains(name)));
+                if owned && !object_names.is_empty() {
+                    inherent.insert(GrantKey {
+                        role: Grantee::parse(&wildcard.role),
+                        object_type: wildcard.object_type,
+                        schema: Some(wildcard.schema.clone()),
+                        name: Some("*".to_string()),
+                    });
+                }
+            }
+        }
+
         PrivilegeInspectionResult {
             grants,
+            inherent,
             diagnostics,
             wildcard_stats: self.wildcard_stats,
         }
@@ -970,7 +1104,8 @@ pub(crate) async fn read_raw_public_privileges(
                         WHEN 'v' THEN 'view'
                         WHEN 'm' THEN 'materialized_view'
                         WHEN 'S' THEN 'sequence'
-                    END AS obj_type
+                    END AS obj_type,
+                    NULL::text AS owner_name
                 FROM pg_class c
                 JOIN pg_namespace n ON n.oid = c.relnamespace
                 CROSS JOIN LATERAL aclexplode(
@@ -1004,7 +1139,8 @@ pub(crate) async fn read_raw_public_privileges(
                     acl.privilege_type,
                     n.nspname::text AS schema_name,
                     (p.proname || '(' || pg_catalog.pg_get_function_identity_arguments(p.oid) || ')')::text AS object_name,
-                    'function' AS obj_type
+                    'function' AS obj_type,
+                    NULL::text AS owner_name
                 FROM pg_proc p
                 JOIN pg_namespace n ON n.oid = p.pronamespace
                 CROSS JOIN LATERAL aclexplode(
@@ -1031,7 +1167,8 @@ pub(crate) async fn read_raw_public_privileges(
                     acl.privilege_type,
                     n.nspname::text AS schema_name,
                     t.typname::text AS object_name,
-                    'type' AS obj_type
+                    'type' AS obj_type,
+                    NULL::text AS owner_name
                 FROM pg_type t
                 JOIN pg_namespace n ON n.oid = t.typnamespace
                 CROSS JOIN LATERAL aclexplode(
@@ -1066,7 +1203,8 @@ pub(crate) async fn read_raw_public_privileges(
                     acl.privilege_type,
                     NULL::text AS schema_name,
                     n.nspname::text AS object_name,
-                    'schema' AS obj_type
+                    'schema' AS obj_type,
+                    NULL::text AS owner_name
                 FROM pg_namespace n
                 CROSS JOIN LATERAL aclexplode(
                     COALESCE(n.nspacl, acldefault('n'::"char", n.nspowner))
@@ -1094,7 +1232,8 @@ pub(crate) async fn read_raw_public_privileges(
                     acl.privilege_type,
                     NULL::text AS schema_name,
                     db.datname::text AS object_name,
-                    'database' AS obj_type
+                    'database' AS obj_type,
+                    NULL::text AS owner_name
                 FROM pg_database db
                 CROSS JOIN LATERAL aclexplode(
                     COALESCE(db.datacl, acldefault('d'::"char", db.datdba))
@@ -1656,6 +1795,13 @@ fn all_privileges() -> BTreeSet<Privilege> {
 ///   'r' = table, 'v' = view, 'm' = materialized view, 'S' = sequence, 'p' = partitioned table
 ///
 /// Only explicit ACLs are inspected. NULL ACLs produce no rows.
+///
+/// Owner-grantee entries are *kept* and tagged via `owner_name`: once any
+/// grant materializes a relation's ACL, PostgreSQL records the owner's
+/// inherent privileges in it. Treating that entry as granted state made older
+/// plans revoke privileges nobody had granted (breaking owner DML and
+/// owner-executed FK key-share checks), while dropping it entirely would make
+/// declared grants on an owner's own objects impossible to converge.
 async fn fetch_relation_privileges(
     pool: &PgPool,
     managed_schemas: &[&str],
@@ -1674,7 +1820,8 @@ async fn fetch_relation_privileges(
                 WHEN 'v' THEN 'view'
                 WHEN 'm' THEN 'materialized_view'
                 WHEN 'S' THEN 'sequence'
-            END AS obj_type
+            END AS obj_type,
+            pg_get_userbyid(c.relowner) AS owner_name
         FROM pg_class c
         JOIN pg_namespace n ON n.oid = c.relnamespace
         CROSS JOIN LATERAL aclexplode(c.relacl) AS acl
@@ -1695,6 +1842,7 @@ async fn fetch_relation_privileges(
 ///
 /// Uses `pg_namespace`. For schema grants, the object_name is the schema name itself.
 /// Only explicit ACLs are inspected. NULL ACLs produce no rows.
+/// Owner-grantee entries are kept and tagged (see `fetch_relation_privileges`).
 async fn fetch_schema_privileges(
     pool: &PgPool,
     managed_schemas: &[&str],
@@ -1707,7 +1855,8 @@ async fn fetch_schema_privileges(
             acl.privilege_type,
             NULL::text AS schema_name,
             n.nspname::text AS object_name,
-            'schema' AS obj_type
+            'schema' AS obj_type,
+            pg_get_userbyid(n.nspowner) AS owner_name
         FROM pg_namespace n
         CROSS JOIN LATERAL aclexplode(n.nspacl) AS acl
         JOIN pg_roles grantee ON grantee.oid = acl.grantee
@@ -1728,6 +1877,7 @@ async fn fetch_schema_privileges(
 /// Function names can be overloaded, so we include the OID-derived
 /// identity signature via `pg_catalog.pg_get_function_identity_arguments()`.
 /// Only explicit ACLs are inspected. NULL ACLs produce no rows.
+/// Owner-grantee entries are kept and tagged (see `fetch_relation_privileges`).
 async fn fetch_function_privileges(
     pool: &PgPool,
     managed_schemas: &[&str],
@@ -1740,7 +1890,8 @@ async fn fetch_function_privileges(
             acl.privilege_type,
             n.nspname AS schema_name,
             p.proname || '(' || pg_catalog.pg_get_function_identity_arguments(p.oid) || ')' AS object_name,
-            'function' AS obj_type
+            'function' AS obj_type,
+            pg_get_userbyid(p.proowner) AS owner_name
         FROM pg_proc p
         JOIN pg_namespace n ON n.oid = p.pronamespace
         CROSS JOIN LATERAL aclexplode(p.proacl) AS acl
@@ -1762,6 +1913,7 @@ async fn fetch_function_privileges(
 /// We filter out internal/array types (typname not starting with '_',
 /// typtype not 'p' for pseudo-types).
 /// Only explicit ACLs are inspected. NULL ACLs produce no rows.
+/// Owner-grantee entries are kept and tagged (see `fetch_relation_privileges`).
 async fn fetch_type_privileges(
     pool: &PgPool,
     managed_schemas: &[&str],
@@ -1774,7 +1926,8 @@ async fn fetch_type_privileges(
             acl.privilege_type,
             n.nspname AS schema_name,
             t.typname::text AS object_name,
-            'type' AS obj_type
+            'type' AS obj_type,
+            pg_get_userbyid(t.typowner) AS owner_name
         FROM pg_type t
         JOIN pg_namespace n ON n.oid = t.typnamespace
         CROSS JOIN LATERAL aclexplode(t.typacl) AS acl
@@ -1796,10 +1949,12 @@ async fn fetch_type_privileges(
 ///
 /// Uses `pg_database`. This is separate because it's not schema-scoped; we
 /// always query the current database. Only explicit ACLs are inspected.
+/// Owner-grantee entries are kept and tagged (see `fetch_relation_privileges`);
+/// the second element of the result holds those keys.
 pub async fn fetch_database_privileges(
     pool: &PgPool,
     managed_roles: &[&str],
-) -> Result<BTreeMap<GrantKey, GrantState>, sqlx::Error> {
+) -> Result<(BTreeMap<GrantKey, GrantState>, BTreeSet<GrantKey>), sqlx::Error> {
     let rows = sqlx::query_as::<_, AclRow>(
         r#"
         SELECT
@@ -1807,7 +1962,8 @@ pub async fn fetch_database_privileges(
             acl.privilege_type,
             NULL::text AS schema_name,
             db.datname::text AS object_name,
-            'database' AS obj_type
+            'database' AS obj_type,
+            pg_get_userbyid(db.datdba) AS owner_name
         FROM pg_database db
         CROSS JOIN LATERAL aclexplode(db.datacl) AS acl
         JOIN pg_roles grantee ON grantee.oid = acl.grantee
@@ -1821,6 +1977,7 @@ pub async fn fetch_database_privileges(
     .await?;
 
     let mut grants: BTreeMap<GrantKey, GrantState> = BTreeMap::new();
+    let mut inherent: BTreeSet<GrantKey> = BTreeSet::new();
 
     for row in rows {
         let Some(grantee) = row.grantee.as_ref() else {
@@ -1839,13 +1996,17 @@ pub async fn fetch_database_privileges(
             name: Some(row.object_name.clone()),
         };
 
+        if row.owner_name.as_deref() == Some(grantee.as_str()) {
+            inherent.insert(key.clone());
+        }
+
         let entry = grants.entry(key).or_insert_with(|| GrantState {
             privileges: std::collections::BTreeSet::new(),
         });
         entry.privileges.insert(privilege);
     }
 
-    Ok(grants)
+    Ok((grants, inherent))
 }
 
 /// A raw column-level ACL row returned by `fetch_column_level_grants`.
@@ -2650,11 +2811,14 @@ mod tests {
     }
 
     fn unique_name(prefix: &str) -> String {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .expect("system clock before unix epoch")
             .as_nanos();
-        format!("{prefix}_{nanos}")
+        let seq = COUNTER.fetch_add(1, Ordering::Relaxed);
+        format!("{prefix}_{nanos}_{seq}")
     }
 
     fn execute_sql(sql: &str) {
@@ -2834,5 +2998,73 @@ mod tests {
         });
 
         assert!(result.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod inherent_tests {
+    use super::*;
+    use crate::InspectConfig;
+    use sqlx::{Executor, PgPool};
+
+    fn with_runtime<T>(future: impl std::future::Future<Output = T>) -> T {
+        tokio::runtime::Runtime::new().unwrap().block_on(future)
+    }
+
+    fn live_url() -> String {
+        std::env::var("DATABASE_URL").expect("DATABASE_URL must be set")
+    }
+
+    async fn exec(pool: &PgPool, sql: &str) {
+        pool.execute(sql).await.unwrap();
+    }
+
+    #[test]
+    #[ignore]
+    fn inspection_tags_owner_grantee_entries_as_inherent() {
+        with_runtime(async {
+            let pool = PgPool::connect(&live_url()).await.unwrap();
+            exec(&pool, "DROP SCHEMA IF EXISTS inh_schema CASCADE").await;
+            exec(&pool, "DROP ROLE IF EXISTS inh_owner").await;
+            exec(&pool, "CREATE ROLE inh_owner NOLOGIN").await;
+            exec(&pool, "CREATE SCHEMA inh_schema AUTHORIZATION inh_owner").await;
+            exec(&pool, "CREATE TABLE inh_schema.widgets(id int)").await;
+            exec(&pool, "ALTER TABLE inh_schema.widgets OWNER TO inh_owner").await;
+            exec(&pool, "GRANT SELECT ON inh_schema.widgets TO inh_owner").await;
+
+            let config = InspectConfig {
+                managed_roles: vec!["inh_owner".to_string()],
+                managed_schemas: vec!["inh_schema".to_string()],
+                privilege_schemas: vec!["inh_schema".to_string()],
+                include_database_privileges: false,
+                database_targets: Vec::new(),
+                membership_grantors: Vec::new(),
+                wildcard_grants: Vec::new(),
+                public_object_scopes: Vec::new(),
+                default_priv_scopes: Vec::new(),
+            };
+            let result = crate::inspect_with_diagnostics(&pool, &config)
+                .await
+                .unwrap();
+
+            assert!(
+                result
+                    .graph
+                    .grants
+                    .contains_key(&pgroles_core::model::GrantKey {
+                        role: "inh_owner".into(),
+                        object_type: ObjectType::Table,
+                        schema: Some("inh_schema".to_string()),
+                        name: Some("widgets".to_string()),
+                    }),
+                "owner entry should be present in grants: {:?}",
+                result.graph.grants
+            );
+            assert_eq!(
+                result.graph.inherent_grants.len(),
+                1,
+                "owner entry should be tagged inherent"
+            );
+        });
     }
 }

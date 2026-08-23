@@ -294,6 +294,179 @@ pub fn filter_external_role_changes(
         .collect()
 }
 
+/// Drop revokes against roles that declare `preserve_undeclared_grants`.
+///
+/// The flag marks a brownfield role whose grant surface pgroles should adopt
+/// before it is fully declared: missing declared privileges are granted, and
+/// nothing else the role holds in scope is revoked — including excess
+/// privileges on grant targets the manifest does declare. Explicit
+/// `ensure: absent` assertions still apply — an asserted absence is a
+/// declaration, not drift discovery.
+pub fn filter_preserved_grant_revokes(
+    changes: Vec<Change>,
+    roles: &[RoleDefinition],
+    desired: &RoleGraph,
+) -> Vec<Change> {
+    let preserved: BTreeSet<&str> = roles
+        .iter()
+        .filter(|role| role.preserve_undeclared_grants)
+        .map(|role| role.name.as_str())
+        .collect();
+
+    if preserved.is_empty() {
+        return changes;
+    }
+
+    changes
+        .into_iter()
+        .flat_map(|change| {
+            let Change::Revoke {
+                role,
+                privileges,
+                object_type,
+                schema,
+                name,
+            } = &change
+            else {
+                return vec![change];
+            };
+            if !preserved.contains(role.as_str()) {
+                return vec![change];
+            }
+            let key = crate::model::GrantKey {
+                role: role.clone(),
+                object_type: *object_type,
+                schema: schema.clone(),
+                name: name.clone(),
+            };
+
+            let wildcard_key = crate::model::GrantKey {
+                name: Some("*".to_string()),
+                ..key.clone()
+            };
+            let wildcard_enforced = desired
+                .grant_absences
+                .get(&wildcard_key)
+                .map(|absent| {
+                    privileges
+                        .intersection(absent)
+                        .copied()
+                        .collect::<BTreeSet<Privilege>>()
+                })
+                .unwrap_or_default();
+
+            if name.as_deref() != Some("*") {
+                let mut enforced = wildcard_enforced;
+                if let Some(absent) = desired.grant_absences.get(&key) {
+                    enforced.extend(privileges.intersection(absent).copied());
+                }
+                return (!enforced.is_empty())
+                    .then(|| Change::Revoke {
+                        role: role.clone(),
+                        privileges: enforced,
+                        object_type: *object_type,
+                        schema: schema.clone(),
+                        name: name.clone(),
+                    })
+                    .into_iter()
+                    .collect();
+            }
+
+            // Inspection can normalize privileges held on every object into
+            // one wildcard key, while an absence assertion still names one
+            // object. Keep a wildcard revoke only for wildcard assertions;
+            // split exact assertions back into exact revokes so preservation
+            // neither discards them nor broadens them to the whole schema.
+            let mut enforced = Vec::new();
+            if !wildcard_enforced.is_empty() {
+                enforced.push(Change::Revoke {
+                    role: role.clone(),
+                    privileges: wildcard_enforced.clone(),
+                    object_type: *object_type,
+                    schema: schema.clone(),
+                    name: name.clone(),
+                });
+            }
+            for (absence_key, absent) in &desired.grant_absences {
+                if absence_key.role != *role
+                    || absence_key.object_type != *object_type
+                    || absence_key.schema != *schema
+                    || absence_key.name.as_deref().is_none_or(|value| value == "*")
+                {
+                    continue;
+                }
+                let exact: BTreeSet<Privilege> = privileges
+                    .intersection(absent)
+                    .copied()
+                    .filter(|privilege| !wildcard_enforced.contains(privilege))
+                    .collect();
+                if !exact.is_empty() {
+                    enforced.push(Change::Revoke {
+                        role: role.clone(),
+                        privileges: exact,
+                        object_type: *object_type,
+                        schema: schema.clone(),
+                        name: absence_key.name.clone(),
+                    });
+                }
+            }
+            enforced
+        })
+        .collect()
+}
+
+/// Messages for `ensure: absent` assertions that can never converge because
+/// the asserted-against grantee owns the target object — its privileges are
+/// inherent. Exact keys are detected directly; wildcard assertions warn when
+/// they overlap any inherently-held entry under their (role, type, schema).
+pub fn unenforceable_absence_warnings(current: &RoleGraph, desired: &RoleGraph) -> Vec<String> {
+    let mut out = Vec::new();
+    for (key, absent) in &desired.grant_absences {
+        if key.name.as_deref() == Some("*") {
+            let range_start = GrantKey {
+                role: key.role.clone(),
+                object_type: key.object_type,
+                schema: key.schema.clone(),
+                name: None,
+            };
+            for (held_key, state) in current.grants.range(range_start..).take_while(|(k, _)| {
+                k.role == key.role && k.object_type == key.object_type && k.schema == key.schema
+            }) {
+                if current.inherent_grants.contains(held_key)
+                    && state
+                        .privileges
+                        .iter()
+                        .any(|privilege| absent.contains(privilege))
+                {
+                    out.push(format!(
+                        "ensure: absent of {} on {} \"{}\".\"*\" for \"{}\" cannot be fully enforced — the grantee owns some covered objects, so those privileges are inherent",
+                        crate::sql::format_privileges(absent),
+                        key.object_type,
+                        key.schema.as_deref().unwrap_or(""),
+                        key.role.as_str()
+                    ));
+                    break;
+                }
+            }
+        } else if current.inherent_grants.contains(key)
+            && current.grants.get(key).is_some_and(|state| {
+                state
+                    .privileges
+                    .iter()
+                    .any(|privilege| absent.contains(privilege))
+            })
+        {
+            out.push(format!(
+                "ensure: absent of {} on {} for \"{}\" cannot be enforced — the grantee owns the object, so those privileges are inherent",
+                crate::sql::format_privileges(absent),
+                key.object_type,
+                key.role.as_str()
+            ));
+        }
+    }
+    out
+}
+
 fn filter_additive_changes(changes: Vec<Change>) -> Vec<Change> {
     let skipped_owner_transfers: BTreeSet<(String, String)> = changes
         .iter()
@@ -808,6 +981,12 @@ fn diff_grants(
                     continue;
                 }
 
+                // An owner-grantee entry carries the owner's inherent
+                // privileges; none of it is revocable state.
+                if current.inherent_grants.contains(key) {
+                    continue;
+                }
+
                 let to_remove: BTreeSet<Privilege> = current_state
                     .privileges
                     .difference(&desired_state.privileges)
@@ -829,6 +1008,11 @@ fn diff_grants(
             continue;
         }
 
+        // Owner-inherent entries are not revocable state.
+        if current.inherent_grants.contains(key) {
+            continue;
+        }
+
         let to_revoke = shadow_filter(key, current_state.privileges.clone());
         if !to_revoke.is_empty() {
             revokes.entry(key.clone()).or_default().extend(to_revoke);
@@ -838,7 +1022,10 @@ fn diff_grants(
     // Absence assertions: revoke `absent ∩ current`. A wildcard assertion
     // range-scans every current key under its (grantee, type, schema) prefix,
     // so one `ON ALL` revoke covers however many objects still hold the
-    // privilege, and an empty range is vacuously converged.
+    // privilege, and an empty range is vacuously converged. Owner-inherent
+    // entries are excluded throughout: an owner's privileges are intrinsic,
+    // so an absence assertion cannot be enforced against them and revoking
+    // would only break owner access.
     for (key, absent_privileges) in &desired.grant_absences {
         let held: BTreeSet<Privilege> = if key.name.as_deref() == Some("*") {
             let range_start = GrantKey {
@@ -853,8 +1040,11 @@ fn diff_grants(
                 .take_while(|(k, _)| {
                     k.role == key.role && k.object_type == key.object_type && k.schema == key.schema
                 })
+                .filter(|(k, _)| !current.inherent_grants.contains(k))
                 .flat_map(|(_, state)| state.privileges.iter().copied())
                 .collect()
+        } else if current.inherent_grants.contains(key) {
+            BTreeSet::new()
         } else {
             current
                 .grants
@@ -1113,6 +1303,7 @@ mod tests {
         RoleDefinition {
             name: name.to_string(),
             external,
+            preserve_undeclared_grants: false,
             login: None,
             superuser: None,
             createdb: None,
@@ -1749,6 +1940,282 @@ memberships:
             }
             other => panic!("expected Grant, got: {other:?}"),
         }
+    }
+
+    #[test]
+    fn unenforceable_absence_warnings_require_actual_overlap() {
+        let key = GrantKey {
+            role: "app_owner".into(),
+            object_type: ObjectType::Table,
+            schema: Some("app".to_string()),
+            name: Some("widgets".to_string()),
+        };
+        let mut current = empty_graph();
+        current.grants.insert(
+            key.clone(),
+            GrantState {
+                privileges: BTreeSet::from([Privilege::Select]),
+            },
+        );
+        current.inherent_grants.insert(key.clone());
+
+        // Asserting an actually-held inherent privilege warns.
+        let mut desired = empty_graph();
+        desired
+            .grant_absences
+            .insert(key.clone(), BTreeSet::from([Privilege::Select]));
+        let warnings = unenforceable_absence_warnings(&current, &desired);
+        assert_eq!(warnings.len(), 1);
+        // Message renders the privilege set readably and carries no literal
+        // backslash from a botched line continuation — it ships into k8s
+        // status objects verbatim.
+        assert!(warnings[0].contains("SELECT"), "got: {}", warnings[0]);
+        assert!(!warnings[0].contains('\\'), "got: {}", warnings[0]);
+
+        // Asserting a privilege the entry does not carry stays silent.
+        let mut satisfied = empty_graph();
+        satisfied
+            .grant_absences
+            .insert(key, BTreeSet::from([Privilege::Delete]));
+        assert!(unenforceable_absence_warnings(&current, &satisfied).is_empty());
+    }
+
+    #[test]
+    fn preserved_role_keeps_undeclared_revokes() {
+        let mut preserved_role = role_definition("brownfield", false);
+        preserved_role.preserve_undeclared_grants = true;
+        let plain_role = role_definition("managed", false);
+
+        let revoke = Change::Revoke {
+            role: "brownfield".into(),
+            privileges: BTreeSet::from([Privilege::Select]),
+            object_type: ObjectType::Table,
+            schema: Some("app".to_string()),
+            name: Some("widgets".to_string()),
+        };
+        let other = Change::Revoke {
+            role: "managed".into(),
+            privileges: BTreeSet::from([Privilege::Select]),
+            object_type: ObjectType::Table,
+            schema: Some("app".to_string()),
+            name: Some("gadgets".to_string()),
+        };
+
+        let changes = filter_preserved_grant_revokes(
+            vec![revoke, other],
+            &[preserved_role, plain_role],
+            &empty_graph(),
+        );
+
+        assert_eq!(changes.len(), 1);
+        match &changes[0] {
+            Change::Revoke { role, .. } => assert_eq!(role.as_str(), "managed"),
+            other => panic!("expected Revoke, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn preserve_flag_respects_absence_assertions() {
+        let mut preserved_role = role_definition("brownfield", false);
+        preserved_role.preserve_undeclared_grants = true;
+
+        let key = GrantKey {
+            role: "brownfield".into(),
+            object_type: ObjectType::Table,
+            schema: Some("app".to_string()),
+            name: Some("widgets".to_string()),
+        };
+        let mut desired = empty_graph();
+        desired
+            .grant_absences
+            .insert(key, BTreeSet::from([Privilege::Delete]));
+
+        let revoke = Change::Revoke {
+            role: "brownfield".into(),
+            // SELECT is not asserted absent → preserved. DELETE is → revoked.
+            privileges: BTreeSet::from([Privilege::Select, Privilege::Delete]),
+            object_type: ObjectType::Table,
+            schema: Some("app".to_string()),
+            name: Some("widgets".to_string()),
+        };
+
+        let changes = filter_preserved_grant_revokes(vec![revoke], &[preserved_role], &desired);
+        match &changes[0] {
+            Change::Revoke { privileges, .. } => {
+                assert_eq!(*privileges, BTreeSet::from([Privilege::Delete]))
+            }
+            other => panic!("expected Revoke, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn preserve_flag_splits_normalized_wildcard_revoke_for_exact_absence() {
+        let mut preserved_role = role_definition("brownfield", false);
+        preserved_role.preserve_undeclared_grants = true;
+
+        let mut desired = empty_graph();
+        desired.grant_absences.insert(
+            GrantKey {
+                role: "brownfield".into(),
+                object_type: ObjectType::Table,
+                schema: Some("app".to_string()),
+                name: Some("widgets".to_string()),
+            },
+            BTreeSet::from([Privilege::Delete]),
+        );
+
+        let changes = filter_preserved_grant_revokes(
+            vec![Change::Revoke {
+                role: "brownfield".into(),
+                privileges: BTreeSet::from([Privilege::Select, Privilege::Delete]),
+                object_type: ObjectType::Table,
+                schema: Some("app".to_string()),
+                name: Some("*".to_string()),
+            }],
+            &[preserved_role],
+            &desired,
+        );
+
+        assert_eq!(
+            changes,
+            vec![Change::Revoke {
+                role: "brownfield".into(),
+                privileges: BTreeSet::from([Privilege::Delete]),
+                object_type: ObjectType::Table,
+                schema: Some("app".to_string()),
+                name: Some("widgets".to_string()),
+            }]
+        );
+    }
+
+    #[test]
+    fn preserve_flag_applies_wildcard_absence_to_exact_revoke() {
+        let mut preserved_role = role_definition("brownfield", false);
+        preserved_role.preserve_undeclared_grants = true;
+
+        let mut desired = empty_graph();
+        desired.grant_absences.insert(
+            GrantKey {
+                role: "brownfield".into(),
+                object_type: ObjectType::Table,
+                schema: Some("app".to_string()),
+                name: Some("*".to_string()),
+            },
+            BTreeSet::from([Privilege::Delete]),
+        );
+
+        let changes = filter_preserved_grant_revokes(
+            vec![Change::Revoke {
+                role: "brownfield".into(),
+                privileges: BTreeSet::from([Privilege::Select, Privilege::Delete]),
+                object_type: ObjectType::Table,
+                schema: Some("app".to_string()),
+                name: Some("widgets".to_string()),
+            }],
+            &[preserved_role],
+            &desired,
+        );
+
+        assert_eq!(
+            changes,
+            vec![Change::Revoke {
+                role: "brownfield".into(),
+                privileges: BTreeSet::from([Privilege::Delete]),
+                object_type: ObjectType::Table,
+                schema: Some("app".to_string()),
+                name: Some("widgets".to_string()),
+            }]
+        );
+    }
+
+    #[test]
+    fn owner_inherent_entry_is_never_revoked() {
+        let key = GrantKey {
+            role: "app_owner".into(),
+            object_type: ObjectType::Table,
+            schema: Some("app".to_string()),
+            name: Some("widgets".to_string()),
+        };
+        let mut current = empty_graph();
+        current.grants.insert(
+            key.clone(),
+            GrantState {
+                privileges: BTreeSet::from([
+                    Privilege::Select,
+                    Privilege::Insert,
+                    Privilege::Truncate,
+                ]),
+            },
+        );
+        current.inherent_grants.insert(key);
+
+        // Nothing in the manifest covers the owner's table entry.
+        let changes = diff(&current, &empty_graph());
+        assert!(
+            changes.iter().all(|change| !matches!(
+                change,
+                Change::Revoke { role, .. } if role.as_str() == "app_owner"
+            )),
+            "owner-inherent entries must not be revoked, got: {changes:?}"
+        );
+    }
+
+    #[test]
+    fn owner_inherent_entry_covers_declared_grant() {
+        // The owner inherently holds every privilege, so a manifest declaring
+        // a subset on the owner's own table needs no GRANT and no REVOKE.
+        let key = GrantKey {
+            role: "app_owner".into(),
+            object_type: ObjectType::Table,
+            schema: Some("app".to_string()),
+            name: Some("widgets".to_string()),
+        };
+        let mut current = empty_graph();
+        current.grants.insert(
+            key.clone(),
+            GrantState {
+                privileges: BTreeSet::from([Privilege::Select, Privilege::Insert]),
+            },
+        );
+        current.inherent_grants.insert(key);
+        let mut desired = empty_graph();
+        desired.grants.insert(
+            GrantKey {
+                role: "app_owner".into(),
+                object_type: ObjectType::Table,
+                schema: Some("app".to_string()),
+                name: Some("widgets".to_string()),
+            },
+            GrantState {
+                privileges: BTreeSet::from([Privilege::Select]),
+            },
+        );
+
+        assert!(diff(&current, &desired).is_empty());
+    }
+
+    #[test]
+    fn absence_assertions_cannot_target_owner_inherent_privileges() {
+        let key = GrantKey {
+            role: "app_owner".into(),
+            object_type: ObjectType::Table,
+            schema: Some("app".to_string()),
+            name: Some("widgets".to_string()),
+        };
+        let mut current = empty_graph();
+        current.grants.insert(
+            key.clone(),
+            GrantState {
+                privileges: BTreeSet::from([Privilege::Select]),
+            },
+        );
+        current.inherent_grants.insert(key.clone());
+        let mut desired = empty_graph();
+        desired
+            .grant_absences
+            .insert(key, BTreeSet::from([Privilege::Select]));
+
+        assert!(diff(&current, &desired).is_empty());
     }
 
     #[test]
@@ -2544,6 +3011,7 @@ memberships:
         let roles = vec![crate::manifest::RoleDefinition {
             name: "app-svc".to_string(),
             external: false,
+            preserve_undeclared_grants: false,
             login: Some(true),
             password: Some(crate::manifest::PasswordSource {
                 from_env: "PGROLES_TEST_MISSING_VAR_9a8b7c6d".to_string(),
@@ -2579,6 +3047,7 @@ memberships:
         let roles = vec![crate::manifest::RoleDefinition {
             name: "app-svc".to_string(),
             external: false,
+            preserve_undeclared_grants: false,
             login: Some(true),
             password: Some(crate::manifest::PasswordSource {
                 from_env: "PGROLES_TEST_EMPTY_VAR_1a2b3c4d".to_string(),
@@ -2618,6 +3087,7 @@ memberships:
         let roles = vec![crate::manifest::RoleDefinition {
             name: "app-svc".to_string(),
             external: false,
+            preserve_undeclared_grants: false,
             login: Some(true),
             password: Some(crate::manifest::PasswordSource {
                 from_env: "PGROLES_TEST_RESOLVE_VAR_5e6f7g8h".to_string(),
@@ -2651,6 +3121,7 @@ memberships:
         let roles = vec![crate::manifest::RoleDefinition {
             name: "external-svc".to_string(),
             external: true,
+            preserve_undeclared_grants: false,
             login: Some(true),
             password: Some(crate::manifest::PasswordSource {
                 from_env: "PGROLES_TEST_EXTERNAL_MISSING_VAR_2b4d6f8h".to_string(),
@@ -2679,6 +3150,7 @@ memberships:
         let roles = vec![crate::manifest::RoleDefinition {
             name: "no-password".to_string(),
             external: false,
+            preserve_undeclared_grants: false,
             login: Some(true),
             password: None,
             password_valid_until: None,

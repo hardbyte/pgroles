@@ -112,16 +112,23 @@ predefined role the server does not have, with the version that introduced it.
 `pgroles inspect` lists all `pg_*` memberships informationally; `pgroles
 generate` exports them.
 
+For brownfield roles whose full grant surface is not yet declared,
+`preserve_undeclared_grants: true` keeps out-of-band access through
+convergence; explicit `ensure: absent` assertions still revoke. Remove the
+flag once the manifest declares the role's real grants. Adopt mode refuses to
+transfer schema ownership away from the live owner unless apply passes
+`--allow-schema-owner-transfers`.
+
 ## Ownership And ACLs
 
 Schema ownership is modeled specially: pgroles converges the declared owner and
 ensures that owner has effective `CREATE` and `USAGE` on the schema.
 
-Table, sequence, function, and type ownership is not modeled. pgroles reconciles
-visible direct ACL entries for managed grantees. If an object owner's explicit
-ACL becomes visible, authoritative reconciliation can revoke privileges not
-declared for that managed role. Declare the ordinary object privileges an owner
-must retain when applications use that role for DML.
+Table, sequence, function, and type ownership is not modeled. Inspection tags
+owner-grantee ACL entries as inherent — PostgreSQL records the owner's
+privileges there once any grant materializes the ACL — so plans never revoke
+them, declared grants on an owner's own objects converge as no-ops, and
+`generate` never exports them.
 
 PostgreSQL materializes an object's whole ACL, owner entry included, the first
 time anything is granted or revoked on it. Any first-time grant does this, and

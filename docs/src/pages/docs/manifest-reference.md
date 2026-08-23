@@ -67,6 +67,10 @@ default_owner: app_migrator
 
 Individual schemas can override this with their own `owner` field.
 
+`default_owner` is an ownership claim, not an annotation: every schema binding without an explicit `owner:` resolves to it, so plans include `ALTER SCHEMA ... OWNER TO <default_owner>` wherever the live schema owner differs. If the named role is not declared under `roles:`, pgroles warns — the role's own privileges are neither inspected nor converged, while every un-owned binding still resolves to it.
+
+Inspection never treats an object's owner-grantee ACL entry as granted state: PostgreSQL records the owner's inherent privileges there once any grant materializes the ACL, and planning revokes against it would strip access PostgreSQL considers intrinsic (including foreign-key key-share checks, which run with the table owner's privileges). Owner entries instead cover any declared grant on the same target — declaring privileges on an owner's own objects converges as a no-op — and `pgroles generate` never exports them.
+
 ## profiles
 
 Profiles are reusable templates that expand into concrete roles, grants, and default privileges when bound to schemas.
@@ -140,6 +144,7 @@ roles:
 |---|---|---|---|
 | `name` | string | *required* | Role name |
 | `external` | bool | `false` | Role lifecycle is managed outside pgroles |
+| `preserve_undeclared_grants` | bool | `false` | Keep the role's undeclared in-scope grants during convergence |
 | `login` | bool | `false` | Can the role log in? |
 | `superuser` | bool | `false` | Superuser privileges |
 | `createdb` | bool | `false` | Can create databases |
@@ -160,6 +165,19 @@ Only `login: true` roles may have a password. Declaring a password on a non-logi
 Use `external: true` for roles whose lifecycle is owned by another system, such as Cloud SQL IAM users or groups created by Terraform or the cloud provider API. pgroles may still reference external roles in grants, schema ownership, default privileges, and as members of managed roles, but it will not create, alter, drop, or password-manage the role itself.
 
 Memberships granted **from** an external role follow declared intent: members listed in a `memberships` stanza converge, undeclared live members are left untouched, and a stanza-level `exclusive: true` opts undeclared members into revocation. PostgreSQL's predefined `pg_*` roles get the same treatment without any declaration — see [memberships](/docs/memberships#predefined-and-external-granted-roles). A `roles:` entry for a `pg_*` name must set `external: true`.
+
+### Preserving undeclared grants
+
+By default, adopt and authoritative modes revoke every privilege a declared role holds that the manifest does not declare. During brownfield adoption that is often premature: the role may hold out-of-band access (granted by migrations or manual SQL) that production still relies on.
+
+```yaml
+roles:
+  - name: app_owner
+    external: true
+    preserve_undeclared_grants: true
+```
+
+With `preserve_undeclared_grants: true`, convergence grants any declared privileges the role lacks but never revokes anything else it holds in scope — including excess privileges on grant targets the manifest does declare. Once the full surface is declared, remove the flag to restore trimming. Explicit `ensure: absent` assertions still revoke — an asserted absence is a declaration, not drift discovery — and owner-inherent privileges are unaffected either way.
 
 {% callout type="note" title="Passwords and drift detection" %}
 Because PostgreSQL does not expose password hashes for comparison, password changes always appear in the plan. The `diff --exit-code` flag treats password-only changes as non-structural; they do not trigger exit code 2.

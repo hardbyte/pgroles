@@ -309,6 +309,7 @@ fn gen_graph(rng: &mut Rng, allow_none: bool, messy: bool) -> RoleGraph {
         roles,
         schemas: gen_schemas(rng, allow_none),
         grants: gen_grants(rng, &role_names),
+        inherent_grants: BTreeSet::new(),
         grant_absences: BTreeMap::new(),
         default_privileges: gen_default_privs(rng, &role_names),
         default_privilege_absences: BTreeMap::new(),
@@ -892,6 +893,54 @@ fn determinism() {
             first, second,
             "seed {seed}: diff was non-deterministic across two calls"
         );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Property 4b: inherent entries are never revoked
+// ---------------------------------------------------------------------------
+
+/// Across the same drifted-graph space as the convergence property, tag an
+/// arbitrary subset of the current grant entries as owner-inherent and assert
+/// the engine never plans a REVOKE against any of them — by construction, not
+/// by coincidence of the generators.
+#[test]
+fn inherent_grants_are_never_revoked() {
+    let mut outer = Rng::new(0x077E_D001);
+    for _ in 0..ITERATIONS {
+        let seed = outer.next_u64();
+        let mut rng = Rng::new(seed);
+
+        let desired = gen_graph(&mut rng, false, true);
+        let mut current = derive_current(&mut rng, &desired);
+
+        for key in current.grants.keys().cloned().collect::<Vec<_>>() {
+            if rng.bool() {
+                current.inherent_grants.insert(key);
+            }
+        }
+
+        for change in diff(&current, &desired) {
+            if let Change::Revoke {
+                role,
+                object_type,
+                schema,
+                name,
+                ..
+            } = change
+            {
+                let key = GrantKey {
+                    role,
+                    object_type,
+                    schema,
+                    name,
+                };
+                assert!(
+                    !current.inherent_grants.contains(&key),
+                    "seed {seed}: revoke targets an owner-inherent entry: {key:?}"
+                );
+            }
+        }
     }
 }
 

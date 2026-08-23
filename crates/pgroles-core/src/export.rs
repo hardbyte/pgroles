@@ -40,6 +40,7 @@ pub fn role_graph_to_manifest(graph: &RoleGraph) -> PolicyManifest {
             RoleDefinition {
                 name: name.clone(),
                 external: false,
+                preserve_undeclared_grants: false,
                 login: if state.login != defaults.login {
                     Some(state.login)
                 } else {
@@ -98,9 +99,13 @@ pub fn role_graph_to_manifest(graph: &RoleGraph) -> PolicyManifest {
         .collect();
 
     // --- Grants ---
+    // Owner-inherent entries are skipped: the grantee holds them as the
+    // object's owner, not by anyone's declaration, so exporting them would
+    // produce a manifest asserting privileges no one granted.
     let grants: Vec<Grant> = graph
         .grants
         .iter()
+        .filter(|(key, _)| !graph.inherent_grants.contains(*key))
         .map(|(key, state)| Grant {
             role: key.role.as_str().to_string(),
             privileges: state.privileges.iter().copied().collect(),

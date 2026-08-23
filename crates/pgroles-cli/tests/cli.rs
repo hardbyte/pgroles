@@ -1428,11 +1428,14 @@ mod live_db {
     }
 
     fn unique_name(prefix: &str) -> String {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .expect("system clock before unix epoch")
             .as_nanos();
-        format!("{prefix}_{nanos}")
+        let seq = COUNTER.fetch_add(1, Ordering::Relaxed);
+        format!("{prefix}_{nanos}_{seq}")
     }
 
     fn execute_sql(sql: &str) {
@@ -4731,6 +4734,682 @@ grants:
         ));
     }
 
+    /// A pre-existing role that owns relations and holds explicit grants must
+    /// not have its inherent owner privileges revoked (issue #201). Once a
+    /// grant materializes the table ACL, PostgreSQL records the owner's
+    /// implicit privileges in it; inspection must not read that entry as
+    /// granted state and plan revokes against it.
+    #[test]
+    #[ignore]
+    fn adopt_mode_does_not_revoke_owner_inherent_privileges() {
+        let schema = unique_name("owner_acl_schema");
+        let owner = unique_name("owner_acl_role");
+
+        execute_sql(&format!(
+            r#"
+            DROP SCHEMA IF EXISTS "{schema}" CASCADE;
+            DROP ROLE IF EXISTS "{owner}";
+            CREATE ROLE "{owner}" NOLOGIN;
+            CREATE SCHEMA "{schema}" AUTHORIZATION "{owner}";
+            CREATE TABLE "{schema}".widgets (id integer);
+            ALTER TABLE "{schema}".widgets OWNER TO "{owner}";
+            GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA "{schema}"
+                TO "{owner}";
+            "#
+        ));
+
+        let manifest_file = write_temp_manifest(&format!(
+            r#"
+default_owner: {owner}
+
+roles:
+  - name: {owner}
+    nologin: true
+
+profiles:
+  writer:
+    grants:
+      - object: {{ type: schema }}
+        privileges: [USAGE]
+      - object: {{ type: table, name: "*" }}
+        privileges: [SELECT, INSERT]
+
+schemas:
+  - name: {schema}
+    profiles: [writer]
+"#
+        ));
+
+        let diff_output = pgroles_cmd()
+            .args([
+                "diff",
+                "--file",
+                manifest_file.path().to_str().unwrap(),
+                "--database-url",
+                &database_url(),
+                "--mode",
+                "adopt",
+            ])
+            .output()
+            .expect("failed to run diff");
+        let diff_stdout = String::from_utf8_lossy(&diff_output.stdout);
+        assert!(
+            !diff_stdout.contains("REVOKE"),
+            "adopt plan must not revoke anything from the table owner; got:\n{diff_stdout}"
+        );
+
+        pgroles_cmd()
+            .args([
+                "apply",
+                "--file",
+                manifest_file.path().to_str().unwrap(),
+                "--database-url",
+                &database_url(),
+                "--mode",
+                "adopt",
+            ])
+            .assert()
+            .success();
+
+        // The owner keeps DML on its own tables — including DELETE and
+        // TRUNCATE/REFERENCES/TRIGGER, which nobody ever granted explicitly.
+        for privilege in [
+            "SELECT",
+            "INSERT",
+            "DELETE",
+            "TRUNCATE",
+            "REFERENCES",
+            "TRIGGER",
+        ] {
+            assert!(
+                query_has_relation_privilege(&owner, &format!("{schema}.widgets"), privilege),
+                "owner should retain {privilege} on its own table"
+            );
+        }
+
+        // Converged: no regrant churn on re-inspection.
+        pgroles_cmd()
+            .args([
+                "diff",
+                "--file",
+                manifest_file.path().to_str().unwrap(),
+                "--database-url",
+                &database_url(),
+                "--mode",
+                "adopt",
+            ])
+            .assert()
+            .success()
+            .stdout(predicate::str::contains("No changes needed"));
+
+        // A manifest that explicitly declares SELECT for the owner on its own
+        // table also converges: the inherent entry covers the declared grant,
+        // so neither a GRANT nor a REVOKE is planned.
+        let declaring_manifest = write_temp_manifest(&format!(
+            r#"
+default_owner: {owner}
+
+roles:
+  - name: {owner}
+    nologin: true
+
+profiles:
+  writer:
+    grants:
+      - object: {{ type: schema }}
+        privileges: [USAGE]
+      - object: {{ type: table, name: "*" }}
+        privileges: [SELECT, INSERT]
+
+grants:
+  - role: {owner}
+    privileges: [SELECT]
+    object: {{ type: table, schema: {schema}, name: "*" }}
+
+schemas:
+  - name: {schema}
+    profiles: [writer]
+"#
+        ));
+        pgroles_cmd()
+            .args([
+                "diff",
+                "--file",
+                declaring_manifest.path().to_str().unwrap(),
+                "--database-url",
+                &database_url(),
+                "--mode",
+                "adopt",
+            ])
+            .assert()
+            .success()
+            .stdout(predicate::str::contains("No changes needed"));
+
+        // Cleanup
+        execute_sql(&format!(
+            r#"
+            DROP SCHEMA IF EXISTS "{schema}" CASCADE;
+            DROP ROLE IF EXISTS "{owner}";
+            "#
+        ));
+    }
+
+    /// A role declaring `preserve_undeclared_grants` keeps grants the manifest
+    /// does not declare, while explicit `ensure: absent` assertions still
+    /// revoke (issue #201: verifiable brownfield adoption).
+    #[test]
+    #[ignore]
+    fn preserve_undeclared_grants_flag_protects_out_of_band_access() {
+        let schema = unique_name("preserve_schema");
+        let role = unique_name("preserve_role");
+
+        execute_sql(&format!(
+            r#"
+            DROP SCHEMA IF EXISTS "{schema}" CASCADE;
+            DROP ROLE IF EXISTS "{role}";
+            CREATE ROLE "{role}" NOLOGIN;
+            CREATE SCHEMA "{schema}";
+            CREATE TABLE "{schema}".widgets (id integer);
+            GRANT SELECT ON "{schema}".widgets TO "{role}";
+            "#
+        ));
+
+        // Nothing declares the table SELECT; preservation keeps it. The
+        // schema-USAGE grant brings the schema into inspection scope.
+        let manifest_file = write_temp_manifest(&format!(
+            r#"
+roles:
+  - name: {role}
+    nologin: true
+    preserve_undeclared_grants: true
+
+grants:
+  - role: {role}
+    privileges: [USAGE]
+    object: {{ type: schema, name: {schema} }}
+"#
+        ));
+
+        pgroles_cmd()
+            .args([
+                "apply",
+                "--file",
+                manifest_file.path().to_str().unwrap(),
+                "--database-url",
+                &database_url(),
+                "--mode",
+                "adopt",
+            ])
+            .assert()
+            .success();
+
+        assert!(
+            query_has_relation_privilege(&role, &format!("{schema}.widgets"), "SELECT"),
+            "undeclared grant should survive under preserve_undeclared_grants"
+        );
+
+        // The same manifest with an explicit absence assertion revokes.
+        let asserting_manifest = write_temp_manifest(&format!(
+            r#"
+roles:
+  - name: {role}
+    nologin: true
+    preserve_undeclared_grants: true
+
+grants:
+  - role: {role}
+    ensure: absent
+    privileges: [SELECT]
+    object: {{ type: table, schema: {schema}, name: widgets }}
+"#
+        ));
+        pgroles_cmd()
+            .args([
+                "apply",
+                "--file",
+                asserting_manifest.path().to_str().unwrap(),
+                "--database-url",
+                &database_url(),
+                "--mode",
+                "adopt",
+            ])
+            .assert()
+            .success();
+
+        assert!(
+            !query_has_relation_privilege(&role, &format!("{schema}.widgets"), "SELECT"),
+            "ensure: absent must revoke despite preserve_undeclared_grants"
+        );
+
+        // Declared keys are not trimmed either: with only SELECT declared,
+        // a held INSERT survives until the flag comes off (issue #201 review,
+        // second pass — pinning actual semantics).
+        execute_sql(&format!(
+            "GRANT INSERT ON \"{schema}\".widgets TO \"{role}\";"
+        ));
+        let declaring_select = write_temp_manifest(&format!(
+            r#"
+roles:
+  - name: {role}
+    nologin: true
+    preserve_undeclared_grants: true
+
+grants:
+  - role: {role}
+    privileges: [SELECT]
+    object: {{ type: table, schema: {schema}, name: widgets }}
+"#
+        ));
+        pgroles_cmd()
+            .args([
+                "apply",
+                "--file",
+                declaring_select.path().to_str().unwrap(),
+                "--database-url",
+                &database_url(),
+                "--mode",
+                "authoritative",
+            ])
+            .assert()
+            .success();
+        assert!(
+            query_has_relation_privilege(&role, &format!("{schema}.widgets"), "INSERT"),
+            "preserve flag must not trim excess on declared grant targets"
+        );
+        assert!(
+            query_has_relation_privilege(&role, &format!("{schema}.widgets"), "SELECT"),
+            "declared privilege should be granted/retained"
+        );
+
+        // Without the flag, the undeclared grant would have been revoked in
+        // the first apply — sanity-check that baseline behavior still holds.
+        execute_sql(&format!(
+            "GRANT SELECT ON \"{schema}\".widgets TO \"{role}\";"
+        ));
+        let plain_manifest = write_temp_manifest(&format!(
+            r#"
+roles:
+  - name: {role}
+    nologin: true
+
+grants:
+  - role: {role}
+    privileges: [USAGE]
+    object: {{ type: schema, name: {schema} }}
+"#
+        ));
+        pgroles_cmd()
+            .args([
+                "apply",
+                "--file",
+                plain_manifest.path().to_str().unwrap(),
+                "--database-url",
+                &database_url(),
+                "--mode",
+                "adopt",
+            ])
+            .assert()
+            .success();
+        assert!(
+            !query_has_relation_privilege(&role, &format!("{schema}.widgets"), "SELECT"),
+            "without the flag, adopt mode revokes undeclared grants"
+        );
+
+        // Cleanup
+        execute_sql(&format!(
+            r#"
+            DROP SCHEMA IF EXISTS "{schema}" CASCADE;
+            DROP ROLE IF EXISTS "{role}";
+            "#
+        ));
+    }
+
+    /// Live regression for wildcard normalization interacting with an exact
+    /// absence assertion on a preserved role. When every table holds DELETE,
+    /// inspection folds it into one wildcard key; apply must split that key
+    /// and revoke only the explicitly named table.
+    #[test]
+    #[ignore]
+    fn preserve_flag_narrows_normalized_wildcard_to_exact_absence() {
+        let schema = unique_name("preserve_exact_schema");
+        let role = unique_name("preserve_exact_role");
+
+        execute_sql(&format!(
+            r#"
+            DROP SCHEMA IF EXISTS "{schema}" CASCADE;
+            DROP ROLE IF EXISTS "{role}";
+            CREATE ROLE "{role}" NOLOGIN;
+            CREATE SCHEMA "{schema}";
+            CREATE TABLE "{schema}".widgets (id integer);
+            CREATE TABLE "{schema}".gadgets (id integer);
+            GRANT DELETE ON ALL TABLES IN SCHEMA "{schema}" TO "{role}";
+            "#
+        ));
+
+        let manifest = write_temp_manifest(&format!(
+            r#"
+roles:
+  - name: {role}
+    nologin: true
+    preserve_undeclared_grants: true
+
+grants:
+  - role: {role}
+    privileges: [SELECT]
+    object: {{ type: table, schema: {schema}, name: "*" }}
+  - role: {role}
+    ensure: absent
+    privileges: [DELETE]
+    object: {{ type: table, schema: {schema}, name: widgets }}
+"#
+        ));
+
+        pgroles_cmd()
+            .args([
+                "apply",
+                "--file",
+                manifest.path().to_str().unwrap(),
+                "--database-url",
+                &database_url(),
+                "--mode",
+                "authoritative",
+            ])
+            .assert()
+            .success();
+
+        assert!(
+            !query_has_relation_privilege(&role, &format!("{schema}.widgets"), "DELETE"),
+            "exact ensure: absent must revoke the normalized privilege"
+        );
+        assert!(
+            query_has_relation_privilege(&role, &format!("{schema}.gadgets"), "DELETE"),
+            "preservation must keep the privilege on other wildcard objects"
+        );
+        pgroles_cmd()
+            .args([
+                "diff",
+                "--file",
+                manifest.path().to_str().unwrap(),
+                "--database-url",
+                &database_url(),
+                "--mode",
+                "authoritative",
+                "--format",
+                "summary",
+            ])
+            .assert()
+            .success()
+            .stdout(predicate::str::contains("No changes needed"));
+
+        execute_sql(&format!(
+            r#"
+            DROP SCHEMA IF EXISTS "{schema}" CASCADE;
+            DROP ROLE IF EXISTS "{role}";
+            "#
+        ));
+    }
+
+    /// Mixed-ownership schema with a wildcard grant to the owner: inherent
+    /// privileges on the owned table must survive convergence even though
+    /// normalization folds both tables into one `name: "*"` key (issue #201
+    /// review: the fold previously leaked inherent bits into a revocable key).
+    #[test]
+    #[ignore]
+    fn mixed_ownership_wildcard_does_not_revoke_owner_inherent_privileges() {
+        let schema = unique_name("mix_schema");
+        let owner = unique_name("mix_owner");
+
+        execute_sql(&format!(
+            r#"
+            DROP SCHEMA IF EXISTS "{schema}" CASCADE;
+            DROP ROLE IF EXISTS "{owner}";
+            CREATE ROLE "{owner}" NOLOGIN;
+            CREATE SCHEMA "{schema}" AUTHORIZATION postgres;
+            CREATE TABLE "{schema}".t_own (id integer);
+            CREATE TABLE "{schema}".t_other (id integer);
+            ALTER TABLE "{schema}".t_own OWNER TO "{owner}";
+            -- Explicit grants on the other role's table materialize t_own's ACL.
+            GRANT SELECT, INSERT, UPDATE ON ALL TABLES IN SCHEMA "{schema}" TO "{owner}";
+            "#
+        ));
+
+        let manifest_file = write_temp_manifest(&format!(
+            r#"
+roles:
+  - name: {owner}
+    nologin: true
+
+grants:
+  - role: {owner}
+    privileges: [SELECT, INSERT]
+    object: {{ type: table, schema: {schema}, name: "*" }}
+"#
+        ));
+
+        let diff_output = pgroles_cmd()
+            .args([
+                "diff",
+                "--file",
+                manifest_file.path().to_str().unwrap(),
+                "--database-url",
+                &database_url(),
+                "--mode",
+                "adopt",
+            ])
+            .output()
+            .expect("failed to run diff");
+        let diff_stdout = String::from_utf8_lossy(&diff_output.stdout);
+        assert!(
+            !diff_stdout.contains(".\"t_own\""),
+            "no statement may target the owned table's drift; got:\n{diff_stdout}"
+        );
+        assert!(
+            diff_stdout.contains("REVOKE UPDATE ON TABLE"),
+            "undeclared UPDATE on the non-owned table should be revoked; got:\n{diff_stdout}"
+        );
+
+        pgroles_cmd()
+            .args([
+                "apply",
+                "--file",
+                manifest_file.path().to_str().unwrap(),
+                "--database-url",
+                &database_url(),
+                "--mode",
+                "adopt",
+            ])
+            .assert()
+            .success();
+
+        // The owner keeps its inherent UPDATE on its own table...
+        assert!(
+            query_has_relation_privilege(&owner, &format!("{schema}.t_own"), "UPDATE"),
+            "owner-inherent UPDATE must survive a mixed-ownership wildcard"
+        );
+        // ...while the explicit drift on the other table is revoked.
+        assert!(
+            !query_has_relation_privilege(&owner, &format!("{schema}.t_other"), "UPDATE"),
+            "undeclared UPDATE on the non-owned table should be revoked"
+        );
+
+        // Cleanup
+        execute_sql(&format!(
+            r#"
+            DROP SCHEMA IF EXISTS "{schema}" CASCADE;
+            DROP ROLE IF EXISTS "{owner}";
+            "#
+        ));
+    }
+
+    /// Mixed-ownership sequences: a wildcard sequence grant must not strip
+    /// the owner's inherent privileges from sequences it owns (issue #201
+    /// review, second round).
+    #[test]
+    #[ignore]
+    fn mixed_ownership_sequence_wildcard_does_not_revoke_owner_inherent_privileges() {
+        let schema = unique_name("mseq_schema");
+        let owner = unique_name("mseq_owner");
+
+        execute_sql(&format!(
+            r#"
+            DROP SCHEMA IF EXISTS "{schema}" CASCADE;
+            DROP ROLE IF EXISTS "{owner}";
+            CREATE ROLE "{owner}" NOLOGIN;
+            CREATE SCHEMA "{schema}" AUTHORIZATION postgres;
+            CREATE SEQUENCE "{schema}".seq_own;
+            CREATE SEQUENCE "{schema}".seq_other;
+            ALTER SEQUENCE "{schema}".seq_own OWNER TO "{owner}";
+            -- Explicit grants materialize seq_own's ACL entry.
+            GRANT USAGE, SELECT, UPDATE ON ALL SEQUENCES IN SCHEMA "{schema}" TO "{owner}";
+            "#
+        ));
+
+        // Desired keeps only USAGE on the wildcard; UPDATE is drift on both
+        // sequences as far as the manifest is concerned.
+        let manifest_file = write_temp_manifest(&format!(
+            r#"
+roles:
+  - name: {owner}
+    nologin: true
+
+grants:
+  - role: {owner}
+    privileges: [USAGE]
+    object: {{ type: sequence, schema: {schema}, name: "*" }}
+"#
+        ));
+
+        pgroles_cmd()
+            .args([
+                "apply",
+                "--file",
+                manifest_file.path().to_str().unwrap(),
+                "--database-url",
+                &database_url(),
+                "--mode",
+                "adopt",
+            ])
+            .assert()
+            .success();
+
+        // The owned sequence keeps its inherent UPDATE...
+        assert!(
+            with_runtime(async {
+                let pool = PgPool::connect(&database_url()).await.unwrap();
+                let has: bool =
+                    sqlx::query_scalar("SELECT has_sequence_privilege($1, $2, 'UPDATE')")
+                        .bind(&owner)
+                        .bind(format!("{schema}.seq_own"))
+                        .fetch_one(&pool)
+                        .await
+                        .unwrap();
+                has
+            }),
+            "owner-inherent UPDATE must survive a mixed-ownership sequence wildcard"
+        );
+        // ...while the explicit drift on the other sequence is revoked.
+        assert!(
+            !with_runtime(async {
+                let pool = PgPool::connect(&database_url()).await.unwrap();
+                let has: bool =
+                    sqlx::query_scalar("SELECT has_sequence_privilege($1, $2, 'UPDATE')")
+                        .bind(&owner)
+                        .bind(format!("{schema}.seq_other"))
+                        .fetch_one(&pool)
+                        .await
+                        .unwrap();
+                has
+            }),
+            "undeclared UPDATE on the non-owned sequence should be revoked"
+        );
+
+        // Cleanup
+        execute_sql(&format!(
+            r#"
+            DROP SCHEMA IF EXISTS "{schema}" CASCADE;
+            DROP ROLE IF EXISTS "{owner}";
+            "#
+        ));
+    }
+
+    /// Adopt mode refuses to transfer schema ownership away from the live
+    /// owner unless `--allow-schema-owner-transfers` is passed (issue #201).
+    #[test]
+    #[ignore]
+    fn adopt_apply_refuses_schema_owner_transfer_without_flag() {
+        let schema = unique_name("transfer_schema");
+        let live_owner = unique_name("transfer_live_owner");
+        let declared_owner = unique_name("transfer_decl_owner");
+
+        execute_sql(&format!(
+            r#"
+            DROP SCHEMA IF EXISTS "{schema}" CASCADE;
+            DROP ROLE IF EXISTS "{live_owner}";
+            DROP ROLE IF EXISTS "{declared_owner}";
+            CREATE ROLE "{live_owner}" NOLOGIN;
+            CREATE ROLE "{declared_owner}" NOLOGIN;
+            CREATE SCHEMA "{schema}" AUTHORIZATION "{live_owner}";
+            "#
+        ));
+
+        let manifest_file = write_temp_manifest(&format!(
+            r#"
+schemas:
+  - name: {schema}
+    owner: {declared_owner}
+"#
+        ));
+
+        // Refused without the flag.
+        pgroles_cmd()
+            .args([
+                "apply",
+                "--file",
+                manifest_file.path().to_str().unwrap(),
+                "--database-url",
+                &database_url(),
+                "--mode",
+                "adopt",
+            ])
+            .assert()
+            .failure()
+            .stderr(predicate::str::contains("allow-schema-owner-transfers"));
+        assert_eq!(
+            query_schema_owner(&schema),
+            Some(live_owner.clone()),
+            "ownership must be untouched after refusal"
+        );
+
+        // Allowed with the flag.
+        pgroles_cmd()
+            .args([
+                "apply",
+                "--file",
+                manifest_file.path().to_str().unwrap(),
+                "--database-url",
+                &database_url(),
+                "--mode",
+                "adopt",
+                "--allow-schema-owner-transfers",
+            ])
+            .assert()
+            .success();
+        assert_eq!(
+            query_schema_owner(&schema),
+            Some(declared_owner.clone()),
+            "flagged apply should transfer ownership"
+        );
+
+        // Cleanup
+        execute_sql(&format!(
+            r#"
+            DROP SCHEMA IF EXISTS "{schema}" CASCADE;
+            DROP ROLE IF EXISTS "{live_owner}";
+            DROP ROLE IF EXISTS "{declared_owner}";
+            "#
+        ));
+    }
+
     /// Inspect without a manifest shows PUBLIC grants for the current database.
     /// A fresh database should have at least CONNECT and TEMPORARY granted to
     /// PUBLIC, and USAGE on the "public" schema.
@@ -5139,7 +5818,7 @@ default_privileges:
         .to_string();
         assert!(
             plan.contains(&format!(
-                r#"REVOKE EXECUTE ON ALL ROUTINES IN SCHEMA "{}" FROM PUBLIC;"#,
+                r#"REVOKE EXECUTE ON ROUTINE "{}"."secret"(x integer) FROM PUBLIC;"#,
                 fixture.schema
             )),
             "plan should revoke PUBLIC EXECUTE on existing routines:\n{plan}"

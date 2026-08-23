@@ -76,6 +76,14 @@ pub struct PostgresPolicySpec {
     #[serde(default)]
     pub reconciliation_mode: CrdReconciliationMode,
 
+    /// Permit adopt mode to transfer schema ownership (`ALTER SCHEMA ...
+    /// OWNER TO ...`) on schemas whose live owner differs. Without this,
+    /// apply-mode adopt policies fail such plans with an
+    /// `OwnerTransferBlocked` condition — the operator equivalent of the
+    /// CLI's `--allow-schema-owner-transfers`.
+    #[serde(default)]
+    pub allow_schema_owner_transfers: bool,
+
     /// Default owner for ALTER DEFAULT PRIVILEGES (e.g. "app_owner").
     #[serde(default)]
     #[schemars(length(min = 1, max = MAX_IDENTIFIER))]
@@ -696,6 +704,11 @@ pub struct RoleSpec {
     /// password-manage, or manage memberships granted from this role.
     #[serde(default)]
     pub external: bool,
+    /// Preserve this role's undeclared in-scope object grants during
+    /// convergence. Revokes against the role are skipped unless the revoked
+    /// privileges are explicitly asserted absent (`ensure: absent`).
+    #[serde(default)]
+    pub preserve_undeclared_grants: bool,
     #[serde(default)]
     pub login: Option<bool>,
     #[serde(default)]
@@ -940,6 +953,12 @@ pub struct PostgresPolicyStatus {
     /// Summary of changes applied in the last reconciliation.
     #[serde(default)]
     pub change_summary: Option<ChangeSummary>,
+
+    /// Advisory warnings from the last reconciliation's computed plan — for
+    /// example adopt-mode schema ownership transfers or an undeclared
+    /// `default_owner`. Populated even when the plan applied cleanly.
+    #[serde(default)]
+    pub plan_warnings: Vec<String>,
 
     /// The reconciliation mode used for the last successful reconcile.
     #[serde(default)]
@@ -2119,6 +2138,7 @@ fn build_policy_manifest<'a>(
         .map(|r| RoleDefinition {
             name: r.name.clone(),
             external: r.external,
+            preserve_undeclared_grants: r.preserve_undeclared_grants,
             login: r.login,
             superuser: r.superuser,
             createdb: r.createdb,
@@ -3069,12 +3089,14 @@ mod tests {
             suspend: false,
             mode: PolicyMode::Apply,
             reconciliation_mode: CrdReconciliationMode::default(),
+            allow_schema_owner_transfers: false,
             default_owner: Some("app_owner".to_string()),
             profiles: std::collections::HashMap::new(),
             schemas: vec![],
             roles: vec![RoleSpec {
                 name: "analytics".to_string(),
                 external: true,
+                preserve_undeclared_grants: false,
                 login: Some(true),
                 superuser: None,
                 createdb: None,
@@ -3132,6 +3154,7 @@ mod tests {
             suspend: false,
             mode: PolicyMode::Apply,
             reconciliation_mode: CrdReconciliationMode::default(),
+            allow_schema_owner_transfers: false,
             default_owner: None,
             profiles: std::collections::HashMap::from([(
                 "editor".to_string(),
@@ -3216,6 +3239,7 @@ mod tests {
             suspend: false,
             mode: PolicyMode::Apply,
             reconciliation_mode: CrdReconciliationMode::default(),
+            allow_schema_owner_transfers: false,
             default_owner: None,
             profiles,
             schemas: vec![SchemaBinding {
@@ -3227,6 +3251,7 @@ mod tests {
             roles: vec![RoleSpec {
                 name: "app-service".to_string(),
                 external: false,
+                preserve_undeclared_grants: false,
                 login: Some(true),
                 superuser: None,
                 createdb: None,
@@ -3274,6 +3299,7 @@ mod tests {
             suspend: false,
             mode: PolicyMode::Apply,
             reconciliation_mode: CrdReconciliationMode::default(),
+            allow_schema_owner_transfers: false,
             default_owner: Some("app_owner".to_string()),
             profiles: std::collections::HashMap::new(),
             schemas: vec![],
@@ -3577,6 +3603,7 @@ mod tests {
             suspend: false,
             mode: PolicyMode::Apply,
             reconciliation_mode: CrdReconciliationMode::default(),
+            allow_schema_owner_transfers: false,
             default_owner: None,
             profiles: Default::default(),
             schemas: vec![],
@@ -4170,6 +4197,7 @@ params:
         spec.roles = vec![RoleSpec {
             name: "app".into(),
             external: false,
+            preserve_undeclared_grants: false,
             login: Some(true),
             password: Some(PasswordSpec {
                 secret_ref: Some(SecretReference {
@@ -4343,6 +4371,7 @@ params:
             suspend: false,
             mode: PolicyMode::Apply,
             reconciliation_mode: CrdReconciliationMode::default(),
+            allow_schema_owner_transfers: false,
             default_owner: None,
             profiles: std::collections::HashMap::new(),
             schemas: vec![],
@@ -4802,6 +4831,7 @@ retirements:
             suspend: false,
             mode: PolicyMode::Apply,
             reconciliation_mode: CrdReconciliationMode::default(),
+            allow_schema_owner_transfers: false,
             default_owner: None,
             profiles: std::collections::HashMap::new(),
             schemas: vec![],
@@ -4833,6 +4863,7 @@ retirements:
             suspend: false,
             mode: PolicyMode::Apply,
             reconciliation_mode: CrdReconciliationMode::default(),
+            allow_schema_owner_transfers: false,
             default_owner: None,
             profiles: std::collections::HashMap::new(),
             schemas: vec![],
@@ -4840,6 +4871,7 @@ retirements:
                 RoleSpec {
                     name: "role-a".to_string(),
                     external: false,
+                    preserve_undeclared_grants: false,
                     login: Some(true),
                     password: Some(PasswordSpec {
                         secret_ref: Some(SecretReference {
@@ -4862,6 +4894,7 @@ retirements:
                 RoleSpec {
                     name: "role-b".to_string(),
                     external: false,
+                    preserve_undeclared_grants: false,
                     login: Some(true),
                     password: Some(PasswordSpec {
                         secret_ref: Some(SecretReference {
@@ -4884,6 +4917,7 @@ retirements:
                 RoleSpec {
                     name: "role-c".to_string(),
                     external: false,
+                    preserve_undeclared_grants: false,
                     login: None,
                     password: None,
                     password_valid_until: None,
@@ -4936,12 +4970,14 @@ retirements:
             suspend: false,
             mode: PolicyMode::Apply,
             reconciliation_mode: CrdReconciliationMode::default(),
+            allow_schema_owner_transfers: false,
             default_owner: None,
             profiles: std::collections::HashMap::new(),
             schemas: vec![],
             roles: vec![RoleSpec {
                 name: "app-user".to_string(),
                 external: false,
+                preserve_undeclared_grants: false,
                 login: Some(false),
                 superuser: None,
                 createdb: None,
@@ -4989,12 +5025,14 @@ retirements:
             suspend: false,
             mode: PolicyMode::Apply,
             reconciliation_mode: CrdReconciliationMode::default(),
+            allow_schema_owner_transfers: false,
             default_owner: None,
             profiles: std::collections::HashMap::new(),
             schemas: vec![],
             roles: vec![RoleSpec {
                 name: "app-user".to_string(),
                 external: false,
+                preserve_undeclared_grants: false,
                 login: None, // omitted, not explicitly false
                 superuser: None,
                 createdb: None,
@@ -5042,12 +5080,14 @@ retirements:
             suspend: false,
             mode: PolicyMode::Apply,
             reconciliation_mode: CrdReconciliationMode::default(),
+            allow_schema_owner_transfers: false,
             default_owner: None,
             profiles: std::collections::HashMap::new(),
             schemas: vec![],
             roles: vec![RoleSpec {
                 name: "app-user".to_string(),
                 external: false,
+                preserve_undeclared_grants: false,
                 login: Some(true),
                 superuser: None,
                 createdb: None,
@@ -5099,12 +5139,14 @@ retirements:
             suspend: false,
             mode: PolicyMode::Apply,
             reconciliation_mode: CrdReconciliationMode::default(),
+            allow_schema_owner_transfers: false,
             default_owner: None,
             profiles: std::collections::HashMap::new(),
             schemas: vec![],
             roles: vec![RoleSpec {
                 name: "app-user".to_string(),
                 external: false,
+                preserve_undeclared_grants: false,
                 login: Some(true),
                 superuser: None,
                 createdb: None,
@@ -5154,12 +5196,14 @@ retirements:
             suspend: false,
             mode: PolicyMode::Apply,
             reconciliation_mode: CrdReconciliationMode::default(),
+            allow_schema_owner_transfers: false,
             default_owner: None,
             profiles: std::collections::HashMap::new(),
             schemas: vec![],
             roles: vec![RoleSpec {
                 name: "app-user".to_string(),
                 external: false,
+                preserve_undeclared_grants: false,
                 login: Some(true),
                 superuser: None,
                 createdb: None,
@@ -5210,12 +5254,14 @@ retirements:
             suspend: false,
             mode: PolicyMode::Apply,
             reconciliation_mode: CrdReconciliationMode::default(),
+            allow_schema_owner_transfers: false,
             default_owner: None,
             profiles: std::collections::HashMap::new(),
             schemas: vec![],
             roles: vec![RoleSpec {
                 name: "app-user".to_string(),
                 external: false,
+                preserve_undeclared_grants: false,
                 login: Some(true),
                 superuser: None,
                 createdb: None,
@@ -5265,12 +5311,14 @@ retirements:
             suspend: false,
             mode: PolicyMode::Apply,
             reconciliation_mode: CrdReconciliationMode::default(),
+            allow_schema_owner_transfers: false,
             default_owner: None,
             profiles: std::collections::HashMap::new(),
             schemas: vec![],
             roles: vec![RoleSpec {
                 name: "app-user".to_string(),
                 external: false,
+                preserve_undeclared_grants: false,
                 login: Some(true),
                 superuser: None,
                 createdb: None,
@@ -5349,6 +5397,7 @@ retirements:
             suspend: false,
             mode: PolicyMode::Apply,
             reconciliation_mode: CrdReconciliationMode::Authoritative,
+            allow_schema_owner_transfers: false,
             default_owner: None,
             profiles: Default::default(),
             schemas: vec![],
@@ -5496,6 +5545,7 @@ retirements:
             suspend: false,
             mode: PolicyMode::Observe,
             reconciliation_mode: CrdReconciliationMode::Authoritative,
+            allow_schema_owner_transfers: false,
             default_owner: None,
             profiles: Default::default(),
             schemas: vec![],
@@ -5907,8 +5957,15 @@ retirements:
 
         // Execution fields belong to the policy alone: a candidate carries no
         // connection (unless `spec.target` overrides it), interval, mode,
-        // suspend or approval.
-        let execution = ["connection", "interval", "mode", "suspend", "approval"];
+        // suspend, approval, or ownership-transfer allowance.
+        let execution = [
+            "connection",
+            "interval",
+            "mode",
+            "suspend",
+            "approval",
+            "allow_schema_owner_transfers",
+        ];
         let policy_content: Vec<&String> = policy_spec
             .as_object()
             .expect("policy spec has properties")

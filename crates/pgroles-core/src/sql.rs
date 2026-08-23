@@ -38,8 +38,18 @@ pub struct SqlContext {
     /// Controls syntax differences like `WITH INHERIT` in membership grants.
     pub pg_major_version: i32,
     /// Optional schema-scoped catalog inventory used to safely expand wildcard
-    /// relation statements without leaking across relation subtypes.
-    pub relation_inventory: BTreeMap<(ObjectType, String), Vec<String>>,
+    /// object statements (relations, sequences, routines) without leaking
+    /// across subtypes.
+    pub object_inventory: BTreeMap<(ObjectType, String), Vec<String>>,
+    /// Relations owned by each managed role, as
+    /// `(role, object_type, schema, object_name)`. Wildcard REVOKEs skip
+    /// objects the grantee owns: an owner's privileges are inherent (an ACL
+    /// entry records them once any grant materializes it), and revoking them
+    /// breaks owner DML and foreign-key key-share checks. This makes the
+    /// never-revoke-owner-privileges invariant hold by construction even when
+    /// inspection-side tagging cannot see per-object ownership — e.g. a
+    /// mixed-ownership schema folded into a `name: "*"` key.
+    pub owned_relations: BTreeSet<(String, ObjectType, String, String)>,
 }
 
 impl SqlContext {
@@ -47,17 +57,46 @@ impl SqlContext {
     pub fn from_version_num(version_num: i32) -> Self {
         Self {
             pg_major_version: version_num / 10000,
-            relation_inventory: BTreeMap::new(),
+            object_inventory: BTreeMap::new(),
+            owned_relations: BTreeSet::new(),
         }
     }
 
-    /// Attach live relation inventory for safer wildcard rendering.
-    pub fn with_relation_inventory(
+    /// Attach live object inventory for safer wildcard rendering.
+    pub fn with_object_inventory(
         mut self,
-        relation_inventory: BTreeMap<(ObjectType, String), Vec<String>>,
+        object_inventory: BTreeMap<(ObjectType, String), Vec<String>>,
     ) -> Self {
-        self.relation_inventory = relation_inventory;
+        self.object_inventory = object_inventory;
         self
+    }
+
+    /// Attach relation ownership for the owner-guard on wildcard REVOKEs.
+    pub fn with_owned_relations(
+        mut self,
+        owned_relations: BTreeSet<(String, ObjectType, String, String)>,
+    ) -> Self {
+        self.owned_relations = owned_relations;
+        self
+    }
+
+    /// Whether the grantee owns this relation. `PUBLIC` owns nothing.
+    pub fn grantee_owns_relation(
+        &self,
+        role: &Grantee,
+        object_type: ObjectType,
+        schema: &str,
+        name: &str,
+    ) -> bool {
+        match role {
+            Grantee::Role(role_name) => self.owned_relations.contains(&(
+                role_name.clone(),
+                object_type,
+                schema.to_string(),
+                name.to_string(),
+            )),
+            Grantee::Public => false,
+        }
     }
 
     /// Whether PG supports `GRANT ... WITH INHERIT TRUE/FALSE` (PG 16+).
@@ -70,7 +109,8 @@ impl Default for SqlContext {
     fn default() -> Self {
         Self {
             pg_major_version: 16, // Default to PG 16+ (current minimum)
-            relation_inventory: BTreeMap::new(),
+            object_inventory: BTreeMap::new(),
+            owned_relations: BTreeSet::new(),
         }
     }
 }
@@ -444,10 +484,14 @@ fn render_privilege_statements(
     let subject_preposition = if action == "GRANT" { "TO" } else { "FROM" };
     if matches!(
         object_type,
-        ObjectType::Table | ObjectType::View | ObjectType::MaterializedView
+        ObjectType::Table
+            | ObjectType::View
+            | ObjectType::MaterializedView
+            | ObjectType::Sequence
+            | ObjectType::Function
     ) && name == Some("*")
     {
-        return render_relation_wildcard(
+        return render_wildcard_expanded(
             action,
             subject_preposition,
             role,
@@ -465,7 +509,7 @@ fn render_privilege_statements(
     )]
 }
 
-fn render_relation_wildcard(
+fn render_wildcard_expanded(
     action: &str,
     subject_preposition: &str,
     role: &Grantee,
@@ -475,19 +519,46 @@ fn render_relation_wildcard(
     ctx: &SqlContext,
 ) -> Vec<String> {
     let schema_name = schema.unwrap_or("public");
+    // Owner guard: a REVOKE must never touch objects the grantee owns. The
+    // owner's privileges are inherent — see `SqlContext::owned_relations`.
+    let skip_owned = action == "REVOKE";
+
+    // Only revokes need per-object expansion (to apply the owner guard).
+    // Grants have no owner interaction, so sequences and routines keep the
+    // compact `ALL ... IN SCHEMA` form regardless of schema size.
+    if !skip_owned && matches!(object_type, ObjectType::Sequence | ObjectType::Function) {
+        return vec![format!(
+            "{action} {privilege_list} ON {} {subject_preposition} {};",
+            format_object_target(object_type, schema, Some("*")),
+            render_grantee(role)
+        )];
+    }
 
     if let Some(object_names) = ctx
-        .relation_inventory
+        .object_inventory
         .get(&(object_type, schema_name.to_string()))
     {
         return object_names
             .iter()
+            .filter(|object_name| {
+                !skip_owned
+                    || !ctx.grantee_owns_relation(role, object_type, schema_name, object_name)
+            })
             .map(|object_name| {
+                let target = match object_type {
+                    // Routine targets carry the identity arguments in the
+                    // inventory name (`f(bigint)`).
+                    ObjectType::Function => format_function_target(Some(schema_name), object_name),
+                    _ => format!(
+                        "{} {}.{}",
+                        sql_object_type_keyword(object_type),
+                        quote_ident(schema_name),
+                        quote_ident(object_name)
+                    ),
+                };
                 format!(
-                    "{action} {privilege_list} ON TABLE {}.{} {subject_preposition} {};",
-                    quote_ident(schema_name),
-                    quote_ident(object_name),
-                    render_grantee(role),
+                    "{action} {privilege_list} ON {target} {subject_preposition} {};",
+                    render_grantee(role)
                 )
             })
             .collect();
@@ -501,10 +572,32 @@ fn render_relation_wildcard(
         Grantee::Role(name) => ("%I".to_string(), format!(", {}", quote_literal(name))),
     };
 
+    // The owner guard survives the relation fallback too: exclude relations
+    // owned by the grantee from the loop when revoking. Routines have no
+    // DO-block fallback (pg_proc needs identity arguments); without inventory
+    // they render in `ALL ROUTINES` form — contexts built by the CLI and the
+    // operator always populate routine inventory.
+    if object_type == ObjectType::Function {
+        return vec![format!(
+            "{action} {privilege_list} ON {} {subject_preposition} {};",
+            format_object_target(object_type, schema, Some("*")),
+            render_grantee(role)
+        )];
+    }
+    let owner_filter = match (skip_owned, role) {
+        (true, Grantee::Role(role_name)) => format!(
+            "AND pg_get_userbyid(c.relowner) <> {}",
+            quote_literal(role_name)
+        ),
+        _ => String::new(),
+    };
+
+    let type_keyword = sql_object_type_keyword(object_type);
     vec![format!(
-        "DO $pgroles$\nDECLARE obj record;\nBEGIN\n  FOR obj IN\n    SELECT n.nspname AS schema_name, c.relname AS object_name\n    FROM pg_class c\n    JOIN pg_namespace n ON n.oid = c.relnamespace\n    WHERE c.relkind IN ({})\n      AND n.nspname = {}\n    ORDER BY c.relname\n  LOOP\n    EXECUTE format('{} {} ON TABLE %I.%I {} {};', obj.schema_name, obj.object_name{});\n  END LOOP;\nEND\n$pgroles$;",
+        "DO $pgroles$\nDECLARE obj record;\nBEGIN\n  FOR obj IN\n    SELECT n.nspname AS schema_name, c.relname AS object_name\n    FROM pg_class c\n    JOIN pg_namespace n ON n.oid = c.relnamespace\n    WHERE c.relkind IN ({})\n      AND n.nspname = {}\n      {}\n    ORDER BY c.relname\n  LOOP\n    EXECUTE format('{} {} ON {type_keyword} %I.%I {} {};', obj.schema_name, obj.object_name{});\n  END LOOP;\nEND\n$pgroles$;",
         relation_relkinds_sql(object_type),
         quote_literal(schema_name),
+        owner_filter,
         action,
         privilege_list,
         subject_preposition,
@@ -518,7 +611,8 @@ fn relation_relkinds_sql(object_type: ObjectType) -> &'static str {
         ObjectType::Table => "'r', 'p'",
         ObjectType::View => "'v'",
         ObjectType::MaterializedView => "'m'",
-        _ => unreachable!("relation_relkinds_literal only supports relation object types"),
+        ObjectType::Sequence => "'S'",
+        _ => unreachable!("relation_relkinds_literal only supports pg_class object types"),
     }
 }
 
@@ -635,7 +729,7 @@ fn sql_object_type_plural(object_type: ObjectType) -> &'static str {
 }
 
 /// Format a privilege set as a comma-separated string.
-fn format_privileges(privileges: &BTreeSet<Privilege>) -> String {
+pub(crate) fn format_privileges(privileges: &BTreeSet<Privilege>) -> String {
     privileges
         .iter()
         .map(|p| p.to_string())
@@ -1069,7 +1163,7 @@ mod tests {
         };
         let sql = render_statements_with_context(
             &change,
-            &SqlContext::default().with_relation_inventory(BTreeMap::from([(
+            &SqlContext::default().with_object_inventory(BTreeMap::from([(
                 (ObjectType::Table, "inventory".to_string()),
                 vec!["orders".to_string(), "widgets".to_string()],
             )])),
@@ -1078,6 +1172,164 @@ mod tests {
         assert_eq!(
             sql,
             "GRANT INSERT, SELECT ON TABLE \"inventory\".\"orders\" TO \"inventory-editor\";\nGRANT INSERT, SELECT ON TABLE \"inventory\".\"widgets\" TO \"inventory-editor\";"
+        );
+    }
+
+    #[test]
+    fn render_wildcard_revoke_skips_objects_the_grantee_owns() {
+        let change = Change::Revoke {
+            role: "app_owner".into(),
+            privileges: BTreeSet::from([Privilege::Update]),
+            object_type: ObjectType::Table,
+            schema: Some("mix".to_string()),
+            name: Some("*".to_string()),
+        };
+        let inventory = BTreeMap::from([(
+            (ObjectType::Table, "mix".to_string()),
+            vec!["t_own".to_string(), "t_other".to_string()],
+        )]);
+        let owned = BTreeSet::from([(
+            "app_owner".to_string(),
+            ObjectType::Table,
+            "mix".to_string(),
+            "t_own".to_string(),
+        )]);
+        let ctx = SqlContext::default()
+            .with_object_inventory(inventory)
+            .with_owned_relations(owned);
+
+        // The owned table is skipped; the other table's explicit drift revokes.
+        assert_eq!(
+            render_statements_with_context(&change, &ctx).join("\n"),
+            "REVOKE UPDATE ON TABLE \"mix\".\"t_other\" FROM \"app_owner\";"
+        );
+
+        // GRANTs are not filtered — granting to an owner is a harmless no-op.
+        let grant = Change::Grant {
+            role: "app_owner".into(),
+            privileges: BTreeSet::from([Privilege::Select]),
+            object_type: ObjectType::Table,
+            schema: Some("mix".to_string()),
+            name: Some("*".to_string()),
+        };
+        assert_eq!(render_statements_with_context(&grant, &ctx).len(), 2);
+    }
+
+    #[test]
+    fn render_wildcard_sequence_revoke_skips_owned_sequence() {
+        let change = Change::Revoke {
+            role: "seq_owner".into(),
+            privileges: BTreeSet::from([Privilege::Update]),
+            object_type: ObjectType::Sequence,
+            schema: Some("mix".to_string()),
+            name: Some("*".to_string()),
+        };
+        let ctx = SqlContext::default()
+            .with_object_inventory(BTreeMap::from([(
+                (ObjectType::Sequence, "mix".to_string()),
+                vec!["seq_own".to_string(), "seq_other".to_string()],
+            )]))
+            .with_owned_relations(BTreeSet::from([(
+                "seq_owner".to_string(),
+                ObjectType::Sequence,
+                "mix".to_string(),
+                "seq_own".to_string(),
+            )]));
+
+        assert_eq!(
+            render_statements_with_context(&change, &ctx).join("\n"),
+            "REVOKE UPDATE ON SEQUENCE \"mix\".\"seq_other\" FROM \"seq_owner\";"
+        );
+    }
+
+    #[test]
+    fn render_wildcard_function_revoke_skips_owned_routine() {
+        let change = Change::Revoke {
+            role: "fn_owner".into(),
+            privileges: BTreeSet::from([Privilege::Execute]),
+            object_type: ObjectType::Function,
+            schema: Some("mix".to_string()),
+            name: Some("*".to_string()),
+        };
+        let ctx = SqlContext::default()
+            .with_object_inventory(BTreeMap::from([(
+                (ObjectType::Function, "mix".to_string()),
+                vec!["f_own(bigint)".to_string(), "f_other(text)".to_string()],
+            )]))
+            .with_owned_relations(BTreeSet::from([(
+                "fn_owner".to_string(),
+                ObjectType::Function,
+                "mix".to_string(),
+                "f_own(bigint)".to_string(),
+            )]));
+
+        assert_eq!(
+            render_statements_with_context(&change, &ctx).join("\n"),
+            "REVOKE EXECUTE ON ROUTINE \"mix\".\"f_other\"(text) FROM \"fn_owner\";"
+        );
+    }
+
+    #[test]
+    fn render_wildcard_grants_keep_all_form_for_sequences_and_routines() {
+        let seq = Change::Grant {
+            role: "r1".into(),
+            privileges: BTreeSet::from([Privilege::Usage]),
+            object_type: ObjectType::Sequence,
+            schema: Some("s".to_string()),
+            name: Some("*".to_string()),
+        };
+        let ctx = SqlContext::default().with_object_inventory(BTreeMap::from([(
+            (ObjectType::Sequence, "s".to_string()),
+            vec!["a".to_string(), "b".to_string(), "c".to_string()],
+        )]));
+        assert_eq!(
+            render_statements_with_context(&seq, &ctx).join("\n"),
+            "GRANT USAGE ON ALL SEQUENCES IN SCHEMA \"s\" TO \"r1\";"
+        );
+
+        let routine = Change::Grant {
+            role: "r1".into(),
+            privileges: BTreeSet::from([Privilege::Execute]),
+            object_type: ObjectType::Function,
+            schema: Some("s".to_string()),
+            name: Some("*".to_string()),
+        };
+        assert_eq!(
+            render_statements_with_context(&routine, &ctx).join("\n"),
+            "GRANT EXECUTE ON ALL ROUTINES IN SCHEMA \"s\" TO \"r1\";"
+        );
+    }
+
+    #[test]
+    fn render_wildcard_sequence_do_block_excludes_owner() {
+        let change = Change::Revoke {
+            role: "seq_owner".into(),
+            privileges: BTreeSet::from([Privilege::Update]),
+            object_type: ObjectType::Sequence,
+            schema: Some("mix".to_string()),
+            name: Some("*".to_string()),
+        };
+        let sql = render_statements_with_context(&change, &SqlContext::default()).join("\n");
+        assert!(
+            sql.contains("relkind IN ('S')")
+                && sql.contains("pg_get_userbyid(c.relowner) <> 'seq_owner'"),
+            "sequence fallback must expand and exclude owner: {sql}"
+        );
+    }
+
+    #[test]
+    fn render_wildcard_revoke_do_block_excludes_owner() {
+        let change = Change::Revoke {
+            role: "app_owner".into(),
+            privileges: BTreeSet::from([Privilege::Update]),
+            object_type: ObjectType::Table,
+            schema: Some("mix".to_string()),
+            name: Some("*".to_string()),
+        };
+        let sql = render_statements_with_context(&change, &SqlContext::default()).join("\n");
+        assert!(
+            sql.contains("pg_get_userbyid(c.relowner) <> 'app_owner'"),
+            "DO-block fallback must exclude owner-owned relations: {sql}"
         );
     }
 
@@ -1152,9 +1404,13 @@ mod tests {
             name: Some("*".to_string()),
         };
         let sql = render(&change);
-        assert_eq!(
-            sql,
-            "REVOKE SELECT, USAGE ON ALL SEQUENCES IN SCHEMA \"inventory\" FROM \"inventory-editor\";"
+        // Without inventory the sequence wildcard renders as a guarded
+        // DO-block: per-object expansion keeps the owner guard available.
+        assert!(
+            sql.contains("relkind IN ('S')")
+                && sql.contains("ON SEQUENCE %I.%I")
+                && sql.contains("pg_get_userbyid(c.relowner) <> 'inventory-editor'"),
+            "sequence wildcard should expand with owner exclusion: {sql}"
         );
     }
 
@@ -1361,7 +1617,7 @@ mod tests {
 
     #[test]
     fn render_materialized_view_wildcard_with_inventory_expands_per_object() {
-        let ctx = SqlContext::default().with_relation_inventory(BTreeMap::from([(
+        let ctx = SqlContext::default().with_object_inventory(BTreeMap::from([(
             (ObjectType::MaterializedView, "reporting".to_string()),
             vec!["daily_sales".to_string(), "weekly_sales".to_string()],
         )]));

@@ -118,8 +118,11 @@ pgroles apply --bundle path/to/pgroles.bundle.yaml --database-url postgres://loc
 | `--database-url` | PostgreSQL connection string (or `DATABASE_URL` env) |
 | `--mode` | Reconciliation mode: `authoritative` (default), `additive`, or `adopt` |
 | `--dry-run` | Print the SQL without executing it |
+| `--allow-schema-owner-transfers` | Permit adopt mode to run `ALTER SCHEMA ... OWNER TO` on schemas whose live owner differs |
 
 `apply` executes the plan inside a single database transaction. Individual changes may still render to multiple SQL statements internally, but the whole apply either commits or rolls back together.
+
+In adopt mode, apply **refuses** a plan that would transfer schema ownership (`ALTER SCHEMA ... OWNER TO ...`) unless `--allow-schema-owner-transfers` is passed — adopt filters role drops, not ownership convergence, and a silent transfer away from a live owner has broken brownfield rollouts before. `diff --mode adopt` warns instead of refusing, so CI drift checks keep working.
 
 Before executing changes, `apply` detects the connecting role's privilege level — true superuser, cloud provider superuser (for the explicitly supported providers), or regular user — and warns about any planned changes that exceed the detected privileges (for example setting `SUPERUSER` or `BYPASSRLS` through a managed-service admin role).
 
@@ -410,6 +413,10 @@ pgroles apply --database-url postgres://localhost/mydb --mode adopt
 ```
 
 Adopt mode filters out: `DROP ROLE`, `DROP OWNED`, `REASSIGN OWNED`, and `TERMINATE SESSIONS`. Revokes and membership removals for managed roles still apply. `ensure: absent` rules apply in this mode.
+
+{% callout type="warning" title="Adopt does not preserve undeclared grants" %}
+Adopt only filters role drops. Every privilege a declared role holds that the manifest does not declare — including out-of-band grants from migrations or manual SQL — is revoked. Review the full plan (`pgroles diff --mode adopt`) before applying, and stay in additive mode until the manifest declares everything the database relies on.
+{% /callout %}
 
 {% callout type="note" title="Adoption path" %}
 A common adoption path is: start with `--mode additive` to verify the manifest produces the right grants, then move to `--mode adopt` to start revoking excess grants within managed roles, and finally switch to `--mode authoritative` when you're confident the manifest is complete.

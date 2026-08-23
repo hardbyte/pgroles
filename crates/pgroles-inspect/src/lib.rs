@@ -35,8 +35,8 @@ pub use memberships::{
 };
 pub use preflight::{AuthorityIssue, preflight_authority_issues};
 pub use privileges::{
-    fetch_column_level_grants, fetch_database_privileges, fetch_object_inventory, fetch_privileges,
-    fetch_relation_inventory,
+    fetch_column_level_grants, fetch_database_privileges, fetch_object_inventory,
+    fetch_owned_relations, fetch_privileges, fetch_relation_inventory,
 };
 pub use public_grants::{PublicGrants, fetch_public_grants, format_public_grants};
 pub use roles::fetch_roles;
@@ -789,21 +789,23 @@ pub async fn inspect_all(
         // No wildcard patterns and no PUBLIC scopes: `generate` reads only
         // explicit managed-role state and never invents PUBLIC or absence
         // policy from what it finds.
-        let privilege_grants =
+        let privileges =
             privileges::fetch_privileges_with_wildcards(pool, &schema_refs, &role_refs, &[], &[])
-                .await?
-                .grants;
-        for (key, state) in privilege_grants {
+                .await?;
+        for (key, state) in privileges.grants {
             graph.grants.insert(key, state);
         }
+        // Owner-inherent entries are never exported: nobody granted them.
+        graph.inherent_grants.extend(privileges.inherent);
         remove_redundant_schema_owner_grants(&mut graph);
     }
 
     // Database privileges
-    let db_grants = fetch_database_privileges(pool, &role_refs).await?;
+    let (db_grants, db_inherent) = fetch_database_privileges(pool, &role_refs).await?;
     for (key, state) in db_grants {
         graph.grants.insert(key, state);
     }
+    graph.inherent_grants.extend(db_inherent);
 
     // Default privileges (schema layer only — no declared scopes, so no
     // global rows and no PUBLIC rows)
@@ -888,13 +890,17 @@ pub async fn fetch_schemas(
     pool: &PgPool,
     managed_schemas: &[&str],
 ) -> Result<Vec<SchemaRow>, InspectError> {
+    // Owner privileges go through the OID overload of has_schema_privilege:
+    // the name overload re-resolves the role and can fail with 42704 when a
+    // concurrent transaction drops it mid-read (seen in CI when parallel
+    // tests create/drop fixture roles while `generate` inventories them).
     let rows = sqlx::query_as::<_, SchemaRow>(
         r#"
         SELECT
             n.nspname AS schema_name,
             owner_role.rolname AS owner_name,
-            has_schema_privilege(owner_role.rolname, n.nspname, 'CREATE') AS owner_has_create,
-            has_schema_privilege(owner_role.rolname, n.nspname, 'USAGE') AS owner_has_usage
+            has_schema_privilege(owner_role.oid, n.nspname, 'CREATE') AS owner_has_create,
+            has_schema_privilege(owner_role.oid, n.nspname, 'USAGE') AS owner_has_usage
         FROM pg_namespace n
         JOIN pg_roles owner_role ON owner_role.oid = n.nspowner
         WHERE n.nspname = ANY($1)

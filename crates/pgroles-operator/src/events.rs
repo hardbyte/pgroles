@@ -401,6 +401,7 @@ fn noteworthy_failure_reason(
         "GcpAuthFailed" => "GcpAuthFailed",
         "InsufficientPrivileges" => "InsufficientPrivileges",
         "UnsafeRoleDrops" => "UnsafeRoleDropsBlocked",
+        "OwnerTransferBlocked" => "OwnerTransferBlocked",
         _ => return None,
     };
 
