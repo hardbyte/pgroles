@@ -220,6 +220,8 @@ const K8S_CALL_TIMEOUT: Duration = Duration::from_secs(30);
 pub(crate) fn plan_advisory_warnings(
     manifest: &pgroles_core::manifest::PolicyManifest,
     expanded: &pgroles_core::manifest::ExpandedManifest,
+    current: &pgroles_core::model::RoleGraph,
+    desired: &pgroles_core::model::RoleGraph,
     mode: pgroles_core::diff::ReconciliationMode,
     changes: &[pgroles_core::diff::Change],
 ) -> Vec<String> {
@@ -241,6 +243,9 @@ pub(crate) fn plan_advisory_warnings(
             }
         }
     }
+    warnings.extend(pgroles_core::diff::unenforceable_absence_warnings(
+        current, desired,
+    ));
     warnings
 }
 
@@ -919,6 +924,7 @@ fn mark_reconcile_failure_status(
             && c.condition_type != "Conflict"
     });
     status.change_summary = None;
+    status.plan_warnings = Vec::new();
     if clear_current_plan_ref {
         status.current_plan_ref = None;
     }
@@ -1047,6 +1053,7 @@ async fn reconcile_apply_inner(
                 .conditions
                 .retain(|c| c.condition_type != "Reconciling" && c.condition_type != "Drifted");
             status.change_summary = None;
+            status.plan_warnings = Vec::new();
             status.last_error = Some(conflict_message.clone());
             status.transient_failure_count = 0;
         })
@@ -1424,7 +1431,14 @@ async fn apply_under_lock(
         &effective_desired,
     );
 
-    let plan_warnings = plan_advisory_warnings(manifest, expanded, reconciliation_mode, &changes);
+    let plan_warnings = plan_advisory_warnings(
+        manifest,
+        expanded,
+        &current,
+        &effective_desired,
+        reconciliation_mode,
+        &changes,
+    );
     if !plan_warnings.is_empty() {
         tracing::warn!(name, namespace, warnings = ?plan_warnings, "plan advisory warnings");
     }
@@ -1642,6 +1656,7 @@ async fn apply_under_lock(
             status.last_attempted_generation = generation;
             status.last_successful_reconcile_time = Some(crate::crd::now_rfc3339());
             status.change_summary = Some(summary.clone());
+            status.plan_warnings = plan_warnings.clone();
             status.last_reconcile_mode = Some(PolicyMode::Observe);
             status.last_error = None;
             status.transient_failure_count = 0;
@@ -2015,6 +2030,7 @@ async fn apply_under_lock(
                                     resource,
                                     generation,
                                     summary.clone(),
+                                    plan_warnings.clone(),
                                     applied_password_source_versions.clone(),
                                 )
                                 .await?;
@@ -2357,6 +2373,7 @@ async fn apply_under_lock(
                                     resource,
                                     generation,
                                     summary.clone(),
+                                    plan_warnings.clone(),
                                     applied_password_source_versions.clone(),
                                 )
                                 .await?;
@@ -2502,6 +2519,7 @@ async fn apply_under_lock(
                     resource,
                     generation,
                     summary,
+                    plan_warnings,
                     applied_password_source_versions,
                 )
                 .await?;
@@ -3142,6 +3160,7 @@ async fn mark_reconciled_no_changes(
     resource: &PostgresPolicy,
     generation: Option<i64>,
     summary: crate::crd::ChangeSummary,
+    plan_warnings: Vec<String>,
     applied_password_source_versions: std::collections::BTreeMap<String, String>,
 ) -> Result<(), ReconcileError> {
     let previous_plan_ref = resource
@@ -3162,6 +3181,7 @@ async fn mark_reconciled_no_changes(
         status.last_attempted_generation = generation;
         status.last_successful_reconcile_time = Some(crate::crd::now_rfc3339());
         status.change_summary = Some(summary);
+        status.plan_warnings = plan_warnings;
         status.last_reconcile_mode = Some(PolicyMode::Apply);
         // Whatever plan was pointed at is gone; leaving the reference behind
         // strands it on a superseded or pruned object.
@@ -3636,6 +3656,8 @@ mod tests {
         let warnings = plan_advisory_warnings(
             &manifest_with_owner,
             &expanded,
+            &pgroles_core::model::RoleGraph::default(),
+            &pgroles_core::model::RoleGraph::default(),
             pgroles_core::diff::ReconciliationMode::Authoritative,
             &[],
         );
@@ -3654,6 +3676,8 @@ mod tests {
             plan_advisory_warnings(
                 &manifest_with_owner,
                 &expanded,
+                &pgroles_core::model::RoleGraph::default(),
+                &pgroles_core::model::RoleGraph::default(),
                 pgroles_core::diff::ReconciliationMode::Authoritative,
                 &[],
             )
@@ -3668,6 +3692,8 @@ mod tests {
         let adopt_warnings = plan_advisory_warnings(
             &manifest_with_owner,
             &expanded,
+            &pgroles_core::model::RoleGraph::default(),
+            &pgroles_core::model::RoleGraph::default(),
             pgroles_core::diff::ReconciliationMode::Adopt,
             &changes,
         );
@@ -3677,6 +3703,8 @@ mod tests {
             plan_advisory_warnings(
                 &manifest_with_owner,
                 &expanded,
+                &pgroles_core::model::RoleGraph::default(),
+                &pgroles_core::model::RoleGraph::default(),
                 pgroles_core::diff::ReconciliationMode::Authoritative,
                 &changes,
             )

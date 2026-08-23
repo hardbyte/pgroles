@@ -363,6 +363,54 @@ pub fn filter_preserved_grant_revokes(
         .collect()
 }
 
+/// Messages for `ensure: absent` assertions that can never converge because
+/// the asserted-against grantee owns the target object — its privileges are
+/// inherent. Exact keys are detected directly; wildcard assertions warn when
+/// they overlap any inherently-held entry under their (role, type, schema).
+pub fn unenforceable_absence_warnings(current: &RoleGraph, desired: &RoleGraph) -> Vec<String> {
+    let mut out = Vec::new();
+    for (key, absent) in &desired.grant_absences {
+        if key.name.as_deref() == Some("*") {
+            let range_start = GrantKey {
+                role: key.role.clone(),
+                object_type: key.object_type,
+                schema: key.schema.clone(),
+                name: None,
+            };
+            for (held_key, state) in current.grants.range(range_start..).take_while(|(k, _)| {
+                k.role == key.role && k.object_type == key.object_type && k.schema == key.schema
+            }) {
+                if current.inherent_grants.contains(held_key)
+                    && state
+                        .privileges
+                        .iter()
+                        .any(|privilege| absent.contains(privilege))
+                {
+                    out.push(format!(
+                        "ensure: absent of {:?} on {} \"{}\".\"*\" for \"{}\" cannot be fully \\
+                         enforced — the grantee owns some covered objects, so those \\
+                         privileges are inherent",
+                        absent,
+                        key.object_type,
+                        key.schema.as_deref().unwrap_or(""),
+                        key.role.as_str()
+                    ));
+                    break;
+                }
+            }
+        } else if current.inherent_grants.contains(key) {
+            out.push(format!(
+                "ensure: absent of {:?} on {} for \"{}\" cannot be enforced — the grantee \\
+                 owns the object, so those privileges are inherent",
+                absent,
+                key.object_type,
+                key.role.as_str()
+            ));
+        }
+    }
+    out
+}
+
 fn filter_additive_changes(changes: Vec<Change>) -> Vec<Change> {
     let skipped_owner_transfers: BTreeSet<(String, String)> = changes
         .iter()

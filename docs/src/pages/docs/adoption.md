@@ -71,7 +71,7 @@ spec:
 
 Once the manifest covers all roles and grants you want managed, switch to `reconciliation_mode: authoritative` to enable full convergence. Review the planned revocations carefully before switching — in a typical brownfield database, this may include thousands of existing grants to roles not yet in the manifest.
 
-Roles whose grant surface is known but not yet fully declared can be onboarded safely with `preserve_undeclared_grants: true` — see [preserving undeclared grants](/docs/manifest-reference#preserving-undeclared-grants). Adopt mode additionally refuses to transfer schema ownership unless `--allow-schema-owner-transfers` is passed (CLI) or the transfer is reviewed in the plan (operator).
+Roles whose grant surface is known but not yet fully declared can be onboarded safely with `preserve_undeclared_grants: true` — see [preserving undeclared grants](/docs/manifest-reference#preserving-undeclared-grants). Adopt mode additionally refuses to transfer schema ownership unless `--allow-schema-owner-transfers` is passed (CLI) or `spec.allow_schema_owner_transfers: true` is set (operator) — reviewing or approving a plan does not bypass the guard.
 
 ## Multi-team adoption with bundles
 

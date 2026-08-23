@@ -523,6 +523,17 @@ fn render_wildcard_expanded(
     // owner's privileges are inherent — see `SqlContext::owned_relations`.
     let skip_owned = action == "REVOKE";
 
+    // Only revokes need per-object expansion (to apply the owner guard).
+    // Grants have no owner interaction, so sequences and routines keep the
+    // compact `ALL ... IN SCHEMA` form regardless of schema size.
+    if !skip_owned && matches!(object_type, ObjectType::Sequence | ObjectType::Function) {
+        return vec![format!(
+            "{action} {privilege_list} ON {} {subject_preposition} {};",
+            format_object_target(object_type, schema, Some("*")),
+            render_grantee(role)
+        )];
+    }
+
     if let Some(object_names) = ctx
         .object_inventory
         .get(&(object_type, schema_name.to_string()))
@@ -1255,6 +1266,37 @@ mod tests {
         assert_eq!(
             render_statements_with_context(&change, &ctx).join("\n"),
             "REVOKE EXECUTE ON ROUTINE \"mix\".\"f_other\"(text) FROM \"fn_owner\";"
+        );
+    }
+
+    #[test]
+    fn render_wildcard_grants_keep_all_form_for_sequences_and_routines() {
+        let seq = Change::Grant {
+            role: "r1".into(),
+            privileges: BTreeSet::from([Privilege::Usage]),
+            object_type: ObjectType::Sequence,
+            schema: Some("s".to_string()),
+            name: Some("*".to_string()),
+        };
+        let ctx = SqlContext::default().with_object_inventory(BTreeMap::from([(
+            (ObjectType::Sequence, "s".to_string()),
+            vec!["a".to_string(), "b".to_string(), "c".to_string()],
+        )]));
+        assert_eq!(
+            render_statements_with_context(&seq, &ctx).join("\n"),
+            "GRANT USAGE ON ALL SEQUENCES IN SCHEMA \"s\" TO \"r1\";"
+        );
+
+        let routine = Change::Grant {
+            role: "r1".into(),
+            privileges: BTreeSet::from([Privilege::Execute]),
+            object_type: ObjectType::Function,
+            schema: Some("s".to_string()),
+            name: Some("*".to_string()),
+        };
+        assert_eq!(
+            render_statements_with_context(&routine, &ctx).join("\n"),
+            "GRANT EXECUTE ON ALL ROUTINES IN SCHEMA \"s\" TO \"r1\";"
         );
     }
 

@@ -1866,18 +1866,8 @@ fn warn_unenforceable_absence_assertions(
     current: &pgroles_core::model::RoleGraph,
     desired: &pgroles_core::model::RoleGraph,
 ) {
-    for key in desired.grant_absences.keys() {
-        if current.inherent_grants.contains(key)
-            && let Some(absent) = desired.grant_absences.get(key)
-        {
-            eprintln!(
-                "Warning: ensure: absent of {:?} on {} for \"{}\" cannot be enforced — the \\
-                 grantee owns the object, so those privileges are inherent",
-                absent,
-                key.object_type,
-                key.role.as_str()
-            );
-        }
+    for warning in pgroles_core::diff::unenforceable_absence_warnings(current, desired) {
+        eprintln!("Warning: {warning}");
     }
 }
 
