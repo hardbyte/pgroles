@@ -5116,6 +5116,97 @@ grants:
         ));
     }
 
+    /// Mixed-ownership sequences: a wildcard sequence grant must not strip
+    /// the owner's inherent privileges from sequences it owns (issue #201
+    /// review, second round).
+    #[test]
+    #[ignore]
+    fn mixed_ownership_sequence_wildcard_does_not_revoke_owner_inherent_privileges() {
+        let schema = unique_name("mseq_schema");
+        let owner = unique_name("mseq_owner");
+
+        execute_sql(&format!(
+            r#"
+            DROP SCHEMA IF EXISTS "{schema}" CASCADE;
+            DROP ROLE IF EXISTS "{owner}";
+            CREATE ROLE "{owner}" NOLOGIN;
+            CREATE SCHEMA "{schema}" AUTHORIZATION postgres;
+            CREATE SEQUENCE "{schema}".seq_own;
+            CREATE SEQUENCE "{schema}".seq_other;
+            ALTER SEQUENCE "{schema}".seq_own OWNER TO "{owner}";
+            -- Explicit grants materialize seq_own's ACL entry.
+            GRANT USAGE, SELECT, UPDATE ON ALL SEQUENCES IN SCHEMA "{schema}" TO "{owner}";
+            "#
+        ));
+
+        // Desired keeps only USAGE on the wildcard; UPDATE is drift on both
+        // sequences as far as the manifest is concerned.
+        let manifest_file = write_temp_manifest(&format!(
+            r#"
+roles:
+  - name: {owner}
+    nologin: true
+
+grants:
+  - role: {owner}
+    privileges: [USAGE]
+    object: {{ type: sequence, schema: {schema}, name: "*" }}
+"#
+        ));
+
+        pgroles_cmd()
+            .args([
+                "apply",
+                "--file",
+                manifest_file.path().to_str().unwrap(),
+                "--database-url",
+                &database_url(),
+                "--mode",
+                "adopt",
+            ])
+            .assert()
+            .success();
+
+        // The owned sequence keeps its inherent UPDATE...
+        assert!(
+            with_runtime(async {
+                let pool = PgPool::connect(&database_url()).await.unwrap();
+                let has: bool =
+                    sqlx::query_scalar("SELECT has_sequence_privilege($1, $2, 'UPDATE')")
+                        .bind(&owner)
+                        .bind(format!("{schema}.seq_own"))
+                        .fetch_one(&pool)
+                        .await
+                        .unwrap();
+                has
+            }),
+            "owner-inherent UPDATE must survive a mixed-ownership sequence wildcard"
+        );
+        // ...while the explicit drift on the other sequence is revoked.
+        assert!(
+            !with_runtime(async {
+                let pool = PgPool::connect(&database_url()).await.unwrap();
+                let has: bool =
+                    sqlx::query_scalar("SELECT has_sequence_privilege($1, $2, 'UPDATE')")
+                        .bind(&owner)
+                        .bind(format!("{schema}.seq_other"))
+                        .fetch_one(&pool)
+                        .await
+                        .unwrap();
+                has
+            }),
+            "undeclared UPDATE on the non-owned sequence should be revoked"
+        );
+
+        // Cleanup
+        execute_sql(&format!(
+            r#"
+            DROP SCHEMA IF EXISTS "{schema}" CASCADE;
+            DROP ROLE IF EXISTS "{owner}";
+            "#
+        ));
+    }
+
     /// Adopt mode refuses to transfer schema ownership away from the live
     /// owner unless `--allow-schema-owner-transfers` is passed (issue #201).
     #[test]
@@ -5602,7 +5693,7 @@ default_privileges:
         .to_string();
         assert!(
             plan.contains(&format!(
-                r#"REVOKE EXECUTE ON ALL ROUTINES IN SCHEMA "{}" FROM PUBLIC;"#,
+                r#"REVOKE EXECUTE ON ROUTINE "{}"."secret"(x integer) FROM PUBLIC;"#,
                 fixture.schema
             )),
             "plan should revoke PUBLIC EXECUTE on existing routines:\n{plan}"

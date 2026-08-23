@@ -594,38 +594,58 @@ pub async fn fetch_relation_inventory(
         .filter(|((object_type, _), _)| {
             matches!(
                 object_type,
-                ObjectType::Table | ObjectType::View | ObjectType::MaterializedView
+                ObjectType::Table
+                    | ObjectType::View
+                    | ObjectType::MaterializedView
+                    | ObjectType::Sequence
+                    | ObjectType::Function
             )
         })
         .collect())
 }
 
-/// Which managed role owns which relation, for the wildcard-REVOKE owner
+/// Which managed role owns which object, for the wildcard-REVOKE owner
 /// guard rendered by `SqlContext`. Complements the ACL-level inherent tag:
 /// ownership is known even where per-object ACL entries were folded into a
-/// `name: "*"` key.
+/// `name: "*"` key. Covers relations, sequences, and routines (with identity
+/// arguments in the name, matching how ACL rows and the inventory spell them).
 pub async fn fetch_owned_relations(
     pool: &PgPool,
     managed_schemas: &[&str],
 ) -> Result<BTreeSet<(String, ObjectType, String, String)>, sqlx::Error> {
-    let rows: Vec<(String, String, String, String)> = sqlx::query_as(
+    let rows: Vec<(String, String, String, Option<String>)> = sqlx::query_as(
         r#"
-        SELECT
-            pg_get_userbyid(c.relowner) AS owner_name,
-            CASE c.relkind
-                WHEN 'r' THEN 'table'
-                WHEN 'p' THEN 'table'
-                WHEN 'v' THEN 'view'
-                WHEN 'm' THEN 'materialized_view'
-                WHEN 'S' THEN 'sequence'
-            END AS obj_type,
-            n.nspname AS schema_name,
-            c.relname::text AS object_name
-        FROM pg_class c
-        JOIN pg_namespace n ON n.oid = c.relnamespace
-        WHERE n.nspname = ANY($1)
-          AND c.relkind IN ('r', 'p', 'v', 'm', 'S')
-        ORDER BY 1, 3, 4
+        SELECT owner_name, obj_type, schema_name, object_name FROM (
+            SELECT
+                pg_get_userbyid(c.relowner) AS owner_name,
+                CASE c.relkind
+                    WHEN 'r' THEN 'table'
+                    WHEN 'p' THEN 'table'
+                    WHEN 'v' THEN 'view'
+                    WHEN 'm' THEN 'materialized_view'
+                    WHEN 'S' THEN 'sequence'
+                END AS obj_type,
+                n.nspname AS schema_name,
+                c.relname::text AS object_name,
+                1 AS sort_key
+            FROM pg_class c
+            JOIN pg_namespace n ON n.oid = c.relnamespace
+            WHERE n.nspname = ANY($1)
+              AND c.relkind IN ('r', 'p', 'v', 'm', 'S')
+            UNION ALL
+            SELECT DISTINCT
+                pg_get_userbyid(p.proowner) AS owner_name,
+                'function' AS obj_type,
+                n.nspname AS schema_name,
+                p.proname || '(' ||
+                    pg_catalog.pg_get_function_identity_arguments(p.oid) || ')'
+                    AS object_name,
+                2 AS sort_key
+            FROM pg_proc p
+            JOIN pg_namespace n ON n.oid = p.pronamespace
+            WHERE n.nspname = ANY($1)
+        ) owned
+        ORDER BY sort_key, owner_name, schema_name, object_name
         "#,
     )
     .bind(managed_schemas)
@@ -636,6 +656,7 @@ pub async fn fetch_owned_relations(
         .into_iter()
         .filter_map(|(owner, obj_type, schema, name)| {
             let object_type = obj_type_str_to_object_type(&obj_type)?;
+            let name = name?;
             Some((owner, object_type, schema, name))
         })
         .collect())

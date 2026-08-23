@@ -1678,7 +1678,7 @@ async fn detect_sql_context_with_config(
     );
     Ok(
         pgroles_core::sql::SqlContext::from_version_num(pg_version.version_num)
-            .with_relation_inventory(relation_inventory)
+            .with_object_inventory(relation_inventory)
             .with_owned_relations(owned_relations),
     )
 }
