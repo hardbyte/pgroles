@@ -69,6 +69,8 @@ spec:
 
 This is the same behavior as the CLI `--mode` flag. See the [CLI reconciliation modes](/docs/cli#reconciliation-modes) section for detailed semantics.
 
+Under `adopt`, an apply-mode policy **refuses** to transfer schema ownership (`ALTER SCHEMA ... OWNER TO ...`) on a schema whose live owner differs, surfacing an `OwnerTransferBlocked` condition — matching the CLI's `--allow-schema-owner-transfers` refusal. Set `spec.allow_schema_owner_transfers: true` to permit the transfers, use `additive` to skip them, or declare each schema's current owner. Observe-mode policies keep producing plans for review either way.
+
 ## Deletion behaviour
 
 When a `PostgresPolicy` resource is deleted, the operator **does not** revoke grants or drop roles. The database is left as-is. This is intentional — resource deletion means "stop managing", not "undo everything".
