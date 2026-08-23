@@ -3303,6 +3303,7 @@ mod tests {
             suspend: false,
             mode: crate::crd::PolicyMode::Apply,
             reconciliation_mode: CrdReconciliationMode::default(),
+            allow_schema_owner_transfers: false,
             default_owner: None,
             profiles: Default::default(),
             schemas: Vec::new(),

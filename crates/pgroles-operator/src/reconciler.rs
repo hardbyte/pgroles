@@ -122,6 +122,9 @@ pub enum ReconcileError {
     #[error("{0}")]
     UnsafeRoleDrops(String),
 
+    #[error("adopt mode would transfer schema ownership: {0}")]
+    OwnerTransferBlocked(String),
+
     #[error("Kubernetes API error: {0}")]
     Kube(#[from] kube::Error),
 
@@ -239,6 +242,39 @@ pub(crate) fn plan_advisory_warnings(
         }
     }
     warnings
+}
+
+/// The adopt-mode schema-ownership-transfer guard.
+///
+/// Returns the blocking message when an adopt plan would transfer ownership
+/// of any schema whose live owner differs, unless explicitly allowed. The
+/// CLI enforces the same rule behind `--allow-schema-owner-transfers`.
+pub(crate) fn adopt_owner_transfer_blocker(
+    mode: pgroles_core::diff::ReconciliationMode,
+    allow_schema_owner_transfers: bool,
+    changes: &[pgroles_core::diff::Change],
+) -> Option<String> {
+    if mode != pgroles_core::diff::ReconciliationMode::Adopt || allow_schema_owner_transfers {
+        return None;
+    }
+    let transfers: Vec<String> = changes
+        .iter()
+        .filter_map(|change| match change {
+            pgroles_core::diff::Change::AlterSchemaOwner { name, owner } => {
+                Some(format!("\"{name}\" -> \"{owner}\""))
+            }
+            _ => None,
+        })
+        .collect();
+    if transfers.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "{} schema(s): {}. Set spec.allow_schema_owner_transfers to permit this, \
+         use additive mode to skip transfers, or declare each schema's current owner.",
+        transfers.len(),
+        transfers.join(", ")
+    ))
 }
 
 async fn bounded_k8s_call<T, F>(call: &'static str, future: F) -> Result<T, ReconcileError>
@@ -551,6 +587,7 @@ fn retry_class_for_reconcile_error(error: &ReconcileError) -> RetryClass {
         | ReconcileError::ExecutorAuthority(_)
         | ReconcileError::ConflictingPolicy(_)
         | ReconcileError::UnsafeRoleDrops(_)
+        | ReconcileError::OwnerTransferBlocked(_)
         | ReconcileError::EmptyPasswordSecret { .. }
         | ReconcileError::NoNamespace
         | ReconcileError::ApprovalDigest(_)
@@ -1390,6 +1427,20 @@ async fn apply_under_lock(
     let plan_warnings = plan_advisory_warnings(manifest, expanded, reconciliation_mode, &changes);
     if !plan_warnings.is_empty() {
         tracing::warn!(name, namespace, warnings = ?plan_warnings, "plan advisory warnings");
+    }
+
+    // Adopt-mode ownership transfer refusal: the operator executes without a
+    // human reviewing the plan, so the CLI's flag-gated refusal applies here
+    // too — but only when SQL will actually run. Observe policies keep
+    // producing plans for review regardless.
+    if matches!(resource.spec.mode, crate::crd::PolicyMode::Apply)
+        && let Some(blocker) = adopt_owner_transfer_blocker(
+            reconciliation_mode,
+            resource.spec.allow_schema_owner_transfers,
+            &changes,
+        )
+    {
+        return Err(ReconcileError::OwnerTransferBlocked(blocker));
     }
 
     let resolved_passwords = resolve_passwords_from_secrets(ctx, resource, namespace).await?;
@@ -3018,7 +3069,7 @@ pub(crate) async fn detect_sql_context(
     let owned_relations = pgroles_inspect::fetch_owned_relations(pool, &privilege_schemas).await?;
     Ok(
         pgroles_core::sql::SqlContext::from_version_num(pg_version.version_num)
-            .with_relation_inventory(relation_inventory)
+            .with_object_inventory(relation_inventory)
             .with_owned_relations(owned_relations),
     )
 }
@@ -3486,6 +3537,7 @@ impl ReconcileError {
                 SqlErrorKind::Transient => "ApplyFailed",
             },
             ReconcileError::UnsafeRoleDrops(_) => "UnsafeRoleDrops",
+            ReconcileError::OwnerTransferBlocked(_) => "OwnerTransferBlocked",
             ReconcileError::EmptyPasswordSecret { .. } => "InvalidSpec",
             ReconcileError::MissingDatabaseObjects(_) => "MissingDatabaseObject",
             ReconcileError::PasswordGeneration(_) => "SecretFetchFailed",
@@ -3525,6 +3577,50 @@ mod tests {
             inherit: true,
             admin: false,
         }
+    }
+
+    #[test]
+    fn adopt_owner_transfer_blocker_gates_on_flag_and_mode() {
+        let changes = vec![pgroles_core::diff::Change::AlterSchemaOwner {
+            name: "etl".to_string(),
+            owner: "pgloader_pg".to_string(),
+        }];
+
+        // Adopt without the flag blocks, naming schemas and the spec field.
+        let blocker = adopt_owner_transfer_blocker(
+            pgroles_core::diff::ReconciliationMode::Adopt,
+            false,
+            &changes,
+        )
+        .expect("should block");
+        assert!(blocker.contains("etl"));
+        assert!(blocker.contains("allow_schema_owner_transfers"));
+
+        // The flag permits it; other modes never block.
+        assert!(
+            adopt_owner_transfer_blocker(
+                pgroles_core::diff::ReconciliationMode::Adopt,
+                true,
+                &changes,
+            )
+            .is_none()
+        );
+        assert!(
+            adopt_owner_transfer_blocker(
+                pgroles_core::diff::ReconciliationMode::Authoritative,
+                false,
+                &changes,
+            )
+            .is_none()
+        );
+        assert!(
+            adopt_owner_transfer_blocker(
+                pgroles_core::diff::ReconciliationMode::Adopt,
+                false,
+                &[],
+            )
+            .is_none()
+        );
     }
 
     #[test]
@@ -3727,6 +3823,7 @@ mod tests {
             suspend: false,
             mode: PolicyMode::Apply,
             reconciliation_mode: CrdReconciliationMode::default(),
+            allow_schema_owner_transfers: false,
             default_owner: None,
             profiles: Default::default(),
             schemas: Vec::new(),
@@ -3768,6 +3865,7 @@ mod tests {
                 suspend: false,
                 mode: PolicyMode::Apply,
                 reconciliation_mode: CrdReconciliationMode::default(),
+                allow_schema_owner_transfers: false,
                 default_owner: None,
                 profiles: Default::default(),
                 schemas: Vec::new(),
@@ -3965,6 +4063,7 @@ mod tests {
                 suspend: false,
                 mode: PolicyMode::Apply,
                 reconciliation_mode: CrdReconciliationMode::default(),
+                allow_schema_owner_transfers: false,
                 default_owner: None,
                 profiles: Default::default(),
                 schemas: vec![pgroles_core::manifest::SchemaBinding {
@@ -3999,6 +4098,7 @@ mod tests {
                 suspend: false,
                 mode: PolicyMode::Apply,
                 reconciliation_mode: CrdReconciliationMode::default(),
+                allow_schema_owner_transfers: false,
                 default_owner: None,
                 profiles: Default::default(),
                 schemas: Vec::new(),

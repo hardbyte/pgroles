@@ -76,6 +76,14 @@ pub struct PostgresPolicySpec {
     #[serde(default)]
     pub reconciliation_mode: CrdReconciliationMode,
 
+    /// Permit adopt mode to transfer schema ownership (`ALTER SCHEMA ...
+    /// OWNER TO ...`) on schemas whose live owner differs. Without this,
+    /// apply-mode adopt policies fail such plans with an
+    /// `OwnerTransferBlocked` condition — the operator equivalent of the
+    /// CLI's `--allow-schema-owner-transfers`.
+    #[serde(default)]
+    pub allow_schema_owner_transfers: bool,
+
     /// Default owner for ALTER DEFAULT PRIVILEGES (e.g. "app_owner").
     #[serde(default)]
     #[schemars(length(min = 1, max = MAX_IDENTIFIER))]
@@ -3081,6 +3089,7 @@ mod tests {
             suspend: false,
             mode: PolicyMode::Apply,
             reconciliation_mode: CrdReconciliationMode::default(),
+            allow_schema_owner_transfers: false,
             default_owner: Some("app_owner".to_string()),
             profiles: std::collections::HashMap::new(),
             schemas: vec![],
@@ -3145,6 +3154,7 @@ mod tests {
             suspend: false,
             mode: PolicyMode::Apply,
             reconciliation_mode: CrdReconciliationMode::default(),
+            allow_schema_owner_transfers: false,
             default_owner: None,
             profiles: std::collections::HashMap::from([(
                 "editor".to_string(),
@@ -3229,6 +3239,7 @@ mod tests {
             suspend: false,
             mode: PolicyMode::Apply,
             reconciliation_mode: CrdReconciliationMode::default(),
+            allow_schema_owner_transfers: false,
             default_owner: None,
             profiles,
             schemas: vec![SchemaBinding {
@@ -3288,6 +3299,7 @@ mod tests {
             suspend: false,
             mode: PolicyMode::Apply,
             reconciliation_mode: CrdReconciliationMode::default(),
+            allow_schema_owner_transfers: false,
             default_owner: Some("app_owner".to_string()),
             profiles: std::collections::HashMap::new(),
             schemas: vec![],
@@ -3591,6 +3603,7 @@ mod tests {
             suspend: false,
             mode: PolicyMode::Apply,
             reconciliation_mode: CrdReconciliationMode::default(),
+            allow_schema_owner_transfers: false,
             default_owner: None,
             profiles: Default::default(),
             schemas: vec![],
@@ -4358,6 +4371,7 @@ params:
             suspend: false,
             mode: PolicyMode::Apply,
             reconciliation_mode: CrdReconciliationMode::default(),
+            allow_schema_owner_transfers: false,
             default_owner: None,
             profiles: std::collections::HashMap::new(),
             schemas: vec![],
@@ -4817,6 +4831,7 @@ retirements:
             suspend: false,
             mode: PolicyMode::Apply,
             reconciliation_mode: CrdReconciliationMode::default(),
+            allow_schema_owner_transfers: false,
             default_owner: None,
             profiles: std::collections::HashMap::new(),
             schemas: vec![],
@@ -4848,6 +4863,7 @@ retirements:
             suspend: false,
             mode: PolicyMode::Apply,
             reconciliation_mode: CrdReconciliationMode::default(),
+            allow_schema_owner_transfers: false,
             default_owner: None,
             profiles: std::collections::HashMap::new(),
             schemas: vec![],
@@ -4954,6 +4970,7 @@ retirements:
             suspend: false,
             mode: PolicyMode::Apply,
             reconciliation_mode: CrdReconciliationMode::default(),
+            allow_schema_owner_transfers: false,
             default_owner: None,
             profiles: std::collections::HashMap::new(),
             schemas: vec![],
@@ -5008,6 +5025,7 @@ retirements:
             suspend: false,
             mode: PolicyMode::Apply,
             reconciliation_mode: CrdReconciliationMode::default(),
+            allow_schema_owner_transfers: false,
             default_owner: None,
             profiles: std::collections::HashMap::new(),
             schemas: vec![],
@@ -5062,6 +5080,7 @@ retirements:
             suspend: false,
             mode: PolicyMode::Apply,
             reconciliation_mode: CrdReconciliationMode::default(),
+            allow_schema_owner_transfers: false,
             default_owner: None,
             profiles: std::collections::HashMap::new(),
             schemas: vec![],
@@ -5120,6 +5139,7 @@ retirements:
             suspend: false,
             mode: PolicyMode::Apply,
             reconciliation_mode: CrdReconciliationMode::default(),
+            allow_schema_owner_transfers: false,
             default_owner: None,
             profiles: std::collections::HashMap::new(),
             schemas: vec![],
@@ -5176,6 +5196,7 @@ retirements:
             suspend: false,
             mode: PolicyMode::Apply,
             reconciliation_mode: CrdReconciliationMode::default(),
+            allow_schema_owner_transfers: false,
             default_owner: None,
             profiles: std::collections::HashMap::new(),
             schemas: vec![],
@@ -5233,6 +5254,7 @@ retirements:
             suspend: false,
             mode: PolicyMode::Apply,
             reconciliation_mode: CrdReconciliationMode::default(),
+            allow_schema_owner_transfers: false,
             default_owner: None,
             profiles: std::collections::HashMap::new(),
             schemas: vec![],
@@ -5289,6 +5311,7 @@ retirements:
             suspend: false,
             mode: PolicyMode::Apply,
             reconciliation_mode: CrdReconciliationMode::default(),
+            allow_schema_owner_transfers: false,
             default_owner: None,
             profiles: std::collections::HashMap::new(),
             schemas: vec![],
@@ -5374,6 +5397,7 @@ retirements:
             suspend: false,
             mode: PolicyMode::Apply,
             reconciliation_mode: CrdReconciliationMode::Authoritative,
+            allow_schema_owner_transfers: false,
             default_owner: None,
             profiles: Default::default(),
             schemas: vec![],
@@ -5521,6 +5545,7 @@ retirements:
             suspend: false,
             mode: PolicyMode::Observe,
             reconciliation_mode: CrdReconciliationMode::Authoritative,
+            allow_schema_owner_transfers: false,
             default_owner: None,
             profiles: Default::default(),
             schemas: vec![],
@@ -5932,8 +5957,15 @@ retirements:
 
         // Execution fields belong to the policy alone: a candidate carries no
         // connection (unless `spec.target` overrides it), interval, mode,
-        // suspend or approval.
-        let execution = ["connection", "interval", "mode", "suspend", "approval"];
+        // suspend, approval, or ownership-transfer allowance.
+        let execution = [
+            "connection",
+            "interval",
+            "mode",
+            "suspend",
+            "approval",
+            "allow_schema_owner_transfers",
+        ];
         let policy_content: Vec<&String> = policy_spec
             .as_object()
             .expect("policy spec has properties")
