@@ -890,13 +890,17 @@ pub async fn fetch_schemas(
     pool: &PgPool,
     managed_schemas: &[&str],
 ) -> Result<Vec<SchemaRow>, InspectError> {
+    // Owner privileges go through the OID overload of has_schema_privilege:
+    // the name overload re-resolves the role and can fail with 42704 when a
+    // concurrent transaction drops it mid-read (seen in CI when parallel
+    // tests create/drop fixture roles while `generate` inventories them).
     let rows = sqlx::query_as::<_, SchemaRow>(
         r#"
         SELECT
             n.nspname AS schema_name,
             owner_role.rolname AS owner_name,
-            has_schema_privilege(owner_role.rolname, n.nspname, 'CREATE') AS owner_has_create,
-            has_schema_privilege(owner_role.rolname, n.nspname, 'USAGE') AS owner_has_usage
+            has_schema_privilege(owner_role.oid, n.nspname, 'CREATE') AS owner_has_create,
+            has_schema_privilege(owner_role.oid, n.nspname, 'USAGE') AS owner_has_usage
         FROM pg_namespace n
         JOIN pg_roles owner_role ON owner_role.oid = n.nspowner
         WHERE n.nspname = ANY($1)
