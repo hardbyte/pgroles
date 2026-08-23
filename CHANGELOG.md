@@ -9,30 +9,56 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [0.10.0-alpha.2] - 2026-08-24
 
-### Changed
+This prerelease makes brownfield adoption safer and adds declarative management of
+memberships in PostgreSQL predefined and externally managed roles.
 
-- **Breaking for adopt-mode users: schema-ownership transfers now require an explicit opt-in.** `apply --mode adopt` fails a plan containing `ALTER SCHEMA ... OWNER TO ...` on a schema whose live owner differs unless `--allow-schema-owner-transfers` is passed, and apply-mode operator policies fail with an `OwnerTransferBlocked` condition unless `spec.allow_schema_owner_transfers: true` is set. Previously both executed the transfer. Add the flag/field if your policy intentionally re-homes schemas, or declare each schema's current owner. (#201)
+### Upgrade notes
+
+- **Declared memberships in `external: true` roles now take effect.** Previous
+  releases accepted these declarations but did not include them in plans. Review
+  the next plan before applying it; pgroles may now grant the declared memberships.
+  Undeclared memberships remain untouched unless the membership rule sets
+  `exclusive: true`. (#200)
+- **Adopt-mode schema ownership transfers require explicit approval.** If an
+  adopt plan would change a schema's owner, pass
+  `--allow-schema-owner-transfers` to `pgroles apply` or set
+  `spec.allow_schema_owner_transfers: true` on an apply-mode `PostgresPolicy`.
+  Without the opt-in, apply stops before making changes and the operator reports
+  `OwnerTransferBlocked`. Diff and observe mode continue to show the proposed
+  transfer. (#201)
 
 ### Added
 
-- **Memberships in predefined (`pg_*`) and external roles are now managed when declared.** (#200) A membership stanza may name a predefined role (`pg_read_all_data`, `pg_monitor`, ...) directly — no `roles:` entry needed — and declared members are granted and kept converged. Undeclared live members of predefined and `external: true` roles stay untouched by default, so adopting pgroles never strips provider-granted memberships; a new stanza-level `exclusive: true` asserts the member list is complete and plans a `REVOKE` for anyone else (never for members that are themselves `pg_*` roles — PostgreSQL's built-in hierarchy is not modified). Declaring a `pg_*` role under `roles:` without `external: true` is now a validation error, exclusive stanzas are rejected on ordinary managed roles, and bundle composition rejects an exclusive member list split across documents.
-- **`pgroles generate` exports predefined-role memberships and `pgroles inspect` reports them** ("master keys") even when no manifest declares them.
-- **Preflight checks for predefined-role grants.** Plans warn — and applies block — when the executor lacks `ADMIN OPTION` on a predefined role it must grant or revoke, and when a manifest references a predefined role the server does not have (with the PostgreSQL version that introduced it, e.g. `pg_maintain` → 17).
-
-### Changed
-
-- **Declared memberships granted from `external: true` roles now converge.** Previously such stanzas parsed but every resulting change was silently filtered out of plans. Manifests that declared them documentation-style will now start granting (and, under `exclusive: true`, revoking) those memberships — for example `GRANT rds_iam TO app_user` can now be policy.
+- **Manage memberships in PostgreSQL predefined roles and `external: true`
+  roles.** Membership rules can grant roles such as `pg_monitor` directly,
+  without adding them to `roles`. By default pgroles manages only the declared
+  members; set `exclusive: true` to revoke other ordinary members as well.
+  PostgreSQL's built-in `pg_*` role hierarchy is always preserved. `generate`
+  now exports predefined-role memberships, `inspect` reports them, and preflight
+  checks that the executor has the required `ADMIN OPTION` and that the role is
+  available on the connected PostgreSQL version. (#200)
+- **Preserve existing grants while adopting a role.** Set
+  `preserve_undeclared_grants: true` on a role to add its declared privileges
+  without removing other in-scope grants. Explicit `ensure: absent` rules still
+  revoke access. Remove the setting once the role's complete access has been
+  captured in policy. (#201)
+- **Persistent operator plan warnings.** `PostgresPolicy.status.plan_warnings`
+  records warnings such as an undeclared `default_owner` or a pending adopt-mode
+  schema ownership transfer, so they remain visible after reconciliation logs
+  expire. (#201)
+- **Interactive PostgreSQL access guide.** The documentation now includes a
+  browser-based course covering roles, ownership, grants, default privileges,
+  drift, offboarding, and security review, with runnable exercises that do not
+  require a local PostgreSQL installation. (#197)
 
 ### Fixed
 
-- **Owner-inherent ACL entries are no longer revocable state.** PostgreSQL records the owner's implicit privileges (`arwdDxtm` — the `m` is MAINTAIN, PG17+) in a relation's ACL as soon as any grant materializes it. Inspection read that entry back as explicit granted state, so convergence planned `REVOKE`s against table owners for privileges nobody had granted — including `TRUNCATE`, `REFERENCES`, and `TRIGGER` — and applying such a plan broke the owner's DML and foreign-key key-share checks. Inspection now tags owner-grantee entries across relations, schemas, functions, types, and databases as *inherent*: the diff engine never revokes them (`ensure: absent` included), treats them as covering any declared grant on the same target so manifests that declare privileges on an owner's own objects still converge, and `pgroles generate` never exports them. As defense-in-depth, wildcard `REVOKE`s render per-object from live inventory for tables, views, materialized views, sequences, and routines — skipping objects the grantee owns — so the guarantee holds by construction even where per-object ACL entries were folded into a `name: "*"` key (mixed-ownership schemas). (#201)
-
-### Added
-
-- **`preserve_undeclared_grants` per-role adoption assertion.** A role marked with the flag keeps its undeclared in-scope grants through adopt and authoritative convergence — brownfield access survives, missing declared privileges are still granted, and nothing is trimmed until the flag is removed. Explicit `ensure: absent` assertions revoke regardless, so the flag is a reviewable stepping stone, not an escape hatch: remove it once the manifest declares the role's real grant surface. Available on both manifest roles and the operator's `RoleSpec`. (#201)
-- **Adopt mode refuses schema-ownership transfers without an explicit opt-in — in the CLI and the operator.** Adopt filters role drops, not ownership convergence; `apply --mode adopt` now fails a plan containing `ALTER SCHEMA ... OWNER TO ...` on a schema whose live owner differs, naming the schemas and the flag, and apply-mode operator policies fail with an `OwnerTransferBlocked` condition unless `spec.allow_schema_owner_transfers: true` is set. `diff` and observe-mode policies warn/record instead of refusing so drift review keeps working. (#201)
-- **Operator surfaces plan warnings in policy status.** `status.plan_warnings` records advisory warnings from the last reconciliation — undeclared `default_owner`, adopt-mode ownership transfers — so they outlive the reconcile log window. (#201)
-- **Plan-time CLI warnings for silently-destructive policy shapes.** `diff`/`apply` warn when adopt mode transfers schema ownership away from the live owner (adopt filters role drops, not ownership convergence), and both the CLI and the operator warn when `default_owner` names a role the policy never declares, since every un-owned schema binding silently resolves to it while the role's own privileges stay uninspected. (#201)
+- **Never revoke an object's privileges from its owner.** pgroles previously
+  interpreted PostgreSQL's implicit owner privileges as ordinary grants and
+  could plan revocations against the owner after another ACL was added. Owner
+  access is now protected across tables, views, materialized views, sequences,
+  schemas, routines, types, and databases, including policies that use wildcard
+  rules. Generated manifests also omit these implicit owner privileges. (#201)
 
 ## [0.10.0-alpha.1] - 2026-08-21
 
