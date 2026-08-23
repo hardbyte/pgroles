@@ -3038,6 +3038,7 @@ mod inherent_tests {
                 privilege_schemas: vec!["inh_schema".to_string()],
                 include_database_privileges: false,
                 database_targets: Vec::new(),
+                membership_grantors: Vec::new(),
                 wildcard_grants: Vec::new(),
                 public_object_scopes: Vec::new(),
                 default_priv_scopes: Vec::new(),

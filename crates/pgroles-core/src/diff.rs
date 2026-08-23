@@ -398,7 +398,14 @@ pub fn unenforceable_absence_warnings(current: &RoleGraph, desired: &RoleGraph) 
                     break;
                 }
             }
-        } else if current.inherent_grants.contains(key) {
+        } else if current.inherent_grants.contains(key)
+            && current.grants.get(key).is_some_and(|state| {
+                state
+                    .privileges
+                    .iter()
+                    .any(|privilege| absent.contains(privilege))
+            })
+        {
             out.push(format!(
                 "ensure: absent of {:?} on {} for \"{}\" cannot be enforced — the grantee \\
                  owns the object, so those privileges are inherent",
@@ -1884,6 +1891,38 @@ memberships:
             }
             other => panic!("expected Grant, got: {other:?}"),
         }
+    }
+
+    #[test]
+    fn unenforceable_absence_warnings_require_actual_overlap() {
+        let key = GrantKey {
+            role: "app_owner".into(),
+            object_type: ObjectType::Table,
+            schema: Some("app".to_string()),
+            name: Some("widgets".to_string()),
+        };
+        let mut current = empty_graph();
+        current.grants.insert(
+            key.clone(),
+            GrantState {
+                privileges: BTreeSet::from([Privilege::Select]),
+            },
+        );
+        current.inherent_grants.insert(key.clone());
+
+        // Asserting an actually-held inherent privilege warns.
+        let mut desired = empty_graph();
+        desired
+            .grant_absences
+            .insert(key.clone(), BTreeSet::from([Privilege::Select]));
+        assert_eq!(unenforceable_absence_warnings(&current, &desired).len(), 1);
+
+        // Asserting a privilege the entry does not carry stays silent.
+        let mut satisfied = empty_graph();
+        satisfied
+            .grant_absences
+            .insert(key, BTreeSet::from([Privilege::Delete]));
+        assert!(unenforceable_absence_warnings(&current, &satisfied).is_empty());
     }
 
     #[test]
