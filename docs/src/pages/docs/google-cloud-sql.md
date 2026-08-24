@@ -95,7 +95,7 @@ grants:
 
 When a group member logs in for the first time, Cloud SQL creates their individual PostgreSQL role automatically and grants them the group's privileges.
 
-Use `external: true` for Cloud SQL IAM users and groups that are created through Cloud SQL IAM APIs, Terraform `google_sql_user`, or another platform owner. That keeps pgroles from changing the role's `LOGIN` attribute or revoking provider-managed role memberships while still allowing grants and ownership references.
+Use `external: true` for Cloud SQL IAM users and groups that are created through Cloud SQL IAM APIs, Terraform `google_sql_user`, or another platform owner. That keeps pgroles from changing the role's lifecycle or attributes while still allowing grants, ownership references, and declared memberships. Undeclared memberships granted from an external role are preserved unless its membership rule explicitly sets `exclusive: true`.
 
 {% callout type="note" title="Group membership propagation" %}
 Changes to Cloud Identity group membership take about 15 minutes to propagate. However, changes to the group's database privileges take effect immediately.

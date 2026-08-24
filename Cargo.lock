@@ -2201,7 +2201,7 @@ dependencies = [
 
 [[package]]
 name = "pgroles-cli"
-version = "0.10.0-alpha.1"
+version = "0.10.0-alpha.2"
 dependencies = [
  "anyhow",
  "assert_cmd",
@@ -2224,7 +2224,7 @@ dependencies = [
 
 [[package]]
 name = "pgroles-core"
-version = "0.10.0-alpha.1"
+version = "0.10.0-alpha.2"
 dependencies = [
  "base64",
  "hmac 0.13.0",
@@ -2241,7 +2241,7 @@ dependencies = [
 
 [[package]]
 name = "pgroles-inspect"
-version = "0.10.0-alpha.1"
+version = "0.10.0-alpha.2"
 dependencies = [
  "pgroles-core",
  "sqlx",
@@ -2252,7 +2252,7 @@ dependencies = [
 
 [[package]]
 name = "pgroles-operator"
-version = "0.10.0-alpha.1"
+version = "0.10.0-alpha.2"
 dependencies = [
  "anyhow",
  "axum",
