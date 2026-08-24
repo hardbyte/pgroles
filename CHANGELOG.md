@@ -9,56 +9,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [0.10.0-alpha.2] - 2026-08-24
 
-This prerelease makes brownfield adoption safer and adds declarative management of
-memberships in PostgreSQL predefined and externally managed roles.
+This prerelease makes brownfield adoption safer and adds declarative management of memberships in PostgreSQL predefined and externally managed roles.
 
 ### Upgrade notes
 
-- **Declared memberships in `external: true` roles now take effect.** Previous
-  releases accepted these declarations but did not include them in plans. Review
-  the next plan before applying it; pgroles may now grant the declared memberships.
-  Undeclared memberships remain untouched unless the membership rule sets
-  `exclusive: true`. (#200)
-- **Adopt-mode schema ownership transfers require explicit approval.** If an
-  adopt plan would change a schema's owner, pass
-  `--allow-schema-owner-transfers` to `pgroles apply` or set
-  `spec.allow_schema_owner_transfers: true` on an apply-mode `PostgresPolicy`.
-  Without the opt-in, apply stops before making changes and the operator reports
-  `OwnerTransferBlocked`. Diff and observe mode continue to show the proposed
-  transfer. (#201)
+- **Declared memberships in `external: true` roles now take effect.** Previous releases accepted these declarations but did not include them in plans. Review the next plan before applying it; pgroles may now grant the declared memberships. Undeclared memberships remain untouched unless the membership rule sets `exclusive: true`. (#200)
+- **Adopt-mode schema ownership transfers require explicit approval.** If an adopt plan would change a schema's owner, pass `--allow-schema-owner-transfers` to `pgroles apply` or set `spec.allow_schema_owner_transfers: true` on an apply-mode `PostgresPolicy`. Without the opt-in, apply stops before making changes and the operator reports `OwnerTransferBlocked`. Diff and observe mode continue to show the proposed transfer. (#201)
 
 ### Added
 
-- **Manage memberships in PostgreSQL predefined roles and `external: true`
-  roles.** Membership rules can grant roles such as `pg_monitor` directly,
-  without adding them to `roles`. By default pgroles manages only the declared
-  members; set `exclusive: true` to revoke other ordinary members as well.
-  PostgreSQL's built-in `pg_*` role hierarchy is always preserved. `generate`
-  now exports predefined-role memberships, `inspect` reports them, and preflight
-  checks that the executor has the required `ADMIN OPTION` and that the role is
-  available on the connected PostgreSQL version. (#200)
-- **Preserve existing grants while adopting a role.** Set
-  `preserve_undeclared_grants: true` on a role to add its declared privileges
-  without removing other in-scope grants. Explicit `ensure: absent` rules still
-  revoke access. Remove the setting once the role's complete access has been
-  captured in policy. (#201)
-- **Persistent operator plan warnings.** `PostgresPolicy.status.plan_warnings`
-  records warnings such as an undeclared `default_owner` or a pending adopt-mode
-  schema ownership transfer, so they remain visible after reconciliation logs
-  expire. (#201)
-- **Interactive PostgreSQL access guide.** The documentation now includes a
-  browser-based course covering roles, ownership, grants, default privileges,
-  drift, offboarding, and security review, with runnable exercises that do not
-  require a local PostgreSQL installation. (#197)
+- **Manage memberships in PostgreSQL predefined roles and `external: true` roles.** Membership rules can grant roles such as `pg_monitor` directly, without adding them to `roles`. By default pgroles manages only the declared members; set `exclusive: true` to revoke other ordinary members as well. PostgreSQL's built-in `pg_*` role hierarchy is always preserved. `generate` now exports predefined-role memberships, `inspect` reports them, and preflight checks that the executor has the required `ADMIN OPTION` and that the role is available on the connected PostgreSQL version. (#200)
+- **Preserve existing grants while adopting a role.** Set `preserve_undeclared_grants: true` on a role to add its declared privileges without removing other in-scope grants. Explicit `ensure: absent` rules still revoke access. Remove the setting once the role's complete access has been captured in policy. (#201)
+- **Persistent operator plan warnings.** `PostgresPolicy.status.plan_warnings` records warnings such as an undeclared `default_owner` or a pending adopt-mode schema ownership transfer, so they remain visible after reconciliation logs expire. (#201)
+- **Interactive PostgreSQL access guide.** The documentation now includes a browser-based course covering roles, ownership, grants, default privileges, drift, offboarding, and security review, with runnable exercises that do not require a local PostgreSQL installation. (#197)
 
 ### Fixed
 
-- **Never revoke an object's privileges from its owner.** pgroles previously
-  interpreted PostgreSQL's implicit owner privileges as ordinary grants and
-  could plan revocations against the owner after another ACL was added. Owner
-  access is now protected across tables, views, materialized views, sequences,
-  schemas, routines, types, and databases, including policies that use wildcard
-  rules. Generated manifests also omit these implicit owner privileges. (#201)
+- **Never revoke an object's privileges from its owner.** pgroles previously interpreted PostgreSQL's implicit owner privileges as ordinary grants and could plan revocations against the owner after another ACL was added. Owner access is now protected across tables, views, materialized views, sequences, schemas, routines, types, and databases, including policies that use wildcard rules. Generated manifests also omit these implicit owner privileges. (#201)
 
 ## [0.10.0-alpha.1] - 2026-08-21
 
