@@ -19,8 +19,15 @@ export function ThemeSelector({ className, ...props }) {
     setTheme(document.documentElement.getAttribute('data-theme') ?? 'system')
   }, [])
 
+  // A theme picked in another tab arrives as a storage event. The attribute
+  // drives the page's colors, so it has to be updated too, not just the menu's
+  // selection.
   useEffect(() => {
-    let handler = () => setTheme(window.localStorage.theme ?? 'system')
+    let handler = () => {
+      let stored = window.localStorage.theme ?? 'system'
+      setTheme(stored)
+      document.documentElement.setAttribute('data-theme', stored)
+    }
     window.addEventListener('storage', handler)
     return () => window.removeEventListener('storage', handler)
   }, [])
