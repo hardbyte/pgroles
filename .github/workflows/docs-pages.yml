@@ -33,7 +33,12 @@ permissions:
 jobs:
   build:
     name: Build docs
-    if: github.event_name != 'pull_request' || github.event.action != 'closed'
+    # Forked pull requests are skipped rather than failed: the install needs
+    # the @partly registry token, which forks never receive.
+    if: >-
+      (github.event_name != 'pull_request' || github.event.action != 'closed')
+      && (github.event_name != 'pull_request'
+          || github.event.pull_request.head.repo.full_name == github.repository)
     runs-on: ubuntu-latest
     defaults:
       run:
@@ -50,9 +55,15 @@ jobs:
           node-version: 20
           cache: npm
           cache-dependency-path: docs/package-lock.json
+          registry-url: https://registry.npmjs.org
 
+      # The docs depend on @partly/pitstop, a restricted package, so the
+      # install needs a token with read access to the @partly scope. Pull
+      # requests from forks do not get the secret and cannot build the docs.
       - name: Install dependencies
         run: npm ci
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NODE_TOKEN }}
 
       - name: Run lab exercises against PGlite
         run: npm run test:labs

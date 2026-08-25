@@ -1,5 +1,5 @@
 pre[class*='language-'] {
-  color: theme('colors.slate.50');
+  color: var(--color-slate-50);
 }
 
 .token.tag,
@@ -8,7 +8,7 @@ pre[class*='language-'] {
 .token.selector .class,
 .token.selector.class,
 .token.function {
-  color: theme('colors.pink.400');
+  color: var(--color-pink-400);
 }
 
 .token.attr-name,
@@ -16,70 +16,70 @@ pre[class*='language-'] {
 .token.rule,
 .token.pseudo-class,
 .token.important {
-  color: theme('colors.slate.300');
+  color: var(--color-slate-300);
 }
 
 .token.module {
-  color: theme('colors.pink.400');
+  color: var(--color-pink-400);
 }
 
 .token.attr-value,
 .token.class,
 .token.string,
 .token.property {
-  color: theme('colors.sky.300');
+  color: var(--color-sky-300);
 }
 
 .token.punctuation,
 .token.attr-equals {
-  color: theme('colors.slate.500');
+  color: var(--color-slate-500);
 }
 
 .token.unit,
 .language-css .token.function {
-  color: theme('colors.teal.200');
+  color: var(--color-teal-200);
 }
 
 .token.comment,
 .token.operator,
 .token.combinator {
-  color: theme('colors.slate.400');
+  color: var(--color-slate-400);
 }
 
 .language-yaml .token.pgroles-section {
-  color: theme('colors.amber.300');
+  color: var(--color-amber-300);
   font-weight: 700;
 }
 
 .language-yaml .token.pgroles-field {
-  color: theme('colors.sky.300');
+  color: var(--color-sky-300);
 }
 
 .language-yaml .token.pgroles-role-ref,
 .language-yaml .token.pgroles-profile-ref,
 .language-yaml .token.pgroles-identifier {
-  color: theme('colors.teal.200');
+  color: var(--color-teal-200);
 }
 
 .language-yaml .token.pgroles-schema-ref,
 .language-yaml .token.pgroles-object-ref {
-  color: theme('colors.cyan.200');
+  color: var(--color-cyan-200);
 }
 
 .language-yaml .token.pgroles-privilege,
 .language-yaml .token.pgroles-enum {
-  color: theme('colors.pink.300');
+  color: var(--color-pink-300);
   font-weight: 600;
 }
 
 .language-yaml .token.pgroles-deprecated {
-  color: theme('colors.amber.300');
-  text-decoration: underline wavy theme('colors.amber.500');
+  color: var(--color-amber-300);
+  text-decoration: underline wavy var(--color-amber-500);
   text-underline-offset: 0.2em;
 }
 
 .language-yaml .token.pgroles-unrecognized {
-  color: theme('colors.rose.300');
-  text-decoration: underline wavy theme('colors.rose.500');
+  color: var(--color-rose-300);
+  text-decoration: underline wavy var(--color-rose-500);
   text-underline-offset: 0.2em;
 }

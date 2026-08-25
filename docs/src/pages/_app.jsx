@@ -2,26 +2,26 @@ import Head from 'next/head'
 import { useRouter } from 'next/router'
 import { IBM_Plex_Mono, IBM_Plex_Sans, Space_Grotesk } from 'next/font/google'
 import { slugifyWithCounter } from '@sindresorhus/slugify'
+import { RouterProvider } from 'react-aria-components'
 
 import { Layout } from '@/components/Layout'
 
-import 'focus-visible'
 import '@/styles/tailwind.css'
 
 const sans = IBM_Plex_Sans({
   subsets: ['latin'],
-  variable: '--font-sans',
+  variable: '--font-plex-sans',
 })
 
 const display = Space_Grotesk({
   subsets: ['latin'],
-  variable: '--font-display',
+  variable: '--font-space-grotesk',
 })
 
 const mono = IBM_Plex_Mono({
   subsets: ['latin'],
   weight: ['400', '500', '600'],
-  variable: '--font-mono',
+  variable: '--font-plex-mono',
 })
 
 function getNodeText(node) {
@@ -67,7 +67,8 @@ function collectHeadings(nodes, slugify = slugifyWithCounter()) {
 }
 
 export default function App({ Component, pageProps }) {
-  let { basePath = '' } = useRouter()
+  let router = useRouter()
+  let { basePath = '' } = router
   let title = pageProps.markdoc?.frontmatter.title
 
   let pageTitle =
@@ -81,15 +82,22 @@ export default function App({ Component, pageProps }) {
     : []
 
   return (
-    <div className={`${sans.variable} ${display.variable} ${mono.variable}`}>
-      <Head>
-        <title>{pageTitle}</title>
-        <link rel="icon" href={`${basePath}/logo.svg`} type="image/svg+xml" />
-        {description && <meta name="description" content={description} />}
-      </Head>
-      <Layout title={title} tableOfContents={tableOfContents}>
-        <Component {...pageProps} />
-      </Layout>
-    </div>
+    <RouterProvider navigate={(href) => router.push(href)}>
+      {/* `font-sans` is applied here, where the font variables are defined, so
+          the whole tree inherits IBM Plex rather than the fallback stack that
+          `html` resolves to. */}
+      <div
+        className={`${sans.variable} ${display.variable} ${mono.variable} font-sans`}
+      >
+        <Head>
+          <title>{pageTitle}</title>
+          <link rel="icon" href={`${basePath}/logo.svg`} type="image/svg+xml" />
+          {description && <meta name="description" content={description} />}
+        </Head>
+        <Layout title={title} tableOfContents={tableOfContents}>
+          <Component {...pageProps} />
+        </Layout>
+      </div>
+    </RouterProvider>
   )
 }

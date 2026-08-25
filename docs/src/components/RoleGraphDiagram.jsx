@@ -13,7 +13,7 @@ export function RoleGraphDiagram() {
       </div>
 
       <div className="px-5 py-6 sm:px-6">
-        <div className="grid items-center gap-4 xl:grid-cols-[minmax(0,0.9fr),auto,minmax(0,1.4fr)]">
+        <div className="grid items-center gap-4 xl:grid-cols-[minmax(0,0.9fr)_auto_minmax(0,1.4fr)]">
           <RoleNode
             eyebrow="Role"
             name="analytics"

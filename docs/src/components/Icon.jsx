@@ -18,9 +18,9 @@ const icons = {
 }
 
 const iconStyles = {
-  stone: '[--icon-foreground:theme(colors.stone.900)] [--icon-background:theme(colors.stone.50)]',
+  stone: '[--icon-foreground:var(--color-stone-900)] [--icon-background:var(--color-stone-50)]',
   amber:
-    '[--icon-foreground:theme(colors.amber.950)] [--icon-background:theme(colors.amber.200)]',
+    '[--icon-foreground:var(--color-amber-950)] [--icon-background:var(--color-amber-200)]',
 }
 
 export function Icon({ color = 'stone', icon, className, ...props }) {

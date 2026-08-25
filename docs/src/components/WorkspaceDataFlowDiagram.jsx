@@ -9,7 +9,7 @@ export function WorkspaceDataFlowDiagram() {
       </div>
 
       <div className="px-5 py-6 sm:px-6">
-        <div className="grid gap-4 xl:grid-cols-[0.95fr,1.35fr,0.95fr]">
+        <div className="grid gap-4 xl:grid-cols-[0.95fr_1.35fr_0.95fr]">
             <DiagramSource
               eyebrow="Inputs"
               title="Desired state"

@@ -1,4 +1,6 @@
-import { Button } from '@/components/Button'
+import { Badge } from '@partly/pitstop/badge'
+import { Button } from '@partly/pitstop/button'
+import { Card, CardContent, CardHeader, CardTitle } from '@partly/pitstop/card'
 
 const manifestSnippet = `profiles:
   writer:
@@ -31,12 +33,18 @@ export function Hero() {
       <div className="absolute inset-x-0 bottom-0 h-20 bg-[linear-gradient(180deg,rgba(245,245,244,0)_0%,rgba(245,245,244,0.94)_86%,rgb(245,245,244)_100%)] dark:h-24 dark:bg-[linear-gradient(180deg,rgba(12,10,9,0)_0%,rgba(12,10,9,0.92)_88%,rgb(12,10,9)_100%)]" />
 
       <div className="relative py-14 sm:px-2 lg:py-16">
-        <div className="mx-auto grid max-w-8xl grid-cols-1 gap-10 px-4 lg:grid-cols-[0.94fr,1.06fr] lg:gap-12 lg:px-8 xl:px-12">
+        <div className="mx-auto grid max-w-8xl grid-cols-1 gap-10 px-4 lg:grid-cols-[0.94fr_1.06fr] lg:gap-12 lg:px-8 xl:px-12">
           <div className="max-w-xl">
-            <div className="flex flex-wrap gap-2 text-[11px] font-semibold uppercase tracking-[0.2em] text-stone-500 dark:text-stone-300">
-              <span className="rounded-full border border-stone-300 bg-white/90 px-3 py-1 shadow-sm dark:border-stone-700 dark:bg-stone-900/60 dark:shadow-none">CLI</span>
-              <span className="rounded-full border border-stone-300 bg-white/90 px-3 py-1 shadow-sm dark:border-stone-700 dark:bg-stone-900/60 dark:shadow-none">Operator</span>
-              <span className="rounded-full border border-amber-300 bg-amber-50 px-3 py-1 text-amber-900 shadow-sm dark:border-amber-500/40 dark:bg-amber-500/10 dark:text-amber-200 dark:shadow-none">Plan before apply</span>
+            <div className="flex flex-wrap gap-2 text-[11px] font-semibold tracking-[0.2em] uppercase">
+              <Badge variant="outline" size="md" className="rounded-full bg-card">
+                CLI
+              </Badge>
+              <Badge variant="outline" size="md" className="rounded-full bg-card">
+                Operator
+              </Badge>
+              <Badge variant="outline" intent="warning" size="md" className="rounded-full">
+                Plan before apply
+              </Badge>
             </div>
 
             <h1 className="mt-5 max-w-2xl font-display text-[2.8rem] leading-[1.02] tracking-[-0.04em] text-stone-950 sm:text-[3.35rem] dark:text-stone-50">
@@ -48,8 +56,10 @@ export function Hero() {
             </p>
 
             <div className="mt-8 flex flex-wrap gap-4">
-              <Button href="/docs/quick-start">Start with a diff</Button>
-              <Button href="/docs/operator" variant="secondary">
+              <Button href="/docs/quick-start" size="lg">
+                Start with a diff
+              </Button>
+              <Button href="/docs/operator" variant="outline" size="lg">
                 Explore the operator
               </Button>
             </div>
@@ -68,7 +78,7 @@ export function Hero() {
               tone="amber"
               code={manifestSnippet}
             />
-            <div className="grid gap-4 lg:grid-cols-[0.92fr,1.08fr]">
+            <div className="grid gap-4 lg:grid-cols-[0.92fr_1.08fr]">
               <ConsoleCard
                 title="Diff summary"
                 eyebrow="Change plan"
@@ -99,39 +109,41 @@ function Stat({ label, value }) {
 }
 
 function ConsoleCard({ eyebrow, title, code, tone }) {
-  const tones = {
-    amber:
-      'border-amber-300/80 bg-white/88 shadow-[0_24px_50px_-34px_rgba(217,119,6,0.18)] dark:border-amber-500/30 dark:bg-stone-950/70 dark:shadow-[0_24px_50px_-34px_rgba(245,158,11,0.32)]',
-    teal:
-      'border-teal-300/80 bg-white/88 shadow-[0_24px_50px_-34px_rgba(13,148,136,0.16)] dark:border-teal-500/30 dark:bg-stone-950/70 dark:shadow-[0_24px_50px_-34px_rgba(20,184,166,0.28)]',
-    stone:
-      'border-stone-300/90 bg-stone-50/92 shadow-[0_24px_50px_-36px_rgba(28,25,23,0.15)] dark:border-stone-700 dark:!bg-stone-950/88 dark:shadow-[0_24px_50px_-38px_rgba(255,255,255,0.07)]',
-  }
-
   const accents = {
     amber: 'bg-amber-500 dark:bg-amber-400',
     teal: 'bg-teal-500 dark:bg-teal-400',
     stone: 'bg-stone-500 dark:bg-stone-400',
   }
 
+  const rings = {
+    amber: 'ring-amber-400/50 dark:ring-amber-500/30',
+    teal: 'ring-teal-400/50 dark:ring-teal-500/30',
+    stone: 'ring-foreground/10',
+  }
+
   return (
-    <div className={`rounded-[1.45rem] border p-4 backdrop-blur ${tones[tone]}`}>
-      <div className="flex items-center justify-between gap-4">
+    <Card
+      size="sm"
+      className={`gap-4 bg-card/90 backdrop-blur ${rings[tone]}`}
+    >
+      <CardHeader className="flex items-center justify-between gap-4">
         <div>
-          <p className="m-0 text-[11px] font-semibold uppercase tracking-[0.22em] text-stone-500 dark:text-stone-400">
+          <p className="m-0 text-[11px] font-semibold tracking-[0.22em] text-muted-foreground uppercase">
             {eyebrow}
           </p>
-          <p className="mt-2 font-display text-lg text-stone-950 dark:text-stone-50">{title}</p>
+          <CardTitle className="mt-2 font-display text-lg">{title}</CardTitle>
         </div>
         <div className="flex gap-1.5">
           <span className={`h-2.5 w-2.5 rounded-full ${accents[tone]}`} />
-          <span className="h-2.5 w-2.5 rounded-full bg-stone-300 dark:bg-stone-700" />
-          <span className="h-2.5 w-2.5 rounded-full bg-stone-300 dark:bg-stone-700" />
+          <span className="h-2.5 w-2.5 rounded-full bg-muted-foreground/40" />
+          <span className="h-2.5 w-2.5 rounded-full bg-muted-foreground/40" />
         </div>
-      </div>
-      <pre className="mt-4 overflow-x-auto rounded-[1.2rem] border border-stone-200 bg-stone-950 p-4 font-mono text-[13px] leading-6 text-stone-200 dark:border-stone-800">
-        <code>{code}</code>
-      </pre>
-    </div>
+      </CardHeader>
+      <CardContent>
+        <pre className="overflow-x-auto rounded-xl bg-stone-950 p-4 font-mono text-[13px] leading-6 text-stone-200">
+          <code>{code}</code>
+        </pre>
+      </CardContent>
+    </Card>
   )
 }
