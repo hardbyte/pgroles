@@ -17,7 +17,7 @@ needs a token with read access to the `@partly` scope:
 npm config set //registry.npmjs.org/:_authToken <token>
 ```
 
-CI reads the same token from the `NODE_TOKEN` repository secret. Pull requests
+CI reads the same token from the `NPM_TOKEN` repository secret. Pull requests
 from forks do not receive it, so the docs workflow skips them.
 
 ## Checks
