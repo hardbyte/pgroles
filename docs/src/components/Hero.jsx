@@ -1,5 +1,6 @@
+import Link from 'next/link'
 import { Badge } from '@partly/pitstop/badge'
-import { Button } from '@partly/pitstop/button'
+import { buttonVariants } from '@partly/pitstop/button'
 import { Card, CardContent, CardHeader, CardTitle } from '@partly/pitstop/card'
 
 const manifestSnippet = `profiles:
@@ -56,12 +57,20 @@ export function Hero() {
             </p>
 
             <div className="mt-8 flex flex-wrap gap-4">
-              <Button href="/docs/quick-start" size="lg">
+              {/* next/link rather than Pitstop's own link-button: React Aria
+                  renders the href verbatim, which drops the site's basePath. */}
+              <Link
+                href="/docs/quick-start"
+                className={buttonVariants({ size: 'lg' })}
+              >
                 Start with a diff
-              </Button>
-              <Button href="/docs/operator" variant="outline" size="lg">
+              </Link>
+              <Link
+                href="/docs/operator"
+                className={buttonVariants({ variant: 'outline', size: 'lg' })}
+              >
                 Explore the operator
-              </Button>
+              </Link>
             </div>
 
             <dl className="mt-9 grid gap-5 border-t border-stone-300/90 pt-5 dark:border-stone-800/90 sm:grid-cols-3">

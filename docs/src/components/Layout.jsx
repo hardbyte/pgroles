@@ -3,7 +3,7 @@ import Link from 'next/link'
 import {useRouter} from 'next/router'
 import {IconBrandGithub} from '@tabler/icons-react'
 import {Button} from '@partly/pitstop/button'
-import {Link as PitstopLink} from '@partly/pitstop/link'
+import {linkStyles} from '@partly/pitstop/link'
 import clsx from 'clsx'
 
 import {Hero} from '@/components/Hero'
@@ -263,13 +263,15 @@ export function Layout({children, title, tableOfContents}) {
                                     Previous
                                 </dt>
                                 <dd className="mt-1">
-                                    <PitstopLink
+                                    <Link
                                         href={previousPage.href}
-                                        variant="muted"
-                                        className="text-base font-semibold hover:text-amber-700 dark:hover:text-amber-300"
+                                        className={clsx(
+                                            linkStyles({variant: 'muted'}),
+                                            'text-base font-semibold hover:text-amber-700 dark:hover:text-amber-300'
+                                        )}
                                     >
                                         <span aria-hidden="true">&larr;</span> {previousPage.title}
-                                    </PitstopLink>
+                                    </Link>
                                 </dd>
                             </div>
                         )}
@@ -279,13 +281,15 @@ export function Layout({children, title, tableOfContents}) {
                                     Next
                                 </dt>
                                 <dd className="mt-1">
-                                    <PitstopLink
+                                    <Link
                                         href={nextPage.href}
-                                        variant="muted"
-                                        className="text-base font-semibold hover:text-amber-700 dark:hover:text-amber-300"
+                                        className={clsx(
+                                            linkStyles({variant: 'muted'}),
+                                            'text-base font-semibold hover:text-amber-700 dark:hover:text-amber-300'
+                                        )}
                                     >
                                         {nextPage.title} <span aria-hidden="true">&rarr;</span>
-                                    </PitstopLink>
+                                    </Link>
                                 </dd>
                             </div>
                         )}
