@@ -213,3 +213,109 @@ fn preflight_names_acl_entries_the_executor_cannot_revoke() {
         );
     });
 }
+
+/// Drop-guard for the membership-revoke roles.
+struct MembershipCleanup;
+
+impl Drop for MembershipCleanup {
+    fn drop(&mut self) {
+        with_runtime(async {
+            if let Ok(pool) = PgPool::connect(&database_url()).await {
+                for role in ["fgrm_exec", "fgrm_alice", "fgrm_grantor", "fgrm_reader"] {
+                    let _ = pool
+                        .execute(format!("DROP ROLE IF EXISTS {role}").as_str())
+                        .await;
+                }
+            }
+        });
+    }
+}
+
+/// Since PostgreSQL 16 a membership edge records its grantor, and a bare
+/// `REVOKE <role> FROM <member>` removes only the edge attributed to the
+/// executor: with ADMIN OPTION but a different grantor it succeeds with a
+/// WARNING and the edge survives. The preflight must name the grantor.
+#[test]
+#[ignore]
+fn preflight_names_membership_edges_the_executor_cannot_revoke() {
+    let _cleanup = MembershipCleanup;
+    with_runtime(async {
+        let pool = PgPool::connect(&database_url())
+            .await
+            .expect("failed to connect");
+        let (version,): (i32,) =
+            sqlx::query_as("SELECT current_setting('server_version_num')::int")
+                .fetch_one(&pool)
+                .await
+                .expect("version probe should run");
+        if version < 160_000 {
+            // Pre-16 revokes are not grantor-attributed; nothing to check.
+            return;
+        }
+        for role in ["fgrm_exec", "fgrm_alice", "fgrm_grantor", "fgrm_reader"] {
+            let _ = pool
+                .execute(format!("DROP ROLE IF EXISTS {role}").as_str())
+                .await;
+        }
+        pool.execute(
+            "CREATE ROLE fgrm_reader; CREATE ROLE fgrm_alice; CREATE ROLE fgrm_grantor; \
+             CREATE ROLE fgrm_exec LOGIN PASSWORD 'fgrm_exec_pw'; \
+             GRANT fgrm_reader TO fgrm_grantor WITH ADMIN OPTION; \
+             GRANT fgrm_reader TO fgrm_exec WITH ADMIN OPTION; \
+             SET ROLE fgrm_grantor; \
+             GRANT fgrm_reader TO fgrm_alice; \
+             RESET ROLE;",
+        )
+        .await
+        .expect("setup should succeed");
+
+        let changes = vec![Change::RemoveMember {
+            role: "fgrm_reader".to_string(),
+            member: "fgrm_alice".to_string(),
+        }];
+
+        // The executor holds ADMIN OPTION on the role, yet the targeted edge
+        // was granted by fgrm_grantor: PostgreSQL would accept the REVOKE
+        // with a WARNING and leave the membership in place.
+        let exec_options = PgConnectOptions::from_str(&database_url())
+            .expect("DATABASE_URL should parse")
+            .username("fgrm_exec")
+            .password("fgrm_exec_pw");
+        let exec_pool = PgPool::connect_with(exec_options)
+            .await
+            .expect("executor should connect");
+        let issues = preflight_authority_issues(&exec_pool, &changes, &RoleGraph::default())
+            .await
+            .expect("preflight should run");
+        let membership: Vec<_> = issues
+            .iter()
+            .filter(|issue| matches!(issue, AuthorityIssue::ForeignGrantorMembershipRevoke { .. }))
+            .collect();
+        assert_eq!(membership.len(), 1, "one unreachable edge: {issues:?}");
+        let AuthorityIssue::ForeignGrantorMembershipRevoke {
+            role,
+            member,
+            grantor,
+            ..
+        } = membership[0]
+        else {
+            unreachable!()
+        };
+        assert_eq!(
+            (role.as_str(), member.as_str()),
+            ("fgrm_reader", "fgrm_alice")
+        );
+        assert_eq!(grantor, "fgrm_grantor");
+
+        // A superuser executor can act as every grantor: no issue.
+        let issues = preflight_authority_issues(&pool, &changes, &RoleGraph::default())
+            .await
+            .expect("preflight should run");
+        assert!(
+            !issues.iter().any(|issue| {
+                matches!(issue, AuthorityIssue::ForeignGrantorMembershipRevoke { .. })
+            }),
+            "superuser must not be flagged: {issues:?}"
+        );
+    });
+}

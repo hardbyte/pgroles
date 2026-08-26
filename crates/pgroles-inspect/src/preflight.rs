@@ -1,6 +1,6 @@
 //! Executor-authority preflight for planned changes.
 //!
-//! Two failure modes are caught before apply:
+//! Several failure modes are caught before apply:
 //!
 //! `ALTER DEFAULT PRIVILEGES FOR ROLE owner` requires the executor to be a
 //! member of the owner role (or a superuser). Without that, apply fails
@@ -24,6 +24,12 @@
 //! grantor is reachable are trusted to the apply; the operator's post-apply
 //! non-convergence detection catches the residue (grantor-selection
 //! shadowing) that no preflight can prove.
+//!
+//! Role-membership revokes have the same shape since PostgreSQL 16, which
+//! records a grantor per membership edge: a bare `REVOKE role FROM member`
+//! removes only the edge attributed to the executor, and with ADMIN OPTION
+//! but a different grantor it succeeds with just a WARNING. Targeted edges
+//! whose grantor the executor cannot act as are reported per edge.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -97,6 +103,23 @@ pub enum AuthorityIssue {
         /// Up to [`REVOKE_EXAMPLE_LIMIT`] surviving entries as
         /// `(object name, grantor)`.
         examples: Vec<(String, String)>,
+    },
+
+    /// A planned membership `REVOKE <role> FROM <member>` targets an edge
+    /// granted by a grantor the executor cannot act as (PostgreSQL 16+).
+    ///
+    /// Since PostgreSQL 16 each membership edge records its grantor, and a
+    /// bare `REVOKE` removes only the edge attributed to the executor: with
+    /// ADMIN OPTION but a different grantor it succeeds with just a WARNING
+    /// ("role ... has not been granted membership ... by role ...") and the
+    /// edge survives, so the same revocation re-plans on every run.
+    /// `REVOKE ... GRANTED BY <grantor>` removes it, but requires the
+    /// privileges of that grantor.
+    ForeignGrantorMembershipRevoke {
+        role: String,
+        member: String,
+        grantor: String,
+        executor: String,
     },
 }
 
@@ -201,6 +224,20 @@ impl std::fmt::Display for AuthorityIssue {
                 }
                 Ok(())
             }
+            AuthorityIssue::ForeignGrantorMembershipRevoke {
+                role,
+                member,
+                grantor,
+                executor,
+            } => write!(
+                f,
+                "UnsatisfiableRevoke: cannot revoke membership of \"{member}\" in \
+                 \"{role}\" as executor \"{executor}\"; the edge was granted by \
+                 \"{grantor}\", and a REVOKE not attributable to the grantor succeeds \
+                 with only a WARNING while leaving the membership in place — run the \
+                 revoke as a role with the privileges of \"{grantor}\" (REVOKE ... \
+                 GRANTED BY \"{grantor}\")"
+            ),
         }
     }
 }
@@ -234,6 +271,11 @@ pub async fn preflight_authority_issues(
         .await?;
         (user, is_superuser, has_createrole)
     };
+    let (server_version_num,): (i32,) =
+        sqlx::query_as("SELECT current_setting('server_version_num')::int")
+            .fetch_one(pool)
+            .await?;
+    let server_major = (server_version_num / 10_000) as u32;
 
     // --- Predefined-role membership authority ---
     // Granting or revoking membership in a predefined (`pg_*`) role requires
@@ -253,12 +295,6 @@ pub async fn preflight_authority_issues(
         })
         .collect();
     if !predefined_targets.is_empty() {
-        let (server_version_num,): (i32,) =
-            sqlx::query_as("SELECT current_setting('server_version_num')::int")
-                .fetch_one(pool)
-                .await?;
-        let server_major = (server_version_num / 10_000) as u32;
-
         let target_list: Vec<String> = predefined_targets.iter().cloned().collect();
         let rows: Vec<(String, bool)> = sqlx::query_as(
             r#"
@@ -294,6 +330,56 @@ pub async fn preflight_authority_issues(
                 server_major,
                 min_version: predefined_role_min_version(role),
             });
+        }
+    }
+
+    // --- Membership revoke grantor attribution (PostgreSQL 16+) ---
+    // Since PG16 each pg_auth_members edge records its grantor, and a bare
+    // `REVOKE <role> FROM <member>` removes only the edge attributed to the
+    // executor: with ADMIN OPTION but a different grantor it succeeds with a
+    // WARNING and the edge survives, re-planning forever. Flag every targeted
+    // edge whose grantor the executor cannot act as. Pre-16 revokes are not
+    // grantor-attributed, so there is nothing to check there.
+    if server_major >= 16 {
+        let remove_targets: Vec<(String, String)> = changes
+            .iter()
+            .filter_map(|change| match change {
+                Change::RemoveMember { role, member } => Some((role.clone(), member.clone())),
+                _ => None,
+            })
+            .collect();
+        if !remove_targets.is_empty() {
+            let (roles, members): (Vec<String>, Vec<String>) = remove_targets.into_iter().unzip();
+            let rows: Vec<(String, String, String, bool)> = sqlx::query_as(
+                r#"
+                SELECT
+                    r.rolname::text AS role_name,
+                    m.rolname::text AS member_name,
+                    g.rolname::text AS grantor_name,
+                    pg_has_role(current_user, am.grantor, 'USAGE') AS can_act
+                FROM pg_auth_members am
+                JOIN pg_roles r ON r.oid = am.roleid
+                JOIN pg_roles m ON m.oid = am.member
+                JOIN pg_roles g ON g.oid = am.grantor
+                JOIN unnest($1::text[], $2::text[]) AS t(role_name, member_name)
+                  ON r.rolname = t.role_name AND m.rolname = t.member_name
+                ORDER BY r.rolname, m.rolname, g.rolname
+                "#,
+            )
+            .bind(&roles)
+            .bind(&members)
+            .fetch_all(pool)
+            .await?;
+            for (role, member, grantor, can_act) in rows {
+                if !can_act {
+                    issues.push(AuthorityIssue::ForeignGrantorMembershipRevoke {
+                        role,
+                        member,
+                        grantor,
+                        executor: executor.clone(),
+                    });
+                }
+            }
         }
     }
 

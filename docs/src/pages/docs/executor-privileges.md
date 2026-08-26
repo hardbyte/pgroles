@@ -15,7 +15,7 @@ This table was verified against a live PostgreSQL 16 server. `CREATEROLE` is the
 |---|---|
 | `CREATE ROLE` | `CREATEROLE` attribute |
 | `ALTER ROLE` / `COMMENT ON ROLE` / passwords / `ALTER ROLE ... SET` config | `CREATEROLE` + `ADMIN OPTION` on the target role (automatic for roles the executor created itself) |
-| `GRANT`/`REVOKE` role memberships | `ADMIN OPTION` on the granted (group) role — automatic for roles the executor created |
+| `GRANT`/`REVOKE` role memberships | `ADMIN OPTION` on the granted (group) role — automatic for roles the executor created. On PostgreSQL 16+ a `REVOKE` removes only the edge the executor's authority attributes; an edge granted by another grantor survives with a `WARNING`, and the plan preflight reports it |
 | `GRANT`/`REVOKE` predefined (`pg_*`) role memberships | `ADMIN OPTION` on the predefined role — never automatic: a superuser must run `GRANT pg_read_all_data TO executor WITH ADMIN OPTION` (or the executor must be superuser). The plan preflight warns and apply blocks when this is missing |
 | `DROP ROLE` | `CREATEROLE` + `ADMIN OPTION` on the role |
 | `CREATE SCHEMA` | `CREATE` privilege on the database |
