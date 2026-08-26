@@ -515,55 +515,105 @@ pub async fn preflight_authority_issues(
             _ => None,
         })
         .collect();
-    if !executor_is_superuser && server_major >= 16 && !removed_edges.is_empty() {
-        let membership_phase_roles: Vec<String> = membership_grantors.iter().cloned().collect();
-        let defaults_phase_roles: Vec<String> = changes
-            .iter()
-            .filter_map(|change| match change {
-                Change::RevokeDefaultPrivilege { owner, .. } => Some(owner.clone()),
-                _ => None,
-            })
-            .collect::<BTreeSet<String>>()
-            .into_iter()
-            .collect();
-        // Only inheriting additions extend USAGE. An added edge referencing
-        // a role the plan also creates cannot resolve against pg_roles yet
-        // and is conservatively ignored.
-        let added_edges: Vec<(String, String)> = changes
-            .iter()
-            .filter_map(|change| match change {
-                Change::AddMember {
-                    role,
-                    member,
-                    inherit: true,
-                    ..
-                } => Some((role.clone(), member.clone())),
-                _ => None,
-            })
-            .collect();
-        let mut unreachable: BTreeSet<String> =
-            grantors_unreachable_mid_plan(pool, &membership_phase_roles, &removed_edges, &[])
-                .await?
+    // Only inheriting additions extend USAGE. An added edge referencing a
+    // role the plan also creates cannot resolve against pg_roles yet and is
+    // conservatively ignored.
+    let added_edges: Vec<(String, String)> = changes
+        .iter()
+        .filter_map(|change| match change {
+            Change::AddMember {
+                role,
+                member,
+                inherit: true,
+                ..
+            } => Some((role.clone(), member.clone())),
+            _ => None,
+        })
+        .collect();
+    let phase_checks_active = !executor_is_superuser && server_major >= 16;
+    // When the plan changes memberships at all, the phase graph — not the
+    // current graph — is authoritative for RevokeDefaultPrivilege owners, so
+    // the current-state owner check below must not double-judge them.
+    let revoke_owners_phase_checked =
+        phase_checks_active && !(removed_edges.is_empty() && added_edges.is_empty());
+    if phase_checks_active {
+        let mut broken_by_plan: BTreeSet<String> = BTreeSet::new();
+        let mut never_usable: BTreeSet<String> = BTreeSet::new();
+
+        // Membership `GRANTED BY` revokes run in the removal batch, before
+        // any addition, so only removals can affect them.
+        if !removed_edges.is_empty() && !membership_grantors.is_empty() {
+            let membership_phase_roles: Vec<String> = membership_grantors.iter().cloned().collect();
+            for (grantor, usable_now) in
+                roles_unreachable_in_graph(pool, &membership_phase_roles, &removed_edges, &[])
+                    .await?
+            {
+                // A grantor the executor cannot use even now was already
+                // flagged exactly (ForeignGrantorMembershipRevoke) above.
+                if usable_now {
+                    broken_by_plan.insert(grantor);
+                }
+            }
+        }
+
+        // Default-privilege revokes run after removals *and* additions: a
+        // path the plan removes may be legitimately replaced, and a path the
+        // executor lacks now may be legitimately acquired (e.g. its ADMIN
+        // OPTION lets it grant the owner to a role it already inherits).
+        if revoke_owners_phase_checked {
+            let defaults_phase_roles: Vec<String> = changes
+                .iter()
+                .filter_map(|change| match change {
+                    Change::RevokeDefaultPrivilege { owner, .. } => Some(owner.clone()),
+                    _ => None,
+                })
+                .collect::<BTreeSet<String>>()
                 .into_iter()
                 .collect();
-        unreachable.extend(
-            grantors_unreachable_mid_plan(
+            for (owner, usable_now) in roles_unreachable_in_graph(
                 pool,
                 &defaults_phase_roles,
                 &removed_edges,
                 &added_edges,
             )
-            .await?,
-        );
-        for grantor in unreachable {
+            .await?
+            {
+                if usable_now {
+                    broken_by_plan.insert(owner);
+                } else {
+                    never_usable.insert(owner);
+                }
+            }
+        }
+
+        for grantor in broken_by_plan {
             issues.push(AuthorityIssue::GrantorAuthorityRemovedByPlan {
                 grantor,
+                executor: executor.clone(),
+            });
+        }
+        for owner in never_usable {
+            issues.push(AuthorityIssue::DefaultPrivilegeOwner {
+                owner,
                 executor: executor.clone(),
             });
         }
     }
 
     // --- Default-privilege owner authority ---
+    // `SetDefaultPrivilege` executes before any membership change, so the
+    // current graph judges it. `RevokeDefaultPrivilege` executes after the
+    // removal and addition batches — when the plan changes memberships (and
+    // the phase checks above ran), those owners were already judged against
+    // the phase graph and are skipped here; both kinds still get the
+    // missing-owner check.
+    let set_owners: BTreeSet<String> = changes
+        .iter()
+        .filter_map(|change| match change {
+            Change::SetDefaultPrivilege { owner, .. } => Some(owner.clone()),
+            _ => None,
+        })
+        .collect();
     let owners: BTreeSet<String> = changes
         .iter()
         .filter_map(|change| match change {
@@ -586,7 +636,7 @@ pub async fn preflight_authority_issues(
         .await?;
         let known: BTreeSet<String> = rows.iter().map(|(owner, _)| owner.clone()).collect();
         for (owner, can_act) in rows {
-            if !can_act {
+            if !can_act && (set_owners.contains(&owner) || !revoke_owners_phase_checked) {
                 issues.push(AuthorityIssue::DefaultPrivilegeOwner {
                     owner,
                     executor: executor.clone(),
@@ -869,25 +919,28 @@ struct GrantorAuthorityRow {
     can_act: bool,
 }
 
-/// Which of `roles` the executor could act as *now* (`pg_has_role USAGE`)
-/// but not at some point mid-plan: inheritance-reachability from the
-/// executor over the live membership graph with `removed` edges deleted and
-/// `added` inheriting edges inserted. Additions resolve against `pg_roles`,
-/// so an edge referencing a role the plan also creates is conservatively
-/// ignored. Superusers are never passed here.
-async fn grantors_unreachable_mid_plan(
+/// Which of `roles` the executor cannot act as at a given plan phase:
+/// inheritance-reachability from the executor over the live membership graph
+/// with `removed` edges deleted and `added` inheriting edges inserted — the
+/// phase equivalent of `pg_has_role(current_user, role, 'USAGE')`. Each
+/// unreachable role is returned with whether the executor can use it *now*,
+/// so callers can distinguish authority the plan breaks from authority the
+/// executor never had. Additions resolve against `pg_roles`, so an edge
+/// referencing a role the plan also creates is conservatively ignored.
+/// Superusers are never passed here.
+async fn roles_unreachable_in_graph(
     pool: &PgPool,
     roles: &[String],
     removed: &[(String, String)],
     added: &[(String, String)],
-) -> Result<Vec<String>, sqlx::Error> {
+) -> Result<Vec<(String, bool)>, sqlx::Error> {
     if roles.is_empty() {
         return Ok(Vec::new());
     }
     let (removed_roles, removed_members): (Vec<String>, Vec<String>) =
         removed.iter().cloned().unzip();
     let (added_roles, added_members): (Vec<String>, Vec<String>) = added.iter().cloned().unzip();
-    let rows: Vec<(String,)> = sqlx::query_as(
+    let rows: Vec<(String, bool)> = sqlx::query_as(
         r#"
         WITH RECURSIVE removed(rolname, memname) AS (
             SELECT * FROM unnest($2::text[], $3::text[])
@@ -916,9 +969,9 @@ async fn grantors_unreachable_mid_plan(
             UNION
             SELECT e.roleid FROM edges e JOIN reach r ON e.member = r.oid
         )
-        SELECT r.rolname::text FROM pg_roles r
+        SELECT r.rolname::text, pg_has_role(current_user, r.oid, 'USAGE')
+        FROM pg_roles r
         WHERE r.rolname = ANY($1)
-          AND pg_has_role(current_user, r.oid, 'USAGE')
           AND r.oid NOT IN (SELECT oid FROM reach)
         "#,
     )
@@ -929,7 +982,7 @@ async fn grantors_unreachable_mid_plan(
     .bind(&added_members)
     .fetch_all(pool)
     .await?;
-    Ok(rows.into_iter().map(|(name,)| name).collect())
+    Ok(rows)
 }
 
 async fn fetch_object_authority(

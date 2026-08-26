@@ -524,3 +524,149 @@ fn additions_restore_grantor_authority_within_one_plan() {
         assert!(replan.is_empty(), "must converge in one apply: {replan:?}");
     });
 }
+
+const PAD_ROLES: [&str; 4] = ["pad_exec", "pad_alice", "pad_newmid", "pad_owner"];
+
+/// Drop-guard for the pure-addition authority test.
+struct PadCleanup;
+
+impl Drop for PadCleanup {
+    fn drop(&mut self) {
+        with_runtime(async {
+            if let Ok(pool) = PgPool::connect(&database_url()).await {
+                let _ = pool
+                    .execute(
+                        "ALTER DEFAULT PRIVILEGES FOR ROLE pad_owner \
+                         REVOKE SELECT ON TABLES FROM pad_alice",
+                    )
+                    .await;
+                for role in PAD_ROLES {
+                    let _ = pool.execute(format!("DROP OWNED BY {role}").as_str()).await;
+                    let _ = pool
+                        .execute(format!("DROP ROLE IF EXISTS {role}").as_str())
+                        .await;
+                }
+            }
+        });
+    }
+}
+
+/// Pure-addition authority: the executor holds the defaults owner with
+/// `ADMIN TRUE, INHERIT FALSE` — it can grant the owner role but does not
+/// inherit its privileges — and the plan contains no removals at all. The
+/// plan's own `AddMember` (owner → a role the executor inherits) acquires the
+/// USAGE the later default-privilege revoke needs, so the plan is executable;
+/// a current-state owner check would reject it with `DefaultPrivilegeOwner`.
+const PAD_MANIFEST: &str = r#"
+roles:
+  - name: pad_owner
+  - name: pad_newmid
+  - name: pad_alice
+
+memberships:
+  - role: pad_owner
+    members:
+      - name: pad_exec
+        admin: true
+        inherit: false
+      - name: pad_newmid
+  - role: pad_newmid
+    members:
+      - name: pad_exec
+
+default_privileges:
+  - owner: pad_owner
+    scope: { type: global }
+    grant:
+      - role: pad_alice
+        ensure: absent
+        privileges: [SELECT]
+        on_type: table
+"#;
+
+#[test]
+#[ignore]
+fn pure_addition_acquires_defaults_owner_authority() {
+    let _cleanup = PadCleanup;
+    with_runtime(async {
+        let pool = PgPool::connect(&database_url())
+            .await
+            .expect("failed to connect");
+        let (version,): (i32,) =
+            sqlx::query_as("SELECT current_setting('server_version_num')::int")
+                .fetch_one(&pool)
+                .await
+                .expect("version probe should run");
+        if version < 160_000 {
+            return;
+        }
+        for role in PAD_ROLES {
+            let _ = pool.execute(format!("DROP OWNED BY {role}").as_str()).await;
+            let _ = pool
+                .execute(format!("DROP ROLE IF EXISTS {role}").as_str())
+                .await;
+        }
+        pool.execute(
+            "CREATE ROLE pad_owner; CREATE ROLE pad_newmid; CREATE ROLE pad_alice; \
+             CREATE ROLE pad_exec LOGIN PASSWORD 'pad_exec_pw'; \
+             GRANT pad_owner TO pad_exec WITH ADMIN TRUE, INHERIT FALSE; \
+             GRANT pad_newmid TO pad_exec; \
+             ALTER DEFAULT PRIVILEGES FOR ROLE pad_owner GRANT SELECT ON TABLES TO pad_alice;",
+        )
+        .await
+        .expect("setup should succeed");
+
+        let exec_options = PgConnectOptions::from_str(&database_url())
+            .expect("DATABASE_URL should parse")
+            .username("pad_exec")
+            .password("pad_exec_pw");
+        let exec_pool = PgPool::connect_with(exec_options)
+            .await
+            .expect("executor should connect");
+
+        // Sanity: the executor cannot use the owner's privileges *now*.
+        let (usage_now,): (bool,) =
+            sqlx::query_as("SELECT pg_has_role(current_user, 'pad_owner', 'USAGE')")
+                .fetch_one(&exec_pool)
+                .await
+                .expect("probe should run");
+        assert!(!usage_now, "the admin-only edge must not inherit");
+
+        let changes = plan(&exec_pool, PAD_MANIFEST).await;
+        assert!(
+            !changes
+                .iter()
+                .any(|change| matches!(change, Change::RemoveMember { .. })),
+            "the plan must be pure-addition: {changes:?}"
+        );
+        assert!(
+            changes.iter().any(|change| matches!(
+                change,
+                Change::AddMember { role, member, inherit: true, .. }
+                    if role == "pad_owner" && member == "pad_newmid"
+            )),
+            "the authority-acquiring addition must be planned: {changes:?}"
+        );
+        assert!(
+            changes.iter().any(
+                |change| matches!(change, Change::RevokeDefaultPrivilege { owner, .. }
+                    if owner == "pad_owner")
+            ),
+            "the owner's default privilege must be revoked: {changes:?}"
+        );
+
+        let issues = preflight_authority_issues(&exec_pool, &changes, &RoleGraph::default())
+            .await
+            .expect("preflight should run");
+        assert!(
+            issues.is_empty(),
+            "the plan's own addition acquires the owner's privileges before \
+             the defaults revoke runs: {issues:?}"
+        );
+
+        apply(&exec_pool, &changes).await;
+
+        let replan = plan(&exec_pool, PAD_MANIFEST).await;
+        assert!(replan.is_empty(), "must converge in one apply: {replan:?}");
+    });
+}
