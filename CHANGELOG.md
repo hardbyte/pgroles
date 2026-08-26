@@ -9,7 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- **Preflight reports revokes the executor cannot enforce.** PostgreSQL's [`REVOKE`](https://www.postgresql.org/docs/current/sql-revoke.html) removes only grants attributable to the executor: an object-privilege revoke matching no such ACL entry succeeds silently, and a role-membership revoke of an edge granted by someone else (PostgreSQL 16+) succeeds with only a `WARNING` — either way the grant survives and re-plans forever. Plans now check both against the live catalogs and report each unreachable entry with its grantor (`UnsatisfiableRevoke`): `diff` warns, `apply` blocks. Previously only `PUBLIC` revokes were checked. See [limitations](https://thepartly.github.io/pgroles/docs/limitations/#grant-options-and-effective-access).
+- **Preflight reports revokes the executor cannot enforce.** PostgreSQL's [`REVOKE`](https://www.postgresql.org/docs/current/sql-revoke.html) removes only grants attributed to the revoker (a superuser acts as the object owner, or the bootstrap superuser for role memberships): an object-privilege revoke matching no such ACL entry succeeds silently, and a role-membership revoke of an edge granted by someone else (PostgreSQL 16+) succeeds with only a `WARNING` — either way the grant survives and re-plans forever, superuser executors included. Plans now check both against the live catalogs and report each unremovable entry with its grantor (`UnsatisfiableRevoke`): `diff` warns, `apply` blocks. Previously only `PUBLIC` revokes were checked. See [limitations](https://thepartly.github.io/pgroles/docs/limitations/#grant-options-and-effective-access).
 
 ### Fixed
 

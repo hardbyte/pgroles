@@ -1,12 +1,12 @@
 //! Live coverage for the foreign-grantor revoke preflight.
 //!
-//! PostgreSQL's REVOKE removes only ACL entries whose grantor the executor
-//! can act as, and a REVOKE matching none of them succeeds silently — no
-//! error, no warning. A privilege granted onward by a delegate
-//! (`WITH GRANT OPTION`) therefore survives the executor's revoke and the
-//! same drift re-plans forever. The preflight must name exactly the entries
-//! that would survive, per grantor, and stay quiet for executors that can
-//! reach every grantor.
+//! PostgreSQL's REVOKE removes only grants attributed to the revoker — a
+//! superuser's revoke acts as the object owner (or, for role memberships,
+//! the bootstrap superuser) — and a REVOKE matching no such entry succeeds
+//! silently (objects) or with only a WARNING (memberships). A privilege
+//! granted onward by a delegate therefore survives everyone's plain revoke,
+//! superusers included, and the same drift re-plans forever. The preflight
+//! must name exactly the entries that would survive, per grantor.
 //!
 //! Requires DATABASE_URL (superuser); run with `cargo test -- --include-ignored`.
 
@@ -164,13 +164,26 @@ fn preflight_names_acl_entries_the_executor_cannot_revoke() {
             &[("fgr_t".to_string(), "fgr_delegate".to_string())]
         );
 
-        // A superuser executor can act as every grantor: no issue.
+        // A superuser's plain REVOKE is performed as though issued by the
+        // owner (verified live): the owner-granted entry is removable, but
+        // the delegate-granted one survives even a superuser's revoke and
+        // must stay reported.
         let issues = preflight_authority_issues(&pool, &revoke_select(), &RoleGraph::default())
             .await
             .expect("preflight should run");
-        assert!(
-            foreign_grantor_issues(&issues).is_empty(),
-            "superuser must not be flagged: {issues:?}"
+        let foreign = foreign_grantor_issues(&issues);
+        assert_eq!(
+            foreign.len(),
+            1,
+            "delegate entry unremovable even for a superuser: {issues:?}"
+        );
+        let AuthorityIssue::ForeignGrantorRevoke { examples, .. } = foreign[0] else {
+            unreachable!()
+        };
+        assert_eq!(
+            examples,
+            &[("fgr_t".to_string(), "fgr_delegate".to_string())],
+            "owner-attributed entry must not be flagged for a superuser"
         );
 
         // Heterogeneous revokes in one schema must not be checked as their
@@ -307,15 +320,42 @@ fn preflight_names_membership_edges_the_executor_cannot_revoke() {
         );
         assert_eq!(grantor, "fgrm_grantor");
 
-        // A superuser executor can act as every grantor: no issue.
-        let issues = preflight_authority_issues(&pool, &changes, &RoleGraph::default())
+        // A superuser's bare membership revoke is attributed to the bootstrap
+        // superuser (verified live): the edge fgrm_grantor granted still
+        // survives it — with only a WARNING — and must stay reported, while
+        // an edge the bootstrap superuser granted (fgrm_reader → fgrm_exec)
+        // is removable and must not be.
+        let both = vec![
+            Change::RemoveMember {
+                role: "fgrm_reader".to_string(),
+                member: "fgrm_alice".to_string(),
+            },
+            Change::RemoveMember {
+                role: "fgrm_reader".to_string(),
+                member: "fgrm_exec".to_string(),
+            },
+        ];
+        let issues = preflight_authority_issues(&pool, &both, &RoleGraph::default())
             .await
             .expect("preflight should run");
-        assert!(
-            !issues.iter().any(|issue| {
-                matches!(issue, AuthorityIssue::ForeignGrantorMembershipRevoke { .. })
-            }),
-            "superuser must not be flagged: {issues:?}"
+        let membership: Vec<_> = issues
+            .iter()
+            .filter(|issue| matches!(issue, AuthorityIssue::ForeignGrantorMembershipRevoke { .. }))
+            .collect();
+        assert_eq!(
+            membership.len(),
+            1,
+            "only the ordinary-grantor edge survives a superuser's revoke: {issues:?}"
+        );
+        let AuthorityIssue::ForeignGrantorMembershipRevoke {
+            member, grantor, ..
+        } = membership[0]
+        else {
+            unreachable!()
+        };
+        assert_eq!(
+            (member.as_str(), grantor.as_str()),
+            ("fgrm_alice", "fgrm_grantor")
         );
     });
 }

@@ -7,29 +7,39 @@
 //! mid-transaction with a permission error, so the check only moves the
 //! failure earlier and names the owner.
 //!
-//! `REVOKE` can be worse than a loud failure: PostgreSQL removes only ACL
-//! entries whose grantor the executor can act as, and a REVOKE matching no
-//! entry silently removes nothing — the next inspection still sees the
-//! privilege, and the controller re-plans the same revoke forever.
+//! `REVOKE` can be worse than a loud failure: every grant is attributed to a
+//! grantor, and a plain REVOKE removes only the entry of the *one* grantor
+//! PostgreSQL selects for the executor. A REVOKE that matches no such entry
+//! silently removes nothing — the next inspection still sees the privilege,
+//! and the controller re-plans the same revoke forever.
 //!
-//! For `REVOKE ... FROM PUBLIC`, implicit PUBLIC grants are always
-//! grantor-owned, so membership in the object owner (which `pg_has_role`
-//! reports true for superusers too) is exactly the authority the revoke
-//! needs. For ordinary role grantees an owner-membership test would be both
-//! too strict (an executor can hold revoke authority via its own grant
-//! option) and too loose (owner membership cannot remove an entry a delegate
-//! granted onward), so those are checked per ACL entry instead: an entry for
-//! the revoked grantee whose *grantor* the executor cannot act as survives
-//! the revoke under any grantor selection, and is reported. Entries whose
-//! grantor is reachable are trusted to the apply; the operator's post-apply
-//! non-convergence detection catches the residue (grantor-selection
-//! shadowing) that no preflight can prove.
+//! The selection rules, verified live against PostgreSQL 16:
 //!
-//! Role-membership revokes have the same shape since PostgreSQL 16, which
-//! records a grantor per membership edge: a bare `REVOKE role FROM member`
-//! removes only the edge attributed to the executor, and with ADMIN OPTION
-//! but a different grantor it succeeds with just a WARNING. Targeted edges
-//! whose grantor the executor cannot act as are reported per edge.
+//! * **Object privileges**: the executor itself when it holds the privilege
+//!   `WITH GRANT OPTION` (shadowing the owner even for owner members),
+//!   otherwise the object's owner when the executor can act as the owner —
+//!   which includes superusers, whose GRANT/REVOKE "is performed as though
+//!   it were issued by the owner of the affected object" (upstream REVOKE
+//!   notes). An entry a delegate granted onward therefore survives
+//!   *everyone's* plain revoke except the delegate's own, superusers
+//!   included, and `GRANTED BY` for object privileges must name the current
+//!   user — only revoking the delegate's grant option with `CASCADE` clears
+//!   it.
+//! * **Role memberships** (PostgreSQL 16+, which records a grantor per
+//!   edge): the executor itself under direct ADMIN OPTION; for superusers
+//!   the bootstrap superuser, which is also how grants *by* any superuser
+//!   are recorded. An edge granted by an ordinary role survives even a
+//!   superuser's bare revoke, with only a WARNING; `REVOKE ... GRANTED BY`
+//!   works for any role holding the grantor's privileges.
+//!
+//! The per-entry checks below flag what those rules make unremovable. For
+//! non-superuser executors the object check keeps the conservative
+//! `pg_has_role(executor, grantor)` test — it never blocks a removable entry
+//! (attribution through membership resolves inside that set), at the cost of
+//! missing the shadowing case, which the operator's post-apply
+//! non-convergence detection catches. For `REVOKE ... FROM PUBLIC`,
+//! implicit PUBLIC grants are always owner-attributed, so the
+//! owner-membership test is exact there.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -80,20 +90,21 @@ pub enum AuthorityIssue {
         examples: Vec<(String, String)>,
     },
 
-    /// A planned `REVOKE ... FROM <role>` targets ACL entries granted by
-    /// grantors the executor cannot act as. PostgreSQL removes only entries
-    /// whose grantor the executor can act as, and a REVOKE matching none of
-    /// them succeeds silently — no error, no warning — so these entries would
-    /// survive and the same drift would re-plan on every run.
+    /// A planned `REVOKE ... FROM <role>` targets ACL entries the executor's
+    /// plain REVOKE cannot remove: PostgreSQL revokes only the entry of the
+    /// one grantor it selects for the executor, and a REVOKE matching no such
+    /// entry succeeds silently — no error, no warning — so these entries
+    /// would survive and the same drift would re-plan on every run.
     ///
     /// This is the ordinary-grantee sibling of [`AuthorityIssue::PublicRevoke`]
-    /// and checks the sharper grantor-level condition: acting as the object's
-    /// *owner* is not enough to remove an entry a delegate granted onward via
-    /// `WITH GRANT OPTION`. The converse gap remains: an entry whose grantor
-    /// *is* actable can still survive when PostgreSQL's grantor selection
-    /// prefers another path (e.g. the executor's own grant option shadowing
-    /// the owner's), which only the post-apply non-convergence detection
-    /// catches.
+    /// and checks per ACL entry: an entry a delegate granted onward via
+    /// `WITH GRANT OPTION` is unremovable even for an owner-acting executor —
+    /// superusers included, whose revoke is performed as though issued by the
+    /// owner. A residue remains for non-superuser executors: an entry whose
+    /// grantor is reachable can still survive when PostgreSQL's grantor
+    /// selection prefers another path (the executor's own grant option
+    /// shadowing the owner's), which only the post-apply non-convergence
+    /// detection catches.
     ForeignGrantorRevoke {
         object_type: ObjectType,
         schema: Option<String>,
@@ -106,14 +117,16 @@ pub enum AuthorityIssue {
     },
 
     /// A planned membership `REVOKE <role> FROM <member>` targets an edge
-    /// granted by a grantor the executor cannot act as (PostgreSQL 16+).
+    /// the executor's plain REVOKE cannot remove (PostgreSQL 16+).
     ///
     /// Since PostgreSQL 16 each membership edge records its grantor, and a
-    /// bare `REVOKE` removes only the edge attributed to the executor: with
-    /// ADMIN OPTION but a different grantor it succeeds with just a WARNING
-    /// ("role ... has not been granted membership ... by role ...") and the
-    /// edge survives, so the same revocation re-plans on every run.
-    /// `REVOKE ... GRANTED BY <grantor>` removes it, but requires the
+    /// bare `REVOKE` removes only the edge whose grantor the revoke is
+    /// attributed to — the executor under direct ADMIN OPTION, or for a
+    /// superuser the bootstrap superuser. Any other edge survives with just
+    /// a WARNING ("role ... has not been granted membership ... by role
+    /// ...") — an edge granted by an ordinary role survives even a
+    /// superuser's bare revoke — so the same revocation re-plans on every
+    /// run. `REVOKE ... GRANTED BY <grantor>` removes it, but requires the
     /// privileges of that grantor.
     ForeignGrantorMembershipRevoke {
         role: String,
@@ -205,10 +218,11 @@ impl std::fmt::Display for AuthorityIssue {
                     f,
                     "UnsatisfiableRevoke: cannot revoke \"{grantee}\" privileges on \
                      {object_type} objects{} as executor \"{executor}\"; {skipped_count} ACL \
-                     entr{} granted by grantors the executor cannot act as, so the REVOKE \
-                     would succeed while silently leaving them in place — revoke the \
-                     delegating grant option (with CASCADE) or run as a role that can act \
-                     as the grantor",
+                     entr{} attributed to grantors this executor's REVOKE cannot remove \
+                     (PostgreSQL revokes only grants made by the revoker; a superuser acts \
+                     as the owner), so the REVOKE would succeed while silently leaving them \
+                     in place — revoke the delegating grantor's grant option with CASCADE, \
+                     or run the revoke as that grantor",
                     match schema {
                         Some(schema) => format!(" in schema \"{schema}\""),
                         None => String::new(),
@@ -356,7 +370,15 @@ pub async fn preflight_authority_issues(
                     r.rolname::text AS role_name,
                     m.rolname::text AS member_name,
                     g.rolname::text AS grantor_name,
-                    pg_has_role(current_user, am.grantor, 'USAGE') AS can_act
+                    CASE WHEN (SELECT rolsuper FROM pg_roles WHERE rolname = current_user)
+                         -- Role grants made by any superuser are recorded as
+                         -- granted by the bootstrap superuser (OID 10), and a
+                         -- superuser's plain REVOKE is attributed the same
+                         -- way — an edge granted by an ordinary role survives
+                         -- even a superuser's revoke, with only a WARNING.
+                         THEN am.grantor = 10 OR g.rolname = current_user
+                         ELSE pg_has_role(current_user, am.grantor, 'USAGE')
+                    END AS can_act
                 FROM pg_auth_members am
                 JOIN pg_roles r ON r.oid = am.roleid
                 JOIN pg_roles m ON m.oid = am.member
@@ -848,7 +870,13 @@ async fn fetch_revoke_grantor_authority(
                     c.relname::text AS object_name,
                     gr.rolname::text AS grantor_name,
                     acl.privilege_type::text AS privilege_type,
-                    pg_has_role(current_user, acl.grantor, 'USAGE') AS can_act
+                    CASE WHEN (SELECT rolsuper FROM pg_roles WHERE rolname = current_user)
+                         -- A superuser's plain REVOKE is performed as though
+                         -- issued by the object's owner, so only the
+                         -- owner-attributed entry is removable.
+                         THEN acl.grantor = c.relowner
+                         ELSE pg_has_role(current_user, acl.grantor, 'USAGE')
+                    END AS can_act
                 FROM pg_class c
                 JOIN pg_namespace n ON n.oid = c.relnamespace
                 CROSS JOIN LATERAL aclexplode(c.relacl) AS acl
@@ -876,7 +904,10 @@ async fn fetch_revoke_grantor_authority(
                         AS object_name,
                     gr.rolname::text AS grantor_name,
                     acl.privilege_type::text AS privilege_type,
-                    pg_has_role(current_user, acl.grantor, 'USAGE') AS can_act
+                    CASE WHEN (SELECT rolsuper FROM pg_roles WHERE rolname = current_user)
+                         THEN acl.grantor = p.proowner
+                         ELSE pg_has_role(current_user, acl.grantor, 'USAGE')
+                    END AS can_act
                 FROM pg_proc p
                 JOIN pg_namespace n ON n.oid = p.pronamespace
                 CROSS JOIN LATERAL aclexplode(p.proacl) AS acl
@@ -901,7 +932,10 @@ async fn fetch_revoke_grantor_authority(
                     t.typname::text AS object_name,
                     gr.rolname::text AS grantor_name,
                     acl.privilege_type::text AS privilege_type,
-                    pg_has_role(current_user, acl.grantor, 'USAGE') AS can_act
+                    CASE WHEN (SELECT rolsuper FROM pg_roles WHERE rolname = current_user)
+                         THEN acl.grantor = t.typowner
+                         ELSE pg_has_role(current_user, acl.grantor, 'USAGE')
+                    END AS can_act
                 FROM pg_type t
                 JOIN pg_namespace n ON n.oid = t.typnamespace
                 CROSS JOIN LATERAL aclexplode(t.typacl) AS acl
@@ -929,7 +963,10 @@ async fn fetch_revoke_grantor_authority(
                     n.nspname::text AS object_name,
                     gr.rolname::text AS grantor_name,
                     acl.privilege_type::text AS privilege_type,
-                    pg_has_role(current_user, acl.grantor, 'USAGE') AS can_act
+                    CASE WHEN (SELECT rolsuper FROM pg_roles WHERE rolname = current_user)
+                         THEN acl.grantor = n.nspowner
+                         ELSE pg_has_role(current_user, acl.grantor, 'USAGE')
+                    END AS can_act
                 FROM pg_namespace n
                 CROSS JOIN LATERAL aclexplode(n.nspacl) AS acl
                 JOIN pg_roles gr ON gr.oid = acl.grantor
@@ -953,7 +990,10 @@ async fn fetch_revoke_grantor_authority(
                     db.datname::text AS object_name,
                     gr.rolname::text AS grantor_name,
                     acl.privilege_type::text AS privilege_type,
-                    pg_has_role(current_user, acl.grantor, 'USAGE') AS can_act
+                    CASE WHEN (SELECT rolsuper FROM pg_roles WHERE rolname = current_user)
+                         THEN acl.grantor = db.datdba
+                         ELSE pg_has_role(current_user, acl.grantor, 'USAGE')
+                    END AS can_act
                 FROM pg_database db
                 CROSS JOIN LATERAL aclexplode(db.datacl) AS acl
                 JOIN pg_roles gr ON gr.oid = acl.grantor
