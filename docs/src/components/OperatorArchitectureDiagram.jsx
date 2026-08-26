@@ -48,7 +48,7 @@ export function OperatorArchitectureDiagram() {
             </div>
           </div>
 
-          <div className="mt-5 grid gap-4 xl:grid-cols-[0.95fr,1.25fr,1fr]">
+          <div className="mt-5 grid gap-4 xl:grid-cols-[0.95fr_1.25fr_1fr]">
             <DiagramPanel
               eyebrow="Watchers"
               title="Trigger sources"
