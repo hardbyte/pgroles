@@ -44,6 +44,12 @@ pub enum PlanCreationResult {
     /// is *Failed*, not pending — nothing is awaiting approval, and callers
     /// must not report it as if it were.
     DeduplicatedFailed(String),
+    /// A plan holding exactly these effects was *Applied* recently, yet the
+    /// database still diffs to the same change set: the SQL executed without
+    /// error but did not converge the inspected state. No new plan was opened;
+    /// re-applying would repeat the same no-ops. The returned plan is the
+    /// recently applied one.
+    DeduplicatedNonConvergent(String),
 }
 
 impl PlanCreationResult {
@@ -52,7 +58,8 @@ impl PlanCreationResult {
         match self {
             PlanCreationResult::Created(name)
             | PlanCreationResult::Deduplicated(name)
-            | PlanCreationResult::DeduplicatedFailed(name) => name,
+            | PlanCreationResult::DeduplicatedFailed(name)
+            | PlanCreationResult::DeduplicatedNonConvergent(name) => name,
         }
     }
 
@@ -65,6 +72,13 @@ impl PlanCreationResult {
     /// plan is in its backoff window rather than awaiting a decision.
     pub fn is_failed_backoff(&self) -> bool {
         matches!(self, PlanCreationResult::DeduplicatedFailed(_))
+    }
+
+    /// True when the identical change set was recently applied without
+    /// converging the database, so the referenced plan is *Applied* and
+    /// executing another copy of it would repeat the same silent no-ops.
+    pub fn is_nonconvergent(&self) -> bool {
+        matches!(self, PlanCreationResult::DeduplicatedNonConvergent(_))
     }
 }
 
@@ -288,6 +302,15 @@ pub enum PlanRetentionConfigError {
 /// dedup check to consider it a match. Plans older than this are ignored so
 /// that retries after the user fixes the environment are not blocked.
 const FAILED_PLAN_DEDUP_WINDOW_SECS: i64 = 120;
+
+/// How recently an Applied plan must have been applied (in seconds) for the
+/// non-convergence check to consider it a match. An identical change set
+/// re-planned this soon after applying means the SQL ran without error but
+/// changed nothing the inspector can see (for example a REVOKE of a privilege
+/// granted by a grantor the executor cannot act as, which PostgreSQL accepts
+/// silently). Re-applying would repeat the no-op — and, because every plan
+/// status write wakes the policy's reconciler, do so in a hot loop.
+const APPLIED_PLAN_NONCONVERGENT_WINDOW_SECS: i64 = 120;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum PlanSqlArtifact {
@@ -612,6 +635,7 @@ pub async fn create_or_update_plan(
     password_source_versions: &BTreeMap<String, String>,
     plan_retention: PlanRetention,
     candidate: Option<CandidatePlanBinding<'_>>,
+    detect_nonconvergent_apply: bool,
 ) -> Result<PlanCreationResult, ReconcileError> {
     let namespace = policy.namespace().ok_or(ReconcileError::NoNamespace)?;
     let policy_name = policy.name_any();
@@ -746,6 +770,33 @@ pub async fn create_or_update_plan(
                 // visible, so retiring a still-actionable plan would leave the
                 // policy holding neither a decision nor a plan to make one on.
                 return Ok(PlanCreationResult::DeduplicatedFailed(plan_name));
+            }
+        }
+    }
+
+    // 5c. Non-convergence check for auto-applying callers. If a plan with
+    // these exact effects was *Applied* moments ago and the diff still
+    // produces them, the SQL ran without error but changed nothing the
+    // inspector can see (e.g. a REVOKE of a privilege granted by a grantor
+    // the executor cannot act as — PostgreSQL accepts it silently). Creating
+    // and executing another identical plan would repeat the no-ops, and since
+    // every plan status write wakes the policy's reconciler, do so in a hot
+    // loop. Only auto-apply opts in: observe mode never executes and manual
+    // mode has a human between replans, so neither can spin this way.
+    if detect_nonconvergent_apply {
+        for plan in &existing_plans {
+            if let Some(ref status) = plan.status
+                && plan_matches_digest(status, &change_digest)
+                && applied_recently_without_converging(plan, now_ts)
+            {
+                let plan_name = plan.name_any();
+                info!(
+                    plan = %plan_name,
+                    policy = %policy_name,
+                    "recently-applied plan has identical change digest but the database \
+                     still reports the same drift; not re-applying"
+                );
+                return Ok(PlanCreationResult::DeduplicatedNonConvergent(plan_name));
             }
         }
     }
@@ -1038,6 +1089,45 @@ async fn supersede_stale_plans(
 // ---------------------------------------------------------------------------
 // Plan execution
 // ---------------------------------------------------------------------------
+
+/// Did this plan apply so recently that an identical replan proves the apply
+/// changed nothing?
+///
+/// The caller has already established that the *current* diff has exactly this
+/// plan's effects. If the plan is `Applied` and its `applied_at` is inside
+/// [`APPLIED_PLAN_NONCONVERGENT_WINDOW_SECS`], then the SQL executed without
+/// error moments ago and the inspector still sees the same drift: the changes
+/// are silent no-ops (for example a REVOKE of a privilege granted by a grantor
+/// the executor cannot act as, which PostgreSQL accepts without effect or
+/// warning). Executing another copy repeats the no-ops — and, because the
+/// policy controller wakes on its own plans' status writes, repeats them
+/// several times a second.
+///
+/// The window keeps this a slow-down, never a stop: once it expires the
+/// policy's interval retries the changes once (external drift genuinely
+/// reintroduced in the window is also fixed then), and if they still do not
+/// converge the next replan lands back here.
+///
+/// `applied_ts <= now_ts` mirrors [`retry_deferred_until_window_expires`]: a
+/// future timestamp — a stepped clock, a skewed replica — would otherwise sit
+/// inside the window until the wall clock catches up, turning the back-off
+/// unbounded.
+fn applied_recently_without_converging(plan: &PostgresPolicyPlan, now_ts: i64) -> bool {
+    let Some(status) = plan.status.as_ref() else {
+        return false;
+    };
+    if status.phase != PlanPhase::Applied {
+        return false;
+    }
+    let applied_ts = status
+        .applied_at
+        .as_deref()
+        .and_then(parse_rfc3339_epoch_secs)
+        .unwrap_or(0);
+    applied_ts > 0
+        && applied_ts <= now_ts
+        && now_ts - applied_ts < APPLIED_PLAN_NONCONVERGENT_WINDOW_SECS
+}
 
 /// Is this plan inside the retry back-off for a failure it already recorded?
 ///
@@ -3145,6 +3235,90 @@ mod tests {
             ..Default::default()
         });
         plan
+    }
+
+    fn plan_applied_at(phase: PlanPhase, age_secs: i64, now_ts: i64) -> PostgresPolicyPlan {
+        let mut plan = PostgresPolicyPlan::new("plan", test_plan_spec());
+        plan.status = Some(PostgresPolicyPlanStatus {
+            phase,
+            applied_at: Some(
+                jiff::Timestamp::from_second(now_ts - age_secs)
+                    .expect("epoch second in range")
+                    .to_string(),
+            ),
+            ..Default::default()
+        });
+        plan
+    }
+
+    /// A plan whose SQL "succeeds" without changing anything the inspector can
+    /// see (e.g. a REVOKE of a privilege granted by a grantor the executor
+    /// cannot act as) replans identically forever. Under `approval: auto` each
+    /// replan minted a fresh plan — the terminal Applied one never matched the
+    /// Pending dedup — and every plan status write woke the policy controller,
+    /// so the same no-ops re-applied about once a second.
+    #[test]
+    fn a_plan_that_just_applied_without_converging_is_not_reapplied_until_the_window_expires() {
+        let now = 1_700_000_000;
+
+        assert!(
+            applied_recently_without_converging(&plan_applied_at(PlanPhase::Applied, 1, now), now),
+            "an identical replan one second after applying means the apply was a no-op"
+        );
+        assert!(
+            applied_recently_without_converging(
+                &plan_applied_at(
+                    PlanPhase::Applied,
+                    APPLIED_PLAN_NONCONVERGENT_WINDOW_SECS - 1,
+                    now
+                ),
+                now
+            ),
+            "still inside the window"
+        );
+        assert!(
+            !applied_recently_without_converging(
+                &plan_applied_at(
+                    PlanPhase::Applied,
+                    APPLIED_PLAN_NONCONVERGENT_WINDOW_SECS,
+                    now
+                ),
+                now
+            ),
+            "the interval retries once the window expires"
+        );
+        assert!(
+            !applied_recently_without_converging(
+                &plan_applied_at(PlanPhase::Failed, 1, now),
+                now
+            ),
+            "only Applied plans prove a no-op apply; failures have their own back-off"
+        );
+        assert!(
+            !applied_recently_without_converging(
+                &plan_applied_at(PlanPhase::Applied, -30, now),
+                now
+            ),
+            "a future applied_at (skewed clock) must not defer unboundedly"
+        );
+        let mut no_timestamp = plan_applied_at(PlanPhase::Applied, 1, now);
+        no_timestamp.status.as_mut().unwrap().applied_at = None;
+        assert!(
+            !applied_recently_without_converging(&no_timestamp, now),
+            "no applied_at means ordering unknown; do not defer"
+        );
+        let mut no_status = plan_applied_at(PlanPhase::Applied, 1, now);
+        no_status.status = None;
+        assert!(!applied_recently_without_converging(&no_status, now));
+    }
+
+    #[test]
+    fn nonconvergent_creation_result_is_neither_created_nor_failed_backoff() {
+        let result = PlanCreationResult::DeduplicatedNonConvergent("plan-x".to_string());
+        assert!(result.is_nonconvergent());
+        assert!(!result.is_created());
+        assert!(!result.is_failed_backoff());
+        assert_eq!(result.plan_name(), "plan-x");
     }
 
     /// Re-executing a plan that just failed is what made a permanently-failing

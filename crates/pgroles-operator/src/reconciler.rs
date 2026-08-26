@@ -150,6 +150,20 @@ pub enum ReconcileError {
     #[error("plan {0} failed recently and was not retried: {1}")]
     PlanRetryDeferred(String, String),
 
+    /// The identical change set was applied moments ago yet still diffs: the
+    /// SQL executed without error but changed nothing the inspector can see.
+    /// Re-applying it every wake would spin, so the retry waits for the
+    /// policy interval.
+    #[error(
+        "plan {0} applied these exact changes recently, but the database still reports them \
+         as drift: the SQL executed without error yet changed nothing pgroles can observe. \
+         This usually means the executor lacks the authority to enforce a change — for \
+         example a REVOKE of a privilege granted by a grantor the executor cannot act as, \
+         which PostgreSQL accepts silently. Review the plan's SQL and the executor's \
+         authority; retrying at the policy interval"
+    )]
+    NonConvergentPlan(String),
+
     #[error("approval digest error: {0}")]
     ApprovalDigest(#[from] pgroles_core::approval::ApprovalDigestError),
 
@@ -584,6 +598,7 @@ fn retry_class_for_reconcile_error(error: &ReconcileError) -> RetryClass {
         // Waiting out the plan's retry window is exactly the normal interval:
         // requeuing sooner would re-enter the back-off and re-defer.
         ReconcileError::PlanRetryDeferred(_, _)
+        | ReconcileError::NonConvergentPlan(_)
         | ReconcileError::ManifestExpansion(_)
         | ReconcileError::InvalidInterval(_, _)
         | ReconcileError::InvalidSpec(_)
@@ -1587,6 +1602,7 @@ async fn apply_under_lock(
                 &applied_password_source_versions,
                 ctx.plan_retention,
                 None,
+                false,
             )
             .await?;
             let plan_name = creation_result.plan_name().to_string();
@@ -1708,6 +1724,7 @@ async fn apply_under_lock(
                     &applied_password_source_versions,
                     ctx.plan_retention,
                     None,
+                    true,
                 )
                 .await?;
                 let plan_name = creation_result.plan_name().to_string();
@@ -1729,6 +1746,21 @@ async fn apply_under_lock(
                         "plan failed recently, deferring retry to the policy interval"
                     );
                     return Err(ReconcileError::PlanRetryDeferred(plan_name, recorded));
+                }
+
+                // Same reasoning as the failed back-off above, for the plan
+                // that "succeeded": it applied these exact effects moments ago
+                // and the database still diffs to them, so executing another
+                // copy would repeat the same silent no-ops once per wake.
+                if creation_result.is_nonconvergent() {
+                    info!(
+                        name,
+                        namespace,
+                        plan = %plan_name,
+                        "identical plan applied recently without converging, deferring retry \
+                         to the policy interval"
+                    );
+                    return Err(ReconcileError::NonConvergentPlan(plan_name));
                 }
 
                 // Fetch the plan, mark it approved, and execute it.
@@ -2055,6 +2087,7 @@ async fn apply_under_lock(
                                 &applied_password_source_versions,
                                 ctx.plan_retention,
                                 None,
+                                false,
                             )
                             .await?;
                             let new_plan_name = new_creation_result.plan_name().to_string();
@@ -2397,6 +2430,7 @@ async fn apply_under_lock(
                                 &applied_password_source_versions,
                                 ctx.plan_retention,
                                 None,
+                                false,
                             )
                             .await?;
                             let replacement = creation_result.plan_name().to_string();
@@ -2544,6 +2578,7 @@ async fn apply_under_lock(
                 &applied_password_source_versions,
                 ctx.plan_retention,
                 None,
+                false,
             )
             .await?;
             let plan_name = creation_result.plan_name().to_string();
@@ -3519,6 +3554,9 @@ impl ReconcileError {
             // back-off exists to stop. The underlying cause is not lost — it
             // is carried verbatim in the message, and so in `last_error`.
             ReconcileError::PlanRetryDeferred(_, _) => "PlanRetryDeferred",
+            // Same stability property as PlanRetryDeferred: engages once and
+            // stays put until the plan converges or the interval retries it.
+            ReconcileError::NonConvergentPlan(_) => "NonConvergentPlan",
             ReconcileError::ApprovalDigest(_) => "ApprovalDigestFailed",
             ReconcileError::ConflictingPolicy(_) => "ConflictingPolicy",
             ReconcileError::UnsatisfiableWildcardGrant(_) => "UnsatisfiableWildcardGrant",

@@ -765,6 +765,7 @@ async fn plan_against_target(
             content_digest_encoding: pgroles_core::candidate::CANDIDATE_CONTENT_ENCODING_V1,
             base_content_digest: &base_content_digest,
         }),
+        false,
     )
     .await?;
     let plan_name = creation.plan_name().to_string();

@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **The operator no longer re-applies a non-convergent plan several times a second.** Some changes execute without error yet change nothing pgroles can observe — for example a `REVOKE` of a privilege granted by a grantor the executor cannot act as, which PostgreSQL accepts silently. Under `approval: auto` each replan minted a fresh plan (the terminal `Applied` one never matched the pending-plan dedup) and every plan status write woke the policy controller, so the same no-op changes re-applied about once a second, minting plan objects as fast as retention could prune them. The reconciler now recognises that a plan with identical effects was applied moments ago and still diffs, reports `Ready=False` with reason `NonConvergentPlan` naming that plan, and retries at the policy interval instead. The condition message explains the likely cause; review the plan's SQL and the executor's authority over the affected grants.
+
 ## [0.10.0-alpha.2] - 2026-08-24
 
 This prerelease makes brownfield adoption safer and adds declarative management of memberships in PostgreSQL predefined and externally managed roles.
