@@ -13,6 +13,8 @@ What pgroles does not cover, so you know where the edges of the declared-state m
 
 ## Membership SET option
 
+On PostgreSQL 15 and older there is no per-membership `INHERIT` option at all: inheritance is governed solely by the member role's `INHERIT` attribute, which pgroles already manages as a role attribute. Inspection on those versions reports the member's attribute as the edge's `inherit` value, so a membership whose member role sets `inherit: false` diffs against the edge default of `true` and plans a revoke-and-regrant that cannot change anything — the plan re-appears on every run. On pre-16 servers, leave the per-member `inherit` field unset and manage inheritance through the role's own `inherit` attribute.
+
 PostgreSQL 16 separates `INHERIT`, `SET`, and `ADMIN` on each role-membership edge. pgroles models and converges `inherit` and `admin`, but does not inspect or manage `pg_auth_members.set_option`. A membership created by pgroles gets PostgreSQL's default `SET TRUE`. An existing `SET FALSE` edge can appear to match, but converging a changed `inherit` or `admin` value revokes and recreates the edge without a `SET` clause, restoring `SET TRUE`. Do not place a `SET FALSE` security boundary on a pgroles-managed membership.
 
 ## Grant options and effective access

@@ -155,7 +155,7 @@ roles:
 | `connection_limit` | int | `-1` (unlimited) | Max concurrent connections |
 | `comment` | string | *none* | Comment on the role |
 | `password` | object | *none* | Password source |
-| `password_valid_until` | string | *none* | Password expiration (ISO 8601) |
+| `password_valid_until` | string | *none* | Password expiration, exactly `YYYY-MM-DDTHH:MM:SSZ` (UTC, whole seconds) — the form inspection reports, so state comparison converges |
 | `config` | map | `{}` | Role-level configuration defaults (`ALTER ROLE ... SET`) |
 
 Roles with `login: true` can declare a password source. The password value is never stored in the manifest; it is resolved at apply time from an environment variable in CLI mode or from a Kubernetes Secret in operator mode.

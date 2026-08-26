@@ -101,7 +101,14 @@ pub async fn fetch_roles(
                     r.rolbypassrls,
                     r.rolconnlimit,
                     d.description AS comment,
+                    -- 'infinity' means "never expires", which the manifest
+                    -- expresses by omitting password_valid_until — and to_char
+                    -- renders it (and '-infinity') as an empty string, which no
+                    -- manifest value can ever equal, so reporting it would
+                    -- re-plan an ALTER ROLE forever. Both non-finite values
+                    -- therefore inspect as "no expiration managed".
                     CASE WHEN r.rolvaliduntil IS NOT NULL
+                              AND isfinite(r.rolvaliduntil)
                          THEN to_char(r.rolvaliduntil AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"')
                          ELSE NULL END AS rolvaliduntil,
                     r.rolconfig
@@ -131,7 +138,14 @@ pub async fn fetch_roles(
                     r.rolbypassrls,
                     r.rolconnlimit,
                     d.description AS comment,
+                    -- 'infinity' means "never expires", which the manifest
+                    -- expresses by omitting password_valid_until — and to_char
+                    -- renders it (and '-infinity') as an empty string, which no
+                    -- manifest value can ever equal, so reporting it would
+                    -- re-plan an ALTER ROLE forever. Both non-finite values
+                    -- therefore inspect as "no expiration managed".
                     CASE WHEN r.rolvaliduntil IS NOT NULL
+                              AND isfinite(r.rolvaliduntil)
                          THEN to_char(r.rolvaliduntil AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"')
                          ELSE NULL END AS rolvaliduntil,
                     r.rolconfig
