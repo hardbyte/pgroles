@@ -360,3 +360,167 @@ fn grantor_revoke_restores_the_configured_execution_role() {
         assert!(!has_select, "the owner-granted entry must be revoked");
     });
 }
+
+const DFP_ROLES: [&str; 5] = [
+    "dfp_exec",
+    "dfp_alice",
+    "dfp_newmid",
+    "dfp_middle",
+    "dfp_owner",
+];
+
+/// Drop-guard for the plan-phase authority test.
+struct DfpCleanup;
+
+impl Drop for DfpCleanup {
+    fn drop(&mut self) {
+        with_runtime(async {
+            if let Ok(pool) = PgPool::connect(&database_url()).await {
+                for role in DFP_ROLES {
+                    let _ = pool
+                        .execute(format!("ALTER DEFAULT PRIVILEGES FOR ROLE {role} REVOKE SELECT ON TABLES FROM dfp_alice").as_str())
+                        .await;
+                    let _ = pool.execute(format!("DROP OWNED BY {role}").as_str()).await;
+                    let _ = pool
+                        .execute(format!("DROP ROLE IF EXISTS {role}").as_str())
+                        .await;
+                }
+            }
+        });
+    }
+}
+
+/// The plan replaces the executor's inheritance path to a default-privilege
+/// owner: it removes the old intermediary edge and adds a new one, then
+/// revokes the owner's default privileges. Phase order makes this executable
+/// (removals → additions → default-privilege revokes), and the preflight must
+/// model the additions — a removal-only simulation would reject this plan.
+/// The whole plan comes out of `diff()` from a manifest, not hand-built
+/// changes, and applies end to end as the non-superuser executor.
+const DFP_MANIFEST: &str = r#"
+roles:
+  - name: dfp_owner
+  - name: dfp_middle
+  - name: dfp_newmid
+  - name: dfp_alice
+
+memberships:
+  # The executor's direct membership is admin-only (INHERIT FALSE): it can
+  # administer dfp_owner but does not inherit its privileges.
+  - role: dfp_owner
+    members:
+      - name: dfp_exec
+        admin: true
+        inherit: false
+      - name: dfp_newmid
+  - role: dfp_middle
+    members:
+      - name: dfp_exec
+  - role: dfp_newmid
+    members:
+      - name: dfp_exec
+        admin: true
+
+default_privileges:
+  - owner: dfp_owner
+    scope: { type: global }
+    grant:
+      - role: dfp_alice
+        ensure: absent
+        privileges: [SELECT]
+        on_type: table
+"#;
+
+#[test]
+#[ignore]
+fn additions_restore_grantor_authority_within_one_plan() {
+    let _cleanup = DfpCleanup;
+    with_runtime(async {
+        let pool = PgPool::connect(&database_url())
+            .await
+            .expect("failed to connect");
+        let (version,): (i32,) =
+            sqlx::query_as("SELECT current_setting('server_version_num')::int")
+                .fetch_one(&pool)
+                .await
+                .expect("version probe should run");
+        if version < 160_000 {
+            return;
+        }
+        for role in DFP_ROLES {
+            let _ = pool.execute(format!("DROP OWNED BY {role}").as_str()).await;
+            let _ = pool
+                .execute(format!("DROP ROLE IF EXISTS {role}").as_str())
+                .await;
+        }
+        // Current state: the executor inherits dfp_owner only through
+        // dfp_middle (an edge the executor granted itself, so its removal is
+        // GRANTED BY the executor); dfp_newmid is inheritable by the executor
+        // but not yet a member of dfp_owner. The manifest drops the middle
+        // path and adds the newmid path in the same plan.
+        pool.execute(
+            "CREATE ROLE dfp_owner; CREATE ROLE dfp_middle; CREATE ROLE dfp_newmid; \
+             CREATE ROLE dfp_alice; \
+             CREATE ROLE dfp_exec LOGIN PASSWORD 'dfp_exec_pw'; \
+             GRANT dfp_owner TO dfp_exec WITH ADMIN TRUE, INHERIT FALSE; \
+             GRANT dfp_middle TO dfp_exec; \
+             GRANT dfp_newmid TO dfp_exec WITH ADMIN OPTION; \
+             ALTER DEFAULT PRIVILEGES FOR ROLE dfp_owner GRANT SELECT ON TABLES TO dfp_alice;",
+        )
+        .await
+        .expect("setup should succeed");
+        // Granted as the executor so the planned removal is attributed to it.
+        pool.execute("SET ROLE dfp_exec; GRANT dfp_owner TO dfp_middle; RESET ROLE;")
+            .await
+            .expect("executor-granted edge should succeed");
+
+        let exec_options = PgConnectOptions::from_str(&database_url())
+            .expect("DATABASE_URL should parse")
+            .username("dfp_exec")
+            .password("dfp_exec_pw");
+        let exec_pool = PgPool::connect_with(exec_options)
+            .await
+            .expect("executor should connect");
+
+        let changes = plan(&exec_pool, DFP_MANIFEST).await;
+        assert!(
+            changes.iter().any(|change| matches!(
+                change,
+                Change::RemoveMember { role, member, .. }
+                    if role == "dfp_owner" && member == "dfp_middle"
+            )),
+            "the old path must be removed: {changes:?}"
+        );
+        assert!(
+            changes.iter().any(|change| matches!(
+                change,
+                Change::AddMember { role, member, inherit: true, .. }
+                    if role == "dfp_owner" && member == "dfp_newmid"
+            )),
+            "the new path must be added: {changes:?}"
+        );
+        assert!(
+            changes.iter().any(
+                |change| matches!(change, Change::RevokeDefaultPrivilege { owner, .. }
+                    if owner == "dfp_owner")
+            ),
+            "the owner's default privilege must be revoked: {changes:?}"
+        );
+
+        // The removal strips the executor's only *current* inheritance path
+        // to dfp_owner, but the addition in the same plan restores one before
+        // the default-privilege revoke runs — the preflight must not flag it.
+        let issues = preflight_authority_issues(&exec_pool, &changes, &RoleGraph::default())
+            .await
+            .expect("preflight should run");
+        assert!(
+            issues.is_empty(),
+            "the added path executes before the defaults revoke: {issues:?}"
+        );
+
+        apply(&exec_pool, &changes).await;
+
+        let replan = plan(&exec_pool, DFP_MANIFEST).await;
+        assert!(replan.is_empty(), "must converge in one apply: {replan:?}");
+    });
+}

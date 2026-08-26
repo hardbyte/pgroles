@@ -97,8 +97,9 @@ fn delegated_public_grant_converges_for_a_non_superuser_executor() {
                 .await
                 .expect("version probe should run");
         if version < 160_000 {
-            // Grantor targeting needs pg_has_role(..., 'SET'); pre-16 keeps
-            // the plain-revoke path.
+            // Object-ACL grantor targeting itself is not version-gated, but
+            // this test's assertions were validated against the PG16+
+            // matrix, which is also where CI runs.
             return;
         }
         let _ = pool.execute("DROP TABLE IF EXISTS pdg_t").await;
@@ -175,5 +176,111 @@ fn delegated_public_grant_converges_for_a_non_superuser_executor() {
         .await
         .expect("probe should run");
         assert!(!public_select, "the delegate's PUBLIC entry must be gone");
+    });
+}
+
+const LP_ROLES: [&str; 3] = ["pdl_exec", "pdl_delegate", "pdl_owner"];
+
+/// Drop-guard for the least-privilege variant.
+struct LpCleanup;
+
+impl Drop for LpCleanup {
+    fn drop(&mut self) {
+        with_runtime(async {
+            if let Ok(pool) = PgPool::connect(&database_url()).await {
+                let _ = pool.execute("DROP TABLE IF EXISTS pdl_t").await;
+                for role in LP_ROLES {
+                    let _ = pool.execute(format!("DROP OWNED BY {role}").as_str()).await;
+                    let _ = pool
+                        .execute(format!("DROP ROLE IF EXISTS {role}").as_str())
+                        .await;
+                }
+            }
+        });
+    }
+}
+
+const LP_MANIFEST: &str = r#"
+grants:
+  - role: PUBLIC
+    ensure: absent
+    privileges: [SELECT]
+    object:
+      type: table
+      schema: public
+      name: pdl_t
+"#;
+
+/// The least-privilege posture: the executor can become the delegate but has
+/// no path to the object owner. The generated SQL is `SET ROLE pdl_delegate;
+/// REVOKE ...;`, which needs exactly that — the PUBLIC owner-authority sweep
+/// must not also demand owner membership for a grantor-targeted revoke.
+#[test]
+#[ignore]
+fn delegated_public_grant_converges_without_owner_membership() {
+    let _cleanup = LpCleanup;
+    with_runtime(async {
+        let pool = PgPool::connect(&database_url())
+            .await
+            .expect("failed to connect");
+        let (version,): (i32,) =
+            sqlx::query_as("SELECT current_setting('server_version_num')::int")
+                .fetch_one(&pool)
+                .await
+                .expect("version probe should run");
+        if version < 160_000 {
+            return;
+        }
+        let _ = pool.execute("DROP TABLE IF EXISTS pdl_t").await;
+        for role in LP_ROLES {
+            let _ = pool
+                .execute(format!("DROP ROLE IF EXISTS {role}").as_str())
+                .await;
+        }
+        pool.execute(
+            "CREATE ROLE pdl_owner; CREATE ROLE pdl_delegate; \
+             CREATE ROLE pdl_exec LOGIN PASSWORD 'pdl_exec_pw'; \
+             CREATE TABLE pdl_t(i int); ALTER TABLE pdl_t OWNER TO pdl_owner; \
+             SET ROLE pdl_owner; \
+             GRANT SELECT ON pdl_t TO pdl_delegate WITH GRANT OPTION; \
+             RESET ROLE; \
+             SET ROLE pdl_delegate; \
+             GRANT SELECT ON pdl_t TO PUBLIC; \
+             RESET ROLE; \
+             GRANT pdl_delegate TO pdl_exec;",
+        )
+        .await
+        .expect("setup should succeed");
+
+        let exec_options = PgConnectOptions::from_str(&database_url())
+            .expect("DATABASE_URL should parse")
+            .username("pdl_exec")
+            .password("pdl_exec_pw");
+        let exec_pool = PgPool::connect_with(exec_options)
+            .await
+            .expect("executor should connect");
+
+        let changes = plan(&exec_pool, LP_MANIFEST).await;
+        assert!(
+            changes.iter().any(|change| matches!(
+                change,
+                Change::Revoke { role: Grantee::Public, grantor: Some(grantor), .. }
+                    if grantor == "pdl_delegate"
+            )),
+            "the PUBLIC revoke must target the delegate's entry: {changes:?}"
+        );
+        let issues = preflight_authority_issues(&exec_pool, &changes, &RoleGraph::default())
+            .await
+            .expect("preflight should run");
+        assert!(
+            issues.is_empty(),
+            "becoming the delegate is the only requirement — owner authority \
+             must not be demanded for a grantor-targeted PUBLIC revoke: {issues:?}"
+        );
+
+        apply(&exec_pool, &changes).await;
+
+        let replan = plan(&exec_pool, LP_MANIFEST).await;
+        assert!(replan.is_empty(), "must converge in one apply: {replan:?}");
     });
 }

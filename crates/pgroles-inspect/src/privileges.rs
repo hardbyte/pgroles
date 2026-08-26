@@ -60,8 +60,9 @@ pub(crate) struct AclRow {
     /// `aclexplode`'s grantor). PostgreSQL's plain REVOKE removes only the
     /// entry of the grantor it selects for the executor, so revoking an entry
     /// attributed elsewhere means acting as its grantor — the diff splits
-    /// revokes per grantor from this. `None` on synthesized rows (inventory,
-    /// PUBLIC defaults) which never feed grantor-targeted revokes.
+    /// revokes per grantor from this. PUBLIC rows carry it too — a delegated
+    /// grant to PUBLIC lives in the delegate's entry. `None` on synthesized
+    /// inventory rows, which never feed grantor-targeted revokes.
     pub(crate) grantor: Option<String>,
 }
 

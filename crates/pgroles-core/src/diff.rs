@@ -81,9 +81,10 @@ pub enum Change {
     /// removes only the entry of the one grantor it selects for the executor
     /// (a superuser acts as the owner), so an entry attributed to another
     /// grantor survives silently — rendering the revoke as
-    /// `SET ROLE <grantor>; REVOKE ...; RESET ROLE;` removes exactly the
-    /// inspected entry (it requires the executor to be able to become the
-    /// grantor, which the preflight checks). `None` renders a plain REVOKE:
+    /// `SET ROLE <grantor>; REVOKE ...;` (restoring the connection's
+    /// configured execution role, or `RESET ROLE` when none is set) removes
+    /// exactly the inspected entry (it requires the executor to be able to
+    /// become the grantor, which the preflight checks). `None` renders a plain REVOKE:
     /// grantor-less inspection and desired-side callers. Skipped in
     /// serialization when `None`, so digests and JSON output of grantor-less
     /// plans are unchanged.
