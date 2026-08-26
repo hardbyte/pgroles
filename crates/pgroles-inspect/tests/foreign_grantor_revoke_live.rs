@@ -40,9 +40,7 @@ impl Drop for Cleanup {
             if let Ok(pool) = PgPool::connect(&database_url()).await {
                 let _ = pool.execute("DROP TABLE IF EXISTS fgr_t").await;
                 for role in ["fgr_exec", "fgr_grantee", "fgr_delegate", "fgr_owner"] {
-                    let _ = pool
-                        .execute(format!("DROP OWNED BY {role}").as_str())
-                        .await;
+                    let _ = pool.execute(format!("DROP OWNED BY {role}").as_str()).await;
                     let _ = pool
                         .execute(format!("DROP ROLE IF EXISTS {role}").as_str())
                         .await;
@@ -107,9 +105,10 @@ fn preflight_names_acl_entries_the_executor_cannot_revoke() {
         // The executor holds its own grant option but is a member of neither
         // grantor: both the owner-granted and the delegate-granted entries
         // for fgr_grantee are out of reach and must be reported.
-        let issues = preflight_authority_issues(&exec_pool, &revoke_select(), &RoleGraph::default())
-            .await
-            .expect("preflight should run");
+        let issues =
+            preflight_authority_issues(&exec_pool, &revoke_select(), &RoleGraph::default())
+                .await
+                .expect("preflight should run");
         let foreign = foreign_grantor_issues(&issues);
         assert_eq!(foreign.len(), 1, "one issue per grantee group: {issues:?}");
         let AuthorityIssue::ForeignGrantorRevoke {
@@ -134,11 +133,16 @@ fn preflight_names_acl_entries_the_executor_cannot_revoke() {
         pool.execute("GRANT fgr_owner TO fgr_exec")
             .await
             .expect("grant should succeed");
-        let issues = preflight_authority_issues(&exec_pool, &revoke_select(), &RoleGraph::default())
-            .await
-            .expect("preflight should run");
+        let issues =
+            preflight_authority_issues(&exec_pool, &revoke_select(), &RoleGraph::default())
+                .await
+                .expect("preflight should run");
         let foreign = foreign_grantor_issues(&issues);
-        assert_eq!(foreign.len(), 1, "delegate entry still unreachable: {issues:?}");
+        assert_eq!(
+            foreign.len(),
+            1,
+            "delegate entry still unreachable: {issues:?}"
+        );
         let AuthorityIssue::ForeignGrantorRevoke {
             skipped_count,
             examples,
@@ -148,7 +152,10 @@ fn preflight_names_acl_entries_the_executor_cannot_revoke() {
             unreachable!()
         };
         assert_eq!(*skipped_count, 1);
-        assert_eq!(examples, &[("fgr_t".to_string(), "fgr_delegate".to_string())]);
+        assert_eq!(
+            examples,
+            &[("fgr_t".to_string(), "fgr_delegate".to_string())]
+        );
 
         // A superuser executor can act as every grantor: no issue.
         let issues = preflight_authority_issues(&pool, &revoke_select(), &RoleGraph::default())

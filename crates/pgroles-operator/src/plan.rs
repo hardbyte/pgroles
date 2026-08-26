@@ -3288,10 +3288,7 @@ mod tests {
             "the interval retries once the window expires"
         );
         assert!(
-            !applied_recently_without_converging(
-                &plan_applied_at(PlanPhase::Failed, 1, now),
-                now
-            ),
+            !applied_recently_without_converging(&plan_applied_at(PlanPhase::Failed, 1, now), now),
             "only Applied plans prove a no-op apply; failures have their own back-off"
         );
         assert!(

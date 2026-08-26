@@ -190,7 +190,11 @@ impl std::fmt::Display for AuthorityIssue {
                         Some(schema) => format!(" in schema \"{schema}\""),
                         None => String::new(),
                     },
-                    if *skipped_count == 1 { "y was" } else { "ies were" },
+                    if *skipped_count == 1 {
+                        "y was"
+                    } else {
+                        "ies were"
+                    },
                 )?;
                 if !examples.is_empty() {
                     write!(f, " (examples: {examples})")?;
