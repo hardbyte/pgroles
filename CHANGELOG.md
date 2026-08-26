@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Preflight now catches revokes the executor cannot enforce, for ordinary role grantees.** PostgreSQL's `REVOKE` removes only ACL entries whose grantor the executor can act as, and a revoke matching none of them succeeds silently — the entry survives and the same drift re-plans on every run. The existing check covered only `PUBLIC`; plans now also explode the live ACLs behind every role-grantee revoke and report each entry whose grantor is out of the executor's reach, naming the object and grantor (`UnsatisfiableRevoke`). `diff` warns, `apply` blocks, and the operator reports the issue and blocks execution, pointing at the fix: revoke the delegating grant option (with `CASCADE`) or run as a role that can act as the grantor.
+
 ### Fixed
 
 - **`password_valid_until` now converges.** Two silent non-convergence bugs in the same field: an expiration written with a timezone offset (`2025-06-15T14:30:00+05:30`) or fractional seconds (`.999Z`) named a valid instant but could never compare equal to the inspected value (always rendered as UTC whole seconds), so the `ALTER ROLE` applied cleanly and re-planned on every run; and a role with `VALID UNTIL 'infinity'` — which pgroles itself sets when an expiration is removed — inspected as an empty string no manifest value can equal, re-planning forever. Inspection now treats non-finite `rolvaliduntil` as "no expiration", and validation accepts exactly the convergent form `YYYY-MM-DDTHH:MM:SSZ`.

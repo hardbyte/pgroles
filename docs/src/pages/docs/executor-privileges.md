@@ -20,7 +20,7 @@ This table was verified against a live PostgreSQL 16 server. `CREATEROLE` is the
 | `DROP ROLE` | `CREATEROLE` + `ADMIN OPTION` on the role |
 | `CREATE SCHEMA` | `CREATE` privilege on the database |
 | `ALTER SCHEMA ... OWNER TO` | ownership of the schema plus membership in the new owner role |
-| `GRANT`/`REVOKE` on tables/sequences/functions | ownership of the objects, directly or via membership in the owning role |
+| `GRANT`/`REVOKE` on tables/sequences/functions | ownership of the objects, directly or via membership in the owning role. A `REVOKE` additionally removes only ACL entries whose *grantor* the executor can act as — an entry a delegate granted onward survives silently. The plan preflight reports such entries and apply blocks |
 | `ALTER DEFAULT PRIVILEGES FOR ROLE x` | membership (privileges) of role `x` — `ADMIN OPTION` alone is **not** enough |
 | `REASSIGN OWNED BY a TO b` (retirements) | membership (privileges) of **both** `a` and `b`. The executor has `ADMIN OPTION` on roles it created, so it can `GRANT a TO executor` itself first — pgroles does not do this automatically |
 | `DROP OWNED BY a` (retirements) | membership (privileges) of `a` |

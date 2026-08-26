@@ -7,15 +7,23 @@
 //! mid-transaction with a permission error, so the check only moves the
 //! failure earlier and names the owner.
 //!
-//! `REVOKE ... FROM PUBLIC` is worse than a loud failure: issued by a role
-//! without the owner's authority it silently removes nothing, the next
-//! inspection still sees the privilege, and the controller re-plans the same
-//! revoke forever. Implicit PUBLIC grants are always grantor-owned, so
-//! membership in the object owner (which `pg_has_role` reports true for
-//! superusers too) is exactly the authority the revoke needs. Role-grantee
-//! revokes are deliberately not checked: an executor can hold revoke
-//! authority for those without owner membership, and blocking such plans
-//! would regress setups that work today.
+//! `REVOKE` can be worse than a loud failure: PostgreSQL removes only ACL
+//! entries whose grantor the executor can act as, and a REVOKE matching no
+//! entry silently removes nothing — the next inspection still sees the
+//! privilege, and the controller re-plans the same revoke forever.
+//!
+//! For `REVOKE ... FROM PUBLIC`, implicit PUBLIC grants are always
+//! grantor-owned, so membership in the object owner (which `pg_has_role`
+//! reports true for superusers too) is exactly the authority the revoke
+//! needs. For ordinary role grantees an owner-membership test would be both
+//! too strict (an executor can hold revoke authority via its own grant
+//! option) and too loose (owner membership cannot remove an entry a delegate
+//! granted onward), so those are checked per ACL entry instead: an entry for
+//! the revoked grantee whose *grantor* the executor cannot act as survives
+//! the revoke under any grantor selection, and is reported. Entries whose
+//! grantor is reachable are trusted to the apply; the operator's post-apply
+//! non-convergence detection catches the residue (grantor-selection
+//! shadowing) that no preflight can prove.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -63,6 +71,31 @@ pub enum AuthorityIssue {
         skipped_count: usize,
         /// Up to [`REVOKE_EXAMPLE_LIMIT`] affected objects as
         /// `(name, owner)`.
+        examples: Vec<(String, String)>,
+    },
+
+    /// A planned `REVOKE ... FROM <role>` targets ACL entries granted by
+    /// grantors the executor cannot act as. PostgreSQL removes only entries
+    /// whose grantor the executor can act as, and a REVOKE matching none of
+    /// them succeeds silently — no error, no warning — so these entries would
+    /// survive and the same drift would re-plan on every run.
+    ///
+    /// This is the ordinary-grantee sibling of [`AuthorityIssue::PublicRevoke`]
+    /// and checks the sharper grantor-level condition: acting as the object's
+    /// *owner* is not enough to remove an entry a delegate granted onward via
+    /// `WITH GRANT OPTION`. The converse gap remains: an entry whose grantor
+    /// *is* actable can still survive when PostgreSQL's grantor selection
+    /// prefers another path (e.g. the executor's own grant option shadowing
+    /// the owner's), which only the post-apply non-convergence detection
+    /// catches.
+    ForeignGrantorRevoke {
+        object_type: ObjectType,
+        schema: Option<String>,
+        grantee: String,
+        executor: String,
+        skipped_count: usize,
+        /// Up to [`REVOKE_EXAMPLE_LIMIT`] surviving entries as
+        /// `(object name, grantor)`.
         examples: Vec<(String, String)>,
     },
 }
@@ -126,6 +159,38 @@ impl std::fmt::Display for AuthorityIssue {
                         Some(schema) => format!(" in schema \"{schema}\""),
                         None => String::new(),
                     },
+                )?;
+                if !examples.is_empty() {
+                    write!(f, " (examples: {examples})")?;
+                }
+                Ok(())
+            }
+            AuthorityIssue::ForeignGrantorRevoke {
+                object_type,
+                schema,
+                grantee,
+                executor,
+                skipped_count,
+                examples,
+            } => {
+                let examples = examples
+                    .iter()
+                    .map(|(name, grantor)| format!("\"{name}\" (grantor \"{grantor}\")"))
+                    .collect::<Vec<_>>()
+                    .join("; ");
+                write!(
+                    f,
+                    "UnsatisfiableRevoke: cannot revoke \"{grantee}\" privileges on \
+                     {object_type} objects{} as executor \"{executor}\"; {skipped_count} ACL \
+                     entr{} granted by grantors the executor cannot act as, so the REVOKE \
+                     would succeed while silently leaving them in place — revoke the \
+                     delegating grant option (with CASCADE) or run as a role that can act \
+                     as the grantor",
+                    match schema {
+                        Some(schema) => format!(" in schema \"{schema}\""),
+                        None => String::new(),
+                    },
+                    if *skipped_count == 1 { "y was" } else { "ies were" },
                 )?;
                 if !examples.is_empty() {
                     write!(f, " (examples: {examples})")?;
@@ -372,7 +437,127 @@ pub async fn preflight_authority_issues(
         });
     }
 
+    // --- Ordinary-grantee revoke grantor authority ---
+    // The PUBLIC check above asks "can the executor act as the owner?", which
+    // approximates the entries an owner made. For ordinary grantees the
+    // sharper question is per ACL entry: PostgreSQL's REVOKE removes only
+    // entries whose *grantor* the executor can act as, and one matching no
+    // entry succeeds silently. An entry a delegate granted onward via
+    // `WITH GRANT OPTION` therefore survives even an owner-acting executor's
+    // revoke, and the same drift re-plans on every run. Explode the live ACLs
+    // of the targeted objects and flag entries for the revoked grantee and
+    // privileges whose grantor is out of the executor's reach.
+    let mut grantee_targets: BTreeMap<(ObjectType, Option<String>, String), GranteeRevokeTargets> =
+        BTreeMap::new();
+    for change in changes {
+        let Change::Revoke {
+            role: Grantee::Role(grantee),
+            object_type,
+            schema,
+            name,
+            privileges,
+        } = change
+        else {
+            continue;
+        };
+        let entry = grantee_targets
+            .entry((*object_type, schema.clone(), grantee.clone()))
+            .or_default();
+        entry
+            .privileges
+            .extend(privileges.iter().map(|privilege| privilege.to_string()));
+        match name.as_deref() {
+            Some("*") => {
+                let range_start = GrantKey {
+                    role: Grantee::Role(grantee.clone()),
+                    object_type: *object_type,
+                    schema: schema.clone(),
+                    name: None,
+                };
+                for (key, _) in current.grants.range(range_start..).take_while(|(key, _)| {
+                    key.role == Grantee::Role(grantee.clone())
+                        && key.object_type == *object_type
+                        && key.schema == *schema
+                }) {
+                    match key.name.as_deref() {
+                        // Same wildcard normalization as the PUBLIC check: a
+                        // collapsed `"*"` key covers the whole scope.
+                        Some("*") => entry.all_in_schema = true,
+                        Some(object_name) => {
+                            entry.names.insert(object_name.to_string());
+                        }
+                        None => {}
+                    }
+                }
+            }
+            Some(object_name) => {
+                entry.names.insert(object_name.to_string());
+            }
+            None => {}
+        }
+    }
+
+    for ((object_type, schema, grantee), target) in grantee_targets {
+        if target.names.is_empty() && !target.all_in_schema {
+            continue;
+        }
+        let privileges: Vec<String> = target.privileges.iter().cloned().collect();
+        let rows = fetch_revoke_grantor_authority(
+            pool,
+            object_type,
+            schema.as_deref(),
+            &target.names,
+            &grantee,
+            &privileges,
+        )
+        .await?;
+        let mut surviving: BTreeSet<(String, String)> = rows
+            .into_iter()
+            .filter(|row| {
+                !row.can_act
+                    && row.schema_name.as_deref() == schema.as_deref()
+                    && (target.all_in_schema || target.names.contains(&row.object_name))
+            })
+            .map(|row| (row.object_name, row.grantor_name))
+            .collect();
+        if surviving.is_empty() {
+            continue;
+        }
+        let skipped_count = surviving.len();
+        let examples: Vec<(String, String)> = std::mem::take(&mut surviving)
+            .into_iter()
+            .take(REVOKE_EXAMPLE_LIMIT)
+            .collect();
+        issues.push(AuthorityIssue::ForeignGrantorRevoke {
+            object_type,
+            schema,
+            grantee,
+            executor: executor.clone(),
+            skipped_count,
+            examples,
+        });
+    }
+
     Ok(issues)
+}
+
+/// Objects one planned `(object_type, schema, grantee)` revoke group reaches,
+/// plus the union of privilege names being revoked across those objects.
+#[derive(Default)]
+struct GranteeRevokeTargets {
+    names: BTreeSet<String>,
+    all_in_schema: bool,
+    privileges: BTreeSet<String>,
+}
+
+/// A live ACL entry for a revoked grantee: which object carries it, who
+/// granted it, and whether the executor can act as that grantor.
+#[derive(Debug, sqlx::FromRow)]
+struct GrantorAuthorityRow {
+    schema_name: Option<String>,
+    object_name: String,
+    grantor_name: String,
+    can_act: bool,
 }
 
 async fn fetch_object_authority(
@@ -496,6 +681,160 @@ async fn fetch_object_authority(
                 WHERE db.datname = current_database()
                 "#,
             )
+            .fetch_all(pool)
+            .await
+        }
+    }
+}
+
+/// Fetch the live ACL entries a planned `REVOKE ... FROM <grantee>` group
+/// would have to remove, with per-entry grantor actability.
+///
+/// One query per catalog family, each exploding the object's ACL column and
+/// keeping entries for the named grantee and privilege types. `can_act` is
+/// `pg_has_role(current_user, grantor, 'USAGE')` — the membership check
+/// PostgreSQL's own grantor resolution walks — so a `false` row is an entry
+/// the executor's REVOKE cannot remove under any grantor selection.
+async fn fetch_revoke_grantor_authority(
+    pool: &PgPool,
+    object_type: ObjectType,
+    schema: Option<&str>,
+    names: &BTreeSet<String>,
+    grantee: &str,
+    privileges: &[String],
+) -> Result<Vec<GrantorAuthorityRow>, sqlx::Error> {
+    let schemas: Vec<String> = schema.map(|s| vec![s.to_string()]).unwrap_or_default();
+    let names: Vec<String> = names.iter().cloned().collect();
+    match object_type {
+        ObjectType::Table
+        | ObjectType::View
+        | ObjectType::MaterializedView
+        | ObjectType::Sequence => {
+            let relkinds: Vec<String> = match object_type {
+                ObjectType::Table => vec!["r".to_string(), "p".to_string()],
+                ObjectType::View => vec!["v".to_string()],
+                ObjectType::MaterializedView => vec!["m".to_string()],
+                _ => vec!["S".to_string()],
+            };
+            sqlx::query_as::<_, GrantorAuthorityRow>(
+                r#"
+                SELECT DISTINCT
+                    n.nspname::text AS schema_name,
+                    c.relname::text AS object_name,
+                    gr.rolname::text AS grantor_name,
+                    pg_has_role(current_user, acl.grantor, 'USAGE') AS can_act
+                FROM pg_class c
+                JOIN pg_namespace n ON n.oid = c.relnamespace
+                CROSS JOIN LATERAL aclexplode(c.relacl) AS acl
+                JOIN pg_roles gr ON gr.oid = acl.grantor
+                JOIN pg_roles ge ON ge.oid = acl.grantee
+                WHERE n.nspname = ANY($1)
+                  AND c.relkind::text = ANY($2)
+                  AND ge.rolname = $3
+                  AND acl.privilege_type = ANY($4)
+                "#,
+            )
+            .bind(&schemas)
+            .bind(&relkinds)
+            .bind(grantee)
+            .bind(privileges)
+            .fetch_all(pool)
+            .await
+        }
+        ObjectType::Function => {
+            sqlx::query_as::<_, GrantorAuthorityRow>(
+                r#"
+                SELECT DISTINCT
+                    n.nspname::text AS schema_name,
+                    (p.proname || '(' || pg_catalog.pg_get_function_identity_arguments(p.oid) || ')')::text
+                        AS object_name,
+                    gr.rolname::text AS grantor_name,
+                    pg_has_role(current_user, acl.grantor, 'USAGE') AS can_act
+                FROM pg_proc p
+                JOIN pg_namespace n ON n.oid = p.pronamespace
+                CROSS JOIN LATERAL aclexplode(p.proacl) AS acl
+                JOIN pg_roles gr ON gr.oid = acl.grantor
+                JOIN pg_roles ge ON ge.oid = acl.grantee
+                WHERE n.nspname = ANY($1)
+                  AND ge.rolname = $2
+                  AND acl.privilege_type = ANY($3)
+                "#,
+            )
+            .bind(&schemas)
+            .bind(grantee)
+            .bind(privileges)
+            .fetch_all(pool)
+            .await
+        }
+        ObjectType::Type => {
+            sqlx::query_as::<_, GrantorAuthorityRow>(
+                r#"
+                SELECT DISTINCT
+                    n.nspname::text AS schema_name,
+                    t.typname::text AS object_name,
+                    gr.rolname::text AS grantor_name,
+                    pg_has_role(current_user, acl.grantor, 'USAGE') AS can_act
+                FROM pg_type t
+                JOIN pg_namespace n ON n.oid = t.typnamespace
+                CROSS JOIN LATERAL aclexplode(t.typacl) AS acl
+                JOIN pg_roles gr ON gr.oid = acl.grantor
+                JOIN pg_roles ge ON ge.oid = acl.grantee
+                WHERE n.nspname = ANY($1)
+                  AND ge.rolname = $2
+                  AND acl.privilege_type = ANY($3)
+                "#,
+            )
+            .bind(&schemas)
+            .bind(grantee)
+            .bind(privileges)
+            .fetch_all(pool)
+            .await
+        }
+        ObjectType::Schema => {
+            // Schema targets carry the schema in `name`, so `names` holds the
+            // schema names and the returned schema_name is NULL (matching how
+            // the revoke change itself is keyed).
+            sqlx::query_as::<_, GrantorAuthorityRow>(
+                r#"
+                SELECT DISTINCT
+                    NULL::text AS schema_name,
+                    n.nspname::text AS object_name,
+                    gr.rolname::text AS grantor_name,
+                    pg_has_role(current_user, acl.grantor, 'USAGE') AS can_act
+                FROM pg_namespace n
+                CROSS JOIN LATERAL aclexplode(n.nspacl) AS acl
+                JOIN pg_roles gr ON gr.oid = acl.grantor
+                JOIN pg_roles ge ON ge.oid = acl.grantee
+                WHERE n.nspname = ANY($1)
+                  AND ge.rolname = $2
+                  AND acl.privilege_type = ANY($3)
+                "#,
+            )
+            .bind(&names)
+            .bind(grantee)
+            .bind(privileges)
+            .fetch_all(pool)
+            .await
+        }
+        ObjectType::Database => {
+            sqlx::query_as::<_, GrantorAuthorityRow>(
+                r#"
+                SELECT DISTINCT
+                    NULL::text AS schema_name,
+                    db.datname::text AS object_name,
+                    gr.rolname::text AS grantor_name,
+                    pg_has_role(current_user, acl.grantor, 'USAGE') AS can_act
+                FROM pg_database db
+                CROSS JOIN LATERAL aclexplode(db.datacl) AS acl
+                JOIN pg_roles gr ON gr.oid = acl.grantor
+                JOIN pg_roles ge ON ge.oid = acl.grantee
+                WHERE db.datname = current_database()
+                  AND ge.rolname = $1
+                  AND acl.privilege_type = ANY($2)
+                "#,
+            )
+            .bind(grantee)
+            .bind(privileges)
             .fetch_all(pool)
             .await
         }
