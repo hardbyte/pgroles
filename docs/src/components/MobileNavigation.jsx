@@ -1,93 +1,46 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import Link from 'next/link'
 import { useRouter } from 'next/router'
-import { Dialog } from '@headlessui/react'
+import { IconMenu2 } from '@tabler/icons-react'
+import { Button } from '@partly/pitstop/button'
+import {
+  Sheet,
+  SheetContent,
+  SheetHeader,
+  SheetTitle,
+} from '@partly/pitstop/sheet'
 
 import { Logomark } from '@/components/Logo'
 import { Navigation } from '@/components/Navigation'
 
-function MenuIcon(props) {
-  return (
-    <svg
-      aria-hidden="true"
-      viewBox="0 0 24 24"
-      fill="none"
-      strokeWidth="2"
-      strokeLinecap="round"
-      {...props}
-    >
-      <path d="M4 7h16M4 12h16M4 17h16" />
-    </svg>
-  )
-}
-
-function CloseIcon(props) {
-  return (
-    <svg
-      aria-hidden="true"
-      viewBox="0 0 24 24"
-      fill="none"
-      strokeWidth="2"
-      strokeLinecap="round"
-      {...props}
-    >
-      <path d="M5 5l14 14M19 5l-14 14" />
-    </svg>
-  )
-}
-
 export function MobileNavigation({ navigation }) {
   let router = useRouter()
   let [isOpen, setIsOpen] = useState(false)
+  let shownPath = useRef(router.asPath)
 
+  // Following a link inside the sheet dismisses it. The ref guard keeps this
+  // to an actual navigation: a bare `setIsOpen(false)` here would also fire on
+  // the re-render that opens the sheet.
   useEffect(() => {
-    if (!isOpen) return
-
-    function onRouteChange() {
-      setIsOpen(false)
-    }
-
-    router.events.on('routeChangeComplete', onRouteChange)
-    router.events.on('routeChangeError', onRouteChange)
-
-    return () => {
-      router.events.off('routeChangeComplete', onRouteChange)
-      router.events.off('routeChangeError', onRouteChange)
-    }
-  }, [router, isOpen])
+    if (shownPath.current === router.asPath) return
+    shownPath.current = router.asPath
+    setIsOpen(false)
+  }, [router.asPath])
 
   return (
-    <>
-      <button
-        type="button"
-        onClick={() => setIsOpen(true)}
-        className="relative"
-        aria-label="Open navigation"
-      >
-        <MenuIcon className="h-6 w-6 stroke-stone-600 dark:stroke-stone-300" />
-      </button>
-      <Dialog
-        open={isOpen}
-        onClose={setIsOpen}
-        className="fixed inset-0 z-50 flex items-start overflow-y-auto bg-stone-950/50 pr-10 backdrop-blur lg:hidden"
-        aria-label="Navigation"
-      >
-        <Dialog.Panel className="min-h-full w-full max-w-xs border-r border-stone-300 bg-stone-50 px-4 pt-5 pb-12 dark:border-stone-800 dark:bg-stone-950 sm:px-6">
-          <div className="flex items-center">
-            <button
-              type="button"
-              onClick={() => setIsOpen(false)}
-              aria-label="Close navigation"
-            >
-              <CloseIcon className="h-6 w-6 stroke-stone-600 dark:stroke-stone-300" />
-            </button>
-            <Link href="/" className="ml-6" aria-label="Home page">
-              <Logomark className="h-9 w-9" />
-            </Link>
-          </div>
-          <Navigation navigation={navigation} className="mt-5 px-1" />
-        </Dialog.Panel>
-      </Dialog>
-    </>
+    <Sheet isOpen={isOpen} onOpenChange={setIsOpen}>
+      <Button variant="ghost" size="icon" aria-label="Open navigation">
+        <IconMenu2 className="size-6" />
+      </Button>
+      <SheetContent side="left" className="px-4 pb-12 sm:px-6 lg:hidden">
+        <SheetHeader className="px-0 pt-1">
+          <SheetTitle className="sr-only">Navigation</SheetTitle>
+          <Link href="/" aria-label="Home page">
+            <Logomark className="h-9 w-9" />
+          </Link>
+        </SheetHeader>
+        <Navigation navigation={navigation} className="px-1" />
+      </SheetContent>
+    </Sheet>
   )
 }

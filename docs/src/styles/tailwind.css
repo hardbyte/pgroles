@@ -1,4 +1,107 @@
-@import 'tailwindcss/base';
+@import '@partly/pitstop/index.css';
 @import './prism.css';
-@import 'tailwindcss/components';
-@import 'tailwindcss/utilities';
+
+@plugin '@tailwindcss/typography';
+
+@source '../';
+@source '../../markdoc';
+/* Tailwind skips node_modules when detecting sources, so Pitstop's own
+   utilities (bg-primary, min-h-9, the entering/exiting animations, ...) are
+   only generated because its build output is named explicitly. */
+@source '../../node_modules/@partly/pitstop/dist';
+
+/* pgroles keeps its own type (IBM Plex / Space Grotesk) rather than Pitstop's
+   Inter. The families come from next/font in `_app.jsx`, which defines them on
+   a wrapper div — so each var needs its own fallback for the elements above
+   that div (html, body), where an unresolved var would invalidate the whole
+   declaration and drop the page back to the browser's serif. */
+@theme inline {
+  --font-sans: var(--font-plex-sans, ui-sans-serif), system-ui, sans-serif;
+  --font-display: var(--font-space-grotesk, ui-sans-serif), system-ui, sans-serif;
+  --font-mono: var(--font-plex-mono, ui-monospace), monospace;
+}
+
+@theme {
+  --text-xs: 0.75rem;
+  --text-xs--line-height: 1rem;
+  --text-sm: 0.875rem;
+  --text-sm--line-height: 1.5rem;
+  --text-base: 1rem;
+  --text-base--line-height: 2rem;
+  --text-lg: 1.125rem;
+  --text-lg--line-height: 1.75rem;
+  --text-xl: 1.25rem;
+  --text-xl--line-height: 2rem;
+  --text-2xl: 1.5rem;
+  --text-2xl--line-height: 2.5rem;
+  --text-3xl: 2rem;
+  --text-3xl--line-height: 2.5rem;
+  --text-4xl: 2.5rem;
+  --text-4xl--line-height: 3rem;
+  --text-5xl: 3rem;
+  --text-5xl--line-height: 3.5rem;
+  --text-6xl: 3.75rem;
+  --text-6xl--line-height: 1;
+  --text-7xl: 4.5rem;
+  --text-7xl--line-height: 1;
+  --text-8xl: 6rem;
+  --text-8xl--line-height: 1;
+  --text-9xl: 8rem;
+  --text-9xl--line-height: 1;
+
+  --container-8xl: 88rem;
+}
+
+/* pgroles' amber/teal/stone identity expressed as Pitstop's tokens, so Pitstop
+   components inherit the docs' palette instead of Partly's blue. */
+:root {
+  --background: var(--color-stone-100);
+  --foreground: var(--color-stone-900);
+  --card: var(--color-white);
+  --card-foreground: var(--color-stone-900);
+  --popover: var(--color-white);
+  --popover-foreground: var(--color-stone-900);
+  --primary: var(--color-amber-500);
+  --primary-foreground: var(--color-stone-950);
+  --secondary: var(--color-stone-200);
+  --secondary-foreground: var(--color-stone-900);
+  --muted: var(--color-stone-100);
+  --muted-foreground: var(--color-stone-500);
+  --accent: var(--color-teal-600);
+  --accent-foreground: var(--color-white);
+  --success: var(--color-teal-600);
+  --success-accent: var(--color-teal-800);
+  --warning: var(--color-amber-600);
+  --warning-accent: var(--color-amber-800);
+  --info: var(--color-teal-600);
+  --info-accent: var(--color-teal-900);
+  --border: var(--color-stone-300);
+  --input: var(--color-stone-300);
+  --ring: var(--color-amber-500);
+}
+
+.dark {
+  --background: var(--color-stone-950);
+  --foreground: var(--color-stone-100);
+  --card: var(--color-stone-900);
+  --card-foreground: var(--color-stone-100);
+  --popover: var(--color-stone-900);
+  --popover-foreground: var(--color-stone-100);
+  --primary: var(--color-amber-300);
+  --primary-foreground: var(--color-stone-950);
+  --secondary: var(--color-stone-800);
+  --secondary-foreground: var(--color-stone-100);
+  --muted: var(--color-stone-800);
+  --muted-foreground: var(--color-stone-400);
+  --accent: var(--color-teal-500);
+  --accent-foreground: var(--color-stone-950);
+  --success: var(--color-teal-500);
+  --success-accent: var(--color-teal-300);
+  --warning: var(--color-amber-500);
+  --warning-accent: var(--color-amber-300);
+  --info: var(--color-teal-500);
+  --info-accent: var(--color-teal-300);
+  --border: var(--color-stone-700);
+  --input: var(--color-stone-700);
+  --ring: var(--color-amber-400);
+}
