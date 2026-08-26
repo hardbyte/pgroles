@@ -39,7 +39,14 @@ impl Drop for Cleanup {
         with_runtime(async {
             if let Ok(pool) = PgPool::connect(&database_url()).await {
                 let _ = pool.execute("DROP TABLE IF EXISTS fgr_t").await;
-                for role in ["fgr_exec", "fgr_grantee", "fgr_delegate", "fgr_owner"] {
+                let _ = pool.execute("DROP TABLE IF EXISTS fgr_t2").await;
+                for role in [
+                    "fgr_exec",
+                    "fgr_grantee",
+                    "fgr_delegate",
+                    "fgr_delegate2",
+                    "fgr_owner",
+                ] {
                     let _ = pool.execute(format!("DROP OWNED BY {role}").as_str()).await;
                     let _ = pool
                         .execute(format!("DROP ROLE IF EXISTS {role}").as_str())
@@ -164,6 +171,45 @@ fn preflight_names_acl_entries_the_executor_cannot_revoke() {
         assert!(
             foreign_grantor_issues(&issues).is_empty(),
             "superuser must not be flagged: {issues:?}"
+        );
+
+        // Heterogeneous revokes in one schema must not be checked as their
+        // cross-product: a foreign-grantor UPDATE entry on fgr_t is untargeted
+        // when the plan revokes SELECT on fgr_t and UPDATE on fgr_t2, and must
+        // not be reported.
+        pool.execute(
+            "DROP TABLE IF EXISTS fgr_t2; DROP ROLE IF EXISTS fgr_delegate2; \
+             CREATE ROLE fgr_delegate2; \
+             CREATE TABLE fgr_t2(i int); ALTER TABLE fgr_t2 OWNER TO fgr_owner; \
+             SET ROLE fgr_owner; \
+             GRANT UPDATE ON fgr_t TO fgr_delegate2 WITH GRANT OPTION; \
+             RESET ROLE; \
+             SET ROLE fgr_delegate2; \
+             GRANT UPDATE ON fgr_t TO fgr_grantee; \
+             RESET ROLE;",
+        )
+        .await
+        .expect("cross-product setup should succeed");
+        let mut heterogeneous = revoke_select();
+        heterogeneous.push(Change::Revoke {
+            role: Grantee::Role("fgr_grantee".to_string()),
+            object_type: ObjectType::Table,
+            schema: Some("public".to_string()),
+            name: Some("fgr_t2".to_string()),
+            privileges: BTreeSet::from([Privilege::Update]),
+        });
+        let issues = preflight_authority_issues(&exec_pool, &heterogeneous, &RoleGraph::default())
+            .await
+            .expect("preflight should run");
+        let foreign = foreign_grantor_issues(&issues);
+        assert_eq!(foreign.len(), 1, "one issue for the grantee: {issues:?}");
+        let AuthorityIssue::ForeignGrantorRevoke { examples, .. } = foreign[0] else {
+            unreachable!()
+        };
+        assert_eq!(
+            examples,
+            &[("fgr_t".to_string(), "fgr_delegate".to_string())],
+            "the untargeted UPDATE entry on fgr_t (grantor fgr_delegate2) must not be flagged"
         );
     });
 }

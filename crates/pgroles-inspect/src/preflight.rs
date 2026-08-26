@@ -467,9 +467,10 @@ pub async fn preflight_authority_issues(
         let entry = grantee_targets
             .entry((*object_type, schema.clone(), grantee.clone()))
             .or_default();
-        entry
-            .privileges
-            .extend(privileges.iter().map(|privilege| privilege.to_string()));
+        let revoked: BTreeSet<String> = privileges
+            .iter()
+            .map(|privilege| privilege.to_string())
+            .collect();
         match name.as_deref() {
             Some("*") => {
                 let range_start = GrantKey {
@@ -486,31 +487,52 @@ pub async fn preflight_authority_issues(
                     match key.name.as_deref() {
                         // Same wildcard normalization as the PUBLIC check: a
                         // collapsed `"*"` key covers the whole scope.
-                        Some("*") => entry.all_in_schema = true,
+                        Some("*") => entry.all_in_schema.extend(revoked.iter().cloned()),
                         Some(object_name) => {
-                            entry.names.insert(object_name.to_string());
+                            entry
+                                .names
+                                .entry(object_name.to_string())
+                                .or_default()
+                                .extend(revoked.iter().cloned());
                         }
                         None => {}
                     }
                 }
             }
             Some(object_name) => {
-                entry.names.insert(object_name.to_string());
+                entry
+                    .names
+                    .entry(object_name.to_string())
+                    .or_default()
+                    .extend(revoked.iter().cloned());
             }
             None => {}
         }
     }
 
     for ((object_type, schema, grantee), target) in grantee_targets {
-        if target.names.is_empty() && !target.all_in_schema {
+        if target.names.is_empty() && target.all_in_schema.is_empty() {
             continue;
         }
-        let privileges: Vec<String> = target.privileges.iter().cloned().collect();
+        // The query filters by the union of privileges for efficiency; the
+        // object → privileges association is re-applied client-side so a
+        // `SELECT` revoke on one table never flags a foreign-grantor `UPDATE`
+        // entry on another.
+        let privileges: Vec<String> = target
+            .names
+            .values()
+            .flatten()
+            .chain(target.all_in_schema.iter())
+            .cloned()
+            .collect::<BTreeSet<String>>()
+            .into_iter()
+            .collect();
+        let names: BTreeSet<String> = target.names.keys().cloned().collect();
         let rows = fetch_revoke_grantor_authority(
             pool,
             object_type,
             schema.as_deref(),
-            &target.names,
+            &names,
             &grantee,
             &privileges,
         )
@@ -520,7 +542,11 @@ pub async fn preflight_authority_issues(
             .filter(|row| {
                 !row.can_act
                     && row.schema_name.as_deref() == schema.as_deref()
-                    && (target.all_in_schema || target.names.contains(&row.object_name))
+                    && (target.all_in_schema.contains(&row.privilege_type)
+                        || target
+                            .names
+                            .get(&row.object_name)
+                            .is_some_and(|revoked| revoked.contains(&row.privilege_type)))
             })
             .map(|row| (row.object_name, row.grantor_name))
             .collect();
@@ -545,22 +571,31 @@ pub async fn preflight_authority_issues(
     Ok(issues)
 }
 
-/// Objects one planned `(object_type, schema, grantee)` revoke group reaches,
-/// plus the union of privilege names being revoked across those objects.
+/// Objects one planned `(object_type, schema, grantee)` revoke group reaches.
+///
+/// The object → privileges association is preserved: a `SELECT` revoke on one
+/// table and an `UPDATE` revoke on another in the same schema must not be
+/// checked as their cross-product, or an untargeted foreign-grantor entry
+/// would be reported and block apply. Privileges from a collapsed `"*"`
+/// wildcard target apply to every object of the type in the schema and are
+/// tracked separately.
 #[derive(Default)]
 struct GranteeRevokeTargets {
-    names: BTreeSet<String>,
-    all_in_schema: bool,
-    privileges: BTreeSet<String>,
+    /// Object name → privilege names being revoked on that object.
+    names: BTreeMap<String, BTreeSet<String>>,
+    /// Privilege names being revoked on every object of the type in the
+    /// schema (from a collapsed `"*"` target). Empty when no wildcard applies.
+    all_in_schema: BTreeSet<String>,
 }
 
-/// A live ACL entry for a revoked grantee: which object carries it, who
-/// granted it, and whether the executor can act as that grantor.
+/// A live ACL entry for a revoked grantee: which object and privilege it
+/// carries, who granted it, and whether the executor can act as that grantor.
 #[derive(Debug, sqlx::FromRow)]
 struct GrantorAuthorityRow {
     schema_name: Option<String>,
     object_name: String,
     grantor_name: String,
+    privilege_type: String,
     can_act: bool,
 }
 
@@ -726,6 +761,7 @@ async fn fetch_revoke_grantor_authority(
                     n.nspname::text AS schema_name,
                     c.relname::text AS object_name,
                     gr.rolname::text AS grantor_name,
+                    acl.privilege_type::text AS privilege_type,
                     pg_has_role(current_user, acl.grantor, 'USAGE') AS can_act
                 FROM pg_class c
                 JOIN pg_namespace n ON n.oid = c.relnamespace
@@ -753,6 +789,7 @@ async fn fetch_revoke_grantor_authority(
                     (p.proname || '(' || pg_catalog.pg_get_function_identity_arguments(p.oid) || ')')::text
                         AS object_name,
                     gr.rolname::text AS grantor_name,
+                    acl.privilege_type::text AS privilege_type,
                     pg_has_role(current_user, acl.grantor, 'USAGE') AS can_act
                 FROM pg_proc p
                 JOIN pg_namespace n ON n.oid = p.pronamespace
@@ -777,6 +814,7 @@ async fn fetch_revoke_grantor_authority(
                     n.nspname::text AS schema_name,
                     t.typname::text AS object_name,
                     gr.rolname::text AS grantor_name,
+                    acl.privilege_type::text AS privilege_type,
                     pg_has_role(current_user, acl.grantor, 'USAGE') AS can_act
                 FROM pg_type t
                 JOIN pg_namespace n ON n.oid = t.typnamespace
@@ -804,6 +842,7 @@ async fn fetch_revoke_grantor_authority(
                     NULL::text AS schema_name,
                     n.nspname::text AS object_name,
                     gr.rolname::text AS grantor_name,
+                    acl.privilege_type::text AS privilege_type,
                     pg_has_role(current_user, acl.grantor, 'USAGE') AS can_act
                 FROM pg_namespace n
                 CROSS JOIN LATERAL aclexplode(n.nspacl) AS acl
@@ -827,6 +866,7 @@ async fn fetch_revoke_grantor_authority(
                     NULL::text AS schema_name,
                     db.datname::text AS object_name,
                     gr.rolname::text AS grantor_name,
+                    acl.privilege_type::text AS privilege_type,
                     pg_has_role(current_user, acl.grantor, 'USAGE') AS can_act
                 FROM pg_database db
                 CROSS JOIN LATERAL aclexplode(db.datacl) AS acl

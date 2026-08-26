@@ -122,5 +122,25 @@ fn valid_until_converges_and_infinity_inspects_as_none() {
             replan.is_empty(),
             "hand-set infinity must not diff against an expiry-free manifest: {replan:?}"
         );
+
+        // '-infinity' means "already expired" — the opposite of "never
+        // expires" — so it must stay visible to the diff: one ALTER ROLE
+        // repairs it to the declared state, and the repair converges.
+        pool.execute("ALTER ROLE vu_live_role VALID UNTIL '-infinity'")
+            .await
+            .expect("hand-set -infinity should succeed");
+        let changes = plan(&pool, MANIFEST_WITHOUT_EXPIRY).await;
+        assert!(
+            changes
+                .iter()
+                .any(|change| matches!(change, Change::AlterRole { .. })),
+            "-infinity must diff against an expiry-free manifest: {changes:?}"
+        );
+        apply(&pool, &changes).await;
+        let replan = plan(&pool, MANIFEST_WITHOUT_EXPIRY).await;
+        assert!(
+            replan.is_empty(),
+            "repairing -infinity must converge: {replan:?}"
+        );
     });
 }
