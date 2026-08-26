@@ -37,7 +37,7 @@ use tracing::debug;
 use pgroles_core::manifest::{ObjectType, Privilege};
 use pgroles_core::model::{
     DefaultPrivKey, DefaultPrivState, DefaultPrivilegeScope, GrantKey, GrantState, Grantee,
-    RoleGraph, SchemaState,
+    MembershipEdge, RoleGraph, SchemaState,
 };
 
 use crate::defaults::fetch_default_privileges;
@@ -401,15 +401,37 @@ impl RawInspection {
         stats.roles = graph.roles.len();
 
         // --- Memberships ---
+        // Since PostgreSQL 16 one (role, member) pair can carry several
+        // pg_auth_members edges with distinct grantors (and, in principle,
+        // distinct options). Aggregate them into one effective edge —
+        // inheritance and admin apply if any edge carries them — so the diff
+        // compares one membership per pair instead of churning on duplicates,
+        // and record every grantor so removals can target each edge with
+        // `REVOKE ... GRANTED BY`.
         let membership_grantors: BTreeSet<String> =
             config.membership_grantors.iter().cloned().collect();
+        let mut effective: BTreeMap<(String, String), MembershipEdge> = BTreeMap::new();
         for row in &self.memberships {
-            if managed_roles.contains(&row.role_name)
-                || membership_grantors.contains(&row.role_name)
+            if !(managed_roles.contains(&row.role_name)
+                || membership_grantors.contains(&row.role_name))
             {
-                graph.memberships.insert(row.to_membership_edge());
+                continue;
+            }
+            let key = (row.role_name.clone(), row.member_name.clone());
+            let edge = effective
+                .entry(key.clone())
+                .or_insert_with(|| row.to_membership_edge());
+            edge.inherit |= row.inherit_option;
+            edge.admin |= row.admin_option;
+            if let Some(grantor) = &row.grantor {
+                graph
+                    .membership_edge_grantors
+                    .entry(key)
+                    .or_default()
+                    .insert(grantor.clone());
             }
         }
+        graph.memberships.extend(effective.into_values());
         stats.memberships = graph.memberships.len();
 
         // --- Schemas ---
@@ -455,6 +477,7 @@ impl RawInspection {
                 graph.grants.insert(key, state);
             }
             graph.inherent_grants.extend(result.inherent);
+            graph.grant_entry_grantors.extend(result.entry_grantors);
             remove_redundant_schema_owner_grants(&mut graph);
             stats.grants = graph.grants.len();
 
@@ -606,6 +629,7 @@ mod tests {
 
     fn membership_row(role: &str, member: &str) -> MembershipRow {
         MembershipRow {
+            grantor: None,
             role_name: role.to_string(),
             member_name: member.to_string(),
             admin_option: false,
@@ -624,6 +648,7 @@ mod tests {
 
     fn table_acl(schema: &str, table: &str, grantee: &str, privilege: &str) -> AclRow {
         AclRow {
+            grantor: None,
             grantee: Some(grantee.to_string()),
             privilege_type: privilege.to_string(),
             schema_name: Some(schema.to_string()),
@@ -635,6 +660,7 @@ mod tests {
 
     fn public_table_acl(schema: &str, table: &str, privilege: &str) -> AclRow {
         AclRow {
+            grantor: None,
             grantee: None,
             privilege_type: privilege.to_string(),
             schema_name: Some(schema.to_string()),
@@ -659,6 +685,7 @@ mod tests {
 
     fn schema_acl(schema: &str, grantee: &str, privilege: &str) -> AclRow {
         AclRow {
+            grantor: None,
             grantee: Some(grantee.to_string()),
             privilege_type: privilege.to_string(),
             schema_name: None,

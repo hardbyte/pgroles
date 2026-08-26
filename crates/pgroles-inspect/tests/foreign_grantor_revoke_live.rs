@@ -59,6 +59,7 @@ impl Drop for Cleanup {
 
 fn revoke_select() -> Vec<Change> {
     vec![Change::Revoke {
+        grantor: None,
         role: Grantee::Role("fgr_grantee".to_string()),
         object_type: ObjectType::Table,
         schema: Some("public".to_string()),
@@ -205,6 +206,7 @@ fn preflight_names_acl_entries_the_executor_cannot_revoke() {
         .expect("cross-product setup should succeed");
         let mut heterogeneous = revoke_select();
         heterogeneous.push(Change::Revoke {
+            grantor: None,
             role: Grantee::Role("fgr_grantee".to_string()),
             object_type: ObjectType::Table,
             schema: Some("public".to_string()),
@@ -244,27 +246,19 @@ impl Drop for MembershipCleanup {
     }
 }
 
-/// Since PostgreSQL 16 a membership edge records its grantor, and a bare
-/// `REVOKE <role> FROM <member>` removes only the edge attributed to the
-/// executor: with ADMIN OPTION but a different grantor it succeeds with a
-/// WARNING and the edge survives. The preflight must name the grantor.
+/// Membership revokes are grantor-targeted: the diff carries the inspected
+/// edge's grantor and rendering emits `REVOKE ... GRANTED BY`, which requires
+/// the privileges of that grantor. The preflight flags exactly the grantors
+/// the executor lacks; a superuser has every role's privileges and is never
+/// flagged (its GRANTED BY succeeds).
 #[test]
 #[ignore]
-fn preflight_names_membership_edges_the_executor_cannot_revoke() {
+fn preflight_names_membership_grantors_the_executor_lacks() {
     let _cleanup = MembershipCleanup;
     with_runtime(async {
         let pool = PgPool::connect(&database_url())
             .await
             .expect("failed to connect");
-        let (version,): (i32,) =
-            sqlx::query_as("SELECT current_setting('server_version_num')::int")
-                .fetch_one(&pool)
-                .await
-                .expect("version probe should run");
-        if version < 160_000 {
-            // Pre-16 revokes are not grantor-attributed; nothing to check.
-            return;
-        }
         for role in ["fgrm_exec", "fgrm_alice", "fgrm_grantor", "fgrm_reader"] {
             let _ = pool
                 .execute(format!("DROP ROLE IF EXISTS {role}").as_str())
@@ -285,11 +279,12 @@ fn preflight_names_membership_edges_the_executor_cannot_revoke() {
         let changes = vec![Change::RemoveMember {
             role: "fgrm_reader".to_string(),
             member: "fgrm_alice".to_string(),
+            grantor: Some("fgrm_grantor".to_string()),
         }];
 
-        // The executor holds ADMIN OPTION on the role, yet the targeted edge
-        // was granted by fgrm_grantor: PostgreSQL would accept the REVOKE
-        // with a WARNING and leave the membership in place.
+        // The executor holds ADMIN OPTION on the role but not the grantor's
+        // privileges: its rendered `REVOKE ... GRANTED BY "fgrm_grantor"`
+        // would be rejected, so the preflight names the missing grantor.
         let exec_options = PgConnectOptions::from_str(&database_url())
             .expect("DATABASE_URL should parse")
             .username("fgrm_exec")
@@ -304,7 +299,7 @@ fn preflight_names_membership_edges_the_executor_cannot_revoke() {
             .iter()
             .filter(|issue| matches!(issue, AuthorityIssue::ForeignGrantorMembershipRevoke { .. }))
             .collect();
-        assert_eq!(membership.len(), 1, "one unreachable edge: {issues:?}");
+        assert_eq!(membership.len(), 1, "one missing grantor: {issues:?}");
         let AuthorityIssue::ForeignGrantorMembershipRevoke {
             role,
             member,
@@ -315,47 +310,36 @@ fn preflight_names_membership_edges_the_executor_cannot_revoke() {
             unreachable!()
         };
         assert_eq!(
-            (role.as_str(), member.as_str()),
-            ("fgrm_reader", "fgrm_alice")
+            (role.as_str(), member.as_str(), grantor.as_str()),
+            ("fgrm_reader", "fgrm_alice", "fgrm_grantor")
         );
-        assert_eq!(grantor, "fgrm_grantor");
 
-        // A superuser's bare membership revoke is attributed to the bootstrap
-        // superuser (verified live): the edge fgrm_grantor granted still
-        // survives it — with only a WARNING — and must stay reported, while
-        // an edge the bootstrap superuser granted (fgrm_reader → fgrm_exec)
-        // is removable and must not be.
-        let both = vec![
-            Change::RemoveMember {
-                role: "fgrm_reader".to_string(),
-                member: "fgrm_alice".to_string(),
-            },
-            Change::RemoveMember {
-                role: "fgrm_reader".to_string(),
-                member: "fgrm_exec".to_string(),
-            },
-        ];
-        let issues = preflight_authority_issues(&pool, &both, &RoleGraph::default())
+        // Membership in the grantor supplies its privileges: no issue, and
+        // the rendered GRANTED BY revoke actually removes the edge.
+        pool.execute("GRANT fgrm_grantor TO fgrm_exec")
+            .await
+            .expect("grant should succeed");
+        let issues = preflight_authority_issues(&exec_pool, &changes, &RoleGraph::default())
             .await
             .expect("preflight should run");
-        let membership: Vec<_> = issues
-            .iter()
-            .filter(|issue| matches!(issue, AuthorityIssue::ForeignGrantorMembershipRevoke { .. }))
-            .collect();
-        assert_eq!(
-            membership.len(),
-            1,
-            "only the ordinary-grantor edge survives a superuser's revoke: {issues:?}"
+        assert!(
+            !issues.iter().any(|issue| matches!(
+                issue,
+                AuthorityIssue::ForeignGrantorMembershipRevoke { .. }
+            )),
+            "grantor privileges satisfy GRANTED BY: {issues:?}"
         );
-        let AuthorityIssue::ForeignGrantorMembershipRevoke {
-            member, grantor, ..
-        } = membership[0]
-        else {
-            unreachable!()
-        };
-        assert_eq!(
-            (member.as_str(), grantor.as_str()),
-            ("fgrm_alice", "fgrm_grantor")
+
+        // A superuser holds every role's privileges: never flagged.
+        let issues = preflight_authority_issues(&pool, &changes, &RoleGraph::default())
+            .await
+            .expect("preflight should run");
+        assert!(
+            !issues.iter().any(|issue| matches!(
+                issue,
+                AuthorityIssue::ForeignGrantorMembershipRevoke { .. }
+            )),
+            "superuser must not be flagged: {issues:?}"
         );
     });
 }

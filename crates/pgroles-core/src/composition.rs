@@ -1079,6 +1079,7 @@ memberships:
 
         let result = validate_changes_against_managed_surface(
             &[Change::Revoke {
+                grantor: None,
                 role: "app".into(),
                 privileges: BTreeSet::from([Privilege::Connect]),
                 object_type: ObjectType::Database,
@@ -1097,6 +1098,7 @@ memberships:
 
         let error = validate_changes_against_managed_surface(
             &[Change::RemoveMember {
+                grantor: None,
                 role: "editor".to_string(),
                 member: "app".to_string(),
             }],

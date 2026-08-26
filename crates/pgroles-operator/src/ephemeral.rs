@@ -1835,9 +1835,13 @@ async fn apply_scoped_memberships_under_lock(
                     continue;
                 }
                 if current_by_key.contains_key(&key) {
+                    // Ephemeral edges are granted by the operator's own
+                    // executor, so its plain REVOKE is attributed correctly;
+                    // no grantor targeting needed.
                     changes.push(pgroles_core::diff::Change::RemoveMember {
                         role: membership.role.clone(),
                         member: membership.member.clone(),
+                        grantor: None,
                     });
                 }
             }
@@ -1847,7 +1851,7 @@ async fn apply_scoped_memberships_under_lock(
     for change in &changes {
         let key = match change {
             pgroles_core::diff::Change::AddMember { role, member, .. }
-            | pgroles_core::diff::Change::RemoveMember { role, member } => {
+            | pgroles_core::diff::Change::RemoveMember { role, member, .. } => {
                 (role.clone(), member.clone())
             }
             _ => {

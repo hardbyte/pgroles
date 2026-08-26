@@ -315,6 +315,11 @@ fn gen_graph(rng: &mut Rng, allow_none: bool, messy: bool) -> RoleGraph {
         default_privilege_absences: BTreeMap::new(),
         memberships: gen_memberships(rng, &role_names),
         exclusive_membership_roles: BTreeSet::new(),
+        // Grantor maps are inspection-only: empty maps diff into plain
+        // grantor-less revokes, which is the semantics this pure harness
+        // models.
+        membership_edge_grantors: BTreeMap::new(),
+        grant_entry_grantors: BTreeMap::new(),
     }
 }
 
@@ -634,6 +639,7 @@ fn apply_changes(graph: &RoleGraph, changes: &[Change]) -> RoleGraph {
                 object_type,
                 schema,
                 name,
+                ..
             } => {
                 // `REVOKE ... ON ALL ... IN SCHEMA` reaches every object of
                 // that type in the schema, not one key.
@@ -737,7 +743,7 @@ fn apply_changes(graph: &RoleGraph, changes: &[Change]) -> RoleGraph {
                     admin: *admin,
                 });
             }
-            Change::RemoveMember { role, member } => {
+            Change::RemoveMember { role, member, .. } => {
                 g.memberships
                     .retain(|e| !(e.role == *role && e.member == *member));
             }

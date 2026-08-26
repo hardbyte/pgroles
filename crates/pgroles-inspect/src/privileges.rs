@@ -56,6 +56,13 @@ pub(crate) struct AclRow {
     /// privileges — inspection tags those keys so the diff engine never plans
     /// revokes against them and `generate` never exports them.
     pub(crate) owner_name: Option<String>,
+    /// The role that granted this ACL entry (`pg_get_userbyid` of
+    /// `aclexplode`'s grantor). PostgreSQL's plain REVOKE removes only the
+    /// entry of the grantor it selects for the executor, so revoking an entry
+    /// attributed elsewhere means acting as its grantor — the diff splits
+    /// revokes per grantor from this. `None` on synthesized rows (inventory,
+    /// PUBLIC defaults) which never feed grantor-targeted revokes.
+    pub(crate) grantor: Option<String>,
 }
 
 impl AclRow {
@@ -129,6 +136,9 @@ impl GrantabilityRow {
 
 pub(crate) struct PrivilegeInspectionResult {
     pub grants: BTreeMap<GrantKey, GrantState>,
+    /// Per-grantor privilege breakdown of each concrete grant target — see
+    /// `RoleGraph::grant_entry_grantors`.
+    pub entry_grantors: BTreeMap<GrantKey, BTreeMap<String, BTreeSet<Privilege>>>,
     /// Grant targets whose ACL entry belongs to the object's owner. The diff
     /// engine never revokes these and treats them as covering any declared
     /// grant on the same target.
@@ -359,7 +369,8 @@ pub async fn fetch_object_inventory(
                 WHEN 'v' THEN 'view'
                 WHEN 'm' THEN 'materialized_view'
             END AS obj_type,
-            NULL::text AS owner_name
+            NULL::text AS owner_name,
+                    NULL::text AS grantor
         FROM pg_class c
         JOIN pg_namespace n ON n.oid = c.relnamespace
         WHERE n.nspname = ANY($1)
@@ -373,7 +384,8 @@ pub async fn fetch_object_inventory(
             n.nspname AS schema_name,
             c.relname::text AS object_name,
             'sequence' AS obj_type,
-            NULL::text AS owner_name
+            NULL::text AS owner_name,
+                    NULL::text AS grantor
         FROM pg_class c
         JOIN pg_namespace n ON n.oid = c.relnamespace
         WHERE n.nspname = ANY($1)
@@ -387,7 +399,8 @@ pub async fn fetch_object_inventory(
             n.nspname AS schema_name,
             p.proname || '(' || pg_catalog.pg_get_function_identity_arguments(p.oid) || ')' AS object_name,
             'function' AS obj_type,
-            NULL::text AS owner_name
+            NULL::text AS owner_name,
+                    NULL::text AS grantor
         FROM pg_proc p
         JOIN pg_namespace n ON n.oid = p.pronamespace
         WHERE n.nspname = ANY($1)
@@ -400,7 +413,8 @@ pub async fn fetch_object_inventory(
             n.nspname AS schema_name,
             t.typname::text AS object_name,
             'type' AS obj_type,
-            NULL::text AS owner_name
+            NULL::text AS owner_name,
+                    NULL::text AS grantor
         FROM pg_type t
         JOIN pg_namespace n ON n.oid = t.typnamespace
         WHERE n.nspname = ANY($1)
@@ -482,7 +496,8 @@ async fn fetch_object_inventory_for_wildcards(
                 WHEN 'v' THEN 'view'
                 WHEN 'm' THEN 'materialized_view'
             END AS obj_type,
-            NULL::text AS owner_name
+            NULL::text AS owner_name,
+                    NULL::text AS grantor
         FROM pg_class c
         JOIN pg_namespace n ON n.oid = c.relnamespace
         JOIN wildcard_scope scope
@@ -504,7 +519,8 @@ async fn fetch_object_inventory_for_wildcards(
             n.nspname AS schema_name,
             c.relname::text AS object_name,
             'sequence' AS obj_type,
-            NULL::text AS owner_name
+            NULL::text AS owner_name,
+                    NULL::text AS grantor
         FROM pg_class c
         JOIN pg_namespace n ON n.oid = c.relnamespace
         JOIN wildcard_scope scope
@@ -521,7 +537,8 @@ async fn fetch_object_inventory_for_wildcards(
             n.nspname AS schema_name,
             p.proname || '(' || pg_catalog.pg_get_function_identity_arguments(p.oid) || ')' AS object_name,
             'function' AS obj_type,
-            NULL::text AS owner_name
+            NULL::text AS owner_name,
+                    NULL::text AS grantor
         FROM pg_proc p
         JOIN pg_namespace n ON n.oid = p.pronamespace
         JOIN wildcard_scope scope
@@ -537,7 +554,8 @@ async fn fetch_object_inventory_for_wildcards(
             n.nspname AS schema_name,
             t.typname::text AS object_name,
             'type' AS obj_type,
-            NULL::text AS owner_name
+            NULL::text AS owner_name,
+                    NULL::text AS grantor
         FROM pg_type t
         JOIN pg_namespace n ON n.oid = t.typnamespace
         JOIN wildcard_scope scope
@@ -807,6 +825,11 @@ pub(crate) fn wildcard_scopes_of(
 pub(crate) struct DerivedPrivileges {
     grants: BTreeMap<GrantKey, GrantState>,
     inherent: BTreeSet<GrantKey>,
+    /// Per-grantor privilege breakdown of each grant target, from the ACL
+    /// entries' recorded grantors. Keyed by the pre-normalization concrete
+    /// keys; wildcard-collapsed keys deliberately have no entry, so their
+    /// revokes fall back to grantor-less rendering.
+    entry_grantors: BTreeMap<GrantKey, BTreeMap<String, BTreeSet<Privilege>>>,
     /// Objects each role owns, keyed by (role, object type, schema). Wildcard
     /// normalization replaces per-name entries with `name: "*"` keys, so the
     /// inherent tags are remapped onto the wildcard key when every object the
@@ -830,6 +853,8 @@ pub(crate) fn derive_privileges(
 ) -> DerivedPrivileges {
     let mut grants: BTreeMap<GrantKey, GrantState> = BTreeMap::new();
     let mut inherent: BTreeSet<GrantKey> = BTreeSet::new();
+    let mut entry_grantors: BTreeMap<GrantKey, BTreeMap<String, BTreeSet<Privilege>>> =
+        BTreeMap::new();
     let mut owned_objects: BTreeMap<(String, ObjectType, String), BTreeSet<String>> =
         BTreeMap::new();
     let has_wildcards = !wildcard_grants.is_empty();
@@ -912,6 +937,21 @@ pub(crate) fn derive_privileges(
             }
         }
 
+        // Record which grantor's ACL entry carries each privilege, so the
+        // diff can target revokes at the entry PostgreSQL will actually
+        // remove. Owner-self entries are inherent and never revoked, so they
+        // need no breakdown.
+        if row.owner_name.as_deref() != Some(grantee.as_str())
+            && let Some(grantor) = &row.grantor
+        {
+            entry_grantors
+                .entry(key.clone())
+                .or_default()
+                .entry(grantor.clone())
+                .or_default()
+                .insert(privilege);
+        }
+
         let entry = grants.entry(key).or_insert_with(|| GrantState {
             privileges: BTreeSet::new(),
         });
@@ -939,6 +979,7 @@ pub(crate) fn derive_privileges(
     DerivedPrivileges {
         grants,
         inherent,
+        entry_grantors,
         owned_objects,
         inventory,
         wildcard_grants: wildcard_grants.to_vec(),
@@ -1033,6 +1074,7 @@ impl DerivedPrivileges {
         PrivilegeInspectionResult {
             grants,
             inherent,
+            entry_grantors: self.entry_grantors,
             diagnostics,
             wildcard_stats: self.wildcard_stats,
         }
@@ -1105,7 +1147,8 @@ pub(crate) async fn read_raw_public_privileges(
                         WHEN 'm' THEN 'materialized_view'
                         WHEN 'S' THEN 'sequence'
                     END AS obj_type,
-                    NULL::text AS owner_name
+                    NULL::text AS owner_name,
+                    NULL::text AS grantor
                 FROM pg_class c
                 JOIN pg_namespace n ON n.oid = c.relnamespace
                 CROSS JOIN LATERAL aclexplode(
@@ -1140,7 +1183,8 @@ pub(crate) async fn read_raw_public_privileges(
                     n.nspname::text AS schema_name,
                     (p.proname || '(' || pg_catalog.pg_get_function_identity_arguments(p.oid) || ')')::text AS object_name,
                     'function' AS obj_type,
-                    NULL::text AS owner_name
+                    NULL::text AS owner_name,
+                    NULL::text AS grantor
                 FROM pg_proc p
                 JOIN pg_namespace n ON n.oid = p.pronamespace
                 CROSS JOIN LATERAL aclexplode(
@@ -1168,7 +1212,8 @@ pub(crate) async fn read_raw_public_privileges(
                     n.nspname::text AS schema_name,
                     t.typname::text AS object_name,
                     'type' AS obj_type,
-                    NULL::text AS owner_name
+                    NULL::text AS owner_name,
+                    NULL::text AS grantor
                 FROM pg_type t
                 JOIN pg_namespace n ON n.oid = t.typnamespace
                 CROSS JOIN LATERAL aclexplode(
@@ -1204,7 +1249,8 @@ pub(crate) async fn read_raw_public_privileges(
                     NULL::text AS schema_name,
                     n.nspname::text AS object_name,
                     'schema' AS obj_type,
-                    NULL::text AS owner_name
+                    NULL::text AS owner_name,
+                    NULL::text AS grantor
                 FROM pg_namespace n
                 CROSS JOIN LATERAL aclexplode(
                     COALESCE(n.nspacl, acldefault('n'::"char", n.nspowner))
@@ -1233,7 +1279,8 @@ pub(crate) async fn read_raw_public_privileges(
                     NULL::text AS schema_name,
                     db.datname::text AS object_name,
                     'database' AS obj_type,
-                    NULL::text AS owner_name
+                    NULL::text AS owner_name,
+                    NULL::text AS grantor
                 FROM pg_database db
                 CROSS JOIN LATERAL aclexplode(
                     COALESCE(db.datacl, acldefault('d'::"char", db.datdba))
@@ -1821,7 +1868,8 @@ async fn fetch_relation_privileges(
                 WHEN 'm' THEN 'materialized_view'
                 WHEN 'S' THEN 'sequence'
             END AS obj_type,
-            pg_get_userbyid(c.relowner) AS owner_name
+            pg_get_userbyid(c.relowner) AS owner_name,
+            pg_get_userbyid(acl.grantor) AS grantor
         FROM pg_class c
         JOIN pg_namespace n ON n.oid = c.relnamespace
         CROSS JOIN LATERAL aclexplode(c.relacl) AS acl
@@ -1856,7 +1904,8 @@ async fn fetch_schema_privileges(
             NULL::text AS schema_name,
             n.nspname::text AS object_name,
             'schema' AS obj_type,
-            pg_get_userbyid(n.nspowner) AS owner_name
+            pg_get_userbyid(n.nspowner) AS owner_name,
+            pg_get_userbyid(acl.grantor) AS grantor
         FROM pg_namespace n
         CROSS JOIN LATERAL aclexplode(n.nspacl) AS acl
         JOIN pg_roles grantee ON grantee.oid = acl.grantee
@@ -1891,7 +1940,8 @@ async fn fetch_function_privileges(
             n.nspname AS schema_name,
             p.proname || '(' || pg_catalog.pg_get_function_identity_arguments(p.oid) || ')' AS object_name,
             'function' AS obj_type,
-            pg_get_userbyid(p.proowner) AS owner_name
+            pg_get_userbyid(p.proowner) AS owner_name,
+            pg_get_userbyid(acl.grantor) AS grantor
         FROM pg_proc p
         JOIN pg_namespace n ON n.oid = p.pronamespace
         CROSS JOIN LATERAL aclexplode(p.proacl) AS acl
@@ -1927,7 +1977,8 @@ async fn fetch_type_privileges(
             n.nspname AS schema_name,
             t.typname::text AS object_name,
             'type' AS obj_type,
-            pg_get_userbyid(t.typowner) AS owner_name
+            pg_get_userbyid(t.typowner) AS owner_name,
+            pg_get_userbyid(acl.grantor) AS grantor
         FROM pg_type t
         JOIN pg_namespace n ON n.oid = t.typnamespace
         CROSS JOIN LATERAL aclexplode(t.typacl) AS acl
@@ -1963,7 +2014,8 @@ pub async fn fetch_database_privileges(
             NULL::text AS schema_name,
             db.datname::text AS object_name,
             'database' AS obj_type,
-            pg_get_userbyid(db.datdba) AS owner_name
+            pg_get_userbyid(db.datdba) AS owner_name,
+            pg_get_userbyid(acl.grantor) AS grantor
         FROM pg_database db
         CROSS JOIN LATERAL aclexplode(db.datacl) AS acl
         JOIN pg_roles grantee ON grantee.oid = acl.grantee

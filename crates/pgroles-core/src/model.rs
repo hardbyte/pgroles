@@ -381,6 +381,23 @@ pub struct RoleGraph {
     /// so declaring privileges on an owner's own objects still converges.
     /// Only populated by inspection.
     pub inherent_grants: BTreeSet<GrantKey>,
+    /// Grantors recorded on each live membership edge, keyed by
+    /// `(granted role, member)`. Since PostgreSQL 16 one pair can carry
+    /// several edges with distinct grantors, and a plain REVOKE removes only
+    /// the edge attributed to the revoker — removing a membership therefore
+    /// means revoking every recorded edge (`REVOKE ... GRANTED BY`). Only
+    /// PG16+ inspection populates this; the desired graph and pre-16
+    /// inspections leave it empty, which diffs into plain grantor-less
+    /// revokes.
+    pub membership_edge_grantors: BTreeMap<(String, String), BTreeSet<String>>,
+    /// Grantors recorded on each live object-privilege ACL entry for managed
+    /// grantees, keyed by grant target, then grantor, holding that grantor's
+    /// privileges. PostgreSQL's plain REVOKE removes only the entry of the
+    /// grantor it selects for the executor (a superuser acts as the owner),
+    /// so revoking a privilege attributed to another grantor means acting as
+    /// that grantor (`SET ROLE`). Only populated by inspection; empty maps
+    /// diff into plain grantor-less revokes.
+    pub grant_entry_grantors: BTreeMap<GrantKey, BTreeMap<String, BTreeSet<Privilege>>>,
 }
 
 impl RoleGraph {

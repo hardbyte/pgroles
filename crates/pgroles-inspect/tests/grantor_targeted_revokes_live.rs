@@ -1,0 +1,229 @@
+//! Live end-to-end convergence for grantor-targeted revokes, as a
+//! NON-superuser executor — the production posture.
+//!
+//! PostgreSQL's plain REVOKE removes only the grant attributed to the
+//! revoker, so before grantor targeting these scenarios re-planned the same
+//! revokes forever: a delegate-granted object entry (unremovable even by
+//! superusers), an owner-granted entry shadowed by the executor's own grant
+//! option, and a membership edge granted by another admin. Inspection now
+//! records each entry's grantor, the diff targets it, and rendering becomes
+//! the grantor (`SET ROLE` for object privileges, `GRANTED BY` for
+//! memberships) inside the plan's single transaction.
+//!
+//! Requires DATABASE_URL (superuser); run with `cargo test -- --include-ignored`.
+
+use sqlx::postgres::PgConnectOptions;
+use sqlx::{Connection, Executor, PgPool};
+use std::str::FromStr;
+
+use pgroles_core::diff::{Change, ReconciliationMode, diff, filter_changes};
+use pgroles_core::manifest::{expand_manifest, parse_manifest};
+use pgroles_core::model::RoleGraph;
+use pgroles_core::sql::render_statements;
+use pgroles_inspect::{InspectConfig, inspect, preflight_authority_issues};
+
+fn database_url() -> String {
+    std::env::var("DATABASE_URL").expect("DATABASE_URL must be set for live DB tests")
+}
+
+fn with_runtime<T>(future: impl std::future::Future<Output = T>) -> T {
+    tokio::runtime::Runtime::new()
+        .expect("failed to create tokio runtime")
+        .block_on(future)
+}
+
+const ROLES: [&str; 6] = [
+    "gtr_exec",
+    "gtr_grantee",
+    "gtr_alice",
+    "gtr_delegate",
+    "gtr_admin",
+    "gtr_owner",
+];
+
+/// Drop-guard removing the test objects and roles even on panic.
+struct Cleanup;
+
+impl Drop for Cleanup {
+    fn drop(&mut self) {
+        with_runtime(async {
+            if let Ok(pool) = PgPool::connect(&database_url()).await {
+                let _ = pool.execute("DROP TABLE IF EXISTS gtr_t").await;
+                for role in ROLES {
+                    let _ = pool.execute(format!("DROP OWNED BY {role}").as_str()).await;
+                    let _ = pool
+                        .execute(format!("DROP ROLE IF EXISTS {role}").as_str())
+                        .await;
+                }
+            }
+        });
+    }
+}
+
+/// The manifest keeps gtr_grantee at INSERT on gtr_t and gtr_reader-style
+/// membership empty, so authoritative reconciliation must revoke the live
+/// SELECT entries (owner- and delegate-granted) and the live membership edge
+/// (granted by gtr_admin).
+const MANIFEST: &str = r#"
+roles:
+  - name: gtr_grantee
+    login: true
+  - name: gtr_alice
+    login: true
+
+grants:
+  - role: gtr_grantee
+    privileges: [INSERT]
+    object:
+      type: table
+      schema: public
+      name: gtr_t
+
+# gtr_admin's own membership (granted by the superuser at setup) is declared
+# so the plan under test contains exactly the three grantor-targeted revokes.
+memberships:
+  - role: gtr_grantee
+    members:
+      - name: gtr_admin
+        admin: true
+"#;
+
+async fn plan(pool: &PgPool, manifest_yaml: &str) -> Vec<Change> {
+    let manifest = parse_manifest(manifest_yaml).expect("manifest should parse");
+    let expanded = expand_manifest(&manifest).expect("manifest should expand");
+    let desired = RoleGraph::from_expanded(&expanded, None).expect("desired graph should build");
+    let config = InspectConfig::from_expanded(&expanded, false);
+    let current = inspect(pool, &config).await.expect("inspection should run");
+    filter_changes(diff(&current, &desired), ReconciliationMode::Authoritative)
+}
+
+/// Apply the way production does: every statement in one transaction on one
+/// connection, so SET ROLE / RESET ROLE bracket exactly their statements.
+async fn apply(pool: &PgPool, changes: &[Change]) {
+    let mut conn = pool.acquire().await.expect("connection should acquire");
+    let mut tx = conn.begin().await.expect("transaction should begin");
+    for change in changes {
+        for statement in render_statements(change) {
+            tx.execute(statement.as_str())
+                .await
+                .unwrap_or_else(|error| panic!("failed `{statement}`: {error}"));
+        }
+    }
+    tx.commit().await.expect("transaction should commit");
+}
+
+#[test]
+#[ignore]
+fn grantor_targeted_revokes_converge_for_a_non_superuser_executor() {
+    let _cleanup = Cleanup;
+    with_runtime(async {
+        let pool = PgPool::connect(&database_url())
+            .await
+            .expect("failed to connect");
+        let (version,): (i32,) =
+            sqlx::query_as("SELECT current_setting('server_version_num')::int")
+                .fetch_one(&pool)
+                .await
+                .expect("version probe should run");
+        if version < 160_000 {
+            // Grantor targeting needs per-edge grantors (memberships) and
+            // pg_has_role(..., 'SET'); pre-16 keeps the plain-revoke paths.
+            return;
+        }
+        let _ = pool.execute("DROP TABLE IF EXISTS gtr_t").await;
+        for role in ROLES {
+            let _ = pool
+                .execute(format!("DROP ROLE IF EXISTS {role}").as_str())
+                .await;
+        }
+        // The tangle no plain revoke can clean up:
+        //   - owner-granted SELECT for gtr_grantee, shadowed for the executor
+        //     by the executor's own grant option;
+        //   - delegate-granted SELECT for gtr_grantee (unremovable even by a
+        //     superuser's plain revoke);
+        //   - a gtr_grantee membership edge for gtr_alice granted by
+        //     gtr_admin (bare revoke would only WARN).
+        // The executor is a plain login role whose only powers are
+        // memberships in the grantors it must become.
+        pool.execute(
+            "CREATE ROLE gtr_owner; CREATE ROLE gtr_delegate; CREATE ROLE gtr_admin; \
+             CREATE ROLE gtr_grantee LOGIN; CREATE ROLE gtr_alice LOGIN; \
+             CREATE ROLE gtr_exec LOGIN PASSWORD 'gtr_exec_pw'; \
+             CREATE TABLE gtr_t(i int); ALTER TABLE gtr_t OWNER TO gtr_owner; \
+             GRANT gtr_grantee TO gtr_admin WITH ADMIN OPTION; \
+             SET ROLE gtr_owner; \
+             GRANT SELECT ON gtr_t TO gtr_grantee; \
+             GRANT SELECT ON gtr_t TO gtr_exec WITH GRANT OPTION; \
+             GRANT SELECT ON gtr_t TO gtr_delegate WITH GRANT OPTION; \
+             RESET ROLE; \
+             SET ROLE gtr_delegate; \
+             GRANT SELECT ON gtr_t TO gtr_grantee; \
+             RESET ROLE; \
+             SET ROLE gtr_admin; \
+             GRANT gtr_grantee TO gtr_alice; \
+             RESET ROLE; \
+             GRANT gtr_owner TO gtr_exec; \
+             GRANT gtr_delegate TO gtr_exec; \
+             GRANT gtr_admin TO gtr_exec;",
+        )
+        .await
+        .expect("setup should succeed");
+
+        let exec_options = PgConnectOptions::from_str(&database_url())
+            .expect("DATABASE_URL should parse")
+            .username("gtr_exec")
+            .password("gtr_exec_pw");
+        let exec_pool = PgPool::connect_with(exec_options)
+            .await
+            .expect("executor should connect");
+
+        let changes = plan(&exec_pool, MANIFEST).await;
+        // Two grantor-targeted SELECT revokes (owner entry + delegate entry),
+        // one grantor-targeted membership revoke, plus the INSERT grant.
+        let object_grantors: Vec<&str> = changes
+            .iter()
+            .filter_map(|change| match change {
+                Change::Revoke { grantor, .. } => grantor.as_deref(),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            object_grantors,
+            ["gtr_delegate", "gtr_owner"],
+            "revokes must target both entries' grantors: {changes:?}"
+        );
+        assert!(
+            changes.iter().any(|change| matches!(
+                change,
+                Change::RemoveMember { grantor: Some(grantor), .. } if grantor == "gtr_admin"
+            )),
+            "membership revoke must target its grantor: {changes:?}"
+        );
+        let issues = preflight_authority_issues(&exec_pool, &changes, &RoleGraph::default())
+            .await
+            .expect("preflight should run");
+        assert!(
+            issues.is_empty(),
+            "executor can become every grantor: {issues:?}"
+        );
+
+        apply(&exec_pool, &changes).await;
+
+        // The previously-unremovable entries are gone and the plan is empty:
+        // the drift that used to re-plan forever converged in one apply.
+        let replan = plan(&exec_pool, MANIFEST).await;
+        assert!(replan.is_empty(), "must converge in one apply: {replan:?}");
+        let (has_select,): (bool,) =
+            sqlx::query_as("SELECT has_table_privilege('gtr_grantee', 'gtr_t', 'SELECT')")
+                .fetch_one(&pool)
+                .await
+                .expect("probe should run");
+        assert!(!has_select, "both SELECT entries must be revoked");
+        let (is_member,): (bool,) =
+            sqlx::query_as("SELECT pg_has_role('gtr_alice', 'gtr_grantee', 'MEMBER')")
+                .fetch_one(&pool)
+                .await
+                .expect("probe should run");
+        assert!(!is_member, "the admin-granted membership edge must be gone");
+    });
+}

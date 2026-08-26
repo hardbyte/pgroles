@@ -4473,6 +4473,7 @@ mod tests {
         accumulate_summary(
             &mut summary,
             &Change::Revoke {
+                grantor: None,
                 role: "r1".into(),
                 object_type: pgroles_core::manifest::ObjectType::Table,
                 schema: Some("public".to_string()),
@@ -4522,6 +4523,7 @@ mod tests {
         accumulate_summary(
             &mut summary,
             &Change::RemoveMember {
+                grantor: None,
                 role: "r1".to_string(),
                 member: "r2".to_string(),
             },

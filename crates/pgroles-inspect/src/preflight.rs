@@ -134,6 +134,15 @@ pub enum AuthorityIssue {
         grantor: String,
         executor: String,
     },
+
+    /// A planned object-privilege revoke targets an ACL entry attributed to
+    /// `grantor`, and the executor cannot become that grantor. The revoke is
+    /// rendered as `SET ROLE <grantor>; REVOKE ...; RESET ROLE;` because a
+    /// plain REVOKE removes only the entry of the grantor PostgreSQL selects
+    /// for the executor (and `GRANTED BY` for object privileges must name the
+    /// current user) — without SET ROLE feasibility the statement fails or
+    /// the entry silently survives.
+    RevokeGrantorUnavailable { grantor: String, executor: String },
 }
 
 impl std::fmt::Display for AuthorityIssue {
@@ -247,10 +256,18 @@ impl std::fmt::Display for AuthorityIssue {
                 f,
                 "UnsatisfiableRevoke: cannot revoke membership of \"{member}\" in \
                  \"{role}\" as executor \"{executor}\"; the edge was granted by \
-                 \"{grantor}\", and a REVOKE not attributable to the grantor succeeds \
-                 with only a WARNING while leaving the membership in place — run the \
-                 revoke as a role with the privileges of \"{grantor}\" (REVOKE ... \
-                 GRANTED BY \"{grantor}\")"
+                 \"{grantor}\" and is removed with REVOKE ... GRANTED BY \
+                 \"{grantor}\", which requires the privileges of that grantor — \
+                 grant the executor membership in \"{grantor}\" or run the revoke \
+                 as a role that has it"
+            ),
+            AuthorityIssue::RevokeGrantorUnavailable { grantor, executor } => write!(
+                f,
+                "UnsatisfiableRevoke: the plan revokes object privileges from ACL \
+                 entries granted by \"{grantor}\", which requires running the REVOKE \
+                 as that grantor (SET ROLE) — executor \"{executor}\" cannot become \
+                 \"{grantor}\"; grant the executor membership in \"{grantor}\" (with \
+                 the SET option) or run the revoke as a role that has it"
             ),
         }
     }
@@ -347,62 +364,103 @@ pub async fn preflight_authority_issues(
         }
     }
 
-    // --- Membership revoke grantor attribution (PostgreSQL 16+) ---
-    // Since PG16 each pg_auth_members edge records its grantor, and a bare
-    // `REVOKE <role> FROM <member>` removes only the edge attributed to the
-    // executor: with ADMIN OPTION but a different grantor it succeeds with a
-    // WARNING and the edge survives, re-planning forever. Flag every targeted
-    // edge whose grantor the executor cannot act as. Pre-16 revokes are not
-    // grantor-attributed, so there is nothing to check there.
-    if server_major >= 16 {
-        let remove_targets: Vec<(String, String)> = changes
+    // --- Revoke grantor feasibility ---
+    // Grantor-targeted changes carry the exact edge or ACL entry inspection
+    // saw, and their rendering acts as that grantor: a membership revoke
+    // renders `REVOKE ... GRANTED BY <grantor>`, which requires the
+    // privileges of the grantor; an object revoke renders
+    // `SET ROLE <grantor>; REVOKE ...; RESET ROLE;`, which requires the
+    // executor to be able to become the grantor (the SET option on PG16+,
+    // plain membership before). Check both up front so an apply never runs a
+    // statement PostgreSQL would reject — no attribution heuristics needed,
+    // the grantor is named on the change.
+    let membership_grantors: BTreeSet<String> = changes
+        .iter()
+        .filter_map(|change| match change {
+            Change::RemoveMember {
+                grantor: Some(grantor),
+                ..
+            } => Some(grantor.clone()),
+            _ => None,
+        })
+        .collect();
+    let revoke_grantors: BTreeSet<String> = changes
+        .iter()
+        .filter_map(|change| match change {
+            Change::Revoke {
+                grantor: Some(grantor),
+                ..
+            } => Some(grantor.clone()),
+            _ => None,
+        })
+        .collect();
+    if !membership_grantors.is_empty() || !revoke_grantors.is_empty() {
+        let all: Vec<String> = membership_grantors
             .iter()
-            .filter_map(|change| match change {
-                Change::RemoveMember { role, member } => Some((role.clone(), member.clone())),
-                _ => None,
-            })
+            .chain(revoke_grantors.iter())
+            .cloned()
+            .collect::<BTreeSet<String>>()
+            .into_iter()
             .collect();
-        if !remove_targets.is_empty() {
-            let (roles, members): (Vec<String>, Vec<String>) = remove_targets.into_iter().unzip();
-            let rows: Vec<(String, String, String, bool)> = sqlx::query_as(
-                r#"
-                SELECT
-                    r.rolname::text AS role_name,
-                    m.rolname::text AS member_name,
-                    g.rolname::text AS grantor_name,
-                    CASE WHEN (SELECT rolsuper FROM pg_roles WHERE rolname = current_user)
-                         -- Role grants made by any superuser are recorded as
-                         -- granted by the bootstrap superuser (OID 10), and a
-                         -- superuser's plain REVOKE is attributed the same
-                         -- way — an edge granted by an ordinary role survives
-                         -- even a superuser's revoke, with only a WARNING.
-                         THEN am.grantor = 10 OR g.rolname = current_user
-                         ELSE pg_has_role(current_user, am.grantor, 'USAGE')
-                    END AS can_act
-                FROM pg_auth_members am
-                JOIN pg_roles r ON r.oid = am.roleid
-                JOIN pg_roles m ON m.oid = am.member
-                JOIN pg_roles g ON g.oid = am.grantor
-                JOIN unnest($1::text[], $2::text[]) AS t(role_name, member_name)
-                  ON r.rolname = t.role_name AND m.rolname = t.member_name
-                ORDER BY r.rolname, m.rolname, g.rolname
-                "#,
-            )
-            .bind(&roles)
-            .bind(&members)
-            .fetch_all(pool)
-            .await?;
-            for (role, member, grantor, can_act) in rows {
-                if !can_act {
+        // 'SET' is the PG16+ SET ROLE feasibility mode; before 16 plain
+        // membership suffices for SET ROLE. 'USAGE' is "has the privileges
+        // of", which is what GRANTED BY requires. Superusers pass both.
+        let set_mode = if server_major >= 16 { "SET" } else { "MEMBER" };
+        let rows: Vec<(String, bool, bool)> = sqlx::query_as(&format!(
+            "SELECT r.rolname::text, \
+                    pg_has_role(current_user, r.oid, 'USAGE'), \
+                    pg_has_role(current_user, r.oid, '{set_mode}') \
+             FROM pg_roles r WHERE r.rolname = ANY($1)"
+        ))
+        .bind(&all)
+        .fetch_all(pool)
+        .await?;
+        let usage: BTreeSet<&str> = rows
+            .iter()
+            .filter(|(_, has_usage, _)| *has_usage)
+            .map(|(name, _, _)| name.as_str())
+            .collect();
+        let settable: BTreeSet<&str> = rows
+            .iter()
+            .filter(|(_, _, can_set)| *can_set)
+            .map(|(name, _, _)| name.as_str())
+            .collect();
+        for change in changes {
+            match change {
+                Change::RemoveMember {
+                    role,
+                    member,
+                    grantor: Some(grantor),
+                } if !usage.contains(grantor.as_str()) => {
                     issues.push(AuthorityIssue::ForeignGrantorMembershipRevoke {
-                        role,
-                        member,
-                        grantor,
+                        role: role.clone(),
+                        member: member.clone(),
+                        grantor: grantor.clone(),
                         executor: executor.clone(),
                     });
                 }
+                Change::Revoke {
+                    grantor: Some(grantor),
+                    ..
+                } if !settable.contains(grantor.as_str()) => {
+                    issues.push(AuthorityIssue::RevokeGrantorUnavailable {
+                        grantor: grantor.clone(),
+                        executor: executor.clone(),
+                    });
+                }
+                _ => {}
             }
         }
+        // One report per unavailable grantor is enough for the object side.
+        issues.dedup_by(|a, b| {
+            matches!(
+                (&a, &b),
+                (
+                    AuthorityIssue::RevokeGrantorUnavailable { grantor: ga, .. },
+                    AuthorityIssue::RevokeGrantorUnavailable { grantor: gb, .. },
+                ) if ga == gb
+            )
+        });
     }
 
     // --- Default-privilege owner authority ---
@@ -549,16 +607,14 @@ pub async fn preflight_authority_issues(
         });
     }
 
-    // --- Ordinary-grantee revoke grantor authority ---
-    // The PUBLIC check above asks "can the executor act as the owner?", which
-    // approximates the entries an owner made. For ordinary grantees the
-    // sharper question is per ACL entry: PostgreSQL's REVOKE removes only
-    // entries whose *grantor* the executor can act as, and one matching no
-    // entry succeeds silently. An entry a delegate granted onward via
-    // `WITH GRANT OPTION` therefore survives even an owner-acting executor's
-    // revoke, and the same drift re-plans on every run. Explode the live ACLs
-    // of the targeted objects and flag entries for the revoked grantee and
-    // privileges whose grantor is out of the executor's reach.
+    // --- Ordinary-grantee revoke grantor authority (grantor-less revokes) ---
+    // A grantor-targeted revoke was checked exactly above; this sweep covers
+    // only the revokes that carry no grantor — snapshots without a per-entry
+    // breakdown and wildcard-collapsed keys — where a plain REVOKE runs and
+    // removes only the entry of the grantor PostgreSQL selects for the
+    // executor. Explode the live ACLs of the targeted objects and flag
+    // entries for the revoked grantee and privileges the plain revoke cannot
+    // reach.
     let mut grantee_targets: BTreeMap<(ObjectType, Option<String>, String), GranteeRevokeTargets> =
         BTreeMap::new();
     for change in changes {
@@ -568,6 +624,7 @@ pub async fn preflight_authority_issues(
             schema,
             name,
             privileges,
+            grantor: None,
         } = change
         else {
             continue;

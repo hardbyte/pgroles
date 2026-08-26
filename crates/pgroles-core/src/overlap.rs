@@ -232,7 +232,7 @@ pub fn change_pairs(change: &Change) -> Vec<EffectPair> {
                 EffectPair::new(owner, object),
             ]
         }
-        Change::AddMember { role, member, .. } | Change::RemoveMember { role, member } => {
+        Change::AddMember { role, member, .. } | Change::RemoveMember { role, member, .. } => {
             vec![EffectPair::new(member, EffectObject::Role(role.clone()))]
         }
     }
@@ -437,6 +437,7 @@ mod tests {
             Some("orders"),
         )]);
         let revoked = effect_pairs(&[Change::Revoke {
+            grantor: None,
             role: Grantee::parse("app_rw"),
             privileges: BTreeSet::from([Privilege::Select]),
             object_type: ObjectType::Table,
@@ -538,6 +539,7 @@ mod tests {
         let overlay = membership_overlay_pairs(&[member_edge("app_rw", "alice")]);
         let candidate = effect_pairs(&[
             Change::RemoveMember {
+                grantor: None,
                 role: "app_rw".to_string(),
                 member: "alice".to_string(),
             },
