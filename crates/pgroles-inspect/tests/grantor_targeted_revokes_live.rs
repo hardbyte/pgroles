@@ -227,3 +227,136 @@ fn grantor_targeted_revokes_converge_for_a_non_superuser_executor() {
         assert!(!is_member, "the admin-granted membership edge must be gone");
     });
 }
+
+const SRE_ROLES: [&str; 4] = ["sre_admin", "sre_owner", "sre_grantee", "sre_exec"];
+
+/// Drop-guard for the setRole-restore test's objects.
+struct SreCleanup;
+
+impl Drop for SreCleanup {
+    fn drop(&mut self) {
+        with_runtime(async {
+            if let Ok(pool) = PgPool::connect(&database_url()).await {
+                let _ = pool.execute("DROP TABLE IF EXISTS sre_t").await;
+                for role in SRE_ROLES {
+                    let _ = pool.execute(format!("DROP OWNED BY {role}").as_str()).await;
+                    let _ = pool
+                        .execute(format!("DROP ROLE IF EXISTS {role}").as_str())
+                        .await;
+                }
+            }
+        });
+    }
+}
+
+/// The operator's `connection.params.setRole` runs `SET ROLE` on every pooled
+/// connection after connect. A grantor-targeted revoke temporarily becomes
+/// the grantor; closing with `RESET ROLE` would reset to the *login* role,
+/// silently dropping the configured boundary for the rest of the plan and the
+/// pooled connection. With `SqlContext::execution_role` detected from the
+/// connection, the revoke restores the configured role instead.
+#[test]
+#[ignore]
+fn grantor_revoke_restores_the_configured_execution_role() {
+    let _cleanup = SreCleanup;
+    with_runtime(async {
+        let admin_pool = PgPool::connect(&database_url())
+            .await
+            .expect("failed to connect");
+        let (version,): (i32,) =
+            sqlx::query_as("SELECT current_setting('server_version_num')::int")
+                .fetch_one(&admin_pool)
+                .await
+                .expect("version probe should run");
+        if version < 160_000 {
+            return;
+        }
+        let _ = admin_pool.execute("DROP TABLE IF EXISTS sre_t").await;
+        for role in SRE_ROLES {
+            let _ = admin_pool
+                .execute(format!("DROP ROLE IF EXISTS {role}").as_str())
+                .await;
+        }
+        // sre_exec is the login role; sre_admin is the configured setRole
+        // target the connection is meant to run as. The owner-granted SELECT
+        // entry forces a grantor-targeted revoke (SET ROLE sre_owner).
+        admin_pool
+            .execute(
+                "CREATE ROLE sre_owner; CREATE ROLE sre_grantee; \
+                 CREATE ROLE sre_admin; \
+                 CREATE ROLE sre_exec LOGIN PASSWORD 'sre_exec_pw'; \
+                 CREATE TABLE sre_t(i int); ALTER TABLE sre_t OWNER TO sre_owner; \
+                 SET ROLE sre_owner; GRANT SELECT ON sre_t TO sre_grantee; RESET ROLE; \
+                 GRANT sre_owner TO sre_admin; \
+                 GRANT sre_admin TO sre_exec;",
+            )
+            .await
+            .expect("setup should succeed");
+
+        // Mirror the operator: SET ROLE after connect on every connection.
+        let exec_options = PgConnectOptions::from_str(&database_url())
+            .expect("DATABASE_URL should parse")
+            .username("sre_exec")
+            .password("sre_exec_pw");
+        let exec_pool = sqlx::postgres::PgPoolOptions::new()
+            .after_connect(|conn, _meta| {
+                Box::pin(async move {
+                    sqlx::Executor::execute(&mut *conn, "SET ROLE sre_admin").await?;
+                    Ok(())
+                })
+            })
+            .connect_with(exec_options)
+            .await
+            .expect("executor should connect");
+
+        let execution_role = pgroles_inspect::detect_execution_role(&exec_pool)
+            .await
+            .expect("execution-role probe should run");
+        assert_eq!(
+            execution_role.as_deref(),
+            Some("sre_admin"),
+            "the configured SET ROLE must be detected"
+        );
+        let ctx = pgroles_core::sql::SqlContext::from_version_num(version)
+            .with_execution_role(execution_role);
+
+        let change = Change::Revoke {
+            role: pgroles_core::model::Grantee::Role("sre_grantee".to_string()),
+            privileges: std::collections::BTreeSet::from([
+                pgroles_core::manifest::Privilege::Select,
+            ]),
+            object_type: pgroles_core::manifest::ObjectType::Table,
+            schema: Some("public".to_string()),
+            name: Some("sre_t".to_string()),
+            grantor: Some("sre_owner".to_string()),
+        };
+        let mut conn = exec_pool
+            .acquire()
+            .await
+            .expect("connection should acquire");
+        let mut tx = conn.begin().await.expect("transaction should begin");
+        for statement in pgroles_core::sql::render_statements_with_context(&change, &ctx) {
+            sqlx::Executor::execute(&mut *tx, statement.as_str())
+                .await
+                .unwrap_or_else(|error| panic!("failed `{statement}`: {error}"));
+        }
+        // The connection must still run as the configured role *inside* the
+        // transaction — later plan statements rely on it.
+        let (current_role,): (String,) = sqlx::query_as("SELECT current_user::text")
+            .fetch_one(&mut *tx)
+            .await
+            .expect("role probe should run");
+        assert_eq!(
+            current_role, "sre_admin",
+            "the configured execution role must be restored, not the login role"
+        );
+        tx.commit().await.expect("transaction should commit");
+
+        let (has_select,): (bool,) =
+            sqlx::query_as("SELECT has_table_privilege('sre_grantee', 'sre_t', 'SELECT')")
+                .fetch_one(&admin_pool)
+                .await
+                .expect("probe should run");
+        assert!(!has_select, "the owner-granted entry must be revoked");
+    });
+}

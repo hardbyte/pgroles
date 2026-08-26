@@ -343,3 +343,147 @@ fn preflight_names_membership_grantors_the_executor_lacks() {
         );
     });
 }
+
+struct GapCleanup;
+
+impl Drop for GapCleanup {
+    fn drop(&mut self) {
+        with_runtime(async {
+            if let Ok(pool) = PgPool::connect(&database_url()).await {
+                for role in ["gap_exec", "gap_alice", "gap_grantor", "gap_reader"] {
+                    let _ = pool
+                        .execute(format!("DROP ROLE IF EXISTS {role}").as_str())
+                        .await;
+                }
+            }
+        });
+    }
+}
+
+/// Grantor authority is checked against execution order, not just the current
+/// graph: a plan can remove the executor's membership path to a grantor and
+/// then need that grantor's privileges later in the same transaction — a
+/// `REVOKE ... GRANTED BY` in the removal batch, or an
+/// `ALTER DEFAULT PRIVILEGES FOR ROLE` after it. The preflight re-checks
+/// those roles against the graph with the plan's removals applied and flags
+/// the dependency-breaking plan instead of letting the apply fail mid-way.
+#[test]
+#[ignore]
+fn preflight_flags_grantor_paths_the_plan_itself_removes() {
+    let _cleanup = GapCleanup;
+    with_runtime(async {
+        let pool = PgPool::connect(&database_url())
+            .await
+            .expect("failed to connect");
+        let (version,): (i32,) =
+            sqlx::query_as("SELECT current_setting('server_version_num')::int")
+                .fetch_one(&pool)
+                .await
+                .expect("version probe should run");
+        if version < 160_000 {
+            return;
+        }
+        for role in ["gap_exec", "gap_alice", "gap_grantor", "gap_reader"] {
+            let _ = pool
+                .execute(format!("DROP ROLE IF EXISTS {role}").as_str())
+                .await;
+        }
+        pool.execute(
+            "CREATE ROLE gap_reader; CREATE ROLE gap_alice; CREATE ROLE gap_grantor; \
+             CREATE ROLE gap_exec LOGIN PASSWORD 'gap_exec_pw'; \
+             GRANT gap_reader TO gap_grantor WITH ADMIN OPTION; \
+             SET ROLE gap_grantor; \
+             GRANT gap_reader TO gap_alice; \
+             RESET ROLE; \
+             GRANT gap_grantor TO gap_exec;",
+        )
+        .await
+        .expect("setup should succeed");
+
+        let exec_options = PgConnectOptions::from_str(&database_url())
+            .expect("DATABASE_URL should parse")
+            .username("gap_exec")
+            .password("gap_exec_pw");
+        let exec_pool = PgPool::connect_with(exec_options)
+            .await
+            .expect("executor should connect");
+
+        // The plan removes the executor's own membership in the grantor and
+        // still needs GRANTED BY that grantor in the same removal batch.
+        let breaking = vec![
+            Change::RemoveMember {
+                role: "gap_grantor".to_string(),
+                member: "gap_exec".to_string(),
+                grantor: None,
+            },
+            Change::RemoveMember {
+                role: "gap_reader".to_string(),
+                member: "gap_alice".to_string(),
+                grantor: Some("gap_grantor".to_string()),
+            },
+        ];
+        let issues = preflight_authority_issues(&exec_pool, &breaking, &RoleGraph::default())
+            .await
+            .expect("preflight should run");
+        assert!(
+            issues.iter().any(|issue| matches!(
+                issue,
+                AuthorityIssue::GrantorAuthorityRemovedByPlan { grantor, .. }
+                    if grantor == "gap_grantor"
+            )),
+            "the removed path must be flagged: {issues:?}"
+        );
+
+        // Without the path-removing change, the same GRANTED BY revoke is
+        // fine against the current graph — no issue.
+        let issues = preflight_authority_issues(&exec_pool, &breaking[1..], &RoleGraph::default())
+            .await
+            .expect("preflight should run");
+        assert!(
+            !issues
+                .iter()
+                .any(|issue| matches!(issue, AuthorityIssue::GrantorAuthorityRemovedByPlan { .. })),
+            "no path is removed: {issues:?}"
+        );
+
+        // An ALTER DEFAULT PRIVILEGES FOR ROLE after the removal batch loses
+        // the owner's privileges the same way.
+        let defaults_breaking = vec![
+            Change::RemoveMember {
+                role: "gap_grantor".to_string(),
+                member: "gap_exec".to_string(),
+                grantor: None,
+            },
+            Change::RevokeDefaultPrivilege {
+                owner: "gap_grantor".to_string(),
+                scope: pgroles_core::model::DefaultPrivilegeScope::Global,
+                on_type: ObjectType::Table,
+                grantee: Grantee::Role("gap_alice".to_string()),
+                privileges: BTreeSet::from([Privilege::Select]),
+            },
+        ];
+        let issues =
+            preflight_authority_issues(&exec_pool, &defaults_breaking, &RoleGraph::default())
+                .await
+                .expect("preflight should run");
+        assert!(
+            issues.iter().any(|issue| matches!(
+                issue,
+                AuthorityIssue::GrantorAuthorityRemovedByPlan { grantor, .. }
+                    if grantor == "gap_grantor"
+            )),
+            "the defaults owner's removed path must be flagged: {issues:?}"
+        );
+
+        // A superuser's authority does not depend on membership paths.
+        let issues = preflight_authority_issues(&pool, &breaking, &RoleGraph::default())
+            .await
+            .expect("preflight should run");
+        assert!(
+            !issues
+                .iter()
+                .any(|issue| matches!(issue, AuthorityIssue::GrantorAuthorityRemovedByPlan { .. })),
+            "superusers keep authority: {issues:?}"
+        );
+    });
+}

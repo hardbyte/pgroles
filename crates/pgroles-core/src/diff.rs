@@ -29,10 +29,12 @@ use crate::model::{
 /// 2. Alter roles (attribute changes)
 /// 3. Grant privileges
 /// 4. Set default privileges
-/// 5. Remove memberships
-/// 6. Add memberships
-/// 7. Revoke default privileges
-/// 8. Revoke privileges
+/// 5. Revoke privileges (before membership removals: a grantor-targeted
+///    revoke runs `SET ROLE <grantor>`, and removing memberships first could
+///    strip the executor's path to that grantor mid-plan)
+/// 6. Remove memberships
+/// 7. Add memberships
+/// 8. Revoke default privileges
 /// 9. Drop roles (after revoking everything from them)
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub enum Change {
@@ -693,10 +695,14 @@ pub fn diff(current: &RoleGraph, desired: &RoleGraph) -> Vec<Change> {
     changes.extend(schema_grants);
     changes.extend(grants);
     changes.extend(set_defaults);
+    // Object revokes run before membership removals: a grantor-targeted
+    // revoke becomes its grantor via `SET ROLE`, and the preflight verifies
+    // that against the *current* membership graph — an earlier membership
+    // removal in the same plan could strip that path mid-transaction.
+    changes.extend(revokes);
     changes.extend(remove_members);
     changes.extend(add_members);
     changes.extend(revoke_defaults);
-    changes.extend(revokes);
     changes.extend(drops);
     changes
 }

@@ -3120,10 +3120,15 @@ pub(crate) async fn detect_sql_context(
     let relation_inventory =
         pgroles_inspect::fetch_relation_inventory(pool, &privilege_schemas).await?;
     let owned_relations = pgroles_inspect::fetch_owned_relations(pool, &privilege_schemas).await?;
+    // The connection may be configured to run as a role other than its login
+    // role (`connection.params.setRole`); grantor-targeted revokes must
+    // restore that role, not `RESET ROLE` back to the login role.
+    let execution_role = pgroles_inspect::detect_execution_role(pool).await?;
     Ok(
         pgroles_core::sql::SqlContext::from_version_num(pg_version.version_num)
             .with_object_inventory(relation_inventory)
-            .with_owned_relations(owned_relations),
+            .with_owned_relations(owned_relations)
+            .with_execution_role(execution_role),
     )
 }
 

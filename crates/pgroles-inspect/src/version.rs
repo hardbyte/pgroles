@@ -33,6 +33,24 @@ impl std::fmt::Display for PgVersion {
     }
 }
 
+/// Detect the role the connection is configured to run as, when it differs
+/// from the login role.
+///
+/// The `role` setting is non-empty when the session ran `SET ROLE` (the
+/// operator's `connection.params.setRole` does this on every pooled
+/// connection) or the client passed `-c role=...` in connection options.
+/// Rendered SQL that temporarily becomes another role restores this role
+/// explicitly rather than using `RESET ROLE`, which would reset to the login
+/// role and drop the configured boundary. Returns `None` when the session
+/// runs as its login role (`role` is unset or `none`).
+pub async fn detect_execution_role(pool: &PgPool) -> Result<Option<String>, sqlx::Error> {
+    let row: (Option<String>,) =
+        sqlx::query_as("SELECT NULLIF(NULLIF(current_setting('role', true), 'none'), '')")
+            .fetch_one(pool)
+            .await?;
+    Ok(row.0)
+}
+
 /// Detect the PostgreSQL server version.
 pub async fn detect_pg_version(pool: &PgPool) -> Result<PgVersion, sqlx::Error> {
     let row: (i32,) = sqlx::query_as("SELECT current_setting('server_version_num')::int")

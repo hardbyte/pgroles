@@ -964,9 +964,12 @@ pub(crate) fn derive_privileges(
     // not wildcard patterns, so their rows stay per-object for the diff's
     // range-scan.
     if !public_scopes.is_empty() {
-        for (key, state) in derive_public_privileges(&raw.public_acl_rows, public_scopes) {
+        let (public_grants, public_entry_grantors) =
+            derive_public_privileges(&raw.public_acl_rows, public_scopes);
+        for (key, state) in public_grants {
             grants.insert(key, state);
         }
+        entry_grantors.extend(public_entry_grantors);
     }
 
     let unsatisfied = if has_wildcards {
@@ -1147,8 +1150,8 @@ pub(crate) async fn read_raw_public_privileges(
                         WHEN 'm' THEN 'materialized_view'
                         WHEN 'S' THEN 'sequence'
                     END AS obj_type,
-                    NULL::text AS owner_name,
-                    NULL::text AS grantor
+                    pg_get_userbyid(c.relowner) AS owner_name,
+                    pg_get_userbyid(acl.grantor) AS grantor
                 FROM pg_class c
                 JOIN pg_namespace n ON n.oid = c.relnamespace
                 CROSS JOIN LATERAL aclexplode(
@@ -1183,8 +1186,8 @@ pub(crate) async fn read_raw_public_privileges(
                     n.nspname::text AS schema_name,
                     (p.proname || '(' || pg_catalog.pg_get_function_identity_arguments(p.oid) || ')')::text AS object_name,
                     'function' AS obj_type,
-                    NULL::text AS owner_name,
-                    NULL::text AS grantor
+                    pg_get_userbyid(p.proowner) AS owner_name,
+                    pg_get_userbyid(acl.grantor) AS grantor
                 FROM pg_proc p
                 JOIN pg_namespace n ON n.oid = p.pronamespace
                 CROSS JOIN LATERAL aclexplode(
@@ -1212,8 +1215,8 @@ pub(crate) async fn read_raw_public_privileges(
                     n.nspname::text AS schema_name,
                     t.typname::text AS object_name,
                     'type' AS obj_type,
-                    NULL::text AS owner_name,
-                    NULL::text AS grantor
+                    pg_get_userbyid(t.typowner) AS owner_name,
+                    pg_get_userbyid(acl.grantor) AS grantor
                 FROM pg_type t
                 JOIN pg_namespace n ON n.oid = t.typnamespace
                 CROSS JOIN LATERAL aclexplode(
@@ -1249,8 +1252,8 @@ pub(crate) async fn read_raw_public_privileges(
                     NULL::text AS schema_name,
                     n.nspname::text AS object_name,
                     'schema' AS obj_type,
-                    NULL::text AS owner_name,
-                    NULL::text AS grantor
+                    pg_get_userbyid(n.nspowner) AS owner_name,
+                    pg_get_userbyid(acl.grantor) AS grantor
                 FROM pg_namespace n
                 CROSS JOIN LATERAL aclexplode(
                     COALESCE(n.nspacl, acldefault('n'::"char", n.nspowner))
@@ -1279,8 +1282,8 @@ pub(crate) async fn read_raw_public_privileges(
                     NULL::text AS schema_name,
                     db.datname::text AS object_name,
                     'database' AS obj_type,
-                    NULL::text AS owner_name,
-                    NULL::text AS grantor
+                    pg_get_userbyid(db.datdba) AS owner_name,
+                    pg_get_userbyid(acl.grantor) AS grantor
                 FROM pg_database db
                 CROSS JOIN LATERAL aclexplode(
                     COALESCE(db.datacl, acldefault('d'::"char", db.datdba))
@@ -1297,6 +1300,10 @@ pub(crate) async fn read_raw_public_privileges(
     Ok(rows)
 }
 
+/// Per-grant-target breakdown of which grantor's ACL entry carries which
+/// privileges (see `RoleGraph::grant_entry_grantors`).
+pub(crate) type EntryGrantors = BTreeMap<GrantKey, BTreeMap<String, BTreeSet<Privilege>>>;
+
 /// Narrow raw PUBLIC rows to the scopes one manifest declared.
 ///
 /// Rows are filtered to the privileges the manifest's PUBLIC rules mention
@@ -1306,8 +1313,10 @@ pub(crate) async fn read_raw_public_privileges(
 pub(crate) fn derive_public_privileges(
     rows: &[AclRow],
     scopes: &[PublicObjectScope],
-) -> BTreeMap<GrantKey, GrantState> {
+) -> (BTreeMap<GrantKey, GrantState>, EntryGrantors) {
     let mut grants: BTreeMap<GrantKey, GrantState> = BTreeMap::new();
+    let mut entry_grantors: BTreeMap<GrantKey, BTreeMap<String, BTreeSet<Privilege>>> =
+        BTreeMap::new();
     for row in rows {
         let Some(privilege) = acl_char_to_privilege(&row.privilege_type) else {
             continue;
@@ -1330,13 +1339,29 @@ pub(crate) fn derive_public_privileges(
             ObjectType::Schema | ObjectType::Database => (None, Some(row.object_name.clone())),
             _ => (row.schema_name.clone(), Some(row.object_name.clone())),
         };
+        let key = GrantKey {
+            role: Grantee::Public,
+            object_type,
+            schema,
+            name,
+        };
+        // Record every entry's grantor — a PUBLIC privilege delegated onward
+        // by a grant-option holder lives in that delegate's ACL entry, and a
+        // plain (owner-attributed) revoke leaves it in place. Unlike the role
+        // path there is no owner-self inherent case to skip: PUBLIC never
+        // owns anything, so even owner-attributed entries (including the
+        // built-in `acldefault` grants) are revocable state and get an exact
+        // `SET ROLE <owner>` attribution.
+        if let Some(grantor) = &row.grantor {
+            entry_grantors
+                .entry(key.clone())
+                .or_default()
+                .entry(grantor.clone())
+                .or_default()
+                .insert(privilege);
+        }
         grants
-            .entry(GrantKey {
-                role: Grantee::Public,
-                object_type,
-                schema,
-                name,
-            })
+            .entry(key)
             .or_insert_with(|| GrantState {
                 privileges: BTreeSet::new(),
             })
@@ -1344,7 +1369,7 @@ pub(crate) fn derive_public_privileges(
             .insert(privilege);
     }
 
-    grants
+    (grants, entry_grantors)
 }
 
 /// Whether some declared PUBLIC scope covers this object and names this

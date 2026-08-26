@@ -50,6 +50,15 @@ pub struct SqlContext {
     /// inspection-side tagging cannot see per-object ownership — e.g. a
     /// mixed-ownership schema folded into a `name: "*"` key.
     pub owned_relations: BTreeSet<(String, ObjectType, String, String)>,
+    /// The role the connection is expected to run as, when it differs from
+    /// the login role — e.g. the operator's `connection.params.setRole`,
+    /// applied via `SET ROLE` after connect, or a `role` GUC in the
+    /// connection options. A grantor-targeted revoke temporarily becomes the
+    /// grantor via `SET ROLE`; restoring with `RESET ROLE` would reset to the
+    /// *login* role, silently dropping the configured execution role for the
+    /// rest of the plan (and the pooled connection). When set, revokes
+    /// restore this role explicitly instead of using `RESET ROLE`.
+    pub execution_role: Option<String>,
 }
 
 impl SqlContext {
@@ -59,7 +68,15 @@ impl SqlContext {
             pg_major_version: version_num / 10000,
             object_inventory: BTreeMap::new(),
             owned_relations: BTreeSet::new(),
+            execution_role: None,
         }
+    }
+
+    /// Attach the connection's configured execution role (see
+    /// [`SqlContext::execution_role`]).
+    pub fn with_execution_role(mut self, execution_role: Option<String>) -> Self {
+        self.execution_role = execution_role;
+        self
     }
 
     /// Attach live object inventory for safer wildcard rendering.
@@ -111,6 +128,7 @@ impl Default for SqlContext {
             pg_major_version: 16, // Default to PG 16+ (current minimum)
             object_inventory: BTreeMap::new(),
             owned_relations: BTreeSet::new(),
+            execution_role: None,
         }
     }
 }
@@ -481,14 +499,25 @@ fn render_revoke(
     // selects for the executor (a superuser acts as the owner), and
     // `GRANTED BY` for object privileges must name the current user — so a
     // grantor-targeted revoke *becomes* the grantor for its statements. The
-    // whole plan runs in one transaction on one connection, so the SET ROLE /
-    // RESET ROLE pair brackets exactly these statements. The preflight
-    // verifies the executor can become the grantor before an apply runs.
+    // whole plan runs in one transaction on one connection, so the SET ROLE
+    // pair brackets exactly these statements. The preflight verifies the
+    // executor can become the grantor before an apply runs. The closing
+    // statement restores the connection's configured execution role when one
+    // is set (e.g. the operator's `connection.params.setRole`, applied via
+    // `SET ROLE` after connect): `RESET ROLE` would reset to the *login*
+    // role instead, silently dropping that boundary for the rest of the plan
+    // and the pooled connection.
     match grantor {
-        Some(grantor) => std::iter::once(format!("SET ROLE {};", quote_ident(grantor)))
-            .chain(statements)
-            .chain(std::iter::once("RESET ROLE;".to_string()))
-            .collect(),
+        Some(grantor) => {
+            let restore = match &ctx.execution_role {
+                Some(role) => format!("SET ROLE {};", quote_ident(role)),
+                None => "RESET ROLE;".to_string(),
+            };
+            std::iter::once(format!("SET ROLE {};", quote_ident(grantor)))
+                .chain(statements)
+                .chain(std::iter::once(restore))
+                .collect()
+        }
         None => statements,
     }
 }
@@ -1560,6 +1589,31 @@ mod tests {
                 "SET ROLE \"report_owner\";".to_string(),
                 "REVOKE SELECT ON TABLE \"app\".\"orders\" FROM \"analyst\";".to_string(),
                 "RESET ROLE;".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn render_revoke_with_grantor_restores_execution_role() {
+        // With a configured execution role (operator setRole / `-c role=...`),
+        // RESET ROLE would fall back to the *login* role and drop that
+        // boundary for the rest of the plan; the restore must be explicit.
+        let ctx = SqlContext::default().with_execution_role(Some("pg_admin".to_string()));
+        let change = Change::Revoke {
+            role: Grantee::Role("analyst".into()),
+            privileges: BTreeSet::from([Privilege::Select]),
+            object_type: ObjectType::Table,
+            schema: Some("app".to_string()),
+            name: Some("orders".to_string()),
+            grantor: Some("report_owner".to_string()),
+        };
+        let statements = render_statements_with_context(&change, &ctx);
+        assert_eq!(
+            statements,
+            vec![
+                "SET ROLE \"report_owner\";".to_string(),
+                "REVOKE SELECT ON TABLE \"app\".\"orders\" FROM \"analyst\";".to_string(),
+                "SET ROLE \"pg_admin\";".to_string(),
             ]
         );
     }
