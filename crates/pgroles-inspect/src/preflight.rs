@@ -530,6 +530,16 @@ pub async fn preflight_authority_issues(
             _ => None,
         })
         .collect();
+    // Owners of `SetDefaultPrivilege` changes, which execute before any
+    // membership change: the current-state owner check below judges them, so
+    // the phase check must not also report an owner that carries both kinds.
+    let set_owners: BTreeSet<String> = changes
+        .iter()
+        .filter_map(|change| match change {
+            Change::SetDefaultPrivilege { owner, .. } => Some(owner.clone()),
+            _ => None,
+        })
+        .collect();
     let phase_checks_active = !executor_is_superuser && server_major >= 16;
     // When the plan changes memberships at all, the phase graph — not the
     // current graph — is authoritative for RevokeDefaultPrivilege owners, so
@@ -593,6 +603,11 @@ pub async fn preflight_authority_issues(
             });
         }
         for owner in never_usable {
+            // An owner that also carries a SetDefaultPrivilege change gets
+            // the identical issue from the current-state check below.
+            if set_owners.contains(&owner) {
+                continue;
+            }
             issues.push(AuthorityIssue::DefaultPrivilegeOwner {
                 owner,
                 executor: executor.clone(),
@@ -607,13 +622,6 @@ pub async fn preflight_authority_issues(
     // the phase checks above ran), those owners were already judged against
     // the phase graph and are skipped here; both kinds still get the
     // missing-owner check.
-    let set_owners: BTreeSet<String> = changes
-        .iter()
-        .filter_map(|change| match change {
-            Change::SetDefaultPrivilege { owner, .. } => Some(owner.clone()),
-            _ => None,
-        })
-        .collect();
     let owners: BTreeSet<String> = changes
         .iter()
         .filter_map(|change| match change {
