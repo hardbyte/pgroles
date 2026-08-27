@@ -9,7 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [0.10.0] - 2026-08-27
 
-This stabilizes the 0.10.0 alpha series. Upgrading from 0.9.0? Also read the [0.10.0-alpha.2] and [0.10.0-alpha.1] notes below — predefined-role membership management, adopt-mode owner-transfer approval, `preserve_undeclared_grants`, and `PostgresPolicyCandidate` all landed there.
+This stabilizes the 0.10.0 alpha series. Upgrading from 0.9.0? Also read the [0.10.0-alpha.2](https://github.com/thepartly/pgroles/releases/tag/v0.10.0-alpha.2) and [0.10.0-alpha.1](https://github.com/thepartly/pgroles/releases/tag/v0.10.0-alpha.1) release notes — predefined-role membership management, adopt-mode owner-transfer approval, `preserve_undeclared_grants`, and `PostgresPolicyCandidate` all landed there, with their own upgrade notes.
 
 ### Added
 
