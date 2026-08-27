@@ -1,21 +1,44 @@
 //! Executor-authority preflight for planned changes.
 //!
-//! Two failure modes are caught before apply:
+//! Several failure modes are caught before apply:
 //!
 //! `ALTER DEFAULT PRIVILEGES FOR ROLE owner` requires the executor to be a
 //! member of the owner role (or a superuser). Without that, apply fails
 //! mid-transaction with a permission error, so the check only moves the
 //! failure earlier and names the owner.
 //!
-//! `REVOKE ... FROM PUBLIC` is worse than a loud failure: issued by a role
-//! without the owner's authority it silently removes nothing, the next
-//! inspection still sees the privilege, and the controller re-plans the same
-//! revoke forever. Implicit PUBLIC grants are always grantor-owned, so
-//! membership in the object owner (which `pg_has_role` reports true for
-//! superusers too) is exactly the authority the revoke needs. Role-grantee
-//! revokes are deliberately not checked: an executor can hold revoke
-//! authority for those without owner membership, and blocking such plans
-//! would regress setups that work today.
+//! `REVOKE` can be worse than a loud failure: every grant is attributed to a
+//! grantor, and a plain REVOKE removes only the entry of the *one* grantor
+//! PostgreSQL selects for the executor. A REVOKE that matches no such entry
+//! silently removes nothing — the next inspection still sees the privilege,
+//! and the controller re-plans the same revoke forever.
+//!
+//! The selection rules, verified live against PostgreSQL 16:
+//!
+//! * **Object privileges**: the executor itself when it holds the privilege
+//!   `WITH GRANT OPTION` (shadowing the owner even for owner members),
+//!   otherwise the object's owner when the executor can act as the owner —
+//!   which includes superusers, whose GRANT/REVOKE "is performed as though
+//!   it were issued by the owner of the affected object" (upstream REVOKE
+//!   notes). An entry a delegate granted onward therefore survives
+//!   *everyone's* plain revoke except the delegate's own, superusers
+//!   included, and `GRANTED BY` for object privileges must name the current
+//!   user — only revoking the delegate's grant option with `CASCADE` clears
+//!   it.
+//! * **Role memberships** (PostgreSQL 16+, which records a grantor per
+//!   edge): the executor itself under direct ADMIN OPTION; for superusers
+//!   the bootstrap superuser, which is also how grants *by* any superuser
+//!   are recorded. An edge granted by an ordinary role survives even a
+//!   superuser's bare revoke, with only a WARNING; `REVOKE ... GRANTED BY`
+//!   works for any role holding the grantor's privileges.
+//!
+//! Grantor-targeted changes (the normal case — inspection records every
+//! entry's grantor, PUBLIC entries included) are checked exactly: per
+//! grantor, can the executor become it. The remaining sweeps cover only
+//! *plain* revokes — grantor-less snapshots and wildcard-collapsed keys —
+//! where the conservative owner/`pg_has_role` tests apply and the operator's
+//! post-apply non-convergence detection remains the backstop for the
+//! shadowing case.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -65,6 +88,78 @@ pub enum AuthorityIssue {
         /// `(name, owner)`.
         examples: Vec<(String, String)>,
     },
+
+    /// A planned `REVOKE ... FROM <role>` targets ACL entries the executor's
+    /// plain REVOKE cannot remove: PostgreSQL revokes only the entry of the
+    /// one grantor it selects for the executor, and a REVOKE matching no such
+    /// entry succeeds silently — no error, no warning — so these entries
+    /// would survive and the same drift would re-plan on every run.
+    ///
+    /// This is the ordinary-grantee sibling of [`AuthorityIssue::PublicRevoke`]
+    /// and checks per ACL entry: an entry a delegate granted onward via
+    /// `WITH GRANT OPTION` is unremovable even for an owner-acting executor —
+    /// superusers included, whose revoke is performed as though issued by the
+    /// owner. A residue remains for non-superuser executors: an entry whose
+    /// grantor is reachable can still survive when PostgreSQL's grantor
+    /// selection prefers another path (the executor's own grant option
+    /// shadowing the owner's), which only the post-apply non-convergence
+    /// detection catches.
+    ForeignGrantorRevoke {
+        object_type: ObjectType,
+        schema: Option<String>,
+        grantee: String,
+        executor: String,
+        skipped_count: usize,
+        /// Up to [`REVOKE_EXAMPLE_LIMIT`] surviving entries as
+        /// `(object name, grantor)`.
+        examples: Vec<(String, String)>,
+    },
+
+    /// A planned membership `REVOKE <role> FROM <member>` targets an edge
+    /// the executor's plain REVOKE cannot remove (PostgreSQL 16+).
+    ///
+    /// Since PostgreSQL 16 each membership edge records its grantor, and a
+    /// bare `REVOKE` removes only the edge whose grantor the revoke is
+    /// attributed to — the executor under direct ADMIN OPTION, or for a
+    /// superuser the bootstrap superuser. Any other edge survives with just
+    /// a WARNING ("role ... has not been granted membership ... by role
+    /// ...") — an edge granted by an ordinary role survives even a
+    /// superuser's bare revoke — so the same revocation re-plans on every
+    /// run. `REVOKE ... GRANTED BY <grantor>` removes it, but requires the
+    /// privileges of that grantor.
+    ForeignGrantorMembershipRevoke {
+        role: String,
+        member: String,
+        grantor: String,
+        executor: String,
+    },
+
+    /// A planned object-privilege revoke targets an ACL entry attributed to
+    /// `grantor`, and the executor cannot become that grantor. The revoke is
+    /// rendered as `SET ROLE <grantor>; REVOKE ...;` (restoring the
+    /// configured execution role afterwards) because a
+    /// plain REVOKE removes only the entry of the grantor PostgreSQL selects
+    /// for the executor (and `GRANTED BY` for object privileges must name the
+    /// current user) — without SET ROLE feasibility the statement fails or
+    /// the entry silently survives.
+    RevokeGrantorUnavailable { grantor: String, executor: String },
+
+    /// The plan itself removes the executor's membership path to a role it
+    /// must still act as later in the same plan.
+    ///
+    /// Membership removals execute in one transaction with everything else.
+    /// A `REVOKE ... GRANTED BY <grantor>` (membership revoke) and an
+    /// `ALTER DEFAULT PRIVILEGES FOR ROLE <owner>` both require the
+    /// privileges of the named role at the moment the statement runs — and a
+    /// membership removal earlier in the plan can strip exactly that path,
+    /// so a preflight against the *current* graph would pass while execution
+    /// fails and rolls back. This issue flags such dependency-breaking plans
+    /// phase by phase: membership revokes are checked against the graph with
+    /// the plan's removals applied, default-privilege revokes against the
+    /// graph with the plan's removals *and* inheriting additions applied —
+    /// they execute after the addition batch, so an option change or a newly
+    /// declared membership can legitimately restore the path first.
+    GrantorAuthorityRemovedByPlan { grantor: String, executor: String },
 }
 
 impl std::fmt::Display for AuthorityIssue {
@@ -132,6 +227,74 @@ impl std::fmt::Display for AuthorityIssue {
                 }
                 Ok(())
             }
+            AuthorityIssue::ForeignGrantorRevoke {
+                object_type,
+                schema,
+                grantee,
+                executor,
+                skipped_count,
+                examples,
+            } => {
+                let examples = examples
+                    .iter()
+                    .map(|(name, grantor)| format!("\"{name}\" (grantor \"{grantor}\")"))
+                    .collect::<Vec<_>>()
+                    .join("; ");
+                write!(
+                    f,
+                    "UnsatisfiableRevoke: cannot revoke \"{grantee}\" privileges on \
+                     {object_type} objects{} as executor \"{executor}\"; {skipped_count} ACL \
+                     entr{} attributed to grantors this executor's REVOKE cannot remove \
+                     (PostgreSQL revokes only grants made by the revoker; a superuser acts \
+                     as the owner), so the REVOKE would succeed while silently leaving them \
+                     in place — revoke the delegating grantor's grant option with CASCADE, \
+                     or run the revoke as that grantor",
+                    match schema {
+                        Some(schema) => format!(" in schema \"{schema}\""),
+                        None => String::new(),
+                    },
+                    if *skipped_count == 1 {
+                        "y was"
+                    } else {
+                        "ies were"
+                    },
+                )?;
+                if !examples.is_empty() {
+                    write!(f, " (examples: {examples})")?;
+                }
+                Ok(())
+            }
+            AuthorityIssue::ForeignGrantorMembershipRevoke {
+                role,
+                member,
+                grantor,
+                executor,
+            } => write!(
+                f,
+                "UnsatisfiableRevoke: cannot revoke membership of \"{member}\" in \
+                 \"{role}\" as executor \"{executor}\"; the edge was granted by \
+                 \"{grantor}\" and is removed with REVOKE ... GRANTED BY \
+                 \"{grantor}\", which requires the privileges of that grantor — \
+                 grant the executor membership in \"{grantor}\" or run the revoke \
+                 as a role that has it"
+            ),
+            AuthorityIssue::RevokeGrantorUnavailable { grantor, executor } => write!(
+                f,
+                "UnsatisfiableRevoke: the plan revokes object privileges from ACL \
+                 entries granted by \"{grantor}\", which requires running the REVOKE \
+                 as that grantor (SET ROLE) — executor \"{executor}\" cannot become \
+                 \"{grantor}\"; grant the executor membership in \"{grantor}\" (with \
+                 the SET option) or run the revoke as a role that has it"
+            ),
+            AuthorityIssue::GrantorAuthorityRemovedByPlan { grantor, executor } => write!(
+                f,
+                "UnsatisfiableRevoke: this plan removes the membership path that \
+                 lets executor \"{executor}\" act with the privileges of \
+                 \"{grantor}\", and a later statement in the same plan must still \
+                 act as \"{grantor}\" (REVOKE ... GRANTED BY or ALTER DEFAULT \
+                 PRIVILEGES FOR ROLE) — split the membership removal into a \
+                 separate, later apply"
+            ),
         }
     }
 }
@@ -165,6 +328,11 @@ pub async fn preflight_authority_issues(
         .await?;
         (user, is_superuser, has_createrole)
     };
+    let (server_version_num,): (i32,) =
+        sqlx::query_as("SELECT current_setting('server_version_num')::int")
+            .fetch_one(pool)
+            .await?;
+    let server_major = (server_version_num / 10_000) as u32;
 
     // --- Predefined-role membership authority ---
     // Granting or revoking membership in a predefined (`pg_*`) role requires
@@ -184,12 +352,6 @@ pub async fn preflight_authority_issues(
         })
         .collect();
     if !predefined_targets.is_empty() {
-        let (server_version_num,): (i32,) =
-            sqlx::query_as("SELECT current_setting('server_version_num')::int")
-                .fetch_one(pool)
-                .await?;
-        let server_major = (server_version_num / 10_000) as u32;
-
         let target_list: Vec<String> = predefined_targets.iter().cloned().collect();
         let rows: Vec<(String, bool)> = sqlx::query_as(
             r#"
@@ -228,7 +390,238 @@ pub async fn preflight_authority_issues(
         }
     }
 
+    // --- Revoke grantor feasibility ---
+    // Grantor-targeted changes carry the exact edge or ACL entry inspection
+    // saw, and their rendering acts as that grantor: a membership revoke
+    // renders `REVOKE ... GRANTED BY <grantor>`, which requires the
+    // privileges of the grantor; an object revoke renders
+    // `SET ROLE <grantor>; REVOKE ...;`, which requires the executor to be
+    // able to become the grantor (the SET option on PG16+, plain membership
+    // before). Check both up front so an apply never runs a
+    // statement PostgreSQL would reject — no attribution heuristics needed,
+    // the grantor is named on the change.
+    let membership_grantors: BTreeSet<String> = changes
+        .iter()
+        .filter_map(|change| match change {
+            Change::RemoveMember {
+                grantor: Some(grantor),
+                ..
+            } => Some(grantor.clone()),
+            _ => None,
+        })
+        .collect();
+    let revoke_grantors: BTreeSet<String> = changes
+        .iter()
+        .filter_map(|change| match change {
+            Change::Revoke {
+                grantor: Some(grantor),
+                ..
+            } => Some(grantor.clone()),
+            _ => None,
+        })
+        .collect();
+    if !membership_grantors.is_empty() || !revoke_grantors.is_empty() {
+        let all: Vec<String> = membership_grantors
+            .iter()
+            .chain(revoke_grantors.iter())
+            .cloned()
+            .collect::<BTreeSet<String>>()
+            .into_iter()
+            .collect();
+        // 'SET' is the PG16+ SET ROLE feasibility mode; before 16 plain
+        // membership suffices for SET ROLE. 'USAGE' is "has the privileges
+        // of", which is what GRANTED BY requires. Superusers pass both.
+        let set_mode = if server_major >= 16 { "SET" } else { "MEMBER" };
+        let rows: Vec<(String, bool, bool)> = sqlx::query_as(&format!(
+            "SELECT r.rolname::text, \
+                    pg_has_role(current_user, r.oid, 'USAGE'), \
+                    pg_has_role(current_user, r.oid, '{set_mode}') \
+             FROM pg_roles r WHERE r.rolname = ANY($1)"
+        ))
+        .bind(&all)
+        .fetch_all(pool)
+        .await?;
+        let usage: BTreeSet<&str> = rows
+            .iter()
+            .filter(|(_, has_usage, _)| *has_usage)
+            .map(|(name, _, _)| name.as_str())
+            .collect();
+        let settable: BTreeSet<&str> = rows
+            .iter()
+            .filter(|(_, _, can_set)| *can_set)
+            .map(|(name, _, _)| name.as_str())
+            .collect();
+        for change in changes {
+            match change {
+                Change::RemoveMember {
+                    role,
+                    member,
+                    grantor: Some(grantor),
+                } if !usage.contains(grantor.as_str()) => {
+                    issues.push(AuthorityIssue::ForeignGrantorMembershipRevoke {
+                        role: role.clone(),
+                        member: member.clone(),
+                        grantor: grantor.clone(),
+                        executor: executor.clone(),
+                    });
+                }
+                Change::Revoke {
+                    grantor: Some(grantor),
+                    ..
+                } if !settable.contains(grantor.as_str()) => {
+                    issues.push(AuthorityIssue::RevokeGrantorUnavailable {
+                        grantor: grantor.clone(),
+                        executor: executor.clone(),
+                    });
+                }
+                _ => {}
+            }
+        }
+        // One report per unavailable grantor is enough for the object side.
+        issues.dedup_by(|a, b| {
+            matches!(
+                (&a, &b),
+                (
+                    AuthorityIssue::RevokeGrantorUnavailable { grantor: ga, .. },
+                    AuthorityIssue::RevokeGrantorUnavailable { grantor: gb, .. },
+                ) if ga == gb
+            )
+        });
+    }
+
+    // --- Grantor authority removed by the plan itself ---
+    // The feasibility checks above run against the *current* membership
+    // graph, but membership changes execute inside the same transaction —
+    // and object revokes are the only grantor-targeted changes ordered
+    // before them. Authority is re-checked phase by phase, matching plan
+    // order (removals, then additions, then default-privilege revokes):
+    //
+    //   - a `REVOKE ... GRANTED BY <grantor>` runs in the removal batch, so
+    //     its grantor must stay reachable in the graph with the plan's
+    //     removals applied (conservative: a removal order that would keep a
+    //     path alive long enough is still flagged);
+    //   - an `ALTER DEFAULT PRIVILEGES FOR ROLE <owner>` runs after the
+    //     addition batch, so the plan's added inheriting edges count too —
+    //     an option change (remove + re-add) or a newly declared membership
+    //     can legitimately restore the executor's path before it runs.
+    //
+    // Requires the per-edge `inherit_option` PostgreSQL 16 records; before
+    // 16 there are no grantor-targeted removals to protect, so the residual
+    // pre-16 default-privilege exposure stays with the post-apply detection.
+    let removed_edges: Vec<(String, String)> = changes
+        .iter()
+        .filter_map(|change| match change {
+            Change::RemoveMember { role, member, .. } => Some((role.clone(), member.clone())),
+            _ => None,
+        })
+        .collect();
+    // Only inheriting additions extend USAGE. An added edge referencing a
+    // role the plan also creates cannot resolve against pg_roles yet and is
+    // conservatively ignored.
+    let added_edges: Vec<(String, String)> = changes
+        .iter()
+        .filter_map(|change| match change {
+            Change::AddMember {
+                role,
+                member,
+                inherit: true,
+                ..
+            } => Some((role.clone(), member.clone())),
+            _ => None,
+        })
+        .collect();
+    // Owners of `SetDefaultPrivilege` changes, which execute before any
+    // membership change: the current-state owner check below judges them, so
+    // the phase check must not also report an owner that carries both kinds.
+    let set_owners: BTreeSet<String> = changes
+        .iter()
+        .filter_map(|change| match change {
+            Change::SetDefaultPrivilege { owner, .. } => Some(owner.clone()),
+            _ => None,
+        })
+        .collect();
+    let phase_checks_active = !executor_is_superuser && server_major >= 16;
+    // When the plan changes memberships at all, the phase graph — not the
+    // current graph — is authoritative for RevokeDefaultPrivilege owners, so
+    // the current-state owner check below must not double-judge them.
+    let revoke_owners_phase_checked =
+        phase_checks_active && !(removed_edges.is_empty() && added_edges.is_empty());
+    if phase_checks_active {
+        let mut broken_by_plan: BTreeSet<String> = BTreeSet::new();
+        let mut never_usable: BTreeSet<String> = BTreeSet::new();
+
+        // Membership `GRANTED BY` revokes run in the removal batch, before
+        // any addition, so only removals can affect them.
+        if !removed_edges.is_empty() && !membership_grantors.is_empty() {
+            let membership_phase_roles: Vec<String> = membership_grantors.iter().cloned().collect();
+            for (grantor, usable_now) in
+                roles_unreachable_in_graph(pool, &membership_phase_roles, &removed_edges, &[])
+                    .await?
+            {
+                // A grantor the executor cannot use even now was already
+                // flagged exactly (ForeignGrantorMembershipRevoke) above.
+                if usable_now {
+                    broken_by_plan.insert(grantor);
+                }
+            }
+        }
+
+        // Default-privilege revokes run after removals *and* additions: a
+        // path the plan removes may be legitimately replaced, and a path the
+        // executor lacks now may be legitimately acquired (e.g. its ADMIN
+        // OPTION lets it grant the owner to a role it already inherits).
+        if revoke_owners_phase_checked {
+            let defaults_phase_roles: Vec<String> = changes
+                .iter()
+                .filter_map(|change| match change {
+                    Change::RevokeDefaultPrivilege { owner, .. } => Some(owner.clone()),
+                    _ => None,
+                })
+                .collect::<BTreeSet<String>>()
+                .into_iter()
+                .collect();
+            for (owner, usable_now) in roles_unreachable_in_graph(
+                pool,
+                &defaults_phase_roles,
+                &removed_edges,
+                &added_edges,
+            )
+            .await?
+            {
+                if usable_now {
+                    broken_by_plan.insert(owner);
+                } else {
+                    never_usable.insert(owner);
+                }
+            }
+        }
+
+        for grantor in broken_by_plan {
+            issues.push(AuthorityIssue::GrantorAuthorityRemovedByPlan {
+                grantor,
+                executor: executor.clone(),
+            });
+        }
+        for owner in never_usable {
+            // An owner that also carries a SetDefaultPrivilege change gets
+            // the identical issue from the current-state check below.
+            if set_owners.contains(&owner) {
+                continue;
+            }
+            issues.push(AuthorityIssue::DefaultPrivilegeOwner {
+                owner,
+                executor: executor.clone(),
+            });
+        }
+    }
+
     // --- Default-privilege owner authority ---
+    // `SetDefaultPrivilege` executes before any membership change, so the
+    // current graph judges it. `RevokeDefaultPrivilege` executes after the
+    // removal and addition batches — when the plan changes memberships (and
+    // the phase checks above ran), those owners were already judged against
+    // the phase graph and are skipped here; both kinds still get the
+    // missing-owner check.
     let owners: BTreeSet<String> = changes
         .iter()
         .filter_map(|change| match change {
@@ -251,7 +644,7 @@ pub async fn preflight_authority_issues(
         .await?;
         let known: BTreeSet<String> = rows.iter().map(|(owner, _)| owner.clone()).collect();
         for (owner, can_act) in rows {
-            if !can_act {
+            if !can_act && (set_owners.contains(&owner) || !revoke_owners_phase_checked) {
                 issues.push(AuthorityIssue::DefaultPrivilegeOwner {
                     owner,
                     executor: executor.clone(),
@@ -287,10 +680,14 @@ pub async fn preflight_authority_issues(
         }
     }
 
-    // --- PUBLIC revoke ownership ---
-    // Collect the objects each planned PUBLIC revoke touches, grouped per
-    // (object_type, schema). `AllInSchema` means every object of that type,
-    // which is what an `ON ALL` statement actually reaches.
+    // --- PUBLIC revoke ownership (grantor-less revokes) ---
+    // Collect the objects each planned *plain* PUBLIC revoke touches, grouped
+    // per (object_type, schema). `AllInSchema` means every object of that
+    // type, which is what an `ON ALL` statement actually reaches. A
+    // grantor-targeted PUBLIC revoke runs `SET ROLE <grantor>` and needs only
+    // that — it was checked exactly above, so requiring owner authority here
+    // as well would block a least-privilege executor whose targeted revoke
+    // succeeds.
     #[derive(Default)]
     struct RevokeTargets {
         names: BTreeSet<String>,
@@ -304,6 +701,7 @@ pub async fn preflight_authority_issues(
             object_type,
             schema,
             name,
+            grantor: None,
             ..
         } = change
         else {
@@ -372,7 +770,227 @@ pub async fn preflight_authority_issues(
         });
     }
 
+    // --- Ordinary-grantee revoke grantor authority (grantor-less revokes) ---
+    // A grantor-targeted revoke was checked exactly above; this sweep covers
+    // only the revokes that carry no grantor — snapshots without a per-entry
+    // breakdown and wildcard-collapsed keys — where a plain REVOKE runs and
+    // removes only the entry of the grantor PostgreSQL selects for the
+    // executor. Explode the live ACLs of the targeted objects and flag
+    // entries for the revoked grantee and privileges the plain revoke cannot
+    // reach.
+    let mut grantee_targets: BTreeMap<(ObjectType, Option<String>, String), GranteeRevokeTargets> =
+        BTreeMap::new();
+    for change in changes {
+        let Change::Revoke {
+            role: Grantee::Role(grantee),
+            object_type,
+            schema,
+            name,
+            privileges,
+            grantor: None,
+        } = change
+        else {
+            continue;
+        };
+        let entry = grantee_targets
+            .entry((*object_type, schema.clone(), grantee.clone()))
+            .or_default();
+        let revoked: BTreeSet<String> = privileges
+            .iter()
+            .map(|privilege| privilege.to_string())
+            .collect();
+        match name.as_deref() {
+            Some("*") => {
+                let range_start = GrantKey {
+                    role: Grantee::Role(grantee.clone()),
+                    object_type: *object_type,
+                    schema: schema.clone(),
+                    name: None,
+                };
+                for (key, _) in current.grants.range(range_start..).take_while(|(key, _)| {
+                    key.role == Grantee::Role(grantee.clone())
+                        && key.object_type == *object_type
+                        && key.schema == *schema
+                }) {
+                    match key.name.as_deref() {
+                        // Same wildcard normalization as the PUBLIC check: a
+                        // collapsed `"*"` key covers the whole scope.
+                        Some("*") => entry.all_in_schema.extend(revoked.iter().cloned()),
+                        Some(object_name) => {
+                            entry
+                                .names
+                                .entry(object_name.to_string())
+                                .or_default()
+                                .extend(revoked.iter().cloned());
+                        }
+                        None => {}
+                    }
+                }
+            }
+            Some(object_name) => {
+                entry
+                    .names
+                    .entry(object_name.to_string())
+                    .or_default()
+                    .extend(revoked.iter().cloned());
+            }
+            None => {}
+        }
+    }
+
+    for ((object_type, schema, grantee), target) in grantee_targets {
+        if target.names.is_empty() && target.all_in_schema.is_empty() {
+            continue;
+        }
+        // The query filters by the union of privileges for efficiency; the
+        // object → privileges association is re-applied client-side so a
+        // `SELECT` revoke on one table never flags a foreign-grantor `UPDATE`
+        // entry on another.
+        let privileges: Vec<String> = target
+            .names
+            .values()
+            .flatten()
+            .chain(target.all_in_schema.iter())
+            .cloned()
+            .collect::<BTreeSet<String>>()
+            .into_iter()
+            .collect();
+        let names: BTreeSet<String> = target.names.keys().cloned().collect();
+        let rows = fetch_revoke_grantor_authority(
+            pool,
+            object_type,
+            schema.as_deref(),
+            &names,
+            &grantee,
+            &privileges,
+        )
+        .await?;
+        let mut surviving: BTreeSet<(String, String)> = rows
+            .into_iter()
+            .filter(|row| {
+                !row.can_act
+                    && row.schema_name.as_deref() == schema.as_deref()
+                    && (target.all_in_schema.contains(&row.privilege_type)
+                        || target
+                            .names
+                            .get(&row.object_name)
+                            .is_some_and(|revoked| revoked.contains(&row.privilege_type)))
+            })
+            .map(|row| (row.object_name, row.grantor_name))
+            .collect();
+        if surviving.is_empty() {
+            continue;
+        }
+        let skipped_count = surviving.len();
+        let examples: Vec<(String, String)> = std::mem::take(&mut surviving)
+            .into_iter()
+            .take(REVOKE_EXAMPLE_LIMIT)
+            .collect();
+        issues.push(AuthorityIssue::ForeignGrantorRevoke {
+            object_type,
+            schema,
+            grantee,
+            executor: executor.clone(),
+            skipped_count,
+            examples,
+        });
+    }
+
     Ok(issues)
+}
+
+/// Objects one planned `(object_type, schema, grantee)` revoke group reaches.
+///
+/// The object → privileges association is preserved: a `SELECT` revoke on one
+/// table and an `UPDATE` revoke on another in the same schema must not be
+/// checked as their cross-product, or an untargeted foreign-grantor entry
+/// would be reported and block apply. Privileges from a collapsed `"*"`
+/// wildcard target apply to every object of the type in the schema and are
+/// tracked separately.
+#[derive(Default)]
+struct GranteeRevokeTargets {
+    /// Object name → privilege names being revoked on that object.
+    names: BTreeMap<String, BTreeSet<String>>,
+    /// Privilege names being revoked on every object of the type in the
+    /// schema (from a collapsed `"*"` target). Empty when no wildcard applies.
+    all_in_schema: BTreeSet<String>,
+}
+
+/// A live ACL entry for a revoked grantee: which object and privilege it
+/// carries, who granted it, and whether the executor can act as that grantor.
+#[derive(Debug, sqlx::FromRow)]
+struct GrantorAuthorityRow {
+    schema_name: Option<String>,
+    object_name: String,
+    grantor_name: String,
+    privilege_type: String,
+    can_act: bool,
+}
+
+/// Which of `roles` the executor cannot act as at a given plan phase:
+/// inheritance-reachability from the executor over the live membership graph
+/// with `removed` edges deleted and `added` inheriting edges inserted — the
+/// phase equivalent of `pg_has_role(current_user, role, 'USAGE')`. Each
+/// unreachable role is returned with whether the executor can use it *now*,
+/// so callers can distinguish authority the plan breaks from authority the
+/// executor never had. Additions resolve against `pg_roles`, so an edge
+/// referencing a role the plan also creates is conservatively ignored.
+/// Superusers are never passed here.
+async fn roles_unreachable_in_graph(
+    pool: &PgPool,
+    roles: &[String],
+    removed: &[(String, String)],
+    added: &[(String, String)],
+) -> Result<Vec<(String, bool)>, sqlx::Error> {
+    if roles.is_empty() {
+        return Ok(Vec::new());
+    }
+    let (removed_roles, removed_members): (Vec<String>, Vec<String>) =
+        removed.iter().cloned().unzip();
+    let (added_roles, added_members): (Vec<String>, Vec<String>) = added.iter().cloned().unzip();
+    let rows: Vec<(String, bool)> = sqlx::query_as(
+        r#"
+        WITH RECURSIVE removed(rolname, memname) AS (
+            SELECT * FROM unnest($2::text[], $3::text[])
+        ),
+        added(rolname, memname) AS (
+            SELECT * FROM unnest($4::text[], $5::text[])
+        ),
+        edges(roleid, member) AS (
+            SELECT m.roleid, m.member
+            FROM pg_auth_members m
+            JOIN pg_roles g ON g.oid = m.roleid
+            JOIN pg_roles mem ON mem.oid = m.member
+            WHERE m.inherit_option
+              AND NOT EXISTS (
+                  SELECT 1 FROM removed d
+                  WHERE d.rolname = g.rolname AND d.memname = mem.rolname
+              )
+            UNION
+            SELECT g.oid, mem.oid
+            FROM added a
+            JOIN pg_roles g ON g.rolname = a.rolname
+            JOIN pg_roles mem ON mem.rolname = a.memname
+        ),
+        reach(oid) AS (
+            SELECT oid FROM pg_roles WHERE rolname = current_user
+            UNION
+            SELECT e.roleid FROM edges e JOIN reach r ON e.member = r.oid
+        )
+        SELECT r.rolname::text, pg_has_role(current_user, r.oid, 'USAGE')
+        FROM pg_roles r
+        WHERE r.rolname = ANY($1)
+          AND r.oid NOT IN (SELECT oid FROM reach)
+        "#,
+    )
+    .bind(roles)
+    .bind(&removed_roles)
+    .bind(&removed_members)
+    .bind(&added_roles)
+    .bind(&added_members)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows)
 }
 
 async fn fetch_object_authority(
@@ -496,6 +1114,183 @@ async fn fetch_object_authority(
                 WHERE db.datname = current_database()
                 "#,
             )
+            .fetch_all(pool)
+            .await
+        }
+    }
+}
+
+/// Fetch the live ACL entries a planned `REVOKE ... FROM <grantee>` group
+/// would have to remove, with per-entry grantor actability.
+///
+/// One query per catalog family, each exploding the object's ACL column and
+/// keeping entries for the named grantee and privilege types. `can_act` is
+/// `pg_has_role(current_user, grantor, 'USAGE')` — the membership check
+/// PostgreSQL's own grantor resolution walks — so a `false` row is an entry
+/// the executor's REVOKE cannot remove under any grantor selection.
+async fn fetch_revoke_grantor_authority(
+    pool: &PgPool,
+    object_type: ObjectType,
+    schema: Option<&str>,
+    names: &BTreeSet<String>,
+    grantee: &str,
+    privileges: &[String],
+) -> Result<Vec<GrantorAuthorityRow>, sqlx::Error> {
+    let schemas: Vec<String> = schema.map(|s| vec![s.to_string()]).unwrap_or_default();
+    let names: Vec<String> = names.iter().cloned().collect();
+    match object_type {
+        ObjectType::Table
+        | ObjectType::View
+        | ObjectType::MaterializedView
+        | ObjectType::Sequence => {
+            let relkinds: Vec<String> = match object_type {
+                ObjectType::Table => vec!["r".to_string(), "p".to_string()],
+                ObjectType::View => vec!["v".to_string()],
+                ObjectType::MaterializedView => vec!["m".to_string()],
+                _ => vec!["S".to_string()],
+            };
+            sqlx::query_as::<_, GrantorAuthorityRow>(
+                r#"
+                SELECT DISTINCT
+                    n.nspname::text AS schema_name,
+                    c.relname::text AS object_name,
+                    gr.rolname::text AS grantor_name,
+                    acl.privilege_type::text AS privilege_type,
+                    CASE WHEN (SELECT rolsuper FROM pg_roles WHERE rolname = current_user)
+                         -- A superuser's plain REVOKE is performed as though
+                         -- issued by the object's owner, so only the
+                         -- owner-attributed entry is removable.
+                         THEN acl.grantor = c.relowner
+                         ELSE pg_has_role(current_user, acl.grantor, 'USAGE')
+                    END AS can_act
+                FROM pg_class c
+                JOIN pg_namespace n ON n.oid = c.relnamespace
+                CROSS JOIN LATERAL aclexplode(c.relacl) AS acl
+                JOIN pg_roles gr ON gr.oid = acl.grantor
+                JOIN pg_roles ge ON ge.oid = acl.grantee
+                WHERE n.nspname = ANY($1)
+                  AND c.relkind::text = ANY($2)
+                  AND ge.rolname = $3
+                  AND acl.privilege_type = ANY($4)
+                "#,
+            )
+            .bind(&schemas)
+            .bind(&relkinds)
+            .bind(grantee)
+            .bind(privileges)
+            .fetch_all(pool)
+            .await
+        }
+        ObjectType::Function => {
+            sqlx::query_as::<_, GrantorAuthorityRow>(
+                r#"
+                SELECT DISTINCT
+                    n.nspname::text AS schema_name,
+                    (p.proname || '(' || pg_catalog.pg_get_function_identity_arguments(p.oid) || ')')::text
+                        AS object_name,
+                    gr.rolname::text AS grantor_name,
+                    acl.privilege_type::text AS privilege_type,
+                    CASE WHEN (SELECT rolsuper FROM pg_roles WHERE rolname = current_user)
+                         THEN acl.grantor = p.proowner
+                         ELSE pg_has_role(current_user, acl.grantor, 'USAGE')
+                    END AS can_act
+                FROM pg_proc p
+                JOIN pg_namespace n ON n.oid = p.pronamespace
+                CROSS JOIN LATERAL aclexplode(p.proacl) AS acl
+                JOIN pg_roles gr ON gr.oid = acl.grantor
+                JOIN pg_roles ge ON ge.oid = acl.grantee
+                WHERE n.nspname = ANY($1)
+                  AND ge.rolname = $2
+                  AND acl.privilege_type = ANY($3)
+                "#,
+            )
+            .bind(&schemas)
+            .bind(grantee)
+            .bind(privileges)
+            .fetch_all(pool)
+            .await
+        }
+        ObjectType::Type => {
+            sqlx::query_as::<_, GrantorAuthorityRow>(
+                r#"
+                SELECT DISTINCT
+                    n.nspname::text AS schema_name,
+                    t.typname::text AS object_name,
+                    gr.rolname::text AS grantor_name,
+                    acl.privilege_type::text AS privilege_type,
+                    CASE WHEN (SELECT rolsuper FROM pg_roles WHERE rolname = current_user)
+                         THEN acl.grantor = t.typowner
+                         ELSE pg_has_role(current_user, acl.grantor, 'USAGE')
+                    END AS can_act
+                FROM pg_type t
+                JOIN pg_namespace n ON n.oid = t.typnamespace
+                CROSS JOIN LATERAL aclexplode(t.typacl) AS acl
+                JOIN pg_roles gr ON gr.oid = acl.grantor
+                JOIN pg_roles ge ON ge.oid = acl.grantee
+                WHERE n.nspname = ANY($1)
+                  AND ge.rolname = $2
+                  AND acl.privilege_type = ANY($3)
+                "#,
+            )
+            .bind(&schemas)
+            .bind(grantee)
+            .bind(privileges)
+            .fetch_all(pool)
+            .await
+        }
+        ObjectType::Schema => {
+            // Schema targets carry the schema in `name`, so `names` holds the
+            // schema names and the returned schema_name is NULL (matching how
+            // the revoke change itself is keyed).
+            sqlx::query_as::<_, GrantorAuthorityRow>(
+                r#"
+                SELECT DISTINCT
+                    NULL::text AS schema_name,
+                    n.nspname::text AS object_name,
+                    gr.rolname::text AS grantor_name,
+                    acl.privilege_type::text AS privilege_type,
+                    CASE WHEN (SELECT rolsuper FROM pg_roles WHERE rolname = current_user)
+                         THEN acl.grantor = n.nspowner
+                         ELSE pg_has_role(current_user, acl.grantor, 'USAGE')
+                    END AS can_act
+                FROM pg_namespace n
+                CROSS JOIN LATERAL aclexplode(n.nspacl) AS acl
+                JOIN pg_roles gr ON gr.oid = acl.grantor
+                JOIN pg_roles ge ON ge.oid = acl.grantee
+                WHERE n.nspname = ANY($1)
+                  AND ge.rolname = $2
+                  AND acl.privilege_type = ANY($3)
+                "#,
+            )
+            .bind(&names)
+            .bind(grantee)
+            .bind(privileges)
+            .fetch_all(pool)
+            .await
+        }
+        ObjectType::Database => {
+            sqlx::query_as::<_, GrantorAuthorityRow>(
+                r#"
+                SELECT DISTINCT
+                    NULL::text AS schema_name,
+                    db.datname::text AS object_name,
+                    gr.rolname::text AS grantor_name,
+                    acl.privilege_type::text AS privilege_type,
+                    CASE WHEN (SELECT rolsuper FROM pg_roles WHERE rolname = current_user)
+                         THEN acl.grantor = db.datdba
+                         ELSE pg_has_role(current_user, acl.grantor, 'USAGE')
+                    END AS can_act
+                FROM pg_database db
+                CROSS JOIN LATERAL aclexplode(db.datacl) AS acl
+                JOIN pg_roles gr ON gr.oid = acl.grantor
+                JOIN pg_roles ge ON ge.oid = acl.grantee
+                WHERE db.datname = current_database()
+                  AND ge.rolname = $1
+                  AND acl.privilege_type = ANY($2)
+                "#,
+            )
+            .bind(grantee)
+            .bind(privileges)
             .fetch_all(pool)
             .await
         }

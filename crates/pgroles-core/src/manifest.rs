@@ -44,7 +44,7 @@ pub enum ManifestError {
     PasswordWithoutLogin { role: String },
 
     #[error(
-        "role \"{role}\" has an invalid password_valid_until value \"{value}\": expected ISO 8601 timestamp (e.g. \"2025-12-31T00:00:00Z\")"
+        "role \"{role}\" has an invalid password_valid_until value \"{value}\": expected a UTC second-precision ISO 8601 timestamp of the exact form \"YYYY-MM-DDTHH:MM:SSZ\" (e.g. \"2025-12-31T00:00:00Z\") — inspection reports the live value in this form, so an offset or fractional-second timestamp would never compare equal and the ALTER ROLE would re-plan forever"
     )]
     InvalidValidUntil { role: String, value: String },
 
@@ -1694,8 +1694,16 @@ fn validate_ensure_conflicts(
 /// hour 00-23, minute/second 00-59). It does not check calendar validity
 /// (e.g. Feb 30 passes). PostgreSQL itself will reject truly invalid dates.
 fn is_valid_iso8601_timestamp(value: &str) -> bool {
-    // Minimum valid: "YYYY-MM-DDTHH:MM:SSZ" = 20 chars
-    if value.len() < 20 {
+    // Exactly "YYYY-MM-DDTHH:MM:SSZ" = 20 chars. Only the UTC second-precision
+    // form is accepted, because desired state is compared against inspection
+    // by string equality and inspection renders `rolvaliduntil` in exactly
+    // this form (`to_char(... AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"')`).
+    // An offset (`+05:30`) or fractional-second (`.999Z`) timestamp names the
+    // same instant PostgreSQL stores, but the strings never compare equal, so
+    // the ALTER ROLE would apply successfully and re-plan on every run —
+    // rejecting the form up front turns a silent non-convergence into a
+    // field-level validation error.
+    if value.len() != 20 {
         return false;
     }
 
@@ -1747,40 +1755,8 @@ fn is_valid_iso8601_timestamp(value: &str) -> bool {
         return false;
     }
 
-    // Remaining suffix must be a valid timezone indicator.
-    let suffix = &value[19..];
-
-    // Handle optional fractional seconds: .NNN
-    let tz_part = if let Some(rest) = suffix.strip_prefix('.') {
-        // Skip digits after the decimal point
-        let frac_end = rest
-            .find(|c: char| !c.is_ascii_digit())
-            .unwrap_or(rest.len());
-        if frac_end == 0 {
-            return false; // "." with no digits
-        }
-        &rest[frac_end..]
-    } else {
-        suffix
-    };
-
-    // Valid timezone indicators: "Z", "+HH:MM", "-HH:MM"
-    match tz_part {
-        "Z" => true,
-        s if (s.starts_with('+') || s.starts_with('-'))
-            && s.len() == 6
-            && s.as_bytes()[3] == b':' =>
-        {
-            let Ok(tz_h) = s[1..3].parse::<u8>() else {
-                return false;
-            };
-            let Ok(tz_m) = s[4..6].parse::<u8>() else {
-                return false;
-            };
-            tz_h <= 14 && tz_m <= 59
-        }
-        _ => false,
-    }
+    // The one accepted timezone indicator is UTC's "Z" (see above).
+    &value[19..] == "Z"
 }
 
 // ---------------------------------------------------------------------------
@@ -2725,13 +2701,9 @@ roles:
 
     #[test]
     fn accept_valid_iso8601_timestamps() {
-        // UTC with Z
+        // Exactly the UTC second-precision form inspection reports.
         assert!(is_valid_iso8601_timestamp("2025-12-31T00:00:00Z"));
-        // With timezone offset
-        assert!(is_valid_iso8601_timestamp("2025-06-15T14:30:00+05:30"));
-        assert!(is_valid_iso8601_timestamp("2025-06-15T14:30:00-05:00"));
-        // With fractional seconds
-        assert!(is_valid_iso8601_timestamp("2025-12-31T23:59:59.999Z"));
+        assert!(is_valid_iso8601_timestamp("2026-06-15T14:30:00Z"));
     }
 
     #[test]
@@ -2742,6 +2714,12 @@ roles:
         assert!(!is_valid_iso8601_timestamp("2025-12-31T25:00:00Z")); // hour 25
         assert!(!is_valid_iso8601_timestamp("2025-12-31T00:00:00")); // no timezone
         assert!(!is_valid_iso8601_timestamp("")); // empty
+        // Valid instants in forms inspection can never render: string equality
+        // against the inspected value would fail forever, so the ALTER ROLE
+        // would apply cleanly and re-plan on every run. Rejected up front.
+        assert!(!is_valid_iso8601_timestamp("2025-06-15T14:30:00+05:30")); // offset
+        assert!(!is_valid_iso8601_timestamp("2025-06-15T14:30:00-05:00")); // offset
+        assert!(!is_valid_iso8601_timestamp("2025-12-31T23:59:59.999Z")); // fractional
     }
 
     #[test]

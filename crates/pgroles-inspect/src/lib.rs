@@ -44,7 +44,7 @@ pub use safety::{
     DropRoleSafetyAssessment, DropRoleSafetyIssue, DropRoleSafetyReport, inspect_drop_role_safety,
 };
 pub use snapshot::RawInspection;
-pub use version::{PgVersion, detect_pg_version};
+pub use version::{PgVersion, detect_execution_role, detect_pg_version};
 
 // ---------------------------------------------------------------------------
 // Errors

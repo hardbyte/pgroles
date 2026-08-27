@@ -325,7 +325,7 @@ fn lookup_bundle_change_owner(
                     }),
             }
         }
-        Change::AddMember { role, member, .. } | Change::RemoveMember { role, member } => {
+        Change::AddMember { role, member, .. } | Change::RemoveMember { role, member, .. } => {
             let key = MembershipKey {
                 role: role.clone(),
                 member: member.clone(),

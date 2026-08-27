@@ -101,9 +101,24 @@ pub async fn fetch_roles(
                     r.rolbypassrls,
                     r.rolconnlimit,
                     d.description AS comment,
-                    CASE WHEN r.rolvaliduntil IS NOT NULL
-                         THEN to_char(r.rolvaliduntil AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"')
-                         ELSE NULL END AS rolvaliduntil,
+                    -- 'infinity' means "never expires", which the manifest
+                    -- expresses by omitting password_valid_until — and to_char
+                    -- renders non-finite timestamps as an empty string, which
+                    -- no manifest value can ever equal, so reporting it would
+                    -- re-plan an ALTER ROLE forever. Positive infinity
+                    -- therefore inspects as "no expiration". Negative infinity
+                    -- means "already expired" — the opposite — so it stays a
+                    -- distinguishable literal: no manifest value equals it
+                    -- either (the validator only accepts finite UTC
+                    -- timestamps), so the diff plans one ALTER ROLE to the
+                    -- declared state and converges on the next inspection.
+                    CASE WHEN r.rolvaliduntil IS NULL
+                              OR r.rolvaliduntil = 'infinity'::timestamptz
+                         THEN NULL
+                         WHEN r.rolvaliduntil = '-infinity'::timestamptz
+                         THEN '-infinity'
+                         ELSE to_char(r.rolvaliduntil AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"')
+                         END AS rolvaliduntil,
                     r.rolconfig
                 FROM pg_roles r
                 LEFT JOIN pg_shdescription d
@@ -131,9 +146,24 @@ pub async fn fetch_roles(
                     r.rolbypassrls,
                     r.rolconnlimit,
                     d.description AS comment,
-                    CASE WHEN r.rolvaliduntil IS NOT NULL
-                         THEN to_char(r.rolvaliduntil AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"')
-                         ELSE NULL END AS rolvaliduntil,
+                    -- 'infinity' means "never expires", which the manifest
+                    -- expresses by omitting password_valid_until — and to_char
+                    -- renders non-finite timestamps as an empty string, which
+                    -- no manifest value can ever equal, so reporting it would
+                    -- re-plan an ALTER ROLE forever. Positive infinity
+                    -- therefore inspects as "no expiration". Negative infinity
+                    -- means "already expired" — the opposite — so it stays a
+                    -- distinguishable literal: no manifest value equals it
+                    -- either (the validator only accepts finite UTC
+                    -- timestamps), so the diff plans one ALTER ROLE to the
+                    -- declared state and converges on the next inspection.
+                    CASE WHEN r.rolvaliduntil IS NULL
+                              OR r.rolvaliduntil = 'infinity'::timestamptz
+                         THEN NULL
+                         WHEN r.rolvaliduntil = '-infinity'::timestamptz
+                         THEN '-infinity'
+                         ELSE to_char(r.rolvaliduntil AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"')
+                         END AS rolvaliduntil,
                     r.rolconfig
                 FROM pg_roles r
                 LEFT JOIN pg_shdescription d

@@ -184,7 +184,7 @@ impl ManagedChangeSurface {
                 on_type: *on_type,
                 grantee: grantee.clone(),
             }),
-            Change::AddMember { role, member, .. } | Change::RemoveMember { role, member } => {
+            Change::AddMember { role, member, .. } | Change::RemoveMember { role, member, .. } => {
                 self.roles.contains(role)
                     || self.explicit_memberships.contains(&MembershipKey {
                         role: role.clone(),
@@ -299,7 +299,7 @@ pub(crate) fn describe_change(change: &Change) -> String {
         Change::AddMember { role, member, .. } => {
             format!("add membership \"{role}\" -> \"{member}\"")
         }
-        Change::RemoveMember { role, member } => {
+        Change::RemoveMember { role, member, .. } => {
             format!("remove membership \"{role}\" -> \"{member}\"")
         }
         Change::TerminateSessions { role } => format!("terminate sessions for role \"{role}\""),
@@ -349,6 +349,7 @@ mod tests {
     #[test]
     fn public_is_named_as_the_pseudo_role_not_as_a_quoted_role() {
         let described = describe_change(&Change::Revoke {
+            grantor: None,
             role: Grantee::Public,
             privileges: BTreeSet::from([Privilege::Execute]),
             object_type: ObjectType::Function,
@@ -362,6 +363,7 @@ mod tests {
     #[test]
     fn a_named_grantee_keeps_the_role_label() {
         let described = describe_change(&Change::Revoke {
+            grantor: None,
             role: Grantee::Role("reader".to_string()),
             privileges: BTreeSet::from([Privilege::Select]),
             object_type: ObjectType::Table,

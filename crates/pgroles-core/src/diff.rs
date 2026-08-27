@@ -29,10 +29,12 @@ use crate::model::{
 /// 2. Alter roles (attribute changes)
 /// 3. Grant privileges
 /// 4. Set default privileges
-/// 5. Remove memberships
-/// 6. Add memberships
-/// 7. Revoke default privileges
-/// 8. Revoke privileges
+/// 5. Revoke privileges (before membership removals: a grantor-targeted
+///    revoke runs `SET ROLE <grantor>`, and removing memberships first could
+///    strip the executor's path to that grantor mid-plan)
+/// 6. Remove memberships
+/// 7. Add memberships
+/// 8. Revoke default privileges
 /// 9. Drop roles (after revoking everything from them)
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub enum Change {
@@ -74,12 +76,26 @@ pub enum Change {
     },
 
     /// Revoke privileges on an object from a grantee.
+    ///
+    /// `grantor` targets the ACL entry to remove. PostgreSQL's plain REVOKE
+    /// removes only the entry of the one grantor it selects for the executor
+    /// (a superuser acts as the owner), so an entry attributed to another
+    /// grantor survives silently — rendering the revoke as
+    /// `SET ROLE <grantor>; REVOKE ...;` (restoring the connection's
+    /// configured execution role, or `RESET ROLE` when none is set) removes
+    /// exactly the inspected entry (it requires the executor to be able to
+    /// become the grantor, which the preflight checks). `None` renders a plain REVOKE:
+    /// grantor-less inspection and desired-side callers. Skipped in
+    /// serialization when `None`, so digests and JSON output of grantor-less
+    /// plans are unchanged.
     Revoke {
         role: Grantee,
         privileges: BTreeSet<Privilege>,
         object_type: ObjectType,
         schema: Option<String>,
         name: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        grantor: Option<String>,
     },
 
     /// Set default privileges (ALTER DEFAULT PRIVILEGES ... GRANT ...).
@@ -109,7 +125,22 @@ pub enum Change {
     },
 
     /// Revoke membership (REVOKE role FROM member).
-    RemoveMember { role: String, member: String },
+    ///
+    /// `grantor` targets the specific membership edge to remove. Since
+    /// PostgreSQL 16 each edge records its grantor and a plain REVOKE removes
+    /// only the edge attributed to the revoker, so an edge granted by someone
+    /// else survives with just a WARNING — rendering `GRANTED BY <grantor>`
+    /// removes exactly the inspected edge instead (it requires the grantor's
+    /// privileges, which the preflight checks). `None` renders a plain
+    /// REVOKE: pre-16 servers (no per-edge attribution) and callers without
+    /// grantor knowledge. Skipped in serialization when `None`, so digests
+    /// and JSON output of grantor-less plans are unchanged.
+    RemoveMember {
+        role: String,
+        member: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        grantor: Option<String>,
+    },
 
     /// Reassign owned objects to a successor role before drop.
     ReassignOwned { from_role: String, to_role: String },
@@ -284,7 +315,7 @@ pub fn filter_external_role_changes(
             Change::AddMember { role, member, .. } => {
                 !unmanaged(role) || declared_edges.contains(&(role.as_str(), member.as_str()))
             }
-            Change::RemoveMember { role, member } => {
+            Change::RemoveMember { role, member, .. } => {
                 !unmanaged(role)
                     || declared_edges.contains(&(role.as_str(), member.as_str()))
                     || (exclusive_roles.contains(role.as_str()) && !is_predefined_role(member))
@@ -326,6 +357,7 @@ pub fn filter_preserved_grant_revokes(
                 object_type,
                 schema,
                 name,
+                grantor,
             } = &change
             else {
                 return vec![change];
@@ -367,6 +399,7 @@ pub fn filter_preserved_grant_revokes(
                         object_type: *object_type,
                         schema: schema.clone(),
                         name: name.clone(),
+                        grantor: grantor.clone(),
                     })
                     .into_iter()
                     .collect();
@@ -385,6 +418,7 @@ pub fn filter_preserved_grant_revokes(
                     object_type: *object_type,
                     schema: schema.clone(),
                     name: name.clone(),
+                    grantor: grantor.clone(),
                 });
             }
             for (absence_key, absent) in &desired.grant_absences {
@@ -407,6 +441,7 @@ pub fn filter_preserved_grant_revokes(
                         object_type: *object_type,
                         schema: schema.clone(),
                         name: absence_key.name.clone(),
+                        grantor: grantor.clone(),
                     });
                 }
             }
@@ -661,10 +696,14 @@ pub fn diff(current: &RoleGraph, desired: &RoleGraph) -> Vec<Change> {
     changes.extend(schema_grants);
     changes.extend(grants);
     changes.extend(set_defaults);
+    // Object revokes run before membership removals: a grantor-targeted
+    // revoke becomes its grantor via `SET ROLE`, and the preflight verifies
+    // that against the *current* membership graph — an earlier membership
+    // removal in the same plan could strip that path mid-transaction.
+    changes.extend(revokes);
     changes.extend(remove_members);
     changes.extend(add_members);
     changes.extend(revoke_defaults);
-    changes.extend(revokes);
     changes.extend(drops);
     changes
 }
@@ -1061,7 +1100,61 @@ fn diff_grants(
     }
 
     for (key, privileges) in &revokes {
-        revokes_out.push(change_revoke(key, privileges));
+        push_revokes_split_by_grantor(current, desired, key, privileges, revokes_out);
+    }
+}
+
+/// Emit the revokes for one grant target, split per ACL-entry grantor.
+///
+/// PostgreSQL's plain REVOKE removes only the entry of the one grantor it
+/// selects for the executor, so a privilege held via entries from several
+/// grantors must be revoked from each. When inspection recorded the target's
+/// per-grantor breakdown, emit one grantor-targeted revoke per grantor whose
+/// entry holds any of the privileges (rendered as `SET ROLE grantor`), plus a
+/// plain revoke for any remainder the breakdown does not cover. Without a
+/// breakdown — pre-existing snapshots, wildcard-collapsed keys, the desired
+/// side — fall back to a single plain revoke, the status quo.
+fn push_revokes_split_by_grantor(
+    current: &RoleGraph,
+    desired: &RoleGraph,
+    key: &GrantKey,
+    privileges: &BTreeSet<Privilege>,
+    revokes_out: &mut Vec<Change>,
+) {
+    // `ALTER SCHEMA ... OWNER TO` rewrites the ACL's attribution (old-owner
+    // entries become new-owner entries), so a grantor recorded at inspection
+    // time is stale once the same plan transfers the schema's owner — and a
+    // `SET ROLE <old owner>` revoke would fail outright. Fall back to a plain
+    // revoke there: after the transfer the entries are owner-attributed, which
+    // is exactly what a plain revoke by an owner-acting executor removes.
+    if key.object_type == ObjectType::Schema
+        && let Some(name) = &key.name
+        && let (Some(current_schema), Some(desired_schema)) =
+            (current.schemas.get(name), desired.schemas.get(name))
+        && desired_schema.owner.is_some()
+        && desired_schema.owner != current_schema.owner
+    {
+        revokes_out.push(change_revoke(key, privileges, None));
+        return;
+    }
+    let Some(per_grantor) = current.grant_entry_grantors.get(key) else {
+        revokes_out.push(change_revoke(key, privileges, None));
+        return;
+    };
+    let mut covered: BTreeSet<Privilege> = BTreeSet::new();
+    for (grantor, grantor_privileges) in per_grantor {
+        let subset: BTreeSet<Privilege> = privileges
+            .intersection(grantor_privileges)
+            .copied()
+            .collect();
+        if !subset.is_empty() {
+            covered.extend(subset.iter().copied());
+            revokes_out.push(change_revoke(key, &subset, Some(grantor.clone())));
+        }
+    }
+    let remainder: BTreeSet<Privilege> = privileges.difference(&covered).copied().collect();
+    if !remainder.is_empty() {
+        revokes_out.push(change_revoke(key, &remainder, None));
     }
 }
 
@@ -1075,13 +1168,18 @@ fn change_grant(key: &GrantKey, privileges: &BTreeSet<Privilege>) -> Change {
     }
 }
 
-fn change_revoke(key: &GrantKey, privileges: &BTreeSet<Privilege>) -> Change {
+fn change_revoke(
+    key: &GrantKey,
+    privileges: &BTreeSet<Privilege>,
+    grantor: Option<String>,
+) -> Change {
     Change::Revoke {
         role: key.role.clone(),
         privileges: privileges.clone(),
         object_type: key.object_type,
         schema: key.schema.clone(),
         name: key.name.clone(),
+        grantor,
     }
 }
 
@@ -1233,6 +1331,31 @@ fn diff_memberships(
         .map(|edge| ((edge.role.as_str(), edge.member.as_str()), edge))
         .collect();
 
+    // Removing a membership means removing every live edge behind it: since
+    // PostgreSQL 16 one (role, member) pair can carry several edges with
+    // distinct grantors, and a plain REVOKE removes only the edge attributed
+    // to the revoker. When inspection recorded the grantors, emit one
+    // grantor-targeted RemoveMember per edge; otherwise a single plain one.
+    let remove_all_edges = |role: &str, member: &str, remove_out: &mut Vec<Change>| match current
+        .membership_edge_grantors
+        .get(&(role.to_string(), member.to_string()))
+    {
+        Some(grantors) if !grantors.is_empty() => {
+            for grantor in grantors {
+                remove_out.push(Change::RemoveMember {
+                    role: role.to_string(),
+                    member: member.to_string(),
+                    grantor: Some(grantor.clone()),
+                });
+            }
+        }
+        _ => remove_out.push(Change::RemoveMember {
+            role: role.to_string(),
+            member: member.to_string(),
+            grantor: None,
+        }),
+    };
+
     // Desired but not current → add
     // Desired and current but different flags → remove + add
     for (&(role, member), &desired_edge) in &desired_map {
@@ -1249,11 +1372,8 @@ fn diff_memberships(
                 if current_edge.inherit != desired_edge.inherit
                     || current_edge.admin != desired_edge.admin
                 {
-                    // Flags changed — revoke and re-grant
-                    remove_out.push(Change::RemoveMember {
-                        role: current_edge.role.clone(),
-                        member: current_edge.member.clone(),
-                    });
+                    // Flags changed — revoke every edge and re-grant one.
+                    remove_all_edges(role, member, remove_out);
                     add_out.push(Change::AddMember {
                         role: desired_edge.role.clone(),
                         member: desired_edge.member.clone(),
@@ -1268,10 +1388,7 @@ fn diff_memberships(
     // Current but not desired → remove
     for &(role, member) in current_map.keys() {
         if !desired_map.contains_key(&(role, member)) {
-            remove_out.push(Change::RemoveMember {
-                role: role.to_string(),
-                member: member.to_string(),
-            });
+            remove_all_edges(role, member, remove_out);
         }
     }
 }
@@ -1538,7 +1655,7 @@ memberships:
         assert!(changes.iter().any(|change| {
             matches!(
                 change,
-                Change::RemoveMember { role, member }
+                Change::RemoveMember { role, member , .. }
                     if role == external && member == "cloudsqlsuperuser"
             )
         }));
@@ -1552,6 +1669,7 @@ memberships:
     fn external_role_filter_keeps_external_role_as_managed_member() {
         let external = "team@example.com";
         let changes = vec![Change::RemoveMember {
+            grantor: None,
             role: "kv-editor".to_string(),
             member: external.to_string(),
         }];
@@ -1588,6 +1706,7 @@ memberships:
                 admin: false,
             },
             Change::RemoveMember {
+                grantor: None,
                 role: "rds_iam".to_string(),
                 member: "app_user".to_string(),
             },
@@ -1612,6 +1731,7 @@ memberships:
                 admin: false,
             },
             Change::RemoveMember {
+                grantor: None,
                 role: "pg_read_all_data".to_string(),
                 member: "rds_superuser".to_string(),
             },
@@ -1635,6 +1755,7 @@ memberships:
     #[test]
     fn exclusive_membership_revokes_undeclared_predefined_members() {
         let changes = vec![Change::RemoveMember {
+            grantor: None,
             role: "pg_read_all_data".to_string(),
             member: "forgotten_contractor".to_string(),
         }];
@@ -1701,6 +1822,7 @@ memberships:
                 admin: false,
             }),
             ("remove_member", |r, m| Change::RemoveMember {
+                grantor: None,
                 role: r.to_string(),
                 member: m.to_string(),
             }),
@@ -1987,6 +2109,7 @@ memberships:
         let plain_role = role_definition("managed", false);
 
         let revoke = Change::Revoke {
+            grantor: None,
             role: "brownfield".into(),
             privileges: BTreeSet::from([Privilege::Select]),
             object_type: ObjectType::Table,
@@ -1994,6 +2117,7 @@ memberships:
             name: Some("widgets".to_string()),
         };
         let other = Change::Revoke {
+            grantor: None,
             role: "managed".into(),
             privileges: BTreeSet::from([Privilege::Select]),
             object_type: ObjectType::Table,
@@ -2031,6 +2155,7 @@ memberships:
             .insert(key, BTreeSet::from([Privilege::Delete]));
 
         let revoke = Change::Revoke {
+            grantor: None,
             role: "brownfield".into(),
             // SELECT is not asserted absent → preserved. DELETE is → revoked.
             privileges: BTreeSet::from([Privilege::Select, Privilege::Delete]),
@@ -2066,6 +2191,7 @@ memberships:
 
         let changes = filter_preserved_grant_revokes(
             vec![Change::Revoke {
+                grantor: None,
                 role: "brownfield".into(),
                 privileges: BTreeSet::from([Privilege::Select, Privilege::Delete]),
                 object_type: ObjectType::Table,
@@ -2079,6 +2205,7 @@ memberships:
         assert_eq!(
             changes,
             vec![Change::Revoke {
+                grantor: None,
                 role: "brownfield".into(),
                 privileges: BTreeSet::from([Privilege::Delete]),
                 object_type: ObjectType::Table,
@@ -2106,6 +2233,7 @@ memberships:
 
         let changes = filter_preserved_grant_revokes(
             vec![Change::Revoke {
+                grantor: None,
                 role: "brownfield".into(),
                 privileges: BTreeSet::from([Privilege::Select, Privilege::Delete]),
                 object_type: ObjectType::Table,
@@ -2119,6 +2247,7 @@ memberships:
         assert_eq!(
             changes,
             vec![Change::Revoke {
+                grantor: None,
                 role: "brownfield".into(),
                 privileges: BTreeSet::from([Privilege::Delete]),
                 object_type: ObjectType::Table,
@@ -2321,7 +2450,7 @@ memberships:
         let changes = diff(&current, &desired);
         assert_eq!(changes.len(), 1);
         assert!(
-            matches!(&changes[0], Change::RemoveMember { role, member } if role == "editors" && member == "old@example.com")
+            matches!(&changes[0], Change::RemoveMember { role, member, .. } if role == "editors" && member == "old@example.com")
         );
     }
 
@@ -2348,7 +2477,7 @@ memberships:
         assert_eq!(changes.len(), 2);
         assert!(matches!(
             &changes[0],
-            Change::RemoveMember { role, member }
+            Change::RemoveMember { role, member , .. }
                 if role == "editors" && member == "user@example.com"
         ));
         assert!(matches!(
@@ -2576,6 +2705,7 @@ memberships:
                 name: Some("*".to_string()),
             },
             Change::Revoke {
+                grantor: None,
                 role: "r1".into(),
                 privileges: BTreeSet::from([Privilege::Insert]),
                 object_type: ObjectType::Table,
@@ -2607,6 +2737,7 @@ memberships:
                 admin: false,
             },
             Change::RemoveMember {
+                grantor: None,
                 role: "editors".to_string(),
                 member: "old@example.com".to_string(),
             },
@@ -2838,6 +2969,7 @@ memberships:
     fn filter_additive_only_destructive_changes_yields_empty() {
         let changes = vec![
             Change::Revoke {
+                grantor: None,
                 role: "r1".into(),
                 privileges: BTreeSet::from([Privilege::Select]),
                 object_type: ObjectType::Table,
@@ -2867,6 +2999,7 @@ memberships:
                 name: Some("*".to_string()),
             },
             Change::Revoke {
+                grantor: None,
                 role: "existing-role".into(),
                 privileges: BTreeSet::from([Privilege::Insert]),
                 object_type: ObjectType::Table,
@@ -3491,6 +3624,7 @@ memberships:
         assert_eq!(
             changes,
             vec![Change::Revoke {
+                grantor: None,
                 role: Grantee::Public,
                 privileges: [Privilege::Execute].into_iter().collect(),
                 object_type: ObjectType::Function,
@@ -3539,6 +3673,7 @@ memberships:
         assert_eq!(
             changes,
             vec![Change::Revoke {
+                grantor: None,
                 role: Grantee::Public,
                 privileges: [Privilege::Execute].into_iter().collect(),
                 object_type: ObjectType::Function,
@@ -3843,6 +3978,7 @@ memberships:
         });
 
         let changes = vec![Change::RemoveMember {
+            grantor: None,
             role: "pg_read_all_data".to_string(),
             member: "forgotten_contractor".to_string(),
         }];

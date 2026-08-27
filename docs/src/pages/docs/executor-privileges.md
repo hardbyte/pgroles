@@ -15,12 +15,12 @@ This table was verified against a live PostgreSQL 16 server. `CREATEROLE` is the
 |---|---|
 | `CREATE ROLE` | `CREATEROLE` attribute |
 | `ALTER ROLE` / `COMMENT ON ROLE` / passwords / `ALTER ROLE ... SET` config | `CREATEROLE` + `ADMIN OPTION` on the target role (automatic for roles the executor created itself) |
-| `GRANT`/`REVOKE` role memberships | `ADMIN OPTION` on the granted (group) role — automatic for roles the executor created |
+| `GRANT`/`REVOKE` role memberships | `ADMIN OPTION` on the granted (group) role — automatic for roles the executor created. On PostgreSQL 16+ pgroles revokes each edge `GRANTED BY` its recorded grantor, which additionally requires the privileges of that grantor (membership with inheritance; superusers qualify everywhere) — the plan preflight reports any grantor the executor lacks |
 | `GRANT`/`REVOKE` predefined (`pg_*`) role memberships | `ADMIN OPTION` on the predefined role — never automatic: a superuser must run `GRANT pg_read_all_data TO executor WITH ADMIN OPTION` (or the executor must be superuser). The plan preflight warns and apply blocks when this is missing |
 | `DROP ROLE` | `CREATEROLE` + `ADMIN OPTION` on the role |
 | `CREATE SCHEMA` | `CREATE` privilege on the database |
 | `ALTER SCHEMA ... OWNER TO` | ownership of the schema plus membership in the new owner role |
-| `GRANT`/`REVOKE` on tables/sequences/functions | ownership of the objects, directly or via membership in the owning role |
+| `GRANT`/`REVOKE` on tables/sequences/functions | ownership of the objects, directly or via membership in the owning role. Revokes run as the recorded grantor of each ACL entry (`SET ROLE`), which requires membership in that grantor with the `SET` option (superusers qualify everywhere) — the plan preflight reports any grantor the executor cannot become |
 | `ALTER DEFAULT PRIVILEGES FOR ROLE x` | membership (privileges) of role `x` — `ADMIN OPTION` alone is **not** enough |
 | `REASSIGN OWNED BY a TO b` (retirements) | membership (privileges) of **both** `a` and `b`. The executor has `ADMIN OPTION` on roles it created, so it can `GRANT a TO executor` itself first — pgroles does not do this automatically |
 | `DROP OWNED BY a` (retirements) | membership (privileges) of `a` |

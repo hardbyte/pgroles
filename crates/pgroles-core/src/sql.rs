@@ -50,6 +50,15 @@ pub struct SqlContext {
     /// inspection-side tagging cannot see per-object ownership — e.g. a
     /// mixed-ownership schema folded into a `name: "*"` key.
     pub owned_relations: BTreeSet<(String, ObjectType, String, String)>,
+    /// The role the connection is expected to run as, when it differs from
+    /// the login role — e.g. the operator's `connection.params.setRole`,
+    /// applied via `SET ROLE` after connect, or a `role` GUC in the
+    /// connection options. A grantor-targeted revoke temporarily becomes the
+    /// grantor via `SET ROLE`; restoring with `RESET ROLE` would reset to the
+    /// *login* role, silently dropping the configured execution role for the
+    /// rest of the plan (and the pooled connection). When set, revokes
+    /// restore this role explicitly instead of using `RESET ROLE`.
+    pub execution_role: Option<String>,
 }
 
 impl SqlContext {
@@ -59,7 +68,15 @@ impl SqlContext {
             pg_major_version: version_num / 10000,
             object_inventory: BTreeMap::new(),
             owned_relations: BTreeSet::new(),
+            execution_role: None,
         }
+    }
+
+    /// Attach the connection's configured execution role (see
+    /// [`SqlContext::execution_role`]).
+    pub fn with_execution_role(mut self, execution_role: Option<String>) -> Self {
+        self.execution_role = execution_role;
+        self
     }
 
     /// Attach live object inventory for safer wildcard rendering.
@@ -111,6 +128,7 @@ impl Default for SqlContext {
             pg_major_version: 16, // Default to PG 16+ (current minimum)
             object_inventory: BTreeMap::new(),
             owned_relations: BTreeSet::new(),
+            execution_role: None,
         }
     }
 }
@@ -172,12 +190,14 @@ pub fn render_statements_with_context(change: &Change, ctx: &SqlContext) -> Vec<
             object_type,
             schema,
             name,
+            grantor,
         } => render_revoke(
             role,
             privileges,
             *object_type,
             schema.as_deref(),
             name.as_deref(),
+            grantor.as_deref(),
             ctx,
         ),
         Change::SetDefaultPrivilege {
@@ -200,7 +220,11 @@ pub fn render_statements_with_context(change: &Change, ctx: &SqlContext) -> Vec<
             inherit,
             admin,
         } => render_add_member(role, member, *inherit, *admin, ctx),
-        Change::RemoveMember { role, member } => render_remove_member(role, member),
+        Change::RemoveMember {
+            role,
+            member,
+            grantor,
+        } => render_remove_member(role, member, grantor.as_deref(), ctx),
         Change::ReassignOwned { from_role, to_role } => render_reassign_owned(from_role, to_role),
         Change::DropOwned { role } => render_drop_owned(role),
         Change::TerminateSessions { role } => render_terminate_sessions(role),
@@ -458,10 +482,11 @@ fn render_revoke(
     object_type: ObjectType,
     schema: Option<&str>,
     name: Option<&str>,
+    grantor: Option<&str>,
     ctx: &SqlContext,
 ) -> Vec<String> {
     let privilege_list = format_privileges(privileges);
-    render_privilege_statements(
+    let statements = render_privilege_statements(
         "REVOKE",
         role,
         &privilege_list,
@@ -469,7 +494,32 @@ fn render_revoke(
         schema,
         name,
         ctx,
-    )
+    );
+    // PostgreSQL's plain REVOKE removes only the ACL entry of the grantor it
+    // selects for the executor (a superuser acts as the owner), and
+    // `GRANTED BY` for object privileges must name the current user — so a
+    // grantor-targeted revoke *becomes* the grantor for its statements. The
+    // whole plan runs in one transaction on one connection, so the SET ROLE
+    // pair brackets exactly these statements. The preflight verifies the
+    // executor can become the grantor before an apply runs. The closing
+    // statement restores the connection's configured execution role when one
+    // is set (e.g. the operator's `connection.params.setRole`, applied via
+    // `SET ROLE` after connect): `RESET ROLE` would reset to the *login*
+    // role instead, silently dropping that boundary for the rest of the plan
+    // and the pooled connection.
+    match grantor {
+        Some(grantor) => {
+            let restore = match &ctx.execution_role {
+                Some(role) => format!("SET ROLE {};", quote_ident(role)),
+                None => "RESET ROLE;".to_string(),
+            };
+            std::iter::once(format!("SET ROLE {};", quote_ident(grantor)))
+                .chain(statements)
+                .chain(std::iter::once(restore))
+                .collect()
+        }
+        None => statements,
+    }
 }
 
 fn render_privilege_statements(
@@ -849,12 +899,32 @@ fn render_add_member(
     vec![sql]
 }
 
-fn render_remove_member(role: &str, member: &str) -> Vec<String> {
-    vec![format!(
-        "REVOKE {} FROM {};",
-        quote_ident(role),
-        quote_ident(member)
-    )]
+fn render_remove_member(
+    role: &str,
+    member: &str,
+    grantor: Option<&str>,
+    ctx: &SqlContext,
+) -> Vec<String> {
+    // Since PostgreSQL 16 each membership edge records its grantor and a
+    // plain REVOKE removes only the edge attributed to the revoker — an edge
+    // granted by someone else survives with just a WARNING. `GRANTED BY`
+    // targets the inspected edge exactly; it requires the grantor's
+    // privileges, which the preflight verifies. Grantor data only exists on
+    // PG16+ inspections, and pre-16 revokes are not grantor-attributed, so
+    // the clause is version-gated alongside the data that feeds it.
+    match grantor {
+        Some(grantor) if ctx.supports_grant_with_options() => vec![format!(
+            "REVOKE {} FROM {} GRANTED BY {};",
+            quote_ident(role),
+            quote_ident(member),
+            quote_ident(grantor)
+        )],
+        _ => vec![format!(
+            "REVOKE {} FROM {};",
+            quote_ident(role),
+            quote_ident(member)
+        )],
+    }
 }
 
 fn render_reassign_owned(from_role: &str, to_role: &str) -> Vec<String> {
@@ -1178,6 +1248,7 @@ mod tests {
     #[test]
     fn render_wildcard_revoke_skips_objects_the_grantee_owns() {
         let change = Change::Revoke {
+            grantor: None,
             role: "app_owner".into(),
             privileges: BTreeSet::from([Privilege::Update]),
             object_type: ObjectType::Table,
@@ -1218,6 +1289,7 @@ mod tests {
     #[test]
     fn render_wildcard_sequence_revoke_skips_owned_sequence() {
         let change = Change::Revoke {
+            grantor: None,
             role: "seq_owner".into(),
             privileges: BTreeSet::from([Privilege::Update]),
             object_type: ObjectType::Sequence,
@@ -1245,6 +1317,7 @@ mod tests {
     #[test]
     fn render_wildcard_function_revoke_skips_owned_routine() {
         let change = Change::Revoke {
+            grantor: None,
             role: "fn_owner".into(),
             privileges: BTreeSet::from([Privilege::Execute]),
             object_type: ObjectType::Function,
@@ -1303,6 +1376,7 @@ mod tests {
     #[test]
     fn render_wildcard_sequence_do_block_excludes_owner() {
         let change = Change::Revoke {
+            grantor: None,
             role: "seq_owner".into(),
             privileges: BTreeSet::from([Privilege::Update]),
             object_type: ObjectType::Sequence,
@@ -1320,6 +1394,7 @@ mod tests {
     #[test]
     fn render_wildcard_revoke_do_block_excludes_owner() {
         let change = Change::Revoke {
+            grantor: None,
             role: "app_owner".into(),
             privileges: BTreeSet::from([Privilege::Update]),
             object_type: ObjectType::Table,
@@ -1365,6 +1440,7 @@ mod tests {
     #[test]
     fn render_revoke_specific_routine_for_function_object() {
         let change = Change::Revoke {
+            grantor: None,
             role: "r1".into(),
             privileges: BTreeSet::from([Privilege::Execute]),
             object_type: ObjectType::Function,
@@ -1397,6 +1473,7 @@ mod tests {
     #[test]
     fn render_revoke_all_sequences() {
         let change = Change::Revoke {
+            grantor: None,
             role: "inventory-editor".into(),
             privileges: BTreeSet::from([Privilege::Usage, Privilege::Select]),
             object_type: ObjectType::Sequence,
@@ -1496,8 +1573,87 @@ mod tests {
     }
 
     #[test]
+    fn render_revoke_with_grantor_wraps_in_set_role() {
+        let change = Change::Revoke {
+            role: Grantee::Role("analyst".into()),
+            privileges: BTreeSet::from([Privilege::Select]),
+            object_type: ObjectType::Table,
+            schema: Some("app".to_string()),
+            name: Some("orders".to_string()),
+            grantor: Some("report_owner".to_string()),
+        };
+        let statements = render_statements(&change);
+        assert_eq!(
+            statements,
+            vec![
+                "SET ROLE \"report_owner\";".to_string(),
+                "REVOKE SELECT ON TABLE \"app\".\"orders\" FROM \"analyst\";".to_string(),
+                "RESET ROLE;".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn render_revoke_with_grantor_restores_execution_role() {
+        // With a configured execution role (operator setRole / `-c role=...`),
+        // RESET ROLE would fall back to the *login* role and drop that
+        // boundary for the rest of the plan; the restore must be explicit.
+        let ctx = SqlContext::default().with_execution_role(Some("pg_admin".to_string()));
+        let change = Change::Revoke {
+            role: Grantee::Role("analyst".into()),
+            privileges: BTreeSet::from([Privilege::Select]),
+            object_type: ObjectType::Table,
+            schema: Some("app".to_string()),
+            name: Some("orders".to_string()),
+            grantor: Some("report_owner".to_string()),
+        };
+        let statements = render_statements_with_context(&change, &ctx);
+        assert_eq!(
+            statements,
+            vec![
+                "SET ROLE \"report_owner\";".to_string(),
+                "REVOKE SELECT ON TABLE \"app\".\"orders\" FROM \"analyst\";".to_string(),
+                "SET ROLE \"pg_admin\";".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn render_remove_member_with_grantor_uses_granted_by() {
+        let change = Change::RemoveMember {
+            role: "editors".to_string(),
+            member: "user@example.com".to_string(),
+            grantor: Some("team_lead".to_string()),
+        };
+        let sql = render(&change);
+        assert_eq!(
+            sql,
+            "REVOKE \"editors\" FROM \"user@example.com\" GRANTED BY \"team_lead\";"
+        );
+    }
+
+    #[test]
+    fn render_remove_member_grantor_is_dropped_pre_pg16() {
+        // Pre-16 revokes are not grantor-attributed and GRANTED BY for role
+        // revocation follows the per-edge grantor model, so the clause is
+        // version-gated with the data that feeds it.
+        let ctx = SqlContext {
+            pg_major_version: 15,
+            ..Default::default()
+        };
+        let change = Change::RemoveMember {
+            role: "editors".to_string(),
+            member: "user@example.com".to_string(),
+            grantor: Some("team_lead".to_string()),
+        };
+        let sql = render_statements_with_context(&change, &ctx).join("\n");
+        assert_eq!(sql, "REVOKE \"editors\" FROM \"user@example.com\";");
+    }
+
+    #[test]
     fn render_remove_member() {
         let change = Change::RemoveMember {
+            grantor: None,
             role: "inventory-editor".to_string(),
             member: "user@example.com".to_string(),
         };
@@ -1622,6 +1778,7 @@ mod tests {
             vec!["daily_sales".to_string(), "weekly_sales".to_string()],
         )]));
         let change = Change::Revoke {
+            grantor: None,
             role: "analytics".into(),
             privileges: [Privilege::Select].into_iter().collect(),
             object_type: ObjectType::MaterializedView,
@@ -1644,6 +1801,7 @@ mod tests {
     #[test]
     fn render_materialized_view_wildcard_without_inventory_uses_catalog_loop() {
         let change = Change::Revoke {
+            grantor: None,
             role: "analytics".into(),
             privileges: [Privilege::Select].into_iter().collect(),
             object_type: ObjectType::MaterializedView,
@@ -1844,6 +2002,7 @@ memberships:
     #[test]
     fn public_renders_unquoted_but_a_role_named_public_does_not() {
         let revoke_public = render(&Change::Revoke {
+            grantor: None,
             role: Grantee::Public,
             privileges: [Privilege::Execute].into_iter().collect(),
             object_type: ObjectType::Function,
@@ -1879,6 +2038,7 @@ memberships:
     fn public_wildcard_revoke_uses_all_routines_in_schema() {
         assert_eq!(
             render(&Change::Revoke {
+                grantor: None,
                 role: Grantee::Public,
                 privileges: [Privilege::Execute].into_iter().collect(),
                 object_type: ObjectType::Function,
@@ -1894,6 +2054,7 @@ memberships:
         // `%I` would render the keyword as the quoted identifier "PUBLIC",
         // which names an ordinary role.
         let sql = render(&Change::Revoke {
+            grantor: None,
             role: Grantee::Public,
             privileges: [Privilege::Select].into_iter().collect(),
             object_type: ObjectType::Table,
@@ -1905,6 +2066,7 @@ memberships:
 
         // Ordinary roles still go through the %I parameter.
         let role_sql = render(&Change::Revoke {
+            grantor: None,
             role: "reader".into(),
             privileges: [Privilege::Select].into_iter().collect(),
             object_type: ObjectType::Table,

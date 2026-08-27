@@ -177,6 +177,7 @@ fn change(rng: &mut Rng) -> Change {
             object_type: object_type(rng),
             schema: Some(SCHEMAS[rng.usize(SCHEMAS.len())].to_string()),
             name: Some(OBJECTS[rng.usize(OBJECTS.len())].to_string()),
+            grantor: if rng.bool() { Some(role(rng)) } else { None },
         },
         7 => Change::SetDefaultPrivilege {
             owner: role(rng),
@@ -201,6 +202,7 @@ fn change(rng: &mut Rng) -> Change {
         10 => Change::RemoveMember {
             role: role(rng),
             member: role(rng),
+            grantor: if rng.bool() { Some(role(rng)) } else { None },
         },
         11 => Change::ReassignOwned {
             from_role: role(rng),

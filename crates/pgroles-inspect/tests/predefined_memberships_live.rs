@@ -147,13 +147,16 @@ fn predefined_membership_lifecycle_end_to_end() {
         let (changes, _) = plan(&pool, DECLARED).await;
         assert!(changes.is_empty(), "expected no changes, got {changes:?}");
 
-        // 3. `exclusive: true` revokes the undeclared member.
+        // 3. `exclusive: true` revokes the undeclared member, targeting the
+        // edge's recorded grantor (the superuser that seeded it) so the
+        // rendered `REVOKE ... GRANTED BY` removes exactly that edge.
         let (changes, _) = plan(&pool, EXCLUSIVE).await;
         assert_eq!(
             changes,
             vec![Change::RemoveMember {
                 role: "pg_read_all_data".to_string(),
                 member: "predef_forgotten".to_string(),
+                grantor: Some("postgres".to_string()),
             }],
             "exclusive should plan exactly the undeclared revoke"
         );

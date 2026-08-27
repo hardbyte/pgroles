@@ -128,9 +128,22 @@ async fn execute_sql(pool: &PgPool, statement: &str, seed: u64, phase: &str) {
 }
 
 async fn execute_changes(pool: &PgPool, changes: &[Change], seed: u64, phase: &str) {
+    // One connection for the whole change list, mirroring production's
+    // single-transaction apply: grantor-targeted revokes render as
+    // `SET ROLE grantor; REVOKE ...; RESET ROLE;`, and running those
+    // statements across pooled connections would strand a connection with an
+    // active SET ROLE (and leave the revoke unattributed).
+    let mut conn = pool
+        .acquire()
+        .await
+        .unwrap_or_else(|error| panic!("seed {seed} [{phase}]: failed to acquire: {error}"));
     for change in changes {
         for statement in render_statements(change) {
-            execute_sql(pool, &statement, seed, phase).await;
+            conn.execute(statement.as_str())
+                .await
+                .unwrap_or_else(|error| {
+                    panic!("seed {seed} [{phase}]: failed `{statement}`: {error}")
+                });
         }
     }
 }
@@ -918,6 +931,7 @@ fn apply_changes(graph: &RoleGraph, changes: &[Change]) -> RoleGraph {
                 object_type,
                 schema,
                 name,
+                ..
             } => {
                 let key = GrantKey {
                     role: role.clone(),
@@ -1001,7 +1015,7 @@ fn apply_changes(graph: &RoleGraph, changes: &[Change]) -> RoleGraph {
                     admin: *admin,
                 });
             }
-            Change::RemoveMember { role, member } => {
+            Change::RemoveMember { role, member, .. } => {
                 g.memberships
                     .retain(|e| !(e.role == *role && e.member == *member));
             }

@@ -116,7 +116,7 @@ spec:
 
 - `password.secretRef.name` — the Secret containing the password value.
 - `password.secretKey` — the key within the Secret. Defaults to the role name if omitted.
-- `password_valid_until` — ISO 8601 timestamp for PostgreSQL `VALID UNTIL`.
+- `password_valid_until` — UTC second-precision timestamp (`YYYY-MM-DDTHH:MM:SSZ`) for PostgreSQL `VALID UNTIL`.
 
 ### Generate and manage a Secret
 

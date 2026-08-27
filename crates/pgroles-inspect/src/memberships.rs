@@ -17,6 +17,12 @@ pub struct MembershipRow {
     /// Available since PostgreSQL 16. For older versions we fall back to
     /// the member role's `rolinherit` attribute.
     pub inherit_option: bool,
+    /// The role that granted this edge. Recorded per edge since
+    /// PostgreSQL 16, where a plain REVOKE removes only the edge attributed
+    /// to the revoker — removing a membership means revoking every grantor's
+    /// edge (`REVOKE ... GRANTED BY`). `None` on older servers, whose revokes
+    /// are not grantor-attributed.
+    pub grantor: Option<String>,
 }
 
 impl MembershipRow {
@@ -71,10 +77,12 @@ pub async fn fetch_predefined_memberships(
                 gr.rolname AS role_name,
                 mr.rolname AS member_name,
                 m.admin_option,
-                m.inherit_option
+                m.inherit_option,
+                g.rolname AS grantor
             FROM pg_auth_members m
             JOIN pg_roles gr ON gr.oid = m.roleid
             JOIN pg_roles mr ON mr.oid = m.member
+            JOIN pg_roles g ON g.oid = m.grantor
             WHERE gr.rolname LIKE 'pg\_%'
               AND mr.rolname NOT LIKE 'pg\_%'
               AND mr.rolname <> 'postgres'
@@ -90,7 +98,8 @@ pub async fn fetch_predefined_memberships(
                 gr.rolname AS role_name,
                 mr.rolname AS member_name,
                 m.admin_option,
-                mr.rolinherit AS inherit_option
+                mr.rolinherit AS inherit_option,
+                NULL::text AS grantor
             FROM pg_auth_members m
             JOIN pg_roles gr ON gr.oid = m.roleid
             JOIN pg_roles mr ON mr.oid = m.member
@@ -160,10 +169,12 @@ async fn fetch_memberships_pg16(
                     gr.rolname AS role_name,
                     mr.rolname AS member_name,
                     m.admin_option,
-                    m.inherit_option
+                    m.inherit_option,
+                    g.rolname AS grantor
                 FROM pg_auth_members m
                 JOIN pg_roles gr ON gr.oid = m.roleid
                 JOIN pg_roles mr ON mr.oid = m.member
+                JOIN pg_roles g ON g.oid = m.grantor
                 WHERE gr.rolname = ANY($1)
                 ORDER BY gr.rolname, mr.rolname
                 "#,
@@ -179,10 +190,12 @@ async fn fetch_memberships_pg16(
                     gr.rolname AS role_name,
                     mr.rolname AS member_name,
                     m.admin_option,
-                    m.inherit_option
+                    m.inherit_option,
+                    g.rolname AS grantor
                 FROM pg_auth_members m
                 JOIN pg_roles gr ON gr.oid = m.roleid
                 JOIN pg_roles mr ON mr.oid = m.member
+                JOIN pg_roles g ON g.oid = m.grantor
                 WHERE gr.rolname NOT LIKE 'pg_%'
                 ORDER BY gr.rolname, mr.rolname
                 "#,
@@ -207,7 +220,8 @@ async fn fetch_memberships_legacy(
                     gr.rolname AS role_name,
                     mr.rolname AS member_name,
                     m.admin_option,
-                    mr.rolinherit AS inherit_option
+                    mr.rolinherit AS inherit_option,
+                    NULL::text AS grantor
                 FROM pg_auth_members m
                 JOIN pg_roles gr ON gr.oid = m.roleid
                 JOIN pg_roles mr ON mr.oid = m.member
@@ -226,7 +240,8 @@ async fn fetch_memberships_legacy(
                     gr.rolname AS role_name,
                     mr.rolname AS member_name,
                     m.admin_option,
-                    mr.rolinherit AS inherit_option
+                    mr.rolinherit AS inherit_option,
+                    NULL::text AS grantor
                 FROM pg_auth_members m
                 JOIN pg_roles gr ON gr.oid = m.roleid
                 JOIN pg_roles mr ON mr.oid = m.member
@@ -251,6 +266,7 @@ mod tests {
     #[test]
     fn membership_row_maps_to_membership_edge() {
         let row = MembershipRow {
+            grantor: None,
             role_name: "editors".to_string(),
             member_name: "alice@example.com".to_string(),
             admin_option: true,

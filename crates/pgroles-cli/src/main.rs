@@ -1676,10 +1676,17 @@ async fn detect_sql_context_with_config(
         pg_major = pg_version.major(),
         "detected PostgreSQL server version"
     );
+    // The connection may be configured to run as a role other than its login
+    // role (e.g. `options=-c role=...`); grantor-targeted revokes must
+    // restore that role, not `RESET ROLE` back to the login role.
+    let execution_role = pgroles_inspect::detect_execution_role(pool)
+        .await
+        .context("failed to detect connection execution role")?;
     Ok(
         pgroles_core::sql::SqlContext::from_version_num(pg_version.version_num)
             .with_object_inventory(relation_inventory)
-            .with_owned_relations(owned_relations),
+            .with_owned_relations(owned_relations)
+            .with_execution_role(execution_role),
     )
 }
 
