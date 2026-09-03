@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Reconcile concurrency is bounded, so peak memory no longer scales with how many policies come due at once.** kube-rs defaults `Config::concurrency` to `0` — unbounded — so every controller reconciled every object whose watch fired, immediately. Reconciling a `PostgresPolicy` inspects the whole managed surface of its database, and the function-ACL read is one `aclexplode` row per function per grantee: ~102k rows on a policy covering 49 schemas and 32 roles. Peak memory was therefore a function of how many policies happened to be due simultaneously rather than the size of any one of them, and on startup every watch fires together. An operator watching 28 such policies was OOM-killed 31 seconds after each start, restarting 1700+ times over five days and never advancing `observed_generation` — 27 of its 28 policies sat `Degraded` with `pool timed out while waiting for an open connection`, which reads as a database fault rather than a concurrency one. Concurrency now defaults to 4 across the policy, access-policy and access-request controllers, and is operator-level configuration via `RECONCILE_CONCURRENCY`; `0` restores the previous unbounded behaviour, and an invalid value refuses startup with the variable named, as the `PLAN_RETENTION_*` bounds already do. A bound also matches what the database can absorb: pools are capped per database and a policy already holds an advisory lock for its own, so reconciles past that point queued on connections rather than progressed.
+
 ## [0.10.0] - 2026-08-27
 
 Everything new since 0.9.0. Highlights: revokes now target each grant's recorded grantor, so delegated grants and foreign-granted memberships finally converge — including for non-superuser executors; `PostgresPolicyCandidate` brings a propose–review–promote workflow for policy changes; memberships in PostgreSQL predefined (`pg_*`) and externally managed roles are declaratively manageable; and brownfield adoption is safer with `preserve_undeclared_grants`, protected owner privileges, and explicit approval for schema ownership transfers.

@@ -5,6 +5,7 @@
 
 pub mod advisory;
 pub mod candidate;
+pub mod concurrency;
 pub mod context;
 pub mod crd;
 pub mod ephemeral;
