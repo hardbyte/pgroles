@@ -8,6 +8,7 @@ use std::sync::Arc;
 
 use futures::{StreamExt, TryStreamExt, stream};
 use k8s_openapi::api::core::v1::Secret;
+use kube::runtime::controller::Config as ControllerConfig;
 use kube::runtime::events::{Recorder, Reporter};
 use kube::runtime::reflector::ObjectRef;
 use kube::runtime::{Controller, WatchStreamExt, predicates, reflector, watcher};
@@ -15,6 +16,7 @@ use kube::{Api, Client, Resource, ResourceExt};
 use tracing::{info, warn};
 use tracing_subscriber::prelude::*;
 
+use pgroles_operator::concurrency::ReconcileConcurrency;
 use pgroles_operator::context::OperatorContext;
 use pgroles_operator::crd::{
     EphemeralAccessPolicy, EphemeralAccessRequest, PostgresPolicy, PostgresPolicyCandidate,
@@ -144,6 +146,19 @@ async fn main() -> anyhow::Result<()> {
     // Resolved once here so a malformed value refuses startup with the exact
     // variable named, instead of surfacing later as retention quietly running
     // with bounds the environment did not ask for.
+    let reconcile_concurrency = ReconcileConcurrency::from_env()?;
+    if reconcile_concurrency.is_unbounded() {
+        // Worth saying out loud: this is the configuration that lets every due
+        // policy allocate its inspection at the same moment.
+        info!("reconcile concurrency is unbounded");
+    } else {
+        info!(
+            concurrency = reconcile_concurrency.get(),
+            "reconcile concurrency bounded"
+        );
+    }
+    let controller_config = ControllerConfig::default().concurrency(reconcile_concurrency.get());
+
     let plan_retention = PlanRetention::from_env()?;
     if plan_retention != PlanRetention::default() {
         info!(
@@ -303,6 +318,7 @@ async fn main() -> anyhow::Result<()> {
     observability.mark_ready();
 
     let policy_controller = Controller::for_stream(policy_stream, reader)
+        .with_config(controller_config.clone())
         .reconcile_on(secret_triggers)
         .reconcile_on(plan_triggers)
         .reconcile_on(candidate_triggers)
@@ -354,6 +370,7 @@ async fn main() -> anyhow::Result<()> {
 
     let access_policy_controller =
         Controller::for_stream(access_policy_stream, access_policy_reader)
+            .with_config(controller_config.clone())
             .reconcile_on(target_access_policy_triggers)
             .shutdown_on_signal()
             .run(
@@ -421,6 +438,7 @@ async fn main() -> anyhow::Result<()> {
 
     let access_request_controller =
         Controller::for_stream(access_request_stream, access_request_reader)
+            .with_config(controller_config)
             .reconcile_on(access_policy_request_triggers)
             .shutdown_on_signal()
             .run(reconcile_access_request, access_request_error_policy, ctx)
