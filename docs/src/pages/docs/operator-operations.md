@@ -23,6 +23,21 @@ Use this page for the external behavior and operating model. For the internal co
 
 {% operator-reconciliation-diagram /%}
 
+### Reconcile concurrency
+
+Each operator controller runs at most four reconciles concurrently by default. This bounds memory and database connection demand when many watched resources become ready at once, particularly during operator startup and watch resynchronization. The limit applies separately to the policy, ephemeral access policy, and ephemeral access request controllers; it is not a single shared global limit.
+
+Set `RECONCILE_CONCURRENCY` on the operator to tune the per-controller limit:
+
+```yaml
+operator:
+  env:
+    - name: RECONCILE_CONCURRENCY
+      value: "2"
+```
+
+Use a positive integer for bounded concurrency. `0` restores kube-rs's unbounded behavior and should be reserved for controlled troubleshooting. An invalid value prevents the operator from starting and names `RECONCILE_CONCURRENCY` in the error.
+
 ## Interval
 
 The `interval` field controls how often the operator re-reconciles, even when the resource hasn't changed. This catches drift from manual SQL changes. Supports durations like `30s`, `5m`, `1h`, or compound forms like `1h30m`. Defaults to `5m`.

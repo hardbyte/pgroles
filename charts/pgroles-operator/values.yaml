@@ -69,7 +69,9 @@ operator:
   # `EPHEMERAL_ACCESS_MAXIMUM_DURATION` (default `24h`) and
   # `EPHEMERAL_ACCESS_MAX_PENDING_TTL` (default `1h`) are the only cluster-wide
   # ceilings on ephemeral access, and an access policy exceeding either is
-  # rejected with `Accepted=False`; the `PLAN_RETENTION_*` variables bound how
+  # rejected with `Accepted=False`; `RECONCILE_CONCURRENCY` (default `4`) bounds
+  # concurrent reconciles per controller, with `0` restoring unbounded behavior;
+  # the `PLAN_RETENTION_*` variables bound how
   # many terminal plans are kept per policy — `PLAN_RETENTION_APPLIED` (default
   # `25`), `PLAN_RETENTION_APPLIED_MIN_AGE` (default `720h`),
   # `PLAN_RETENTION_APPLIED_CEILING` (default `200`), `PLAN_RETENTION_DECIDED`
@@ -89,6 +91,8 @@ operator:
     #   value: 24h
     # - name: EPHEMERAL_ACCESS_MAX_PENDING_TTL
     #   value: 1h
+    # - name: RECONCILE_CONCURRENCY
+    #   value: "4"
     # - name: PLAN_RETENTION_APPLIED
     #   value: "25"
     # - name: PLAN_RETENTION_APPLIED_MIN_AGE
