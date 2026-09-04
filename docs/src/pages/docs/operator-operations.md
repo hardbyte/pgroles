@@ -38,6 +38,25 @@ operator:
 
 Use a positive integer for bounded concurrency. `0` restores kube-rs's unbounded behavior and should be reserved for controlled troubleshooting. An invalid value prevents the operator from starting and names `RECONCILE_CONCURRENCY` in the error.
 
+### Measuring expensive policies
+
+Inspection metrics include raw `acl_rows`, final `grants`, and concrete
+`grantor_keys` under `pgroles.inspect.items`. These are observed counts, not
+unique-object totals across reconciles. `pgroles.inspect.duration` separates
+`privilege_derive` and `privilege_normalize` from catalog reads.
+`pgroles.processing.duration` reports diff and summary construction.
+Debug logs report plan rendering time and SQL bytes without logging SQL.
+
+`pgroles.runtime.scheduling_lag` measures delay of a one-second runtime timer.
+It helps identify async-worker starvation; it is **not** HTTP health-probe
+latency. Correlate it with container CPU throttling, working set, and restarts.
+
+ACL derivation runs on one bounded blocking worker per process. Concurrent
+callers share snapshots through `Arc`; increasing reconcile concurrency does
+not increase the number of simultaneous derivations. It can still increase
+memory held by reads and queued snapshots. Keep the serial default on small
+CPU allocations and validate the complete workload before raising it.
+
 ## Interval
 
 The `interval` field controls how often the operator re-reconciles, even when the resource hasn't changed. This catches drift from manual SQL changes. Supports durations like `30s`, `5m`, `1h`, or compound forms like `1h30m`. Defaults to `5m`.

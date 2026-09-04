@@ -23,12 +23,30 @@ The manifest does not model `WITH GRANT OPTION` for application grantees. pgrole
 
 Delegation also constrains what a `REVOKE` can do, because PostgreSQL attributes every grant to a grantor and a plain revoke removes only grants attributed to the revoker (see the upstream [REVOKE](https://www.postgresql.org/docs/current/sql-revoke.html) and [GRANT](https://www.postgresql.org/docs/current/sql-grant.html) documentation): "a user can only revoke privileges that were granted directly by that user", and a superuser's revoke "is performed as though it were issued by the owner of the affected object" — for role memberships (PostgreSQL 16+, which records a grantor per edge), by the bootstrap superuser. A plain revoke matching no such entry **succeeds silently** (object privileges) or with only a `WARNING` (memberships), leaving the grant in place.
 
-pgroles therefore plans revokes **per recorded grantor**. Inspection reads each ACL entry's and membership edge's grantor — including entries whose grantee is `PUBLIC`, which a grant-option holder can also create — and the rendered SQL acts as that grantor: object revokes run as `SET ROLE grantor; REVOKE ...;` inside the plan's single transaction (object `GRANTED BY` must name the current user), then restore the connection's configured execution role (the operator's `connection.params.setRole`, or the login role when none is set); membership revokes run as `REVOKE ... GRANTED BY grantor`. A delegate-granted privilege or a foreign-admin membership edge converges like any other, provided the executor can become the grantor:
+pgroles plans object revokes per concrete object and recorded grantor, including
+wildcard rules and PUBLIC. It runs each revoke as `SET ROLE <grantor>` inside the
+apply transaction, then restores the configured execution role. Membership
+revokes use `REVOKE ... GRANTED BY <grantor>`.
 
-- for **object revokes**, membership in the grantor with the `SET` option (PostgreSQL 16's default on granted memberships) — superusers can become anyone;
-- for **membership revokes**, the privileges of the grantor (membership with inheritance) — superusers hold every role's privileges.
+| Operation | Executor authority required |
+| --- | --- |
+| Object revoke | Ability to `SET ROLE` to each recorded grantor |
+| Membership revoke | Usable privileges of each recorded grantor, through inheritance |
 
-The plan preflight verifies exactly that, per grantor, and reports what the executor is missing (`UnsatisfiableRevoke`: warning on `diff`, blocking on `apply`). Because everything executes in one transaction, the preflight also checks authority against the plan's own execution order: object revokes run before membership removals, and later statements are judged against a conservative approximation of the membership graph at their phase — membership revokes see the whole removal batch applied at once, and additions that reference roles the same plan creates are ignored. A `GRANTED BY` membership revoke whose grantor path the plan's removals strip is flagged rather than left to fail mid-apply (split such a removal into a separate, later apply); a default-privilege revoke runs after the plan's own membership additions, so a path the plan replaces or newly acquires — say, an admin-only executor granting the owner to a role it already inherits — counts and is not falsely rejected. Object-ACL grantors are recorded on every supported version; membership-edge grantors exist only since PostgreSQL 16, so membership revokes on older servers — and object revokes for wildcard-collapsed grant keys — fall back to the plain revoke, and the operator's post-apply detection — a plan whose exact effects were just applied yet still diff, reported as `Ready=False` with reason `NonConvergentPlan` — remains the backstop for anything attribution-shaped that slips through.
+Preflight reports `UnsatisfiableRevoke` when that authority is missing: `diff`
+warns and `apply` blocks. It checks authority against the plan's execution order,
+so removing a membership cannot silently invalidate a later statement's authority.
+
+Wildcard revocations expand to concrete changes because different objects may
+have different owners and grantors. Owner-inherent privileges are preserved.
+The plan can therefore contain more entries than the wildcard rules in the
+manifest; review its complete SQL. This behavior ships in the next release after
+0.10.1. In 0.10.0–0.10.1, wildcard-collapsed revokes can fall back to a plain revoke
+and leave delegated entries behind; see [#215](https://github.com/thepartly/pgroles/issues/215).
+
+If identical effects remain after apply, the operator reports `NonConvergentPlan`
+and retries at the policy interval. Investigate the retained ACL and authority
+instead of repeatedly approving the same changes.
 
 More generally, pgroles converges managed direct ACLs; it does not claim that absence from a manifest means absence of effective access. Membership, ownership, `PUBLIC`, column grants, row security, or unmodeled object types may change the answer. Use PostgreSQL's `has_*_privilege` and `pg_has_role` functions to verify the effective path. Work through [The permission chain](/docs/postgresql-access-model) and [The security review](/docs/postgresql-security-review) to test those paths interactively.
 
