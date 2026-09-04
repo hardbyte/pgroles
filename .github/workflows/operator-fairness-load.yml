@@ -249,6 +249,136 @@ jobs:
           kubectl exec postgres-0 -- psql -U postgres -d loadtest -tAc "SELECT has_sequence_privilege('loada_05-editor', 'loada_05.audit_seq', 'USAGE');" | grep -qx "t"
           kubectl exec postgres-0 -- psql -U postgres -d churntest -tAc "SELECT has_table_privilege('churna_10-viewer', 'churna_10.items', 'SELECT');" | grep -qx "t"
 
+      # The fairness scenarios are the heaviest shape this repository runs:
+      # five policies across three databases, applied at once and then churned
+      # through credential failures. A change that makes concurrent reconciles
+      # cost more memory shows up here and nowhere else, and only as a restart
+      # — every assertion above is about convergence, which an operator that
+      # was OOM-killed and came back can still eventually satisfy.
+      - name: Assert the operator survived the run
+        run: |
+          source scripts/e2e-helpers.sh
+          assert_operator_healthy
+
       - name: Cleanup
         if: always()
         run: kind delete cluster --name pgroles-fairness
+
+  # ---------------------------------------------------------------------------
+  # ACL inspection burst — does peak memory track the concurrency bound or the
+  # policy count?
+  # ---------------------------------------------------------------------------
+  #
+  # The fairness scenarios above cover contention. This one covers allocation,
+  # which is the failure mode this guards against: reconciling a policy
+  # materialises its database's whole managed ACL surface, and with
+  # unbounded concurrency every policy due at once allocates its own copy. On
+  # startup that is all of them.
+  #
+  # Its own cluster, because the fixture is large and its two operator restarts
+  # would perturb the fairness timings next door.
+  acl-inspection-burst:
+    name: ACL Inspection Burst
+    needs: decide
+    if: needs.decide.outputs.should_run == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: ./.github/actions/setup-e2e
+        with:
+          cluster-name: pgroles-acl-burst
+
+      - name: Give the operator room to show the difference
+        run: |
+          # The chart ships a 128Mi limit, which this fixture exceeds under
+          # either configuration — that is itself worth knowing, and is the
+          # subject of a separate conversation about the shipped defaults. The
+          # question here is the *shape* of the growth, so the limit is raised
+          # far enough that the bounded run has clear headroom and the
+          # unbounded run is free to be much larger before the kernel steps in.
+          kubectl -n pgroles-system set resources deployment/pgroles-operator \
+            --containers=operator --limits=memory=512Mi --requests=memory=64Mi
+          kubectl -n pgroles-system rollout status deployment/pgroles-operator --timeout=180s
+
+          # Free up `basic-policy` (created by the composite for its health
+          # check) so it is not one more thing reconciling during the burst.
+          kubectl delete pgr basic-policy --wait=true
+
+      - name: Run the ACL inspection burst
+        run: scripts/e2e-acl-inspection-burst.sh
+
+      - name: Diagnostics
+        if: failure()
+        run: |
+          kubectl get pgr -A -o wide || true
+          kubectl -n pgroles-system get pods -o wide || true
+          kubectl -n pgroles-system logs deployment/pgroles-operator --tail=500 || true
+          kubectl -n pgroles-system logs deployment/pgroles-operator --previous --tail=500 || true
+          kubectl get events -A --sort-by=.lastTimestamp | tail -100 || true
+
+      - name: Cleanup
+        if: always()
+        run: kind delete cluster --name pgroles-acl-burst
+
+  # ---------------------------------------------------------------------------
+  # Notify on failure
+  # ---------------------------------------------------------------------------
+  #
+  # A nightly nobody reads is a nightly nobody runs. Failures land as an issue
+  # so they surface where the rest of the work does, and repeat failures append
+  # to the open one rather than filing a new issue every morning.
+  notify-failure:
+    name: Create issue on failure
+    needs:
+      - decide
+      - fairness-load
+      - acl-inspection-burst
+    # Branch dispatches are useful for validating changes to this workflow, but
+    # must not create repository issues. Only failures of the workflow on main
+    # represent the maintained nightly signal.
+    if: failure() && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      - uses: actions/checkout@v6
+      - name: Build issue body
+        run: |
+          RUN_URL="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          # The heredoc body is indented to match the surrounding YAML block, so
+          # it is unindented on the way out — ten leading spaces would render
+          # the whole issue as one code block.
+          sed 's/^          //' > issue_body.md <<EOF
+          Nightly operator fairness/load run failed on $(date -u +%Y-%m-%d), at commit \`${{ github.sha }}\`.
+
+          **Job results:**
+          - fairness-load: ${{ needs.fairness-load.result }}
+          - acl-inspection-burst: ${{ needs.acl-inspection-burst.result }}
+
+          A failing \`acl-inspection-burst\` means peak reconcile memory is tracking policy
+          count rather than the concurrency bound, or the operator was killed reconciling
+          its own policies. A failing \`fairness-load\` means policies are starving each
+          other, most often behind a shared credential failure.
+
+          [View run](${RUN_URL})
+          EOF
+      - name: Create or update the issue
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # The label has to exist before it can be filtered on or applied.
+          gh label create nightly-failure \
+            --description "A scheduled run failed" --color B60205 2>/dev/null || true
+          EXISTING="$(gh issue list --label nightly-failure --state open --limit 1 --json number --jq '.[0].number // empty')"
+          if [ -n "$EXISTING" ]; then
+            gh issue comment "$EXISTING" --body-file issue_body.md
+          else
+            gh issue create \
+              --title "Nightly operator fairness/load failure ($(date -u +%Y-%m-%d))" \
+              --body-file issue_body.md \
+              --label nightly-failure
+          fi

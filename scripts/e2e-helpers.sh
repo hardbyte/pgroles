@@ -628,3 +628,76 @@ wait_for_pending_plan_ref() {
   kubectl get pgplan -l "pgroles.io/policy=$policy" -o wide >&2 || true
   return 1
 }
+
+# -- Operator health helpers --------------------------------------------------
+
+active_operator_pod_json() {
+  local namespace="${1:-pgroles-system}"
+  kubectl -n "$namespace" get pods \
+    -l app.kubernetes.io/name=pgroles-operator -o json \
+    | jq -e '
+        [.items[] | select(.metadata.deletionTimestamp == null)]
+        | if length == 1 then .[0]
+          else error("expected exactly one active operator pod, found \(length)")
+          end
+      '
+}
+
+# Working set of the active operator container, from kubelet accounting.
+operator_memory_bytes() {
+  local namespace="${1:-pgroles-system}"
+  local pod_json pod_uid node
+  pod_json="$(active_operator_pod_json "$namespace")" || return 1
+  pod_uid="$(jq -r '.metadata.uid' <<<"$pod_json")"
+  node="$(jq -r '.spec.nodeName' <<<"$pod_json")"
+  kubectl get --raw "/api/v1/nodes/${node}/proxy/stats/summary" \
+    | jq -er --arg uid "$pod_uid" '
+        .pods[]
+        | select(.podRef.uid == $uid)
+        | .containers[]
+        | select(.name == "operator")
+        | (.memory.workingSetBytes // .memory.usageBytes)
+        | select(. > 0)
+      '
+}
+
+# Fail if the operator crashed during a scenario, naming the reason.
+#
+# Memory is the resource an operator overruns silently: peak allocation scales
+# with how much of a database a reconcile inspects and with how many reconciles
+# run at once, neither of which any assertion about policy convergence can see.
+# A run whose policies all reached Ready can still have had the operator
+# OOM-killed and restarted underneath it, which in a real cluster is
+# CrashLoopBackOff and a policy graph that stops converging. E2E deploys the
+# operator at the same 128Mi limit the chart ships, so a regression that widens
+# peak memory shows up here as a restart, and only if something looks.
+#
+# `OOMKilled` is called out separately from other exit reasons because it is
+# the one that says the change was in memory rather than in logic.
+assert_operator_healthy() {
+  local namespace="${1:-pgroles-system}"
+  local pod_json pod restarts reason
+
+  if ! pod_json="$(active_operator_pod_json "$namespace" 2>/dev/null)"; then
+    echo "::error::expected exactly one active operator pod in $namespace"
+    kubectl -n "$namespace" get pods -o wide || true
+    return 1
+  fi
+  pod="$(jq -r '.metadata.name' <<<"$pod_json")"
+  restarts="$(jq -r '[.status.containerStatuses[]? | select(.name == "operator")][0].restartCount // 0' <<<"$pod_json")"
+  reason="$(jq -r '[.status.containerStatuses[]? | select(.name == "operator")][0].lastState.terminated.reason // empty' <<<"$pod_json")"
+
+  if [ "$reason" = "OOMKilled" ]; then
+    echo "::error::operator pod $pod was OOM-killed ($restarts restart(s)); peak memory now exceeds the deployed limit"
+  elif [ "${restarts:-0}" -gt 0 ]; then
+    echo "::error::operator pod $pod restarted $restarts time(s), last termination reason: ${reason:-unknown}"
+  else
+    echo "operator pod $pod: 0 restarts"
+    return 0
+  fi
+
+  kubectl -n "$namespace" get pods -o wide || true
+  kubectl -n "$namespace" describe deployment/pgroles-operator || true
+  kubectl -n "$namespace" logs deployment/pgroles-operator --previous --tail=200 || true
+  return 1
+}

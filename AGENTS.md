@@ -91,7 +91,7 @@ diff(current, effective desired) → Vec<Change> → sql::render_all_with_contex
 - **Plan lifecycle and load E2E** — plan approval flows, plus generated-policy convergence at higher object counts and ephemeral-request load
 - **Ephemeral access E2E** — runs twice: once for the trusted-writer posture, once for the Kyverno secure-admission profile in `k8s/security/`
 
-The heavier fairness/load coverage lives in `.github/workflows/operator-fairness-load.yml` and runs on a nightly schedule when `main` has changed.
+The heavier fairness/load coverage lives in `.github/workflows/operator-fairness-load.yml` and runs on a nightly schedule when `main` has changed. It carries two scenarios — fairness/load, and an ACL inspection burst that measures whether the operator's peak working set tracks the concurrency bound or the policy count — and files a `nightly-failure` issue when either fails, appending to the open one rather than opening a new issue per night.
 
 ## Agent Skills
 

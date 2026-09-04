@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+source "$(dirname "$0")/e2e-helpers.sh"
+
 # A deliberately modest request-cache regression for a standard GitHub-hosted
 # runner. This does not claim a production capacity limit; ResourceQuota should
 # provide that hard stop. It catches accidental per-request memory explosions
@@ -28,23 +30,6 @@ cleanup() {
   rm -f "$sample_file" "$stop_file"
 }
 trap cleanup EXIT
-
-operator_memory_bytes() {
-  local pod_json pod_uid node
-  pod_json="$(kubectl -n pgroles-system get pod \
-    -l app.kubernetes.io/name=pgroles-operator -o json)"
-  pod_uid="$(jq -r '.items[0].metadata.uid' <<<"$pod_json")"
-  node="$(jq -r '.items[0].spec.nodeName' <<<"$pod_json")"
-  kubectl get --raw "/api/v1/nodes/${node}/proxy/stats/summary" \
-    | jq -er --arg uid "$pod_uid" '
-        .pods[]
-        | select(.podRef.uid == $uid)
-        | .containers[]
-        | select(.name == "operator")
-        | (.memory.workingSetBytes // .memory.usageBytes)
-        | select(. > 0)
-      '
-}
 
 wait_for_access_policy() {
   for attempt in $(seq 1 45); do

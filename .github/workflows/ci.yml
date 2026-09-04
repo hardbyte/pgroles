@@ -762,6 +762,11 @@ jobs:
           assert_password_set empty-pw-user
           wait_for_event_reason empty-password-secret-policy Recovered
 
+          # The broadest set of scenarios in the repository, and until now none
+          # of them could tell a healthy operator from one that was killed and
+          # restarted part way through reaching the same end state.
+          assert_operator_healthy
+
       - name: Verify OTLP metrics reach the collector
         run: |
           for i in $(seq 1 30); do
@@ -855,8 +860,24 @@ jobs:
           pg_query "SELECT has_table_privilege('loadb_10-viewer', 'loadb_10.items', 'SELECT')" loadtest | grep -qx "t"
           pg_query "SELECT has_sequence_privilege('loadb_05-editor', 'loadb_05.audit_seq', 'USAGE')" loadtest | grep -qx "t"
 
+          # Every assertion above is about convergence, which says nothing
+          # about what the operator paid to get there. An operator that was
+          # OOM-killed part way through and came back still converges these
+          # policies eventually, so only a restart check sees it.
+          assert_operator_healthy
+
       - name: Run ephemeral request cache regression
         run: scripts/e2e-ephemeral-request-load.sh
+
+      # Again, because the step above is where 250 requests are pushed through
+      # the operator and is the likelier place for it to die. Its own peak and
+      # throughput budgets are satisfiable by an operator that was killed and
+      # recovered quickly, and the check after the load policies covers only
+      # what ran before it. Two calls also say which scenario did it.
+      - name: Assert the operator survived the whole job
+        run: |
+          source scripts/e2e-helpers.sh
+          assert_operator_healthy
 
       - name: Diagnostics
         if: failure()
@@ -2088,6 +2109,11 @@ jobs:
       - name: Run plan decision admission E2E
         if: matrix.secure == 'true'
         run: scripts/e2e-plan-decision-admission.sh
+
+      - name: Assert the operator survived the ephemeral access scenarios
+        run: |
+          source scripts/e2e-helpers.sh
+          assert_operator_healthy
 
       - name: Diagnostics
         if: failure()
