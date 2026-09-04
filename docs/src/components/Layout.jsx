@@ -49,6 +49,7 @@ const navigation = [
             {title: 'Plan and approval', href: '/docs/operator-plan-approval'},
             {title: 'Candidates and promotion', href: '/docs/operator-candidates'},
             {title: 'Running the operator', href: '/docs/operator-operations'},
+            {title: 'CRD API reference', href: '/docs/operator-api-reference'},
             {title: 'Status and telemetry', href: '/docs/operator-status'},
             {title: 'Troubleshooting index', href: '/docs/operator-troubleshooting'},
             {title: 'RBAC and security', href: '/docs/operator-security'},

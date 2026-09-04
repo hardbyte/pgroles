@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Documentation
+
+- Generate a complete field reference and downloadable served schema for all five CRDs; require source descriptions and detect reference drift in CI.
+
 ## [0.10.1] - 2026-09-04
 
 ### Fixed
