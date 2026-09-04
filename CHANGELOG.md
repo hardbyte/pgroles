@@ -9,7 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- **Bounded operator reconciliation concurrency.** Each controller now runs at most four reconciles concurrently by default, preventing startup and resync bursts from exhausting operator memory or database connection pools. Set the operator-wide `RECONCILE_CONCURRENCY` environment variable to tune the per-controller limit; `0` restores the previous unbounded behavior. Invalid values prevent the operator from starting and identify the variable in the error.
+- **Bounded operator reconciliation concurrency.** Each controller now runs one reconcile at a time by default, preventing startup and resync bursts from exhausting operator memory, CPU, or database connection pools. Operators provisioned with more CPU can set `RECONCILE_CONCURRENCY` to process independent databases in parallel; `0` restores the previous unbounded behavior. Invalid values prevent the operator from starting and identify the variable in the error.
 
 ## [0.10.0] - 2026-08-27
 

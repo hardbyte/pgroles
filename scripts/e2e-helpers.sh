@@ -646,9 +646,13 @@ active_operator_pod_json() {
 # Working set of the active operator container, from kubelet accounting.
 operator_memory_bytes() {
   local namespace="${1:-pgroles-system}"
+  local excluded_pod_uid="${2:-}"
   local pod_json pod_uid node
   pod_json="$(active_operator_pod_json "$namespace")" || return 1
   pod_uid="$(jq -r '.metadata.uid' <<<"$pod_json")"
+  if [ -n "$excluded_pod_uid" ] && [ "$pod_uid" = "$excluded_pod_uid" ]; then
+    return 1
+  fi
   node="$(jq -r '.spec.nodeName' <<<"$pod_json")"
   kubectl get --raw "/api/v1/nodes/${node}/proxy/stats/summary" \
     | jq -er --arg uid "$pod_uid" '
