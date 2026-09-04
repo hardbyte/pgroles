@@ -189,7 +189,7 @@ pgroles diff -f pgroles.yaml --mode adopt --format markdown > pgroles-review.md
 pgroles diff --bundle bundle.yaml --mode adopt --format markdown > bundle-review.md
 ```
 
-The report includes complete redacted change details, source attribution, and conservative priorities. Revocations, retirement, ownership transfers, password changes, role alterations, PUBLIC grants, elevated new roles, and membership administration are high priority. Other access changes still require review; these labels do not evaluate your application's transitive privileges or availability requirements.
+Markdown records declared password changes without resolving application-password environment variables; database connection credentials are still required. The report includes complete redacted change details, source attribution, and conservative priorities. Revocations, retirement, ownership transfers, password changes, role alterations, PUBLIC grants, elevated new roles, and membership administration are high priority. Other access changes still require review; these labels do not evaluate your application's transitive privileges or availability requirements.
 
 The `pgroles.review.v1` fingerprint identifies the displayed changes, source attribution, and reconciliation mode. Password values are excluded, so password-only value changes do not change this fingerprint. It is not a database-state fingerprint or an operator approval token. Existing `--format json` output remains available for structured integrations, including bundle ownership annotations.
 

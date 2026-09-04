@@ -825,6 +825,35 @@ fn cmd_render_bundle(
     Ok(ExitCode::SUCCESS)
 }
 
+// Markdown is a review-only artifact: declared password intent is sufficient.
+// Never resolve or hash credential values for this format.
+fn diff_password_changes(
+    mut changes: Vec<pgroles_core::diff::Change>,
+    expanded: &pgroles_core::manifest::ExpandedManifest,
+    format: &OutputFormat,
+) -> Result<Vec<pgroles_core::diff::Change>> {
+    if matches!(format, OutputFormat::Markdown) {
+        let names: std::collections::BTreeSet<_> = expanded
+            .roles
+            .iter()
+            .filter(|role| !role.external && role.password.is_some())
+            .map(|role| role.name.clone())
+            .collect();
+        changes.extend(
+            names
+                .into_iter()
+                .map(|name| pgroles_core::diff::Change::SetPassword {
+                    name,
+                    password: "[REDACTED]".to_owned(),
+                }),
+        );
+        Ok(changes)
+    } else {
+        let passwords = resolve_passwords(expanded).context("failed to resolve role passwords")?;
+        Ok(inject_password_changes(changes, &passwords))
+    }
+}
+
 async fn cmd_diff(
     file: Option<&Path>,
     bundle: Option<&Path>,
@@ -861,9 +890,7 @@ async fn cmd_diff(
             validated.composed.manifest.default_owner.as_deref(),
             &validated.composed.expanded.roles,
         );
-        let resolved_passwords = resolve_passwords(&validated.composed.expanded)
-            .context("failed to resolve role passwords")?;
-        let changes = inject_password_changes(changes, &resolved_passwords);
+        let changes = diff_password_changes(changes, &validated.composed.expanded, format)?;
         validate_changes_against_managed_surface(
             &changes,
             &validated.composed.managed_change_surface,
@@ -951,9 +978,7 @@ async fn cmd_diff(
         validated.manifest.default_owner.as_deref(),
         &validated.expanded.roles,
     );
-    let resolved_passwords =
-        resolve_passwords(&validated.expanded).context("failed to resolve role passwords")?;
-    let changes = inject_password_changes(changes, &resolved_passwords);
+    let changes = diff_password_changes(changes, &validated.expanded, format)?;
     preflight_authority(&pool, &changes, &current, false).await?;
     let drop_safety = inspect_drop_safety(&pool, &changes, &validated.manifest.retirements).await?;
     let summary = PlanSummary::from_changes(&changes);
@@ -2148,6 +2173,24 @@ mod tests {
         assert!(rendered.contains("SQLSTATE 42704"));
         assert!(rendered.contains("server=10.0.0.5"));
         assert!(rendered.contains("role \"accounts-editor\" does not exist"));
+    }
+
+    #[test]
+    fn markdown_password_intent_does_not_require_secret_environment() {
+        let validated = validate_manifest("roles:\n  - name: reviewer\n    login: true\n    password:\n      from_env: PGROLES_REVIEW_TEST_UNSET_70185\n").unwrap();
+        let changes =
+            diff_password_changes(vec![], &validated.expanded, &OutputFormat::Markdown).unwrap();
+        assert!(
+            matches!(&changes[..], [pgroles_core::diff::Change::SetPassword { name, password }] if name == "reviewer" && password == "[REDACTED]")
+        );
+        assert!(diff_password_changes(vec![], &validated.expanded, &OutputFormat::Sql).is_err());
+        let mut external = validated.expanded;
+        external.roles[0].external = true;
+        assert!(
+            diff_password_changes(vec![], &external, &OutputFormat::Markdown)
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]
