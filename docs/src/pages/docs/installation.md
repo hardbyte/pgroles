@@ -8,6 +8,10 @@ description: How to install the pgroles CLI tool.
 - **PostgreSQL 16, 17, 18**: Supported and tested in CI, including per-membership `INHERIT` and `ADMIN` options
 - **Earlier PostgreSQL releases**: Unsupported
 
+## Released binaries
+
+Download the binary for your platform from the [latest stable release](https://github.com/thepartly/pgroles/releases/latest). Keep the CLI version aligned with the release documentation and any scripts that consume its JSON output.
+
 ## From source
 
 pgroles is written in Rust. Build and install with Cargo:
@@ -48,35 +52,6 @@ Published container images are multi-arch for `linux/amd64` and `linux/arm64`.
 The release workflow builds the Linux binaries first and then assembles the
 runtime images from those artifacts, so published images do not recompile Rust
 inside the Docker publish jobs.
-
-## Local Docker validation
-
-To reproduce the live CLI tests against a local PostgreSQL:
-
-```shell
-docker run --rm --name pgroles-pg18 \
-  -e POSTGRES_PASSWORD=testpassword \
-  -e POSTGRES_DB=pgroles_test \
-  -p 5432:5432 \
-  postgres:18
-```
-
-In another shell:
-
-```shell
-export DATABASE_URL=postgres://postgres:testpassword@localhost:5432/pgroles_test
-cargo test -p pgroles-cli --test cli live_db::diff_against_live_db -- --ignored --exact
-cargo test -p pgroles-cli --test cli live_db::diff_summary_format -- --ignored --exact
-```
-
-Use `postgres:16` or `postgres:17` if you want to reproduce the full CI matrix locally.
-
-## Contributor notes
-
-- `docker/Dockerfile` is the source-build path used for local builds and E2E-style flows.
-- `docker/Dockerfile.runtime` is the release assembly path used in GitHub Actions.
-- BuildKit cache mounts are used in `docker/Dockerfile` for Cargo registry, git, and target caches.
-- The release workflow does not need Cargo cache mounts in the Docker step because it consumes prebuilt Linux binaries from the earlier build job.
 
 ## Verify installation
 

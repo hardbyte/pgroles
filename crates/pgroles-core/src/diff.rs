@@ -961,9 +961,8 @@ fn diff_grants(
             .map(|(k, v)| ((&k.role, &k.schema, k.object_type), &v.privileges))
             .collect();
 
-    // Absence wildcards suppress per-name revokes for the same reason: the
-    // single `ON ALL` revoke they emit already covers every object, so a
-    // per-name revoke of the same privilege would only duplicate it.
+    // Absence wildcards collect their own concrete revokes below. Suppress
+    // the ordinary per-name path so it does not emit duplicate statements.
     let absence_wildcards: BTreeMap<(&Grantee, &Option<String>, ObjectType), &BTreeSet<Privilege>> =
         desired
             .grant_absences
@@ -1060,8 +1059,8 @@ fn diff_grants(
 
     // Absence assertions: revoke `absent ∩ current`. A wildcard assertion
     // range-scans every current key under its (grantee, type, schema) prefix,
-    // so one `ON ALL` revoke covers however many objects still hold the
-    // privilege, and an empty range is vacuously converged. Owner-inherent
+    // then expands into object/grantor-targeted revokes. An empty range is
+    // vacuously converged. Owner-inherent
     // entries are excluded throughout: an owner's privileges are intrinsic,
     // so an absence assertion cannot be enforced against them and revoking
     // would only break owner access.
@@ -1112,7 +1111,7 @@ fn diff_grants(
 /// per-grantor breakdown, emit one grantor-targeted revoke per grantor whose
 /// entry holds any of the privileges (rendered as `SET ROLE grantor`), plus a
 /// plain revoke for any remainder the breakdown does not cover. Without a
-/// breakdown — pre-existing snapshots, wildcard-collapsed keys, the desired
+/// breakdown — pre-existing snapshots or the desired
 /// side — fall back to a single plain revoke, the status quo.
 fn push_revokes_split_by_grantor(
     current: &RoleGraph,
@@ -1121,6 +1120,68 @@ fn push_revokes_split_by_grantor(
     privileges: &BTreeSet<Privilege>,
     revokes_out: &mut Vec<Change>,
 ) {
+    // Normalization compacts shared privileges, but ACL attribution remains
+    // concrete: objects in one wildcard can have different owners/grantors.
+    // Expand revokes against that inventory, never run a broad revoke as each
+    // grantor (which could touch objects it cannot administer or owner ACLs).
+    if key.name.as_deref() == Some("*") {
+        let start = GrantKey {
+            name: None,
+            ..key.clone()
+        };
+        let in_scope = |candidate: &GrantKey| {
+            candidate.role == key.role
+                && candidate.object_type == key.object_type
+                && candidate.schema == key.schema
+        };
+        let mut concrete: BTreeMap<GrantKey, BTreeSet<Privilege>> = BTreeMap::new();
+        for (target, grantors) in current
+            .grant_entry_grantors
+            .range(start.clone()..)
+            .take_while(|(target, _)| in_scope(target))
+        {
+            if target.name.as_deref() != Some("*") {
+                concrete
+                    .entry(target.clone())
+                    .or_default()
+                    .extend(grantors.values().flatten().copied());
+            }
+        }
+        for (target, state) in current
+            .grants
+            .range(start.clone()..)
+            .take_while(|(target, _)| in_scope(target))
+        {
+            if target.name.as_deref() != Some("*") {
+                concrete
+                    .entry(target.clone())
+                    .or_default()
+                    .extend(&state.privileges);
+            }
+        }
+        // An all-owner scope has no revocable grantor metadata. Its concrete
+        // inherent tags still prove that a wildcard revoke must not run.
+        let has_inherent = current
+            .inherent_grants
+            .range(start..)
+            .take_while(|target| in_scope(target))
+            .next()
+            .is_some();
+        if !concrete.is_empty() || has_inherent {
+            for (target, held) in concrete {
+                if current.inherent_grants.contains(&target) {
+                    continue;
+                }
+                let subset = privileges.intersection(&held).copied().collect();
+                if !BTreeSet::is_empty(&subset) {
+                    push_revokes_split_by_grantor(current, desired, &target, &subset, revokes_out);
+                }
+            }
+            return;
+        }
+        // Legacy/caller-built graphs without concrete inspection metadata
+        // retain their existing grantor-less behavior.
+    }
     // `ALTER SCHEMA ... OWNER TO` rewrites the ACL's attribution (old-owner
     // entries become new-owner entries), so a grantor recorded at inspection
     // time is stale once the same plan transfers the schema's owner — and a
@@ -3647,7 +3708,7 @@ memberships:
     }
 
     #[test]
-    fn wildcard_absence_emits_one_revoke_covering_every_matching_object() {
+    fn wildcard_absence_revokes_each_matching_object() {
         let mut current = RoleGraph::default();
         for name in ["f(integer)", "f(text)", "g()"] {
             current.grants.insert(
@@ -3672,14 +3733,14 @@ memberships:
         let changes = diff(&current, &desired);
         assert_eq!(
             changes,
-            vec![Change::Revoke {
-                grantor: None,
-                role: Grantee::Public,
-                privileges: [Privilege::Execute].into_iter().collect(),
-                object_type: ObjectType::Function,
-                schema: Some("api".to_string()),
-                name: Some("*".to_string()),
-            }]
+            ["f(integer)", "f(text)", "g()"]
+                .into_iter()
+                .map(|name| change_revoke(
+                    &public_function_key("api", name),
+                    &BTreeSet::from([Privilege::Execute]),
+                    None
+                ))
+                .collect::<Vec<_>>()
         );
     }
 

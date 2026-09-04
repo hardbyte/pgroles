@@ -48,7 +48,8 @@ kubectl get pods -n pgroles-system \
   -l app.kubernetes.io/instance=pgroles-operator
 ```
 
-The chart installs four CRDs: `PostgresPolicy`, `PostgresPolicyPlan`, and the
+The chart installs five CRDs: `PostgresPolicy`, `PostgresPolicyPlan`,
+`PostgresPolicyCandidate`, and the
 `EphemeralAccessPolicy` / `EphemeralAccessRequest` pair behind
 [ephemeral access](/docs/ephemeral-access). The operator watches every namespace
 unless `operator.watchNamespace` scopes it to one.
@@ -106,7 +107,7 @@ spec:
 
   grants:
     - role: pgroles_quickstart_reader
-      object: { type: database }
+      object: { type: database, name: app }
       privileges: [CONNECT]
 ```
 

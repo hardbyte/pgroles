@@ -130,10 +130,9 @@ privileges there once any grant materializes the ACL — so plans never revoke
 them, declared grants on an owner's own objects converge as no-ops, and
 `generate` never exports them.
 
-PostgreSQL materializes an object's whole ACL, owner entry included, the first
-time anything is granted or revoked on it. Any first-time grant does this, and
-so does revoking `EXECUTE` from PUBLIC. Expect one extra convergence pass on
-such objects, and declare the owner privileges that must survive it.
+PostgreSQL materializes an object's ACL on the first grant or revoke, including
+a revoke of implicit PUBLIC access. Inspection protects owner entries, so
+materialization alone should not require an extra owner-repair pass.
 
 Ownership rights such as altering or dropping an object, and the owner's
 implicit grant options, remain PostgreSQL behavior outside the object ACL model.
@@ -170,6 +169,11 @@ Review effective and transitive privileges, not role names alone.
 - PUBLIC is reconciled only where a rule names it. A privilege PUBLIC holds that
   no rule mentions is left alone in every mode, so deleting a `present` PUBLIC
   rule does not revoke anything — switch it to `ensure: absent` instead.
+
+Wildcard revocations preserve concrete grantor attribution. Review per-object
+changes and ensure the executor can act as every recorded grantor. Do not
+replace those statements with a broad plain REVOKE. Versions through 0.10.1
+have a known wildcard grantor gap; use the matching release limitations.
 
 ## Safe Removal
 

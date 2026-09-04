@@ -670,3 +670,100 @@ fn pure_addition_acquires_defaults_owner_authority() {
         assert!(replan.is_empty(), "must converge in one apply: {replan:?}");
     });
 }
+
+/// Wildcard convergence must address both delegates on every concrete object,
+/// preserving owner privileges and named exceptions.
+#[test]
+#[ignore]
+fn wildcard_revokes_keep_concrete_grantors_and_converge() {
+    with_runtime(async {
+        let pool = PgPool::connect(&database_url()).await.unwrap();
+        pool.execute("DROP SCHEMA IF EXISTS wgr CASCADE; \
+          DROP ROLE IF EXISTS wgr_exec; DROP ROLE IF EXISTS wgr_reader; DROP ROLE IF EXISTS wgr_a; DROP ROLE IF EXISTS wgr_b; \
+          CREATE ROLE wgr_exec LOGIN PASSWORD 'wgr_test_password'; CREATE ROLE wgr_reader; CREATE ROLE wgr_a; CREATE ROLE wgr_b; \
+          CREATE SCHEMA wgr; GRANT USAGE ON SCHEMA wgr TO PUBLIC; \
+          CREATE TABLE wgr.t(i int); CREATE TABLE wgr.u(i int); \
+          GRANT SELECT ON ALL TABLES IN SCHEMA wgr TO wgr_a, wgr_b WITH GRANT OPTION; \
+          GRANT INSERT ON ALL TABLES IN SCHEMA wgr TO wgr_reader; \
+          SET ROLE wgr_a; GRANT SELECT ON ALL TABLES IN SCHEMA wgr TO wgr_reader, PUBLIC; RESET ROLE; \
+          SET ROLE wgr_b; GRANT SELECT ON ALL TABLES IN SCHEMA wgr TO wgr_reader, PUBLIC; RESET ROLE;")
+          .await.unwrap();
+        let manifest = "roles:\n  - name: wgr_reader\ngrants:\n  - role: wgr_reader\n    privileges: [INSERT]\n    object: {type: table, schema: wgr, name: '*'}\n  - role: PUBLIC\n    ensure: absent\n    privileges: [SELECT]\n    object: {type: table, schema: wgr, name: '*'}\n";
+        let changes = plan(&pool, manifest).await;
+        let revokes: Vec<_> = changes
+            .iter()
+            .filter(|c| matches!(c, Change::Revoke { .. }))
+            .collect();
+        assert_eq!(
+            revokes.len(),
+            8,
+            "two grantors x two objects x two grantees: {changes:?}"
+        );
+        assert!(revokes.iter().all(
+            |c| matches!(c, Change::Revoke {name: Some(n), grantor: Some(_), ..} if n != "*")
+        ));
+        assert!(filter_changes(changes.clone(), ReconciliationMode::Additive).is_empty());
+        assert!(
+            preflight_authority_issues(&pool, &changes, &RoleGraph::default())
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        let exec = PgPool::connect_with(
+            PgConnectOptions::from_str(&database_url())
+                .unwrap()
+                .username("wgr_exec")
+                .password("wgr_test_password"),
+        )
+        .await
+        .unwrap();
+        let denied = preflight_authority_issues(&exec, &changes, &RoleGraph::default())
+            .await
+            .unwrap();
+        assert!(
+            !denied.is_empty(),
+            "missing grantor authority must block apply"
+        );
+        pool.execute("GRANT wgr_a, wgr_b TO wgr_exec")
+            .await
+            .unwrap();
+        assert!(
+            preflight_authority_issues(&exec, &changes, &RoleGraph::default())
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        apply(&exec, &changes).await;
+        assert!(plan(&pool, manifest).await.is_empty());
+        // A wildcard spanning owned and delegated objects must preserve the
+        // owner's ACL while removing the undeclared privilege on the other.
+        pool.execute("ALTER TABLE wgr.t OWNER TO wgr_reader; SET ROLE wgr_a; GRANT SELECT ON wgr.u TO wgr_reader; RESET ROLE").await.unwrap();
+        let mixed = plan(&pool, manifest).await;
+        assert!(
+            mixed
+                .iter()
+                .all(|c| matches!(c, Change::Revoke {name: Some(n), ..} if n == "u")),
+            "{mixed:?}"
+        );
+        assert_eq!(mixed.len(), 1);
+        apply(&pool, &mixed).await;
+        assert!(plan(&pool, manifest).await.is_empty());
+        let (owner_select,): (bool,) =
+            sqlx::query_as("SELECT has_table_privilege('wgr_reader', 'wgr.t', 'SELECT')")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert!(owner_select);
+        // A named exception next to a wildcard must remain granted and
+        // produce an empty replan, even when all objects once held SELECT.
+        pool.execute("SET ROLE wgr_a; GRANT SELECT ON wgr.u TO wgr_reader; RESET ROLE")
+            .await
+            .unwrap();
+        let exception = format!(
+            "{manifest}  - role: wgr_reader\n    privileges: [SELECT]\n    object: {{type: table, schema: wgr, name: u}}\n"
+        );
+        assert!(plan(&pool, &exception).await.is_empty());
+        exec.close().await;
+        pool.execute("DROP SCHEMA wgr CASCADE; DROP OWNED BY wgr_reader, wgr_a, wgr_b; DROP ROLE wgr_exec, wgr_reader, wgr_a, wgr_b").await.unwrap();
+    });
+}
