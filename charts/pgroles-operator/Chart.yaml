@@ -5,8 +5,8 @@ description: >-
   Define roles, memberships, grants, and default privileges in YAML
   and let the operator converge your database to the desired state.
 type: application
-version: 0.10.0
-appVersion: "0.10.0"
+version: 0.10.1
+appVersion: "0.10.1"
 icon: https://raw.githubusercontent.com/thepartly/pgroles/main/docs/public/logo.svg
 sources:
   - https://github.com/thepartly/pgroles
@@ -16,16 +16,8 @@ maintainers:
     url: https://hardbyte.nz
 annotations:
   artifacthub.io/changes: |
-    - kind: added
-      description: 'Bounded, request-driven PostgreSQL memberships. EphemeralAccessPolicy defines a requestable bundle; immutable EphemeralAccessRequest resources resolve, activate, expire, and revoke one grant without touching the durable PostgresPolicy. approval.mode Required is only a real approval boundary under admission enforcement — deploy the Kyverno profile in k8s/security/ or front the API with a trusted broker before relying on it. Requires PostgreSQL 16 or later.'
-    - kind: added
-      description: 'Approving a plan that can never execute is now reported. A policy in mode plan never consults spec.approval, so annotating its plan silently did nothing; the policy now reports an ApprovalIgnored condition and a warning Event.'
-    - kind: added
-      description: 'A generated Helm chart reference documenting every value, including serviceAccount.annotations for GKE Workload Identity and the EPHEMERAL_ACCESS_MAXIMUM_DURATION and EPHEMERAL_ACCESS_MAX_PENDING_TTL ceilings.'
-    - kind: deprecated
-      description: 'Omitting spec.approval on a PostgresPolicy. Behaviour is unchanged — the value is still inferred from spec.mode — but policies relying on it now report an ApprovalUnset condition. Write down the value you already get; a future release will reject the omission.'
-    - kind: removed
-      description: 'PostgresPolicy status fields planned_sql, planned_sql_truncated, and last_reconcile_time, superseded by PostgresPolicyPlan in 0.5.0. Read plan SQL from the plan the policy points at, and replace last_reconcile_time with status.last_successful_reconcile_time.'
+    - kind: fixed
+      description: 'Operator reconciliation is now bounded to one in-flight reconcile per controller by default, preventing startup and resynchronization bursts from exhausting memory, CPU, or database connection pools. Set RECONCILE_CONCURRENCY to opt into more parallelism when the operator has sufficient resources.'
   artifacthub.io/category: database
   artifacthub.io/operator: "true"
   artifacthub.io/prerelease: "false"
