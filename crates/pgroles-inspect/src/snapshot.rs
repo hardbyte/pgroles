@@ -52,6 +52,25 @@ use crate::{
     remove_redundant_schema_owner_grants,
 };
 
+/// Bound CPU work across both ordinary and shared candidate inspections.
+async fn bounded_cpu<T: Send + 'static>(
+    work: impl FnOnce() -> T + Send + 'static,
+) -> Result<T, InspectError> {
+    static GATE: std::sync::OnceLock<Arc<tokio::sync::Semaphore>> = std::sync::OnceLock::new();
+    let permit = GATE
+        .get_or_init(|| Arc::new(tokio::sync::Semaphore::new(1)))
+        .clone()
+        .acquire_owned()
+        .await
+        .expect("derivation gate never closes");
+    tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        work()
+    })
+    .await
+    .map_err(|error| InspectError::DerivationTask(error.to_string()))
+}
+
 /// A raw, uninterpreted read of the database over one scope.
 ///
 /// Safe to derive any config whose scope is contained in the one that was
@@ -366,6 +385,19 @@ impl RawInspection {
         None
     }
 
+    /// Derive on one process-wide blocking worker, keeping CPU-heavy ACL
+    /// folding off Tokio's async workers. The permit stays with the work even
+    /// when its caller is cancelled. Arc shares the snapshot without cloning
+    /// its ACL inventory. Lazy grantability reads remain async and never hold
+    /// the CPU permit, so one stalled database cannot occupy the CPU lane.
+    pub async fn derive_bounded(
+        self: &Arc<Self>,
+        pool: &PgPool,
+        config: &InspectConfig,
+    ) -> Result<InspectionResult, InspectError> {
+        self.derive_impl(pool, config, Some(Arc::clone(self))).await
+    }
+
     /// Produce the inspection `config` would have produced on its own.
     ///
     /// Pure except for the lazy grantability read, which happens at most once
@@ -374,6 +406,15 @@ impl RawInspection {
         &self,
         pool: &PgPool,
         config: &InspectConfig,
+    ) -> Result<InspectionResult, InspectError> {
+        self.derive_impl(pool, config, None).await
+    }
+
+    async fn derive_impl(
+        &self,
+        pool: &PgPool,
+        config: &InspectConfig,
+        offload: Option<Arc<Self>>,
     ) -> Result<InspectionResult, InspectError> {
         if let Some(axis) = self.uncovered_axis(config) {
             return Err(InspectError::ScopeNotCovered(axis));
@@ -389,6 +430,7 @@ impl RawInspection {
         let mut diagnostics = InspectionDiagnostics::default();
         let mut stats = InspectionStats {
             phase_durations: self.phase_durations.clone(),
+            acl_rows: self.privileges.acl_rows.len() + self.privileges.public_acl_rows.len(),
             ..InspectionStats::default()
         };
 
@@ -454,20 +496,49 @@ impl RawInspection {
         // A PUBLIC rule names its own target, so one aimed at the database
         // carries no schema and must still be derived.
         if !privilege_schemas.is_empty() || !config.public_object_scopes.is_empty() {
-            let derived = privileges::derive_privileges(
-                &self.privileges,
-                &privilege_schemas,
-                &managed_roles,
-                &config.wildcard_grants,
-                &config.public_object_scopes,
-            );
+            let derive_started = Instant::now();
+            let derived = if let Some(snapshot) = offload.as_ref() {
+                let snapshot = Arc::clone(snapshot);
+                let schemas = privilege_schemas.clone();
+                let roles = managed_roles.clone();
+                let config = config.clone();
+                bounded_cpu(move || {
+                    privileges::derive_privileges(
+                        &snapshot.privileges,
+                        &schemas,
+                        &roles,
+                        &config.wildcard_grants,
+                        &config.public_object_scopes,
+                    )
+                })
+                .await?
+            } else {
+                privileges::derive_privileges(
+                    &self.privileges,
+                    &privilege_schemas,
+                    &managed_roles,
+                    &config.wildcard_grants,
+                    &config.public_object_scopes,
+                )
+            };
+            stats
+                .phase_durations
+                .insert("privilege_derive", derive_started.elapsed());
             let (grantability, read_performed) = if derived.unsatisfied.is_empty() {
                 (None, false)
             } else {
                 let (raw, fetched) = self.grantability(pool).await?;
                 (Some(raw), fetched)
             };
-            let result = derived.finish(grantability.as_deref(), read_performed);
+            let finish_started = Instant::now();
+            let result = if offload.is_some() {
+                bounded_cpu(move || derived.finish(grantability.as_deref(), read_performed)).await?
+            } else {
+                derived.finish(grantability.as_deref(), read_performed)
+            };
+            stats
+                .phase_durations
+                .insert("privilege_normalize", finish_started.elapsed());
 
             stats.wildcard = result.wildcard_stats;
             diagnostics
@@ -477,7 +548,8 @@ impl RawInspection {
                 graph.grants.insert(key, state);
             }
             graph.inherent_grants.extend(result.inherent);
-            graph.grant_entry_grantors.extend(result.entry_grantors);
+            graph.grant_entry_grantors = result.entry_grantors;
+            stats.grantor_keys = graph.grant_entry_grantors.len();
             remove_redundant_schema_owner_grants(&mut graph);
             stats.grants = graph.grants.len();
 
@@ -644,6 +716,52 @@ mod tests {
             owner_has_create: true,
             owner_has_usage: true,
         }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn bounded_derivation_works_on_a_single_worker_without_copying_snapshot() {
+        let snapshot = Arc::new(snapshot());
+        let config = config(&["alice"], &["app"], false, vec![]);
+        let expected = snapshot.derive(&unreachable_pool(), &config).await.unwrap();
+        let result = snapshot
+            .derive_bounded(&unreachable_pool(), &config)
+            .await
+            .unwrap();
+        assert_eq!(result.graph.grants, expected.graph.grants);
+        assert_eq!(Arc::strong_count(&snapshot), 1);
+    }
+
+    #[test]
+    fn shuffled_acl_rows_preserve_graph_and_diagnostics() {
+        let mut snapshot = snapshot();
+        let mut scope = config(
+            &["alice"],
+            &["app"],
+            false,
+            vec![WildcardGrantPattern {
+                role: "alice".into(),
+                object_type: ObjectType::Table,
+                schema: "app".into(),
+                privileges: BTreeSet::from([Privilege::Select]),
+            }],
+        );
+        scope.public_object_scopes = vec![public_scope("app", "widgets", &[Privilege::Select])];
+        let expected = derive_pure(&snapshot, &scope);
+        snapshot.privileges.acl_rows.reverse();
+        snapshot.privileges.public_acl_rows.reverse();
+        snapshot.roles.reverse();
+        snapshot.memberships.reverse();
+        let actual = derive_pure(&snapshot, &scope);
+        assert_eq!(actual.graph.grants, expected.graph.grants);
+        assert_eq!(actual.graph.inherent_grants, expected.graph.inherent_grants);
+        assert_eq!(
+            actual.graph.grant_entry_grantors,
+            expected.graph.grant_entry_grantors
+        );
+        assert_eq!(actual.graph.memberships, expected.graph.memberships);
+        assert!(pgroles_core::diff::diff(&actual.graph, &expected.graph).is_empty());
+        assert!(pgroles_core::diff::diff(&expected.graph, &actual.graph).is_empty());
+        assert_eq!(actual.diagnostics, expected.diagnostics);
     }
 
     fn table_acl(schema: &str, table: &str, grantee: &str, privilege: &str) -> AclRow {

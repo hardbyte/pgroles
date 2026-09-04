@@ -663,6 +663,7 @@ pub async fn create_or_update_plan(
     // 1. Render the full executable SQL (not redacted). This is a review
     //    artifact only — never an execution payload, and never the approval
     //    identity.
+    let render_started = std::time::Instant::now();
     let full_sql = render_full_sql(changes, sql_context);
 
     // 2. Compute the approval identity: a canonical digest of the typed
@@ -687,6 +688,13 @@ pub async fn create_or_update_plan(
 
     // 5. Render redacted SQL for display (passwords masked).
     let redacted_sql = render_redacted_sql(changes, sql_context);
+    tracing::debug!(
+        phase = "plan_render",
+        elapsed_ms = render_started.elapsed().as_secs_f64() * 1000.0,
+        changes = changes.len(),
+        sql_bytes = full_sql.len(),
+        "plan processing phase"
+    );
 
     // Candidate plans are pruned by candidate retention (their owner cascades),
     // never by the policy's plan retention, which would not see them anyway.

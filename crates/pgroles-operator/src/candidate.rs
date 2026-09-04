@@ -515,7 +515,7 @@ struct SharedInspection {
     /// `None` when there was nothing to share (no plannable candidate on the
     /// parent's own target) or when the shared read failed — in which case
     /// every candidate falls back to inspecting for itself, exactly as before.
-    raw: Option<pgroles_inspect::RawInspection>,
+    raw: Option<std::sync::Arc<pgroles_inspect::RawInspection>>,
     /// Database inspections performed during this pass: the shared read counts
     /// as one, and each fallback adds another. This is the number the issue
     /// asks to bound, so it is measured rather than assumed. (The at-most-one
@@ -552,7 +552,7 @@ impl SharedInspection {
             && let Some(raw) = self.raw.as_ref()
             && raw.covers(config)
         {
-            return Ok(raw.derive(target.pool(), config).await?);
+            return Ok(raw.derive_bounded(target.pool(), config).await?);
         }
 
         self.inspections
@@ -605,7 +605,7 @@ async fn shared_inspection(
     let union = pgroles_inspect::InspectConfig::union_of(configs.iter());
     match pgroles_inspect::RawInspection::read(planning.pool, &union).await {
         Ok(raw) => SharedInspection {
-            raw: Some(raw),
+            raw: Some(std::sync::Arc::new(raw)),
             inspections: std::sync::atomic::AtomicUsize::new(1),
             plannable,
         },

@@ -7,18 +7,17 @@ Review what a change would do to production before it becomes the desired state.
 
 ---
 
-{% callout type="note" title="What is not built" %}
-The kind, the content digest, the planning lifecycle, **promotion** (the
-subject of this page), and the `pgroles candidate` CLI subcommands are
-implemented. Two things named below are not: `pgroles plan`, and
-`spec.contentRef` for content too large to embed.
+## The review loop
 
-Every recipe on this page is given twice, as `kubectl` and as `pgroles
-candidate`. The `kubectl` form is not a fallback: it is the definition, and it
-is what you use where the CLI is not installed. **Deciding** a plan has only
-the `kubectl` form; this is deliberate (see [Reviewing and
-deciding](#reviewing-and-deciding)).
-{% /callout %}
+1. Create a candidate from the **complete proposed content**, while the parent keeps enforcing.
+2. Read its plan with `pgroles candidate status` and `pgroles candidate diff`.
+3. Approve that plan using the authenticated status-decision workflow.
+4. Merge exactly the reviewed content into the parent policy.
+5. Verify the plan is Applied and the parent has converged. If the effects changed, review the replacement plan.
+
+Approval alone never promotes or executes a candidate. The sections below give
+commands for each step, followed by lifecycle and recovery details.
+
 
 ## What a candidate is
 

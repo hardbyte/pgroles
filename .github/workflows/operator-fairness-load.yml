@@ -278,17 +278,26 @@ jobs:
   # Its own cluster, because the fixture is large and its two operator restarts
   # would perturb the fairness timings next door.
   acl-inspection-burst:
-    name: ACL Inspection Burst
+    name: ACL Inspection Burst (${{ matrix.workers }} workers)
     needs: decide
     if: needs.decide.outputs.should_run == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        workers: [1, 2]
     steps:
       - uses: actions/checkout@v6
 
       - uses: ./.github/actions/setup-e2e
         with:
           cluster-name: pgroles-acl-burst
+
+      - name: Set runtime worker count
+        run: |
+          kubectl -n pgroles-system set env deployment/pgroles-operator TOKIO_WORKER_THREADS=${{ matrix.workers }}
+          kubectl -n pgroles-system rollout status deployment/pgroles-operator --timeout=180s
 
       - name: Give the operator room to show the difference
         run: |

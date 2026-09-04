@@ -16,7 +16,7 @@ use std::path::{Path, PathBuf};
 
 use jsonschema::Validator;
 use kube::CustomResourceExt;
-use pgroles_core::manifest::parse_manifest;
+use pgroles_core::manifest::{expand_manifest, parse_manifest};
 use pgroles_operator::crd::{
     EphemeralAccessPolicy, EphemeralAccessRequest, PostgresPolicy, PostgresPolicyPlan,
     postgres_policy_candidate_crd,
@@ -314,6 +314,20 @@ fn doc_manifests_match_generated_crd_schemas() {
                 };
 
                 checked += 1;
+                // JSON Schema cannot execute Kubernetes CEL. Also run the
+                // shared semantic validator for policy content, including
+                // constraints such as database targets requiring a name.
+                let content = match kind {
+                    "PostgresPolicy" => value.get("spec"),
+                    "PostgresPolicyCandidate" => value.pointer("/spec/content"),
+                    _ => None,
+                };
+                if let Some(content) = content {
+                    let yaml = serde_yaml::to_string(content).expect("content should serialize");
+                    if let Err(error) = parse_manifest(&yaml).and_then(|m| expand_manifest(&m)) {
+                        failures.push(format!("{name}: {kind} invalid policy content: {error}"));
+                    }
+                }
                 for error in validator.iter_errors(&value) {
                     let path = error.instance_path().to_string();
                     let path = if path.is_empty() { "<root>" } else { &path };
