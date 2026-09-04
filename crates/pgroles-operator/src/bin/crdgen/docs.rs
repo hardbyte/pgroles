@@ -12,6 +12,34 @@ fn text(value: &str) -> String {
         .replace('\n', " ")
 }
 
+// allOf adds requirements; alternatives guarantee only their intersection.
+fn required_fields(schema: &Value) -> std::collections::BTreeSet<String> {
+    let mut result: std::collections::BTreeSet<String> = schema["required"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .map(str::to_owned)
+        .collect();
+    if let Some(branches) = schema["allOf"].as_array() {
+        for branch in branches {
+            result.extend(required_fields(branch));
+        }
+    }
+    for keyword in ["oneOf", "anyOf"] {
+        if let Some(branches) = schema[keyword].as_array() {
+            let mut sets = branches.iter().map(required_fields);
+            if let Some(mut common) = sets.next() {
+                for set in sets {
+                    common.retain(|name| set.contains(name));
+                }
+                result.extend(common);
+            }
+        }
+    }
+    result
+}
+
 fn walk(
     schema: &Value,
     path: &str,
@@ -105,7 +133,7 @@ fn walk(
         }
     }
     if let Some(properties) = schema.get("properties").and_then(Value::as_object) {
-        let required = schema.get("required").and_then(Value::as_array);
+        let required = required_fields(schema);
         // serde_json's default map is ordered; explicitly sort to preserve the
         // contract even if another dependency enables preserve_order later.
         let mut keys: Vec<_> = properties.keys().collect();
@@ -114,7 +142,7 @@ fn walk(
             walk(
                 &properties[key],
                 &format!("{path}.{key}"),
-                required.is_some_and(|names| names.iter().any(|n| n.as_str() == Some(key))),
+                required.contains(key),
                 true,
                 output,
             )?;
@@ -262,6 +290,21 @@ mod tests {
         let assets = schemas(&crd(schema.clone())).unwrap();
         let parsed: Value = serde_json::from_str(&assets[0].1).unwrap();
         assert_eq!(parsed["properties"]["spec"], schema);
+    }
+    #[test]
+    fn parent_fields_inherit_only_guaranteed_composition_requirements() {
+        let schema = json!({"description":"Spec", "properties": {
+            "type":{"type":"string","description":"Tag"},
+            "a":{"type":"string","description":"A"},
+            "b":{"type":"string","description":"B"}},
+            "oneOf":[{"required":["type","a"]},{"required":["type","b"]}]});
+        let body = &render(&crd(schema)).unwrap()[0].1;
+        assert!(body.contains("`spec.type` | **string; required"));
+        assert!(body.contains("`spec.a` | **string; optional"));
+        assert_eq!(
+            required_fields(&json!({"allOf":[{"required":["a"]},{"anyOf":[{"required":["b"]}]}]})),
+            ["a".to_string(), "b".to_string()].into()
+        );
     }
     #[test]
     fn all_product_schemas_have_descriptions() {

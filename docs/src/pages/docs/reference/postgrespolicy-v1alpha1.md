@@ -21,7 +21,7 @@ For workflows, see [operator guidance](/docs/operator), [approval](/docs/operato
 | `spec.connection.params.auth` | **object; optional.** Provider-backed authentication for connections that use short-lived credentials instead of a static PostgreSQL password. **Constraints:** {"nullable":true}. |
 | `spec.connection.params.auth.impersonateServiceAccount` | **string; optional.** Target Google service account to impersonate before requesting the Cloud SQL login token. Omit to use the pod's bound identity. **Constraints:** {"nullable":true}. |
 | `spec.connection.params.auth.scope` | **string; optional.** OAuth scope requested for the access token. **Constraints:** {"nullable":true}. |
-| `spec.connection.params.auth.type` | **string; optional.** Provider authentication mechanism. **Constraints:** {"enum":["gcp_workload_identity"]}. |
+| `spec.connection.params.auth.type` | **string; required.** Provider authentication mechanism. **Constraints:** {"enum":["gcp_workload_identity"]}. |
 | `spec.connection.params.auth` | **oneOf branch 1 (conditional).** Fields below apply within this branch. |
 | `spec.connection.params.auth` | **union; item or branch.** Constraints on this array item, map value, or conditional schema. |
 | `spec.connection.params.dbname` | **string; optional.** Database name as a literal value. **Constraints:** {"nullable":true}. |
