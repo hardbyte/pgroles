@@ -25,7 +25,7 @@ Use this page for the external behavior and operating model. For the internal co
 
 ### Reconcile concurrency
 
-Each operator controller runs at most four reconciles concurrently by default. This bounds memory and database connection demand when many watched resources become ready at once, particularly during operator startup and watch resynchronization. The limit applies separately to the policy, ephemeral access policy, and ephemeral access request controllers; it is not a single shared global limit.
+Each operator controller runs one reconcile at a time by default. This bounds memory, CPU, and database connection demand when many watched resources become ready at once, particularly during operator startup and watch resynchronization. The limit applies separately to the policy, ephemeral access policy, and ephemeral access request controllers; it is not a single shared global limit. Operators provisioned with more CPU can raise it to process independent databases in parallel.
 
 Set `RECONCILE_CONCURRENCY` on the operator to tune the per-controller limit:
 

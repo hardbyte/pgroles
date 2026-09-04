@@ -22,10 +22,11 @@ pub struct ReconcileConcurrency(u16);
 
 impl Default for ReconcileConcurrency {
     fn default() -> Self {
-        // Enough to keep a slow database from stalling unrelated policies,
-        // low enough that peak inspection memory stays a small multiple of one
-        // policy's. Unbounded is the only value that cannot be reasoned about.
-        Self(4)
+        // A single large inspection can consume a Tokio worker thread for
+        // long enough that running one per worker starves health probes under
+        // the chart's 200m CPU limit. Keep the safe default serial; operators
+        // with more CPU can opt into parallelism explicitly.
+        Self(1)
     }
 }
 
@@ -111,6 +112,7 @@ mod tests {
     fn defaults_to_a_bounded_value() {
         let resolved = ReconcileConcurrency::from_lookup(lookup(None)).expect("default resolves");
         assert_eq!(resolved, ReconcileConcurrency::default());
+        assert_eq!(resolved.get(), 1);
         assert!(
             !resolved.is_unbounded(),
             "the default must bound concurrency; unbounded is what exhausts memory"
