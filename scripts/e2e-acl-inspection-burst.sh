@@ -11,8 +11,8 @@ set -euo pipefail
 # else in this repository could see that failure mode: every other scenario asserts
 # convergence, which an operator that was killed and came back still reaches.
 #
-# The measurement here is a restart, because a restart is the burst: every
-# watch fires together. It runs twice against the same fixture, unbounded
+# The measurement here is a configuration rollout, because startup is the
+# burst: every watch fires together. It runs twice against the same fixture, unbounded
 # first so each phase starts from a fresh pod with a clean baseline, and
 # asserts the relationship rather than an absolute — a threshold nobody has
 # measured is a coin flip, while "bounded must cost materially less than
@@ -58,23 +58,6 @@ secret_name() { printf 'burst-%02d-credentials' "$1"; }
 # of roles, which the operator correctly reports as a conflict.
 role_prefix_for() { printf 'burst%02d_reader' "$1"; }
 
-# The kubelet's stats endpoint is briefly unavailable for a pod that has just
-# started, and a single failed read under `set -e` would end the run rather
-# than the sample.
-operator_memory_bytes_settled() {
-  local attempt value
-  for attempt in $(seq 1 30); do
-    value="$(operator_memory_bytes 2>/dev/null || true)"
-    if [ -n "$value" ]; then
-      printf '%s\n' "$value"
-      return 0
-    fi
-    sleep 2
-  done
-  echo "::error::the kubelet reported no memory for the operator container" >&2
-  return 1
-}
-
 # Every burst policy has reconciled at least once since `since`, an RFC3339
 # UTC timestamp. These sort lexicographically, which is the whole reason the
 # comparison can be done in the shell.
@@ -104,7 +87,7 @@ wait_for_reconciles_since() {
   return 1
 }
 
-# Sample the operator across the restart the caller just triggered, and set
+# Roll the operator into one configuration, sample across that rollout, and set
 # `measured_peak` to the highest working-set sample from the fresh pod.
 #
 # The result is a global rather than stdout because everything in here — the
@@ -119,19 +102,10 @@ stop_sampler() {
   fi
 }
 
-measure_rollout_burst() {
-  local label="$1" since="$2"
-  local baseline peak
-
-  kubectl -n "$namespace" rollout status "$deployment" --timeout=180s || return 1
-
-  # A fresh pod, so the baseline is not carrying the previous phase's
-  # allocations: glibc does not necessarily return freed pages to the OS, and a
-  # baseline that already included the last burst would flatten the difference
-  # being measured. It is taken as soon as the pod is Ready, which is a moment
-  # after its first reconciles begin, so it errs high and the reported growth
-  # errs low.
-  baseline="$(operator_memory_bytes_settled)" || return 1
+run_phase() {
+  local label="$1"
+  shift
+  local baseline old_pod_uid peak
 
   # A phase that failed part way may have left its sampler running; it would
   # otherwise keep appending to the file this phase is about to read.
@@ -139,14 +113,30 @@ measure_rollout_burst() {
 
   rm -f "$sample_file" "$stop_file"
   touch "$sample_file"
-  printf '%s\n' "$baseline" >>"$sample_file"
+  old_pod_uid="$(active_operator_pod_json "$namespace" | jq -r '.metadata.uid')" || return 1
   (
     while [ ! -e "$stop_file" ]; do
-      operator_memory_bytes >>"$sample_file" 2>/dev/null || true
+      operator_memory_bytes "$namespace" "$old_pod_uid" >>"$sample_file" 2>/dev/null || true
       sleep 1
     done
   ) &
   sampler_pid="$!"
+
+  # `set env` changes the pod template in both phases (absent -> 0 -> absent),
+  # so it is itself the one rollout under measurement. Starting the sampler and
+  # timestamp before that mutation avoids missing the startup burst. A separate
+  # `rollout restart` would create a second pod and allow late status writes
+  # from the configuration rollout to satisfy the wait for the wrong burst.
+  local since
+  since="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  if ! kubectl -n "$namespace" set env "$deployment" "$@"; then
+    stop_sampler
+    return 1
+  fi
+  if ! kubectl -n "$namespace" rollout status "$deployment" --timeout=180s; then
+    stop_sampler
+    return 1
+  fi
 
   if ! wait_for_reconciles_since "$since"; then
     stop_sampler
@@ -154,8 +144,9 @@ measure_rollout_burst() {
   fi
 
   stop_sampler
-  operator_memory_bytes >>"$sample_file" 2>/dev/null || true
+  operator_memory_bytes "$namespace" "$old_pod_uid" >>"$sample_file" 2>/dev/null || true
 
+  baseline="$(head -n 1 "$sample_file")"
   peak="$(sort -nr "$sample_file" | head -n 1)"
   if [ -z "$peak" ]; then
     echo "::error::no memory samples were collected for the $label phase" >&2
@@ -206,26 +197,6 @@ for i in $(seq 1 "$policy_count"); do
 done
 
 # -- Measurement --------------------------------------------------------------
-
-# Each phase settles its configuration change first and then restarts
-# explicitly, rather than relying on the env change to roll the deployment.
-# Removing a variable that is already absent is a no-op, and a phase that
-# quietly failed to restart would measure an idle operator and pass.
-#
-# `since` is taken before the restart: a timestamp taken after the new pod is
-# Ready would miss the reconciles it had already started, and the wait would
-# then sit out a whole 5m interval waiting for the next ones.
-run_phase() {
-  local label="$1"
-  shift
-  kubectl -n "$namespace" set env "$deployment" "$@" || return 1
-  kubectl -n "$namespace" rollout status "$deployment" --timeout=180s || return 1
-
-  local since
-  since="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-  kubectl -n "$namespace" rollout restart "$deployment" || return 1
-  measure_rollout_burst "$label" "$since" || return 1
-}
 
 # The unbounded phase is allowed to fail. Being OOM-killed, or never getting
 # every policy through a reconcile because it keeps being killed, is a result
