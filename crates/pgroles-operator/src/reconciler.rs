@@ -2006,6 +2006,13 @@ async fn apply_under_lock(
                                 pgroles_core::approval::TargetIdentityVerdict::Proceed => {
                                     if decision == crate::plan::ApprovedPlanDecision::Clear {
                                         crate::plan::SupersedeCause::EffectsCleared
+                                    } else if current_plan.status.as_ref().is_some_and(|status| {
+                                        crate::plan::password_source_changed(
+                                            status,
+                                            &applied_password_source_versions,
+                                        )
+                                    }) {
+                                        crate::plan::SupersedeCause::PasswordSourceChanged
                                     } else {
                                         crate::plan::SupersedeCause::EffectsChanged
                                     }
@@ -2910,6 +2917,18 @@ async fn materialize_pending_generated_secrets(
         )
         .await
         .map_err(Box::new)?;
+
+        // Stop the process, not merely this reconcile task, at the exact
+        // Secret-first boundary. Compiled out of ordinary and release images.
+        #[cfg(feature = "e2e-fault-injection")]
+        if std::env::var("PGROLES_E2E_CRASH_AFTER_GENERATED_SECRET")
+            .ok()
+            .as_deref()
+            == Some(format!("{namespace}/{}", resource.name_any()).as_str())
+        {
+            eprintln!("E2E fault injection: generated Secret persisted; aborting before SQL");
+            std::process::abort();
+        }
 
         applied_password_source_versions
             .insert(pending.role.clone(), materialized.source_version.clone());

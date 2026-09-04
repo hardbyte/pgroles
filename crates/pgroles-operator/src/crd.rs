@@ -1302,6 +1302,11 @@ pub struct PostgresPolicyPlanStatus {
     /// verifier. See `pgroles_core::approval`.
     #[serde(default)]
     pub change_digest: Option<String>,
+    /// Diagnostic SHA-256 digest of the password source-version map. Contains
+    /// no password material. A mismatch identifies credential-source changes;
+    /// approval remains bound by changeDigest. Absent on older plans.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub password_source_digest: Option<String>,
     /// Version tag of the encoding `change_digest` was computed under. Digests
     /// from different encodings are never comparable.
     #[serde(default)]

@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Identify password-source changes when superseding approval plans. Exercise Secret-first crash recovery in a feature-gated operator E2E, including reapproval, credential reuse, and database authentication.
+
 ## [0.10.1] - 2026-09-04
 
 ### Fixed

@@ -29,6 +29,21 @@ use crate::k8s_names::{LabelValue, truncate_name_prefix};
 use crate::reconciler::ReconcileError;
 use pgroles_core::approval::{APPROVAL_EFFECT_ENCODING_V3, TargetIdentity};
 
+/// Diagnostic fingerprint; the approval digest remains the execution gate.
+pub fn password_source_digest(versions: &BTreeMap<String, String>) -> String {
+    compute_sql_hash(&serde_json::to_string(versions).expect("source versions serialize"))
+}
+
+pub fn password_source_changed(
+    status: &PostgresPolicyPlanStatus,
+    versions: &BTreeMap<String, String>,
+) -> bool {
+    status
+        .password_source_digest
+        .as_deref()
+        .is_some_and(|old| old != password_source_digest(versions))
+}
+
 /// Result of plan creation — distinguishes genuinely new plans from
 /// deduplication hits so callers can decide whether to emit events.
 #[derive(Debug, Clone)]
@@ -377,6 +392,8 @@ pub enum SupersedeCause {
     /// The effects this plan described are not the effects the policy would
     /// produce now.
     EffectsChanged,
+    /// A credential source version changed after planning.
+    PasswordSourceChanged,
     /// The effects are gone entirely: applied out of band, or edited away.
     /// No replacement plan is opened.
     EffectsCleared,
@@ -407,6 +424,7 @@ impl SupersedeCause {
     pub fn reason(self) -> &'static str {
         match self {
             SupersedeCause::TargetChanged(reason) => reason.as_str(),
+            SupersedeCause::PasswordSourceChanged => "PasswordSourceChanged",
             // Promotion is the one supersede a reviewer can act on by filing a
             // successor candidate, so it names itself rather than hiding
             // behind the generic reason.
@@ -423,6 +441,9 @@ impl SupersedeCause {
     /// Human-readable condition `message`.
     pub fn message(self) -> &'static str {
         match self {
+            SupersedeCause::PasswordSourceChanged => {
+                "password source versions changed after planning; review and approve the replacement plan"
+            }
             SupersedeCause::EffectsChanged => {
                 "the policy's effects changed since this plan was computed, so it no longer \
                  describes what would happen"
@@ -733,6 +754,7 @@ pub async fn create_or_update_plan(
                 &plan_name,
                 &change_digest,
                 expected_base,
+                password_source_versions,
             )
             .await?;
             return Ok(PlanCreationResult::Deduplicated(plan_name));
@@ -957,6 +979,7 @@ pub async fn create_or_update_plan(
         last_error: None,
         sql_hash: Some(sql_hash),
         change_digest: Some(change_digest.clone()),
+        password_source_digest: Some(password_source_digest(password_source_versions)),
         change_digest_encoding: Some(APPROVAL_EFFECT_ENCODING_V3.to_string()),
         target_physical_identity: target_identity.physical.clone(),
         target_logical_fingerprint: target_identity.logical.clone(),
@@ -998,6 +1021,7 @@ pub async fn create_or_update_plan(
         &plan_name,
         &change_digest,
         expected_base,
+        password_source_versions,
     )
     .await?;
 
@@ -1040,6 +1064,7 @@ async fn supersede_stale_plans(
     new_plan_name: &str,
     new_digest: &str,
     expected_base: Option<&str>,
+    password_source_versions: &BTreeMap<String, String>,
 ) -> Result<(), ReconcileError> {
     for plan in existing_plans {
         let Some(ref status) = plan.status else {
@@ -1060,6 +1085,8 @@ async fn supersede_stale_plans(
         }
         let cause = if base_stale {
             SupersedeCause::BaseContentChanged
+        } else if password_source_changed(status, password_source_versions) {
+            SupersedeCause::PasswordSourceChanged
         } else {
             SupersedeCause::ReplacedByNewerPlan
         };
@@ -3766,11 +3793,33 @@ mod tests {
     /// itself; the previous single message claimed the database had changed
     /// even when it was an effect-neutral policy edit that retired the plan.
     #[test]
+    fn diagnostic_source_digest_detects_secret_materialization_without_passwords() {
+        let missing = BTreeMap::from([("app".into(), "credential:password:missing".into())]);
+        let real = BTreeMap::from([("app".into(), "credential:password:42".into())]);
+        let status = PostgresPolicyPlanStatus {
+            password_source_digest: Some(password_source_digest(&missing)),
+            ..Default::default()
+        };
+        assert!(!password_source_changed(&status, &missing));
+        assert!(password_source_changed(&status, &real));
+        assert!(!password_source_changed(
+            &PostgresPolicyPlanStatus::default(),
+            &real
+        ));
+        let status = PostgresPolicyPlanStatus {
+            password_source_digest: Some(password_source_digest(&real)),
+            ..Default::default()
+        };
+        assert!(!password_source_changed(&status, &real));
+    }
+
+    #[test]
     fn every_supersede_cause_names_its_own_reason() {
         use pgroles_core::approval::TargetIdentityReason;
 
         let causes = [
             SupersedeCause::EffectsChanged,
+            SupersedeCause::PasswordSourceChanged,
             SupersedeCause::EffectsCleared,
             SupersedeCause::ReplacedByNewerPlan,
             SupersedeCause::PolicyStoppedPlanning,
@@ -3783,6 +3832,7 @@ mod tests {
         for cause in causes {
             match cause {
                 SupersedeCause::EffectsChanged
+                | SupersedeCause::PasswordSourceChanged
                 | SupersedeCause::EffectsCleared
                 | SupersedeCause::ReplacedByNewerPlan
                 | SupersedeCause::PolicyStoppedPlanning

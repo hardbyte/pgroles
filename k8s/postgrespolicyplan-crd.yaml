@@ -403,6 +403,11 @@
                     "nullable": true,
                     "type": "string"
                   },
+                  "passwordSourceDigest": {
+                    "description": "Diagnostic SHA-256 digest of the password source-version map. Contains\nno password material. A mismatch identifies credential-source changes;\napproval remains bound by changeDigest. Absent on older plans.",
+                    "nullable": true,
+                    "type": "string"
+                  },
                   "phase": {
                     "default": "Pending",
                     "description": "Phase: Pending, Approved, Applying, Applied, Failed, Superseded.",
