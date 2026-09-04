@@ -11,6 +11,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Identify password-source changes when superseding approval plans. Exercise Secret-first crash recovery in a feature-gated operator E2E, including reapproval, credential reuse, and database authentication.
 
+- Wildcard revocations retain concrete object/grantor attribution, including PUBLIC and mixed-owner scopes. Normalization preserves named-object exceptions; owner privileges remain protected. Revocations may produce more concrete plan entries and require fresh approval when effects differ. (#215)
+- Operator onboarding examples now name the target database, and documentation validation checks policy semantics in addition to JSON Schema. The CLI quick start uses additive mode; adoption and upgrade guides explain mode and version transitions.
+
+### Changed
+
+- ACL derivation runs on a single bounded blocking worker per process without copying the raw snapshot. Inspection exposes ACL/grantor cardinality and derivation phases; operator telemetry adds processing duration and runtime scheduling lag. Removed redundant ACL query sorting and an intermediate row-pointer allocation. Reconcile concurrency still defaults to one. (#214)
+
 ## [0.10.1] - 2026-09-04
 
 ### Fixed

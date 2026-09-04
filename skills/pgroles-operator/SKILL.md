@@ -204,7 +204,7 @@ spec:
         login: false
     grants:
       - role: reporting_reader
-        object: { type: database }
+        object: { type: database, name: app }
         privileges: [CONNECT]
 ```
 

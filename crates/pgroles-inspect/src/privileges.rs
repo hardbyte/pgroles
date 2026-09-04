@@ -828,8 +828,8 @@ pub(crate) struct DerivedPrivileges {
     inherent: BTreeSet<GrantKey>,
     /// Per-grantor privilege breakdown of each grant target, from the ACL
     /// entries' recorded grantors. Keyed by the pre-normalization concrete
-    /// keys; wildcard-collapsed keys deliberately have no entry, so their
-    /// revokes fall back to grantor-less rendering.
+    /// keys, including keys compacted by wildcard normalization. The diff
+    /// range-scans these keys to expand wildcard revokes per object/grantor.
     entry_grantors: BTreeMap<GrantKey, BTreeMap<String, BTreeSet<Privilege>>>,
     /// Objects each role owns, keyed by (role, object type, schema). Wildcard
     /// normalization replaces per-name entries with `name: "*"` keys, so the
@@ -873,13 +873,12 @@ pub(crate) fn derive_privileges(
         .map(|(scope, names)| (scope.clone(), names.clone()))
         .collect();
 
-    let rows: Vec<&AclRow> = raw
+    let rows = raw
         .acl_rows
         .iter()
-        .filter(|row| row.in_scope(managed_schemas, managed_roles))
-        .collect();
+        .filter(|row| row.in_scope(managed_schemas, managed_roles));
 
-    for row in &rows {
+    for row in rows {
         if has_wildcards
             && let Some(object_type) = obj_type_str_to_object_type(&row.obj_type)
             && !matches!(object_type, ObjectType::Schema | ObjectType::Database)
@@ -891,10 +890,7 @@ pub(crate) fn derive_privileges(
                 .or_default()
                 .insert(row.object_name.clone());
         }
-    }
-    wildcard_stats.inventory_objects = inventory.values().map(BTreeSet::len).sum();
 
-    for row in rows {
         let Some(grantee) = row.grantee.as_ref() else {
             continue;
         };
@@ -958,6 +954,8 @@ pub(crate) fn derive_privileges(
         });
         entry.privileges.insert(privilege);
     }
+
+    wildcard_stats.inventory_objects = inventory.values().map(BTreeSet::len).sum();
 
     // PUBLIC state, kept only for declared scopes. Merged before wildcard
     // normalization so a present-ensure PUBLIC wildcard collapses its
@@ -1779,7 +1777,10 @@ fn normalize_wildcard_grants(
             insert_vacuous_wildcard(&mut grants, wildcard);
             continue;
         }
-        let mut shared_privileges = all_privileges();
+        // Only compact the privileges this wildcard declares. Extras must
+        // remain concrete so a named exception (for example SELECT on one
+        // table beside a wildcard INSERT) is not erased by normalization.
+        let mut shared_privileges = wildcard.privileges.clone();
 
         for object_name in object_names {
             let key = GrantKey {
@@ -1903,7 +1904,6 @@ async fn fetch_relation_privileges(
         WHERE n.nspname = ANY($1)
           AND c.relkind IN ('r', 'p', 'v', 'm', 'S')
           AND grantee.rolname = ANY($2)
-        ORDER BY n.nspname, c.relname
         "#,
     )
     .bind(managed_schemas)
@@ -1937,7 +1937,6 @@ async fn fetch_schema_privileges(
         JOIN pg_roles grantee ON grantee.oid = acl.grantee
         WHERE n.nspname = ANY($1)
           AND grantee.rolname = ANY($2)
-        ORDER BY n.nspname
         "#,
     )
     .bind(managed_schemas)
@@ -1974,7 +1973,6 @@ async fn fetch_function_privileges(
         JOIN pg_roles grantee ON grantee.oid = acl.grantee
         WHERE n.nspname = ANY($1)
           AND grantee.rolname = ANY($2)
-        ORDER BY n.nspname, p.proname
         "#,
     )
     .bind(managed_schemas)
@@ -2013,7 +2011,6 @@ async fn fetch_type_privileges(
           AND t.typname NOT LIKE '\_%'
           AND t.typtype <> 'p'
           AND grantee.rolname = ANY($2)
-        ORDER BY n.nspname, t.typname
         "#,
     )
     .bind(managed_schemas)
@@ -2047,7 +2044,6 @@ pub async fn fetch_database_privileges(
         JOIN pg_roles grantee ON grantee.oid = acl.grantee
         WHERE db.datname = current_database()
           AND grantee.rolname = ANY($1)
-        ORDER BY db.datname
         "#,
     )
     .bind(managed_roles)
