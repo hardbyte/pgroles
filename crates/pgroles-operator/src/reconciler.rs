@@ -672,6 +672,7 @@ fn inspect_error_is_non_transient(error: &pgroles_inspect::InspectError) -> bool
         // A scope the shared snapshot never read: a programming error in the
         // caller, not something a retry can fix.
         pgroles_inspect::InspectError::ScopeNotCovered(_)
+        | pgroles_inspect::InspectError::DerivationTask(_)
         | pgroles_inspect::InspectError::DatabaseTargetMismatch { .. } => true,
     }
 }
@@ -1428,6 +1429,7 @@ async fn apply_under_lock(
              use adopt or authoritative mode to enforce absence"
         );
     }
+    let diff_started = std::time::Instant::now();
     let mut changes = pgroles_core::diff::filter_changes(
         pgroles_core::diff::apply_role_retirements(
             pgroles_core::diff::diff(&current, &effective_desired),
@@ -1471,6 +1473,9 @@ async fn apply_under_lock(
     {
         return Err(ReconcileError::OwnerTransferBlocked(blocker));
     }
+
+    ctx.observability
+        .record_processing_phase("diff", diff_started.elapsed());
 
     let resolved_passwords = resolve_passwords_from_secrets(ctx, resource, namespace).await?;
     let (password_changes, mut applied_password_source_versions) =
@@ -1523,7 +1528,10 @@ async fn apply_under_lock(
         Some(message)
     };
 
+    let summary_started = std::time::Instant::now();
     let summary = summarize_changes(&changes);
+    ctx.observability
+        .record_processing_phase("summary", summary_started.elapsed());
     let sql_ctx = detect_sql_context(pool, &inspect_config).await?;
 
     let effective_approval = resource.spec.effective_approval();
@@ -3589,7 +3597,8 @@ impl ReconcileError {
                         SqlErrorKind::Transient => "DatabaseInspectionFailed",
                     }
                 }
-                pgroles_inspect::InspectError::ScopeNotCovered(_) => "DatabaseInspectionFailed",
+                pgroles_inspect::InspectError::ScopeNotCovered(_)
+                | pgroles_inspect::InspectError::DerivationTask(_) => "DatabaseInspectionFailed",
                 pgroles_inspect::InspectError::DatabaseTargetMismatch { .. } => {
                     "InvalidDatabaseTarget"
                 }

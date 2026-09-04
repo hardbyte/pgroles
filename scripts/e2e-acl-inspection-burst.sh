@@ -27,7 +27,7 @@ schema_count="${BURST_SCHEMAS:-10}"
 function_count="${BURST_FUNCTIONS:-100}"
 role_count="${BURST_ROLES:-40}"
 # The bounded run must stay under this share of the unbounded run's peak.
-# Generous on purpose: the defaults give unbounded 2.5x the concurrency of
+# Generous on purpose: the defaults give unbounded 10x the concurrency of
 # bounded, so a real bound clears this comfortably and only its removal, which
 # makes the two runs identical, cannot.
 max_bounded_share_percent="${BURST_MAX_BOUNDED_SHARE_PERCENT:-80}"
