@@ -256,7 +256,7 @@ export function Layout({children, title, tableOfContents}) {
                                 )}
                             </header>
                         )}
-                        <Prose>{children}</Prose>
+                        <Prose className={router.pathname.startsWith('/docs/reference/') ? 'crd-reference' : undefined}>{children}</Prose>
                     </article>
                     <dl className="mt-12 flex border-t border-stone-300 pt-6 dark:border-stone-800">
                         {previousPage && (
