@@ -1788,6 +1788,8 @@ fn should_patch_existing_plan_status(plan: &PostgresPolicyPlan) -> bool {
         .map(|status| {
             status.phase == PlanPhase::Pending
                 && status.change_digest.is_none()
+                && status.computed_at.is_none()
+                && status.sql_hash.is_none()
                 && !has_terminal_decision(status)
         })
         .unwrap_or(true)
@@ -4220,6 +4222,9 @@ mod tests {
     fn computed_or_decided_pending_plans_cannot_be_rewritten_on_name_collision() {
         let mut computed = test_plan("same-second", PlanPhase::Pending, None);
         computed.status.as_mut().unwrap().change_digest = Some("old-effects".into());
+        assert!(!should_patch_existing_plan_status(&computed));
+        computed.status.as_mut().unwrap().change_digest = None;
+        computed.status.as_mut().unwrap().sql_hash = Some("legacy-sql".into());
         assert!(!should_patch_existing_plan_status(&computed));
         for decision in ["Approved", "Denied"] {
             let decided =
