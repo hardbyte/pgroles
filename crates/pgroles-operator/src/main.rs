@@ -10,7 +10,7 @@ use futures::{StreamExt, TryStreamExt, stream};
 use k8s_openapi::api::core::v1::Secret;
 use kube::runtime::controller::Config as ControllerConfig;
 use kube::runtime::events::{Recorder, Reporter};
-use kube::runtime::reflector::ObjectRef;
+use kube::runtime::reflector::{ObjectRef, Store};
 use kube::runtime::{Controller, WatchStreamExt, predicates, reflector, watcher};
 use kube::{Api, Client, Resource, ResourceExt};
 use tracing::{info, warn};
@@ -32,6 +32,23 @@ use pgroles_operator::observability::{
 use pgroles_operator::plan::PlanRetention;
 use pgroles_operator::reconciler::{error_policy, reconcile};
 use pgroles_operator::request_index::RequestIndex;
+
+/// Build a controller with the operator-wide concurrency bound already applied.
+///
+/// Keeping construction behind this helper makes the safe path the natural path:
+/// callers cannot receive a controller that still has kube-rs's unbounded default.
+fn configured_controller<K>(
+    trigger: impl futures::Stream<Item = Result<K, watcher::Error>> + Send + 'static,
+    reader: Store<K>,
+    concurrency: ReconcileConcurrency,
+) -> Controller<K>
+where
+    K: Clone + Resource + serde::de::DeserializeOwned + std::fmt::Debug + Send + Sync + 'static,
+    K::DynamicType: Default + Eq + Hash + Clone,
+{
+    Controller::for_stream(trigger, reader)
+        .with_config(ControllerConfig::default().concurrency(concurrency.get()))
+}
 
 /// Hash for plan decision changes — triggers parent policy reconciliation when
 /// a reviewer records a decision, or the operator moves the plan's phase.
@@ -157,8 +174,6 @@ async fn main() -> anyhow::Result<()> {
             "reconcile concurrency bounded"
         );
     }
-    let controller_config = ControllerConfig::default().concurrency(reconcile_concurrency.get());
-
     let plan_retention = PlanRetention::from_env()?;
     if plan_retention != PlanRetention::default() {
         info!(
@@ -317,8 +332,7 @@ async fn main() -> anyhow::Result<()> {
     info!("starting controllers");
     observability.mark_ready();
 
-    let policy_controller = Controller::for_stream(policy_stream, reader)
-        .with_config(controller_config.clone())
+    let policy_controller = configured_controller(policy_stream, reader, reconcile_concurrency)
         .reconcile_on(secret_triggers)
         .reconcile_on(plan_triggers)
         .reconcile_on(candidate_triggers)
@@ -368,21 +382,23 @@ async fn main() -> anyhow::Result<()> {
             stream::iter(refs)
         });
 
-    let access_policy_controller =
-        Controller::for_stream(access_policy_stream, access_policy_reader)
-            .with_config(controller_config.clone())
-            .reconcile_on(target_access_policy_triggers)
-            .shutdown_on_signal()
-            .run(
-                reconcile_access_policy,
-                access_policy_error_policy,
-                ctx.clone(),
-            )
-            .for_each(|result| async move {
-                if let Err(error) = result {
-                    tracing::error!(%error, "ephemeral access policy reconcile failed");
-                }
-            });
+    let access_policy_controller = configured_controller(
+        access_policy_stream,
+        access_policy_reader,
+        reconcile_concurrency,
+    )
+    .reconcile_on(target_access_policy_triggers)
+    .shutdown_on_signal()
+    .run(
+        reconcile_access_policy,
+        access_policy_error_policy,
+        ctx.clone(),
+    )
+    .for_each(|result| async move {
+        if let Err(error) = result {
+            tracing::error!(%error, "ephemeral access policy reconcile failed");
+        }
+    });
 
     let access_requests: Api<EphemeralAccessRequest> = match &watch_namespace {
         Some(namespace) => Api::namespaced(client.clone(), namespace),
@@ -436,17 +452,19 @@ async fn main() -> anyhow::Result<()> {
                 .flat_map(stream::iter)
             });
 
-    let access_request_controller =
-        Controller::for_stream(access_request_stream, access_request_reader)
-            .with_config(controller_config)
-            .reconcile_on(access_policy_request_triggers)
-            .shutdown_on_signal()
-            .run(reconcile_access_request, access_request_error_policy, ctx)
-            .for_each(|result| async move {
-                if let Err(error) = result {
-                    tracing::error!(%error, "ephemeral access request reconcile failed");
-                }
-            });
+    let access_request_controller = configured_controller(
+        access_request_stream,
+        access_request_reader,
+        reconcile_concurrency,
+    )
+    .reconcile_on(access_policy_request_triggers)
+    .shutdown_on_signal()
+    .run(reconcile_access_request, access_request_error_policy, ctx)
+    .for_each(|result| async move {
+        if let Err(error) = result {
+            tracing::error!(%error, "ephemeral access request reconcile failed");
+        }
+    });
 
     futures::future::join3(
         policy_controller,
@@ -471,6 +489,37 @@ mod tests {
         REQUESTED_RECONCILE_ANNOTATION, SecretReference,
     };
     use std::collections::BTreeMap;
+
+    /// Raw controller construction belongs in `configured_controller`, where
+    /// applying the operator-wide concurrency config is part of construction.
+    /// This catches a future controller built directly with kube-rs's unbounded
+    /// default instead of relying on counts that unrelated builder calls can
+    /// accidentally balance.
+    #[test]
+    fn controllers_are_constructed_through_the_configured_helper() {
+        let source = include_str!("main.rs");
+        let body: String = source
+            .split_once("mod tests {")
+            .map(|(before, _)| before)
+            .expect("this binary has a test module")
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert_eq!(
+            body.matches("Controller::").count(),
+            1,
+            "construct controllers through configured_controller; raw kube-rs controllers use \
+             unbounded concurrency by default"
+        );
+        assert!(
+            body.contains(
+                ".with_config(ControllerConfig::default().concurrency(concurrency.get()))"
+            ),
+            "configured_controller must apply the resolved concurrency bound"
+        );
+    }
 
     fn test_policy() -> PostgresPolicy {
         let spec = PostgresPolicySpec {
