@@ -72,7 +72,7 @@ enum Commands {
         #[arg(long, env = "DATABASE_URL")]
         database_url: String,
 
-        /// Output format: "sql" for raw SQL, "summary" for a brief summary, "json" for machine-readable JSON.
+        /// Output format: "sql" for raw SQL, "summary" for a brief summary, "json" for machine-readable JSON, "markdown" for a redacted review table.
         #[arg(long, default_value = "sql")]
         format: OutputFormat,
 
@@ -367,6 +367,7 @@ enum OutputFormat {
     Sql,
     Summary,
     Json,
+    Markdown,
 }
 
 /// CLI wrapper for `ReconciliationMode` — clap derives the `ValueEnum` from this.
@@ -891,6 +892,20 @@ async fn cmd_diff(
                     eprintln!("\n{drop_safety}");
                 }
             }
+            OutputFormat::Markdown => {
+                print!(
+                    "{}",
+                    pgroles_core::review::render_markdown(
+                        &changes,
+                        &bundle_path.display().to_string(),
+                        mode,
+                        Some(&validated.composed.report_context())
+                    )?
+                );
+                if !drop_safety.is_empty() {
+                    eprintln!("\n{drop_safety}");
+                }
+            }
             OutputFormat::Json => {
                 println!(
                     "{}",
@@ -958,6 +973,20 @@ async fn cmd_diff(
         }
         OutputFormat::Summary => {
             print!("{summary}");
+            if !drop_safety.is_empty() {
+                eprintln!("\n{drop_safety}");
+            }
+        }
+        OutputFormat::Markdown => {
+            print!(
+                "{}",
+                pgroles_core::review::render_markdown(
+                    &changes,
+                    &file_path.display().to_string(),
+                    mode,
+                    None
+                )?
+            );
             if !drop_safety.is_empty() {
                 eprintln!("\n{drop_safety}");
             }

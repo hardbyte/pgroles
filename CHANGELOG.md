@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `pgroles diff --format markdown` renders redacted review tables with source attribution, conservative priorities, and a versioned report fingerprint. Existing JSON formats and drift exit codes are unchanged.
+
 ## [0.10.1] - 2026-09-04
 
 ### Fixed

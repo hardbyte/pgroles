@@ -178,3 +178,19 @@ Use the same manifest against different databases, or maintain separate manifest
 pgroles apply -f pgroles.yaml --database-url "$STAGING_DATABASE_URL"
 pgroles apply -f pgroles.yaml --database-url "$PROD_DATABASE_URL"
 ```
+
+## Review summaries
+
+Use `pgroles diff --format markdown` to produce a redacted table for a review artifact:
+
+```bash
+pgroles diff -f pgroles.yaml --mode adopt --format markdown > pgroles-review.md
+# Bundle reports attribute each change to its owning source document.
+pgroles diff --bundle bundle.yaml --mode adopt --format markdown > bundle-review.md
+```
+
+The report includes complete redacted change details, source attribution, and conservative priorities. Revocations, retirement, ownership transfers, password changes, role alterations, PUBLIC grants, elevated new roles, and membership administration are high priority. Other access changes still require review; these labels do not evaluate your application's transitive privileges or availability requirements.
+
+The `pgroles.review.v1` fingerprint identifies the displayed changes, source attribution, and reconciliation mode. Password values are excluded, so password-only value changes do not change this fingerprint. It is not a database-state fingerprint or an operator approval token. Existing `--format json` output remains available for structured integrations, including bundle ownership annotations.
+
+Keep stderr with the report: executor-authority warnings and role-drop preflight findings are emitted there. `--exit-code` retains its existing drift semantics with this format. Posting a report is a separate pipeline action; generating one does not publish it.
