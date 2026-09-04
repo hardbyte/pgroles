@@ -52,7 +52,7 @@ spec:
 
   grants:
     - role: myapp-readonly
-      object: { type: database }
+      object: { type: database, name: app }
       privileges: [CONNECT]
 ```
 

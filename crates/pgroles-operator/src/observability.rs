@@ -1,5 +1,6 @@
 //! Operator health endpoints and OTLP metrics export.
 
+use std::future::IntoFuture;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -33,6 +34,8 @@ struct Metrics {
     reconcile_duration_ms: Histogram<u64>,
     reconcile_inflight: UpDownCounter<i64>,
     inspect_duration_ms: Histogram<u64>,
+    processing_duration_ms: Histogram<f64>,
+    scheduling_lag_ms: Histogram<f64>,
     inspect_items_total: Counter<u64>,
     wildcard_grantability_queries_total: Counter<u64>,
     wildcard_unsatisfied_grants_total: Counter<u64>,
@@ -169,6 +172,15 @@ impl OperatorObservability {
         }
     }
 
+    pub fn record_processing_phase(&self, phase: &'static str, duration: Duration) {
+        if let Some(metrics) = &self.metrics {
+            metrics.processing_duration_ms.record(
+                duration.as_secs_f64() * 1000.0,
+                &[KeyValue::new("phase", phase)],
+            );
+        }
+    }
+
     pub fn record_inspection(&self, stats: &pgroles_inspect::InspectionStats) {
         let Some(metrics) = &self.metrics else {
             return;
@@ -186,6 +198,8 @@ impl OperatorObservability {
             ("memberships", stats.memberships),
             ("schemas", stats.schemas),
             ("grants", stats.grants),
+            ("acl_rows", stats.acl_rows),
+            ("grantor_keys", stats.grantor_keys),
             ("default_privileges", stats.default_privileges),
             (
                 "wildcard_configured_grants",
@@ -420,9 +434,24 @@ pub async fn serve_health(
     let app = Router::new()
         .route("/livez", get(livez))
         .route("/readyz", get(readyz))
-        .with_state(observability);
+        .with_state(observability.clone());
 
-    serve(listener, app).await?;
+    let lag = async {
+        let mut timer = tokio::time::interval(Duration::from_secs(1));
+        timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            let scheduled = timer.tick().await;
+            if let Some(metrics) = &observability.metrics {
+                metrics
+                    .scheduling_lag_ms
+                    .record(scheduled.elapsed().as_secs_f64() * 1000.0, &[]);
+            }
+        }
+    };
+    tokio::select! {
+        result = serve(listener, app).into_future() => { result?; }
+        () = lag => {}
+    }
     Ok(())
 }
 
@@ -511,6 +540,16 @@ impl Metrics {
             reconcile_inflight: meter
                 .i64_up_down_counter("pgroles.reconcile.inflight")
                 .with_description("In-flight reconciliations")
+                .build(),
+            processing_duration_ms: meter
+                .f64_histogram("pgroles.processing.duration")
+                .with_unit("ms")
+                .with_description("Synchronous policy processing by phase")
+                .build(),
+            scheduling_lag_ms: meter
+                .f64_histogram("pgroles.runtime.scheduling_lag")
+                .with_unit("ms")
+                .with_description("Delay of a one-second runtime timer; not HTTP probe latency")
                 .build(),
             inspect_duration_ms: meter
                 .u64_histogram("pgroles.inspect.duration")
@@ -775,6 +814,8 @@ mod tests {
         observability.record_invalid_spec();
         observability.record_database_connection_failure();
         observability.record_inspection(&pgroles_inspect::InspectionStats {
+            acl_rows: 20,
+            grantor_keys: 5,
             roles: 3,
             memberships: 2,
             schemas: 1,
@@ -796,6 +837,7 @@ mod tests {
                 grantability_objects: 3,
             },
         });
+        observability.record_processing_phase("diff", Duration::from_millis(3));
         observability.record_plan_result("drift");
         observability.record_planned_changes(2);
         observability.record_candidate_planning(Duration::from_millis(37));
@@ -822,6 +864,7 @@ mod tests {
         assert!(metric_exists(&metrics, "pgroles.reconcile.total"));
         assert!(metric_exists(&metrics, "pgroles.reconcile.duration"));
         assert!(metric_exists(&metrics, "pgroles.inspect.duration"));
+        assert!(metric_exists(&metrics, "pgroles.processing.duration"));
         assert!(metric_exists(
             &metrics,
             "pgroles.candidate.planning.duration"
@@ -829,7 +872,7 @@ mod tests {
         // A histogram, not a counter — the interesting value is the
         // inspections-per-pass distribution, so there is no sum to assert on.
         assert!(metric_exists(&metrics, "pgroles.candidate.inspections"));
-        assert_eq!(u64_sum_value(&metrics, "pgroles.inspect.items"), Some(119));
+        assert_eq!(u64_sum_value(&metrics, "pgroles.inspect.items"), Some(144));
         assert_eq!(
             u64_sum_value(&metrics, "pgroles.ephemeral_access.transitions"),
             Some(2)

@@ -362,6 +362,9 @@ jobs:
         with:
           cluster-name: pgroles-e2e-operator
 
+      - name: Run the documented operator quick start
+        run: scripts/e2e-doc-quick-start.sh
+
       - name: Run operator scenarios
         run: |
           source scripts/e2e-helpers.sh

@@ -12,7 +12,7 @@ One YAML file. Every role, grant, and privilege in your database — defined, di
 
 Managing PostgreSQL roles and privileges across environments is error-prone. Teams typically resort to ad-hoc SQL scripts, manual `GRANT` statements, or fragile migration files. When a new schema is added or a role needs adjusting, it's easy to miss a grant or leave stale privileges in place.
 
-pgroles takes a **convergent, declarative approach**: you define the desired state in a YAML manifest, and pgroles computes the exact SQL needed to bring your database in line. Anything in the database but not in the manifest gets revoked or dropped — so your access control never drifts.
+pgroles takes a **convergent, declarative approach**: you define the desired state in a YAML manifest, and pgroles computes the exact SQL needed to bring your database in line. pgroles reconciles the access your policy manages; the reconciliation mode determines what it may remove. Start with additive mode on an existing database, then review an adopt-mode plan when you are ready to remove undeclared access.
 
 Built for platform teams, DBAs, and anyone managing more than a handful of PostgreSQL roles across environments.
 
@@ -20,7 +20,7 @@ Built for platform teams, DBAs, and anyone managing more than a handful of Postg
 
 - **Write privilege rules once**, expand them across every schema automatically via profiles
 - **See exactly what will change** before touching the database with `pgroles diff`
-- **Convergent diff engine** — the manifest is the entire truth; stale grants get revoked
+- **Convergent diff engine** — remove undeclared access within the managed scope when your reconciliation mode permits it
 - **Dry-run mode** to preview generated SQL without executing
 - **Default privilege management** so future tables get the right grants automatically
 - **Role membership management** with inherit and admin flags

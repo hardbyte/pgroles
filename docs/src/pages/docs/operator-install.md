@@ -92,3 +92,5 @@ requires patching the Deployment.
 - Ensure the management role can grant every wildcard-managed privilege on every matching object, either by owning those objects or holding the required `WITH GRANT OPTION`.
 - Validate and review the manifest with the CLI before handing it to the operator.
 - Treat deletion as "stop managing", not "revert the database".
+
+For the complete version-matched procedure and 0.10 migration checklist, see [upgrading the operator](/docs/operator-upgrades).

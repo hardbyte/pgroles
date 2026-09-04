@@ -10,17 +10,11 @@ Get up and running with pgroles in a few minutes. {% .lead %}
 ## Prerequisites
 
 - **PostgreSQL 16, 17, or 18** — the versions supported and tested in CI
-- **Rust toolchain** (for building from source)
+- A disposable database named `mydb`, with a table in `public` and an administrator connection for this exercise
 
 ## Installation
 
-Build from source using Cargo:
-
-```shell
-cargo install --git https://github.com/thepartly/pgroles pgroles-cli
-```
-
-This installs the `pgroles` binary.
+Download the binary for your platform from the [latest stable release](https://github.com/thepartly/pgroles/releases/latest), then verify `pgroles --version`. See [installation](/docs/installation) for containers and Cargo.
 
 {% callout type="note" title="Starting from an existing database?" %}
 Use `pgroles generate --database-url ... > pgroles.yaml` first, then refine the generated flat manifest into profiles and schema bindings.
@@ -75,7 +69,7 @@ Manifest is valid.
 See what SQL would be generated against a live database:
 
 ```shell
-pgroles diff --database-url postgres://localhost/mydb
+pgroles diff --mode additive --database-url postgres://localhost/mydb
 ```
 
 This shows the exact SQL statements needed to converge the database to match your manifest.
@@ -89,13 +83,13 @@ The `diff` command (also available as `plan`) is read-only. It connects to your 
 When you're happy with the plan, apply it:
 
 ```shell
-pgroles apply --database-url postgres://localhost/mydb
+pgroles apply --mode additive --database-url postgres://localhost/mydb
 ```
 
 Or preview without executing:
 
 ```shell
-pgroles apply --database-url postgres://localhost/mydb --dry-run
+pgroles apply --mode additive --database-url postgres://localhost/mydb --dry-run
 ```
 
 ## Using environment variables
@@ -104,6 +98,10 @@ Instead of passing `--database-url` every time, set the `DATABASE_URL` environme
 
 ```shell
 export DATABASE_URL=postgres://localhost/mydb
-pgroles diff
-pgroles apply
+pgroles diff --mode additive
+pgroles apply --mode additive
 ```
+
+## Verify the result
+
+Run the same additive diff again; it should print `-- No changes needed`. This proves convergence within additive mode, which leaves undeclared access untouched. Continue with [staged adoption](/docs/adoption) before enabling revocations on an existing database.

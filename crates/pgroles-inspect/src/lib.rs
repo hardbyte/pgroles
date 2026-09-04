@@ -52,6 +52,8 @@ pub use version::{PgVersion, detect_execution_role, detect_pg_version};
 
 #[derive(Debug, Error)]
 pub enum InspectError {
+    #[error("inspection derivation task failed: {0}")]
+    DerivationTask(String),
     #[error("database query error: {0}")]
     Database(#[from] sqlx::Error),
     /// A [`RawInspection`] was asked to derive an [`InspectConfig`] whose
@@ -253,6 +255,10 @@ pub struct InspectionResult {
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct InspectionStats {
+    /// ACL rows fetched by the shared snapshot (before per-policy filtering).
+    pub acl_rows: usize,
+    /// Concrete keys retaining the grantors needed for targeted revocation.
+    pub grantor_keys: usize,
     pub roles: usize,
     pub memberships: usize,
     pub schemas: usize,
@@ -839,7 +845,7 @@ pub async fn inspect_with_diagnostics(
     config: &InspectConfig,
 ) -> Result<InspectionResult, InspectError> {
     let raw = RawInspection::read(pool, config).await?;
-    raw.derive(pool, config).await
+    std::sync::Arc::new(raw).derive_bounded(pool, config).await
 }
 
 /// Fetch the names of all non-system schemas in the target database.
