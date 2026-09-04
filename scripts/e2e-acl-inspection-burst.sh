@@ -217,11 +217,6 @@ done
 unbounded_completed=1
 run_phase 'unbounded (RECONCILE_CONCURRENCY=0)' RECONCILE_CONCURRENCY=0 || unbounded_completed=0
 unbounded_peak="$measured_peak"
-# The shipped liveness/readiness timeout is two seconds. This measures actual
-# HTTP requests via the API proxy, rather than treating zero restarts as a
-# latency measurement. Proxy overhead makes this a conservative bound.
-python3 "$(dirname "$0")/sample-operator-probes.py" --check --output "$probe_file" \
-  | tee -a "${GITHUB_STEP_SUMMARY:-/dev/null}"
 kubectl -n "$namespace" get pods -o wide || true
 if [ "$unbounded_completed" -eq 0 ]; then
   echo "the unbounded phase did not complete; the bounded phase is the whole assertion"
@@ -229,6 +224,11 @@ fi
 
 run_phase 'bounded (default)' RECONCILE_CONCURRENCY-
 bounded_peak="$measured_peak"
+# The shipped liveness/readiness timeout is two seconds. This measures actual
+# HTTP requests via the API proxy, rather than treating zero restarts as a
+# latency measurement. Proxy overhead makes this a conservative bound.
+python3 "$(dirname "$0")/sample-operator-probes.py" --check --output "$probe_file" \
+  | tee -a "${GITHUB_STEP_SUMMARY:-/dev/null}"
 
 printf 'ACL inspection burst: %s policies x %s schemas x %s functions x %s roles (%s ACL rows each). Peak working set after restart: unbounded %s MiB, bounded %s MiB.\n' \
   "$policy_count" "$schema_count" "$function_count" "$role_count" \
