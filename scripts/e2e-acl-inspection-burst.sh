@@ -35,6 +35,8 @@ max_bounded_share_percent="${BURST_MAX_BOUNDED_SHARE_PERCENT:-80}"
 namespace=pgroles-system
 deployment="deployment/pgroles-operator"
 sample_file="$(mktemp)"
+probe_file="$(mktemp)"
+probe_pid=""
 stop_file="$(mktemp)"
 rm -f "$stop_file"
 sampler_pid=""
@@ -44,7 +46,8 @@ cleanup() {
   if [ -n "$sampler_pid" ]; then
     wait "$sampler_pid" 2>/dev/null || true
   fi
-  rm -f "$sample_file" "$stop_file"
+  if [ -n "$probe_pid" ]; then wait "$probe_pid" 2>/dev/null || true; fi
+  rm -f "$sample_file" "$stop_file" "$probe_file"
 }
 trap cleanup EXIT
 
@@ -100,6 +103,10 @@ stop_sampler() {
     wait "$sampler_pid" 2>/dev/null || true
     sampler_pid=""
   fi
+  if [ -n "$probe_pid" ]; then
+    wait "$probe_pid"
+    probe_pid=""
+  fi
 }
 
 run_phase() {
@@ -121,6 +128,9 @@ run_phase() {
     done
   ) &
   sampler_pid="$!"
+  python3 "$(dirname "$0")/sample-operator-probes.py" --namespace "$namespace" \
+    --exclude-uid "$old_pod_uid" --output "$probe_file" --stop "$stop_file" &
+  probe_pid="$!"
 
   # `set env` changes the pod template in both phases (absent -> 0 -> absent),
   # so it is itself the one rollout under measurement. Starting the sampler and
@@ -207,6 +217,11 @@ done
 unbounded_completed=1
 run_phase 'unbounded (RECONCILE_CONCURRENCY=0)' RECONCILE_CONCURRENCY=0 || unbounded_completed=0
 unbounded_peak="$measured_peak"
+# The shipped liveness/readiness timeout is two seconds. This measures actual
+# HTTP requests via the API proxy, rather than treating zero restarts as a
+# latency measurement. Proxy overhead makes this a conservative bound.
+python3 "$(dirname "$0")/sample-operator-probes.py" --check --output "$probe_file" \
+  | tee -a "${GITHUB_STEP_SUMMARY:-/dev/null}"
 kubectl -n "$namespace" get pods -o wide || true
 if [ "$unbounded_completed" -eq 0 ]; then
   echo "the unbounded phase did not complete; the bounded phase is the whole assertion"
