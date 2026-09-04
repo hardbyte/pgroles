@@ -9,6 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Retry plan-name collisions with computed or decided plans instead of treating a non-actionable plan as a successfully created replacement. (#185)
+
 - Identify password-source changes when superseding approval plans. Exercise Secret-first crash recovery in a feature-gated operator E2E, including reapproval, credential reuse, and database authentication.
 
 - Wildcard revocations retain concrete object/grantor attribution, including PUBLIC and mixed-owner scopes. Normalization preserves named-object exceptions; owner privileges remain protected. Revocations may produce more concrete plan entries and require fresh approval when effects differ. (#215)

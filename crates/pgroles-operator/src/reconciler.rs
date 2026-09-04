@@ -198,6 +198,8 @@ pub enum ReconcileError {
 
     #[error("plan SQL storage error: {0}")]
     PlanSqlStorage(String),
+    #[error("plan name {0} collided with an existing computed plan; retrying with a fresh name")]
+    PlanNameCollision(String),
 
     #[error("Kubernetes API call \"{0}\" did not complete within {1:?}")]
     ApiStalled(&'static str, Duration),
@@ -594,6 +596,7 @@ fn retry_class_for_reconcile_error(error: &ReconcileError) -> RetryClass {
         ReconcileError::LockContention(_, _) => RetryClass::LockContention,
         // The watch resyncs on its own, so this clears without operator action.
         ReconcileError::RequestIndexNotReady(_) => RetryClass::Transient,
+        ReconcileError::PlanNameCollision(_) => RetryClass::Transient,
         ReconcileError::PendingEphemeralAccessCleanup(_) => RetryClass::CleanupPending,
         // Waiting out the plan's retry window is exactly the normal interval:
         // requeuing sooner would re-enter the back-off and re-defer.
@@ -3633,6 +3636,7 @@ impl ReconcileError {
             ReconcileError::MissingDatabaseObjects(_) => "MissingDatabaseObject",
             ReconcileError::PasswordGeneration(_) => "SecretFetchFailed",
             ReconcileError::PlanSqlStorage(_) => "PlanSqlStorageFailed",
+            ReconcileError::PlanNameCollision(_) => "PlanNameCollision",
             ReconcileError::Kube(_) => "KubernetesApiError",
             ReconcileError::ApiStalled(_, _) => "KubernetesApiStalled",
             ReconcileError::NoNamespace => "InvalidResource",

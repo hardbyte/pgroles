@@ -915,37 +915,43 @@ pub async fn create_or_update_plan(
         ),
     ]));
 
-    let (created_plan, created_new_plan) =
-        match plans_api.create(&PostParams::default(), &plan).await {
-            Ok(plan) => (plan, true),
-            Err(kube::Error::Api(api_err)) if api_err.code == 409 => {
-                let existing = plans_api.get(&plan_name).await?;
-                // The name collided, which is normally our own retry. Confirm
-                // ownership before patching anyone's status: plan names embed a
-                // 215-byte-truncated policy prefix, so two policies sharing that
-                // prefix can in principle collide, and this is otherwise the one
-                // mutation site the owner-UID discipline does not cover.
-                if !owner.owns(&existing) {
-                    // Roll back only the ConfigMap this reconcile created. The
-                    // orphan reaper would collect it eventually — it carries our
-                    // UID — but leaving it is a pointless transient orphan. One
-                    // we merely adopted belongs to an earlier reconcile.
-                    rollback_plan_sql_configmap(client, &namespace, sql_configmap_name.as_ref())
-                        .await;
-                    return Err(ReconcileError::PlanSqlStorage(format!(
-                        "plan {plan_name} already exists and is owned by another object"
-                    )));
-                }
-                if !should_patch_existing_plan_status(&existing) {
-                    return Ok(PlanCreationResult::Deduplicated(existing.name_any()));
-                }
-                (existing, false)
-            }
-            Err(err) => {
+    let (created_plan, created_new_plan) = match plans_api
+        .create(&PostParams::default(), &plan)
+        .await
+    {
+        Ok(plan) => (plan, true),
+        Err(kube::Error::Api(api_err)) if api_err.code == 409 => {
+            let existing = plans_api.get(&plan_name).await?;
+            // The name collided, which is normally our own retry. Confirm
+            // ownership before patching anyone's status: plan names embed a
+            // 215-byte-truncated policy prefix, so two policies sharing that
+            // prefix can in principle collide, and this is otherwise the one
+            // mutation site the owner-UID discipline does not cover.
+            if !owner.owns(&existing) {
+                // Roll back only the ConfigMap this reconcile created. The
+                // orphan reaper would collect it eventually — it carries our
+                // UID — but leaving it is a pointless transient orphan. One
+                // we merely adopted belongs to an earlier reconcile.
                 rollback_plan_sql_configmap(client, &namespace, sql_configmap_name.as_ref()).await;
-                return Err(err.into());
+                return Err(ReconcileError::PlanSqlStorage(format!(
+                    "plan {plan_name} already exists and is owned by another object"
+                )));
             }
-        };
+            if !should_patch_existing_plan_status(&existing) {
+                // A terminal or already-computed plan with the same
+                // second/SQL name is not a newly actionable replacement.
+                // Retry after the naming window moves; never repoint the
+                // policy to it or overwrite an existing decision.
+                rollback_plan_sql_configmap(client, &namespace, sql_configmap_name.as_ref()).await;
+                return Err(ReconcileError::PlanNameCollision(existing.name_any()));
+            }
+            (existing, false)
+        }
+        Err(err) => {
+            rollback_plan_sql_configmap(client, &namespace, sql_configmap_name.as_ref()).await;
+            return Err(err.into());
+        }
+    };
     let plan_name = created_plan.name_any();
 
     // 11. Update plan status.
@@ -1779,7 +1785,11 @@ fn is_orphan_sql_configmap(
 fn should_patch_existing_plan_status(plan: &PostgresPolicyPlan) -> bool {
     plan.status
         .as_ref()
-        .map(|status| status.phase == PlanPhase::Pending)
+        .map(|status| {
+            status.phase == PlanPhase::Pending
+                && status.change_digest.is_none()
+                && !has_terminal_decision(status)
+        })
         .unwrap_or(true)
 }
 
@@ -2080,6 +2090,18 @@ pub(crate) fn compute_sql_hash(sql: &str) -> String {
 /// content persistence succeeds but plan creation fails.
 fn generate_plan_name(policy_name: &str, sql_hash: &str) -> String {
     let timestamp = format_timestamp_compact();
+    // Freeze only the named test policy, allowing a live 409 without racing
+    // the wall clock. Ordinary/released builds omit this branch entirely.
+    #[cfg(feature = "e2e-fault-injection")]
+    let timestamp = if std::env::var("PGROLES_E2E_FREEZE_PLAN_NAME_FOR")
+        .ok()
+        .as_deref()
+        == Some(policy_name)
+    {
+        "20000101-000000".to_string()
+    } else {
+        timestamp
+    };
     let suffix = &sql_hash[..12.min(sql_hash.len())];
     // Kubernetes names must be <= 253 chars and DNS-compatible.
     // Reserve 4 chars for the potential "-sql" ConfigMap suffix.
@@ -4192,6 +4214,30 @@ mod tests {
         assert!(!should_patch_existing_plan_status(&approved));
         assert!(!should_patch_existing_plan_status(&applying));
         assert!(!should_patch_existing_plan_status(&applied));
+    }
+
+    #[test]
+    fn computed_or_decided_pending_plans_cannot_be_rewritten_on_name_collision() {
+        let mut computed = test_plan("same-second", PlanPhase::Pending, None);
+        computed.status.as_mut().unwrap().change_digest = Some("old-effects".into());
+        assert!(!should_patch_existing_plan_status(&computed));
+        for decision in ["Approved", "Denied"] {
+            let decided =
+                test_plan_with_decisions("same-second", PlanPhase::Pending, &[(decision, "True")]);
+            assert!(!should_patch_existing_plan_status(&decided));
+        }
+        for phase in [
+            PlanPhase::Applied,
+            PlanPhase::Rejected,
+            PlanPhase::Superseded,
+            PlanPhase::Failed,
+        ] {
+            assert!(!should_patch_existing_plan_status(&test_plan(
+                "same-second",
+                phase,
+                None
+            )));
+        }
     }
 
     #[test]
