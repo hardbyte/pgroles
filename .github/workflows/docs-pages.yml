@@ -69,6 +69,10 @@ jobs:
       - name: Run lab exercises against PGlite
         run: npm run test:labs
 
+      - name: Verify generated reference rendering
+        working-directory: docs
+        run: npm run test:reference
+
       - name: Build static export
         env:
           DOCS_BASE_PATH: >-

@@ -3,6 +3,8 @@ title: Kubernetes operator
 description: Run pgroles as a Kubernetes operator that continuously reconciles PostgreSQL roles against a custom resource.
 ---
 
+For field types, defaults, and admission constraints, see the [CRD API reference](/docs/operator-api-reference).
+
 Declare your PostgreSQL roles, memberships, and privileges as a Kubernetes resource, and let the operator keep the database matching it. {% .lead %}
 
 ---

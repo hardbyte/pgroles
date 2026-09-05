@@ -1,9 +1,13 @@
 //! Generate CustomResourceDefinition files for pgroles CRDs.
 //!
 //! Usage: `cargo run --bin crdgen -- --output-dir charts/pgroles-operator/crds/`
+//! Reference: `cargo run --bin crdgen -- --docs-dir docs/src/pages/docs/reference --schemas-dir docs/public/crd-reference`
 //! Without --output-dir, prints all CRDs to stdout separated by `---`.
 
 use std::path::PathBuf;
+
+#[path = "crdgen/docs.rs"]
+mod docs;
 
 use kube::CustomResourceExt;
 use pgroles_operator::crd::{
@@ -51,6 +55,40 @@ fn generate() -> Vec<CrdOutput> {
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
+
+    if let Some(pos) = args.iter().position(|a| a == "--docs-dir") {
+        let dir = PathBuf::from(args.get(pos + 1).expect("--docs-dir requires a path"));
+        let schema_pos = args
+            .iter()
+            .position(|a| a == "--schemas-dir")
+            .expect("--docs-dir also requires --schemas-dir");
+        let schema_dir = PathBuf::from(
+            args.get(schema_pos + 1)
+                .expect("--schemas-dir requires a path"),
+        );
+        // Validate all schemas before writing any output.
+        let pages: Vec<_> = generate()
+            .iter()
+            .flat_map(|crd| {
+                docs::render(&serde_json::from_str(&crd.json).expect("generated CRD should parse"))
+                    .unwrap_or_else(|error| {
+                        panic!("{error}; add the description to the Rust schema source")
+                    })
+            })
+            .collect();
+        std::fs::create_dir_all(&dir).expect("failed to create docs directory");
+        for (name, body) in pages {
+            std::fs::write(dir.join(name), body).expect("failed to write CRD reference");
+        }
+        std::fs::create_dir_all(&schema_dir).expect("failed to create schema directory");
+        for crd in generate() {
+            for (name, body) in docs::schemas(&serde_json::from_str(&crd.json).unwrap()).unwrap() {
+                std::fs::write(schema_dir.join(name), body)
+                    .expect("failed to write schema download");
+            }
+        }
+        return;
+    }
 
     if let Some(pos) = args.iter().position(|a| a == "--output-dir") {
         let dir = PathBuf::from(args.get(pos + 1).expect("--output-dir requires a path"));

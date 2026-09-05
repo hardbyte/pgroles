@@ -15,6 +15,10 @@ readme = "README.md"
 name = "pgroles_operator"
 path = "src/lib.rs"
 
+[features]
+# Only the plan lifecycle E2E image enables this; release builds omit it.
+e2e-fault-injection = []
+
 [dependencies]
 pgroles-core = { workspace = true }
 pgroles-inspect = { workspace = true }

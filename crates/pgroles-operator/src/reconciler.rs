@@ -198,6 +198,10 @@ pub enum ReconcileError {
 
     #[error("plan SQL storage error: {0}")]
     PlanSqlStorage(String),
+    #[error(
+        "plan name {0} collided with an incompatible existing plan; retrying with a fresh name"
+    )]
+    PlanNameCollision(String),
 
     #[error("Kubernetes API call \"{0}\" did not complete within {1:?}")]
     ApiStalled(&'static str, Duration),
@@ -594,6 +598,7 @@ fn retry_class_for_reconcile_error(error: &ReconcileError) -> RetryClass {
         ReconcileError::LockContention(_, _) => RetryClass::LockContention,
         // The watch resyncs on its own, so this clears without operator action.
         ReconcileError::RequestIndexNotReady(_) => RetryClass::Transient,
+        ReconcileError::PlanNameCollision(_) => RetryClass::Transient,
         ReconcileError::PendingEphemeralAccessCleanup(_) => RetryClass::CleanupPending,
         // Waiting out the plan's retry window is exactly the normal interval:
         // requeuing sooner would re-enter the back-off and re-defer.
@@ -2014,6 +2019,13 @@ async fn apply_under_lock(
                                 pgroles_core::approval::TargetIdentityVerdict::Proceed => {
                                     if decision == crate::plan::ApprovedPlanDecision::Clear {
                                         crate::plan::SupersedeCause::EffectsCleared
+                                    } else if current_plan.status.as_ref().is_some_and(|status| {
+                                        crate::plan::password_source_changed(
+                                            status,
+                                            &applied_password_source_versions,
+                                        )
+                                    }) {
+                                        crate::plan::SupersedeCause::PasswordSourceChanged
                                     } else {
                                         crate::plan::SupersedeCause::EffectsChanged
                                     }
@@ -2919,6 +2931,18 @@ async fn materialize_pending_generated_secrets(
         .await
         .map_err(Box::new)?;
 
+        // Stop the process, not merely this reconcile task, at the exact
+        // Secret-first boundary. Compiled out of ordinary and release images.
+        #[cfg(feature = "e2e-fault-injection")]
+        if std::env::var("PGROLES_E2E_CRASH_AFTER_GENERATED_SECRET")
+            .ok()
+            .as_deref()
+            == Some(format!("{namespace}/{}", resource.name_any()).as_str())
+        {
+            eprintln!("E2E fault injection: generated Secret persisted; aborting before SQL");
+            std::process::abort();
+        }
+
         applied_password_source_versions
             .insert(pending.role.clone(), materialized.source_version.clone());
 
@@ -3614,6 +3638,7 @@ impl ReconcileError {
             ReconcileError::MissingDatabaseObjects(_) => "MissingDatabaseObject",
             ReconcileError::PasswordGeneration(_) => "SecretFetchFailed",
             ReconcileError::PlanSqlStorage(_) => "PlanSqlStorageFailed",
+            ReconcileError::PlanNameCollision(_) => "PlanNameCollision",
             ReconcileError::Kube(_) => "KubernetesApiError",
             ReconcileError::ApiStalled(_, _) => "KubernetesApiStalled",
             ReconcileError::NoNamespace => "InvalidResource",

@@ -291,6 +291,22 @@ cluster-wide impact before doing so.
 Resume reconciliation before removing recovery or maintenance-blocking state,
 then force reconciliation and verify recovery.
 
+## Generated-password crash recovery
+
+The operator writes a generated password Secret after approval and before SQL.
+If it crashes between those steps, preserve that Secret. A changed password
+source supersedes the old plan with `PasswordSourceChanged`; review and approve
+the replacement plan, which reuses the credential. Do not delete the Secret or
+reapprove the superseded plan. Verify the replacement is `Applied`, the parent
+policy converges, and the credential authenticates without exposing its value.
+New plans record a diagnostic `passwordSourceDigest`; older plans without it
+still fail closed through the approval digest and may show a generic replacement
+reason.
+
+For `PlanNameCollision`, allow the operator to retry with a fresh name. It
+preserves the existing plan and decision; do not delete a decided plan to
+unblock replacement creation.
+
 ## Troubleshooting Order
 
 1. Confirm Kubernetes context, namespace, chart version, CRD, and policy

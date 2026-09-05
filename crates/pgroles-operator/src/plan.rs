@@ -29,6 +29,21 @@ use crate::k8s_names::{LabelValue, truncate_name_prefix};
 use crate::reconciler::ReconcileError;
 use pgroles_core::approval::{APPROVAL_EFFECT_ENCODING_V3, TargetIdentity};
 
+/// Diagnostic fingerprint; the approval digest remains the execution gate.
+pub fn password_source_digest(versions: &BTreeMap<String, String>) -> String {
+    compute_sql_hash(&serde_json::to_string(versions).expect("source versions serialize"))
+}
+
+pub fn password_source_changed(
+    status: &PostgresPolicyPlanStatus,
+    versions: &BTreeMap<String, String>,
+) -> bool {
+    status
+        .password_source_digest
+        .as_deref()
+        .is_some_and(|old| old != password_source_digest(versions))
+}
+
 /// Result of plan creation — distinguishes genuinely new plans from
 /// deduplication hits so callers can decide whether to emit events.
 #[derive(Debug, Clone)]
@@ -377,6 +392,8 @@ pub enum SupersedeCause {
     /// The effects this plan described are not the effects the policy would
     /// produce now.
     EffectsChanged,
+    /// A credential source version changed after planning.
+    PasswordSourceChanged,
     /// The effects are gone entirely: applied out of band, or edited away.
     /// No replacement plan is opened.
     EffectsCleared,
@@ -407,6 +424,7 @@ impl SupersedeCause {
     pub fn reason(self) -> &'static str {
         match self {
             SupersedeCause::TargetChanged(reason) => reason.as_str(),
+            SupersedeCause::PasswordSourceChanged => "PasswordSourceChanged",
             // Promotion is the one supersede a reviewer can act on by filing a
             // successor candidate, so it names itself rather than hiding
             // behind the generic reason.
@@ -423,6 +441,9 @@ impl SupersedeCause {
     /// Human-readable condition `message`.
     pub fn message(self) -> &'static str {
         match self {
+            SupersedeCause::PasswordSourceChanged => {
+                "password source versions changed after planning; review and approve the replacement plan"
+            }
             SupersedeCause::EffectsChanged => {
                 "the policy's effects changed since this plan was computed, so it no longer \
                  describes what would happen"
@@ -741,6 +762,7 @@ pub async fn create_or_update_plan(
                 &plan_name,
                 &change_digest,
                 expected_base,
+                password_source_versions,
             )
             .await?;
             return Ok(PlanCreationResult::Deduplicated(plan_name));
@@ -893,37 +915,43 @@ pub async fn create_or_update_plan(
         ),
     ]));
 
-    let (created_plan, created_new_plan) =
-        match plans_api.create(&PostParams::default(), &plan).await {
-            Ok(plan) => (plan, true),
-            Err(kube::Error::Api(api_err)) if api_err.code == 409 => {
-                let existing = plans_api.get(&plan_name).await?;
-                // The name collided, which is normally our own retry. Confirm
-                // ownership before patching anyone's status: plan names embed a
-                // 215-byte-truncated policy prefix, so two policies sharing that
-                // prefix can in principle collide, and this is otherwise the one
-                // mutation site the owner-UID discipline does not cover.
-                if !owner.owns(&existing) {
-                    // Roll back only the ConfigMap this reconcile created. The
-                    // orphan reaper would collect it eventually — it carries our
-                    // UID — but leaving it is a pointless transient orphan. One
-                    // we merely adopted belongs to an earlier reconcile.
-                    rollback_plan_sql_configmap(client, &namespace, sql_configmap_name.as_ref())
-                        .await;
-                    return Err(ReconcileError::PlanSqlStorage(format!(
-                        "plan {plan_name} already exists and is owned by another object"
-                    )));
-                }
-                if !should_patch_existing_plan_status(&existing) {
-                    return Ok(PlanCreationResult::Deduplicated(existing.name_any()));
-                }
-                (existing, false)
-            }
-            Err(err) => {
+    let (created_plan, created_new_plan) = match plans_api
+        .create(&PostParams::default(), &plan)
+        .await
+    {
+        Ok(plan) => (plan, true),
+        Err(kube::Error::Api(api_err)) if api_err.code == 409 => {
+            let existing = plans_api.get(&plan_name).await?;
+            // The name collided, which is normally our own retry. Confirm
+            // ownership before patching anyone's status: plan names embed a
+            // 215-byte-truncated policy prefix, so two policies sharing that
+            // prefix can in principle collide, and this is otherwise the one
+            // mutation site the owner-UID discipline does not cover.
+            if !owner.owns(&existing) {
+                // Roll back only the ConfigMap this reconcile created. The
+                // orphan reaper would collect it eventually — it carries our
+                // UID — but leaving it is a pointless transient orphan. One
+                // we merely adopted belongs to an earlier reconcile.
                 rollback_plan_sql_configmap(client, &namespace, sql_configmap_name.as_ref()).await;
-                return Err(err.into());
+                return Err(ReconcileError::PlanSqlStorage(format!(
+                    "plan {plan_name} already exists and is owned by another object"
+                )));
             }
-        };
+            if !can_resume_plan_creation(&existing, &plan.spec) {
+                // A completed or differently scoped plan with the same
+                // second/SQL name is not this interrupted creation.
+                // Retry after the naming window moves; never repoint the
+                // policy to it or overwrite an existing decision.
+                rollback_plan_sql_configmap(client, &namespace, sql_configmap_name.as_ref()).await;
+                return Err(ReconcileError::PlanNameCollision(existing.name_any()));
+            }
+            (existing, false)
+        }
+        Err(err) => {
+            rollback_plan_sql_configmap(client, &namespace, sql_configmap_name.as_ref()).await;
+            return Err(err.into());
+        }
+    };
     let plan_name = created_plan.name_any();
 
     // 11. Update plan status.
@@ -965,6 +993,7 @@ pub async fn create_or_update_plan(
         last_error: None,
         sql_hash: Some(sql_hash),
         change_digest: Some(change_digest.clone()),
+        password_source_digest: Some(password_source_digest(password_source_versions)),
         change_digest_encoding: Some(APPROVAL_EFFECT_ENCODING_V3.to_string()),
         target_physical_identity: target_identity.physical.clone(),
         target_logical_fingerprint: target_identity.logical.clone(),
@@ -1006,6 +1035,7 @@ pub async fn create_or_update_plan(
         &plan_name,
         &change_digest,
         expected_base,
+        password_source_versions,
     )
     .await?;
 
@@ -1048,6 +1078,7 @@ async fn supersede_stale_plans(
     new_plan_name: &str,
     new_digest: &str,
     expected_base: Option<&str>,
+    password_source_versions: &BTreeMap<String, String>,
 ) -> Result<(), ReconcileError> {
     for plan in existing_plans {
         let Some(ref status) = plan.status else {
@@ -1068,6 +1099,8 @@ async fn supersede_stale_plans(
         }
         let cause = if base_stale {
             SupersedeCause::BaseContentChanged
+        } else if password_source_changed(status, password_source_versions) {
+            SupersedeCause::PasswordSourceChanged
         } else {
             SupersedeCause::ReplacedByNewerPlan
         };
@@ -1749,10 +1782,26 @@ fn is_orphan_sql_configmap(
         .unwrap_or(true)
 }
 
+// SQL-equivalent changes can still have different scope, policy generations,
+// or candidate base pins. Recover only the exact interrupted create: status
+// for a new computation must never be attached to another persisted spec.
+fn can_resume_plan_creation(
+    existing: &PostgresPolicyPlan,
+    intended_spec: &PostgresPolicyPlanSpec,
+) -> bool {
+    existing.spec == *intended_spec && should_patch_existing_plan_status(existing)
+}
+
 fn should_patch_existing_plan_status(plan: &PostgresPolicyPlan) -> bool {
     plan.status
         .as_ref()
-        .map(|status| status.phase == PlanPhase::Pending)
+        .map(|status| {
+            status.phase == PlanPhase::Pending
+                && status.change_digest.is_none()
+                && status.computed_at.is_none()
+                && status.sql_hash.is_none()
+                && !has_terminal_decision(status)
+        })
         .unwrap_or(true)
 }
 
@@ -2053,6 +2102,18 @@ pub(crate) fn compute_sql_hash(sql: &str) -> String {
 /// content persistence succeeds but plan creation fails.
 fn generate_plan_name(policy_name: &str, sql_hash: &str) -> String {
     let timestamp = format_timestamp_compact();
+    // Freeze only the named test policy, allowing a live 409 without racing
+    // the wall clock. Ordinary/released builds omit this branch entirely.
+    #[cfg(feature = "e2e-fault-injection")]
+    let timestamp = if std::env::var("PGROLES_E2E_FREEZE_PLAN_NAME_FOR")
+        .ok()
+        .as_deref()
+        == Some(policy_name)
+    {
+        "20000101-000000".to_string()
+    } else {
+        timestamp
+    };
     let suffix = &sql_hash[..12.min(sql_hash.len())];
     // Kubernetes names must be <= 253 chars and DNS-compatible.
     // Reserve 4 chars for the potential "-sql" ConfigMap suffix.
@@ -3769,6 +3830,27 @@ mod tests {
         assert_eq!(check_plan_approval(&plan), PlanApprovalState::Pending);
     }
 
+    #[test]
+    fn diagnostic_source_digest_detects_secret_materialization_without_passwords() {
+        let missing = BTreeMap::from([("app".into(), "credential:password:missing".into())]);
+        let real = BTreeMap::from([("app".into(), "credential:password:42".into())]);
+        let status = PostgresPolicyPlanStatus {
+            password_source_digest: Some(password_source_digest(&missing)),
+            ..Default::default()
+        };
+        assert!(!password_source_changed(&status, &missing));
+        assert!(password_source_changed(&status, &real));
+        assert!(!password_source_changed(
+            &PostgresPolicyPlanStatus::default(),
+            &real
+        ));
+        let status = PostgresPolicyPlanStatus {
+            password_source_digest: Some(password_source_digest(&real)),
+            ..Default::default()
+        };
+        assert!(!password_source_changed(&status, &real));
+    }
+
     /// The supersede condition is often the only trace a reviewer sees of why
     /// the plan they were looking at vanished. Every cause must describe
     /// itself; the previous single message claimed the database had changed
@@ -3779,6 +3861,7 @@ mod tests {
 
         let causes = [
             SupersedeCause::EffectsChanged,
+            SupersedeCause::PasswordSourceChanged,
             SupersedeCause::EffectsCleared,
             SupersedeCause::ReplacedByNewerPlan,
             SupersedeCause::PolicyStoppedPlanning,
@@ -3791,6 +3874,7 @@ mod tests {
         for cause in causes {
             match cause {
                 SupersedeCause::EffectsChanged
+                | SupersedeCause::PasswordSourceChanged
                 | SupersedeCause::EffectsCleared
                 | SupersedeCause::ReplacedByNewerPlan
                 | SupersedeCause::PolicyStoppedPlanning
@@ -4145,6 +4229,36 @@ mod tests {
     }
 
     #[test]
+    fn computed_or_decided_pending_plans_cannot_be_rewritten_on_name_collision() {
+        let mut computed = test_plan("same-second", PlanPhase::Pending, None);
+        computed.status.as_mut().unwrap().change_digest = Some("old-effects".into());
+        assert!(!should_patch_existing_plan_status(&computed));
+        computed.status.as_mut().unwrap().change_digest = None;
+        computed.status.as_mut().unwrap().sql_hash = Some("legacy-sql".into());
+        assert!(!should_patch_existing_plan_status(&computed));
+        computed.status.as_mut().unwrap().sql_hash = None;
+        computed.status.as_mut().unwrap().computed_at = Some("2026-09-05T00:00:00Z".into());
+        assert!(!should_patch_existing_plan_status(&computed));
+        for decision in ["Approved", "Denied"] {
+            let decided =
+                test_plan_with_decisions("same-second", PlanPhase::Pending, &[(decision, "True")]);
+            assert!(!should_patch_existing_plan_status(&decided));
+        }
+        for phase in [
+            PlanPhase::Applied,
+            PlanPhase::Rejected,
+            PlanPhase::Superseded,
+            PlanPhase::Failed,
+        ] {
+            assert!(!should_patch_existing_plan_status(&test_plan(
+                "same-second",
+                phase,
+                None
+            )));
+        }
+    }
+
+    #[test]
     fn existing_pending_or_statusless_plan_can_be_patched_on_create_conflict() {
         let pending = test_plan("plan-1", PlanPhase::Pending, None);
         let mut statusless = pending.clone();
@@ -4152,6 +4266,42 @@ mod tests {
 
         assert!(should_patch_existing_plan_status(&pending));
         assert!(should_patch_existing_plan_status(&statusless));
+    }
+
+    #[test]
+    fn interrupted_create_resumes_only_with_the_same_persisted_spec() {
+        let mut interrupted = test_plan("same-second", PlanPhase::Pending, None);
+        for statusless in [false, true] {
+            if statusless {
+                interrupted.status = None;
+            }
+            let intended = interrupted.spec.clone();
+            assert!(can_resume_plan_creation(&interrupted, &intended));
+
+            let mut next_generation = intended.clone();
+            next_generation.policy_generation += 1;
+            assert!(!can_resume_plan_creation(&interrupted, &next_generation));
+
+            let mut next_scope = intended.clone();
+            next_scope.owned_roles.push("newly-managed".into());
+            assert!(!can_resume_plan_creation(&interrupted, &next_scope));
+
+            let mut next_target = intended.clone();
+            next_target.managed_database_identity = "other-db".into();
+            assert!(!can_resume_plan_creation(&interrupted, &next_target));
+
+            let mut candidate = intended.clone();
+            candidate.origin = Some(crate::crd::PlanOrigin {
+                kind: "PostgresPolicyCandidate".into(),
+                name: "proposal".into(),
+                uid: "proposal-uid".into(),
+                content_digest: Some("content".into()),
+                content_digest_encoding: Some("v1".into()),
+                policy_uid: Some("policy-uid".into()),
+                base_content_digest: Some("new-base".into()),
+            });
+            assert!(!can_resume_plan_creation(&interrupted, &candidate));
+        }
     }
 
     #[test]

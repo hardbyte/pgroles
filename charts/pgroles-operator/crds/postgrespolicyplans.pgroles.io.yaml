@@ -111,10 +111,12 @@
                         "type": "string"
                       },
                       "kind": {
+                        "description": "Kind of the resource that requested this plan.",
                         "maxLength": 63,
                         "type": "string"
                       },
                       "name": {
+                        "description": "Name of the originating resource.",
                         "maxLength": 253,
                         "type": "string"
                       },
@@ -125,6 +127,7 @@
                         "type": "string"
                       },
                       "uid": {
+                        "description": "UID binding the plan to this exact originating resource.",
                         "maxLength": 63,
                         "type": "string"
                       }
@@ -161,6 +164,7 @@
                     "description": "Reference to the policy that generated this plan.",
                     "properties": {
                       "name": {
+                        "description": "Name of the originating PostgresPolicy in the same namespace.",
                         "type": "string"
                       }
                     },
@@ -183,12 +187,15 @@
                     "nullable": true,
                     "properties": {
                       "bundleHash": {
+                        "description": "Digest binding an ephemeral plan to its resolved membership bundle.",
                         "type": "string"
                       },
                       "kind": {
+                        "description": "Execution scope identifier for the ephemeral membership bundle.",
                         "type": "string"
                       },
                       "operation": {
+                        "description": "Ephemeral bundle operation, when this is an ephemeral plan.",
                         "enum": [
                           "Activate",
                           "Revoke"
@@ -248,71 +255,85 @@
                     "properties": {
                       "default_privileges_revoked": {
                         "default": 0,
+                        "description": "Number of default privilege revoke steps.",
                         "format": "int32",
                         "type": "integer"
                       },
                       "default_privileges_set": {
                         "default": 0,
+                        "description": "Number of default privilege grant steps.",
                         "format": "int32",
                         "type": "integer"
                       },
                       "grants_added": {
                         "default": 0,
+                        "description": "Number of object privilege grant steps.",
                         "format": "int32",
                         "type": "integer"
                       },
                       "grants_revoked": {
                         "default": 0,
+                        "description": "Number of object privilege revoke steps.",
                         "format": "int32",
                         "type": "integer"
                       },
                       "members_added": {
                         "default": 0,
+                        "description": "Number of membership additions.",
                         "format": "int32",
                         "type": "integer"
                       },
                       "members_removed": {
                         "default": 0,
+                        "description": "Number of membership removals.",
                         "format": "int32",
                         "type": "integer"
                       },
                       "passwords_set": {
                         "default": 0,
+                        "description": "Number of password updates.",
                         "format": "int32",
                         "type": "integer"
                       },
                       "roles_altered": {
                         "default": 0,
+                        "description": "Number of role attribute or configuration changes.",
                         "format": "int32",
                         "type": "integer"
                       },
                       "roles_created": {
                         "default": 0,
+                        "description": "Number of role creations.",
                         "format": "int32",
                         "type": "integer"
                       },
                       "roles_dropped": {
                         "default": 0,
+                        "description": "Number of role drops.",
                         "format": "int32",
                         "type": "integer"
                       },
                       "schema_owners_altered": {
                         "default": 0,
+                        "description": "Number of schema ownership changes.",
                         "format": "int32",
                         "type": "integer"
                       },
                       "schemas_created": {
                         "default": 0,
+                        "description": "Number of schema creations.",
                         "format": "int32",
                         "type": "integer"
                       },
                       "sessions_terminated": {
                         "default": 0,
+                        "description": "Number of session-termination steps.",
                         "format": "int32",
                         "type": "integer"
                       },
                       "total": {
                         "default": 0,
+                        "description": "Number of all planned change steps.",
                         "format": "int32",
                         "type": "integer"
                       }
@@ -369,6 +390,7 @@
                     "properties": {
                       "groups": {
                         "default": [],
+                        "description": "Kubernetes groups recorded for this actor.",
                         "items": {
                           "maxLength": 256,
                           "minLength": 1,
@@ -378,11 +400,13 @@
                         "type": "array"
                       },
                       "uid": {
+                        "description": "Optional Kubernetes user UID recorded by admission.",
                         "maxLength": 128,
                         "nullable": true,
                         "type": "string"
                       },
                       "username": {
+                        "description": "Kubernetes username asserted for this actor; authenticated only when enforced by admission.",
                         "maxLength": 512,
                         "minLength": 1,
                         "type": "string"
@@ -400,6 +424,11 @@
                   },
                   "lastError": {
                     "description": "Error message if apply failed.",
+                    "nullable": true,
+                    "type": "string"
+                  },
+                  "passwordSourceDigest": {
+                    "description": "Diagnostic SHA-256 digest of the password source-version map. Contains\nno password material. A mismatch identifies credential-source changes;\napproval remains bound by changeDigest. Absent on older plans.",
                     "nullable": true,
                     "type": "string"
                   },
@@ -468,9 +497,11 @@
                         "type": "string"
                       },
                       "key": {
+                        "description": "Data key containing SQL in the referenced ConfigMap.",
                         "type": "string"
                       },
                       "name": {
+                        "description": "Name of the ConfigMap containing the rendered SQL.",
                         "type": "string"
                       }
                     },

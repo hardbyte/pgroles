@@ -26,10 +26,11 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     install -Dm755 /build/target/release/pgroles /out/pgroles
 
 FROM base AS builder-operator
+ARG OPERATOR_FEATURES=""
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \
     --mount=type=cache,target=/build/target \
-    cargo build --release --package pgroles-operator && \
+    cargo build --release --package pgroles-operator --features "$OPERATOR_FEATURES" && \
     install -Dm755 /build/target/release/pgroles-operator /out/pgroles-operator
 
 # ---------------------------------------------------------------------------
