@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.11.0] - 2026-09-06
+
+### Upgrade notes
+
+- Upgrade all five CRDs from the matching chart before the controller. Plans now include an optional diagnostic `passwordSourceDigest`; the approval digest remains the execution authority.
+- Wildcard revocations retain concrete object/grantor attribution. Review the executor's grantor authority and replacement plans; changed effects require fresh approval. Reconciliation concurrency still defaults to one.
+- Policy-level `role_pattern` is now effective in CLI manifests where older versions silently ignored it. In Kubernetes, reapply the field after upgrading CRDs and inspect existing schema patterns: values inserted by the previous CRD still override inheritance. Review generated role names before applying a naming change. See the [operator upgrade guide](https://thepartly.github.io/pgroles/docs/operator-upgrades/).
+- Rust callers must supply the new optional policy-level `role_pattern` field and use `Option<String>` for `SchemaBinding.role_pattern`. `None` inherits; `Some(pattern)` is an explicit override, even when it equals the built-in pattern.
+
 ### Added
 
 - `pgroles diff --format markdown` renders redacted review tables with source attribution, conservative priorities, and a versioned report fingerprint. Existing JSON formats and drift exit codes are unchanged.

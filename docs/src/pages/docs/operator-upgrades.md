@@ -65,7 +65,9 @@ helm upgrade pgroles-operator oci://ghcr.io/thepartly/charts/pgroles-operator \
   it after upgrading the CRDs. Existing resources may also contain schema-level
   patterns inserted by the previous CRD's defaulting. Inspect the live resource:
   those values still override the policy pattern. Remove an override only when
-  you intend that schema to inherit the new convention.
+  you intend that schema to inherit the new convention. Inspect outstanding
+  candidates and plans after the upgrade; review any replacement plans before
+  approving them.
 - Reconciliation concurrency still defaults to one. Retain that setting unless
   measurements justify increasing it.
 
