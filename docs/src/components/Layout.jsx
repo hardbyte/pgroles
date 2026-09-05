@@ -49,6 +49,7 @@ const navigation = [
             {title: 'Plan and approval', href: '/docs/operator-plan-approval'},
             {title: 'Candidates and promotion', href: '/docs/operator-candidates'},
             {title: 'Running the operator', href: '/docs/operator-operations'},
+            {title: 'CRD API reference', href: '/docs/operator-api-reference'},
             {title: 'Upgrading', href: '/docs/operator-upgrades'},
             {title: 'Status and telemetry', href: '/docs/operator-status'},
             {title: 'Troubleshooting index', href: '/docs/operator-troubleshooting'},
@@ -255,7 +256,7 @@ export function Layout({children, title, tableOfContents}) {
                                 )}
                             </header>
                         )}
-                        <Prose>{children}</Prose>
+                        <Prose className={router.pathname.startsWith('/docs/reference/') ? 'crd-reference' : undefined}>{children}</Prose>
                     </article>
                     <dl className="mt-12 flex border-t border-stone-300 pt-6 dark:border-stone-800">
                         {previousPage && (

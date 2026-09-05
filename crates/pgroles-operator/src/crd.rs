@@ -557,6 +557,7 @@ pub struct ConnectionParams {
 /// Provider-backed authentication for `connection.params`.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(tag = "type")]
+#[schemars(transform = schemars::transform::RecursiveTransform(describe_auth_tag))]
 pub enum ConnectionAuth {
     /// Fetch a Cloud SQL IAM database login token using the GKE metadata
     /// server. `username` must be the Cloud SQL PostgreSQL IAM role name
@@ -571,6 +572,19 @@ pub enum ConnectionAuth {
         #[serde(default)]
         scope: Option<String>,
     },
+}
+
+fn describe_auth_tag(schema: &mut schemars::Schema) {
+    if let Some(tag) = schema
+        .get_mut("properties")
+        .and_then(|p| p.get_mut("type"))
+        .and_then(serde_json::Value::as_object_mut)
+    {
+        tag.insert(
+            "description".into(),
+            serde_json::json!("Provider authentication mechanism."),
+        );
+    }
 }
 
 impl ConnectionAuth {
@@ -632,17 +646,21 @@ pub struct SecretReference {
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct ProfileSpec {
     #[serde(default)]
+    /// Whether the role may initiate database sessions.
     pub login: Option<bool>,
 
     #[serde(default)]
+    /// Whether privileges from role memberships are inherited automatically.
     pub inherit: Option<bool>,
 
     #[serde(default)]
     #[schemars(length(max = MAX_PROFILE_GRANTS))]
+    /// Object privilege templates expanded for each bound schema.
     pub grants: Vec<ProfileGrantSpec>,
 
     #[serde(default)]
     #[schemars(length(max = MAX_PROFILE_DEFAULT_PRIVILEGES))]
+    /// Privileges to grant on future objects created by the configured owner.
     pub default_privileges: Vec<DefaultPrivilegeGrantSpec>,
 
     /// Role-level configuration parameter defaults for generated roles,
@@ -658,8 +676,10 @@ pub struct ProfileSpec {
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct ProfileGrantSpec {
     #[schemars(length(min = 1, max = MAX_PRIVILEGES))]
+    /// PostgreSQL privileges to reconcile on the selected objects.
     pub privileges: Vec<Privilege>,
     #[serde(alias = "on")]
+    /// Object kind and target to which the privileges apply.
     pub object: ProfileObjectTargetSpec,
     /// Whether the privilege must be present or absent. Matches the top-level
     /// `grants` entries, which carry the same field. Profiles are additive
@@ -673,9 +693,11 @@ pub struct ProfileGrantSpec {
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct ProfileObjectTargetSpec {
     #[serde(rename = "type")]
+    /// PostgreSQL object kind.
     pub object_type: ObjectType,
     #[serde(default)]
     #[schemars(length(min = 1, max = MAX_OBJECT_NAME))]
+    /// Object name; omission selects the object-kind scope supported by the profile.
     pub name: Option<String>,
 }
 
@@ -684,9 +706,12 @@ pub struct ProfileObjectTargetSpec {
 pub struct DefaultPrivilegeGrantSpec {
     #[serde(default)]
     #[schemars(length(min = 1, max = MAX_IDENTIFIER))]
+    /// Grantee role; omitted values use the generated profile role.
     pub role: Option<String>,
     #[schemars(length(min = 1, max = MAX_PRIVILEGES))]
+    /// PostgreSQL privileges to reconcile on the selected objects.
     pub privileges: Vec<Privilege>,
+    /// Kind of future object affected by the default privilege.
     pub on_type: ObjectType,
     /// Whether the privilege must be present or absent. Matches the
     /// top-level `default_privileges` entries, which carry the same field.
@@ -698,10 +723,11 @@ pub struct DefaultPrivilegeGrantSpec {
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct RoleSpec {
     #[schemars(length(min = 1, max = MAX_IDENTIFIER))]
+    /// PostgreSQL role name.
     pub name: String,
     /// Treat this role as externally managed. The operator may reference it in
     /// grants, ownership, and memberships, but will not create, alter, drop,
-    /// password-manage, or manage memberships granted from this role.
+    /// or password-manage it. Declared membership edges remain managed.
     #[serde(default)]
     pub external: bool,
     /// Preserve this role's undeclared in-scope object grants during
@@ -710,23 +736,32 @@ pub struct RoleSpec {
     #[serde(default)]
     pub preserve_undeclared_grants: bool,
     #[serde(default)]
+    /// Whether the role may initiate database sessions.
     pub login: Option<bool>,
     #[serde(default)]
+    /// Whether the role bypasses PostgreSQL permission checks as a superuser.
     pub superuser: Option<bool>,
     #[serde(default)]
+    /// Whether the role may create databases.
     pub createdb: Option<bool>,
     #[serde(default)]
+    /// Whether the role may create and administer roles, subject to server-version rules.
     pub createrole: Option<bool>,
     #[serde(default)]
+    /// Whether privileges from role memberships are inherited automatically.
     pub inherit: Option<bool>,
     #[serde(default)]
+    /// Whether the role may initiate replication connections.
     pub replication: Option<bool>,
     #[serde(default)]
+    /// Whether the role bypasses row-level security.
     pub bypassrls: Option<bool>,
     #[serde(default)]
+    /// Maximum concurrent connections for the role; -1 means unlimited.
     pub connection_limit: Option<i32>,
     #[serde(default)]
     #[schemars(length(max = MAX_OBJECT_NAME))]
+    /// Descriptive PostgreSQL role comment.
     pub comment: Option<String>,
     /// Password source for this role. Either a reference to an existing Secret
     /// or a request for the operator to generate one.
@@ -1031,6 +1066,7 @@ pub struct PolicyCondition {
 /// Reference to a `PostgresPolicyPlan` resource.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct PlanReference {
+    /// Name of the PostgresPolicyPlan in the same namespace.
     pub name: String,
 }
 
@@ -1039,32 +1075,46 @@ pub struct PlanReference {
 #[serde(default)]
 pub struct ChangeSummary {
     #[serde(default)]
+    /// Number of role creations.
     pub roles_created: i32,
     #[serde(default)]
+    /// Number of role attribute or configuration changes.
     pub roles_altered: i32,
     #[serde(default)]
+    /// Number of schema creations.
     pub schemas_created: i32,
     #[serde(default)]
+    /// Number of schema ownership changes.
     pub schema_owners_altered: i32,
     #[serde(default)]
+    /// Number of role drops.
     pub roles_dropped: i32,
     #[serde(default)]
+    /// Number of session-termination steps.
     pub sessions_terminated: i32,
     #[serde(default)]
+    /// Number of object privilege grant steps.
     pub grants_added: i32,
     #[serde(default)]
+    /// Number of object privilege revoke steps.
     pub grants_revoked: i32,
     #[serde(default)]
+    /// Number of default privilege grant steps.
     pub default_privileges_set: i32,
     #[serde(default)]
+    /// Number of default privilege revoke steps.
     pub default_privileges_revoked: i32,
     #[serde(default)]
+    /// Number of membership additions.
     pub members_added: i32,
     #[serde(default)]
+    /// Number of membership removals.
     pub members_removed: i32,
     #[serde(default)]
+    /// Number of password updates.
     pub passwords_set: i32,
     #[serde(default)]
+    /// Number of all planned change steps.
     pub total: i32,
 }
 
@@ -1135,10 +1185,13 @@ pub struct PostgresPolicyPlanSpec {
 #[serde(rename_all = "camelCase")]
 pub struct PlanOrigin {
     #[schemars(length(max = 63))]
+    /// Kind of the resource that requested this plan.
     pub kind: String,
     #[schemars(length(max = 253))]
+    /// Name of the originating resource.
     pub name: String,
     #[schemars(length(max = 63))]
+    /// UID binding the plan to this exact originating resource.
     pub uid: String,
     /// Canonical content digest of the originating candidate, and the encoding
     /// it was computed under.
@@ -1180,8 +1233,11 @@ pub struct PlanOrigin {
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct PlanScope {
+    /// Execution scope identifier for the ephemeral membership bundle.
     pub kind: String,
+    /// Ephemeral bundle operation, when this is an ephemeral plan.
     pub operation: ScopedPlanOperation,
+    /// Digest binding an ephemeral plan to its resolved membership bundle.
     pub bundle_hash: String,
 }
 
@@ -1194,6 +1250,7 @@ pub enum ScopedPlanOperation {
 /// Reference to the parent `PostgresPolicy` that generated a plan.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 pub struct PolicyPlanRef {
+    /// Name of the originating PostgresPolicy in the same namespace.
     pub name: String,
 }
 
@@ -1371,7 +1428,9 @@ pub struct PostgresPolicyPlanStatus {
 /// Reference to a ConfigMap containing SQL for a plan.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct SqlRef {
+    /// Name of the ConfigMap containing the rendered SQL.
     pub name: String,
+    /// Data key containing SQL in the referenced ConfigMap.
     pub key: String,
     /// Compression used for the referenced SQL content. Missing means older
     /// uncompressed ConfigMap data.
@@ -1437,26 +1496,36 @@ pub const EPHEMERAL_MEMBERSHIP_SEMANTICS_V1: &str =
 )]
 #[serde(rename_all = "camelCase")]
 pub struct EphemeralAccessPolicySpec {
+    /// PostgresPolicy in this namespace that manages the target database.
     pub postgres_policy_ref: LocalObjectReference,
     #[schemars(length(min = 1, max = 32))]
+    /// Role memberships that this policy permits a subject to request.
     pub memberships: Vec<EphemeralMembership>,
     #[schemars(length(max = 64), regex(pattern = r"^([0-9]+[smh])+$"))]
+    /// Longest permitted access duration, using s, m, and h units.
     pub maximum_duration: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(length(max = 64), regex(pattern = r"^([0-9]+[smh])+$"))]
+    /// Duration used when a request omits requestedDuration; one of the two must be supplied.
     pub default_duration: Option<String>,
     #[serde(rename = "pendingRequestTTL", default = "default_pending_request_ttl")]
     #[schemars(length(max = 64), regex(pattern = r"^([0-9]+[smh])+$"))]
+    /// Time allowed for a pending request to receive approval before it expires.
     pub pending_request_ttl: String,
+    /// Whether requests must explain why access is needed.
     pub justification: EphemeralJustificationPolicy,
+    /// Whether activation requires a recorded approval decision.
     pub approval: EphemeralApprovalPolicy,
     #[serde(default)]
+    /// Stops admission of new access through this policy while retaining revocation handling.
     pub suspend: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(length(max = 128))]
+    /// Optional human-readable policy label.
     pub display_name: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(length(max = 2048))]
+    /// Optional explanation of the access this policy provides.
     pub description: Option<String>,
 }
 
@@ -1467,23 +1536,28 @@ fn default_pending_request_ttl() -> String {
 #[derive(KubeSchema, Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct LocalObjectReference {
     #[schemars(length(min = 1, max = 253))]
+    /// Name of the referenced resource in the same namespace.
     pub name: String,
 }
 
 #[derive(KubeSchema, Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct EphemeralMembership {
     #[schemars(length(min = 1, max = 63))]
+    /// PostgreSQL role whose membership will be granted to the subject.
     pub role: String,
+    /// Whether privileges from role memberships are inherited automatically.
     pub inherit: bool,
 }
 
 #[derive(KubeSchema, Debug, Clone, Serialize, Deserialize)]
 pub struct EphemeralJustificationPolicy {
+    /// Whether a request must include a non-empty justification.
     pub required: bool,
 }
 
 #[derive(KubeSchema, Debug, Clone, Serialize, Deserialize)]
 pub struct EphemeralApprovalPolicy {
+    /// Automatic activates without a human decision; Required waits for approval.
     pub mode: EphemeralApprovalMode,
 }
 
@@ -1495,14 +1569,18 @@ pub enum EphemeralApprovalMode {
 
 #[derive(KubeSchema, Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+/// Controller observations for an ephemeral access policy.
 pub struct EphemeralAccessPolicyStatus {
     #[serde(default)]
+    /// Policy generation last processed by the controller.
     pub observed_generation: Option<i64>,
     #[serde(default)]
     #[schemars(length(max = 16))]
+    /// Controller observations about acceptance and readiness.
     pub conditions: Vec<EphemeralAccessCondition>,
     #[serde(default)]
     #[schemars(length(max = 32), inner(length(min = 1, max = 63)))]
+    /// Validated PostgreSQL roles available through this policy.
     pub resolved_roles: Vec<String>,
 }
 
@@ -1527,22 +1605,27 @@ pub struct EphemeralAccessPolicyStatus {
 )]
 #[serde(rename_all = "camelCase")]
 pub struct EphemeralAccessRequestSpec {
+    /// EphemeralAccessPolicy in this namespace that defines the requested bundle.
     pub access_policy_ref: LocalObjectReference,
+    /// PostgreSQL role receiving the temporary memberships.
     pub subject: EphemeralAccessSubject,
     /// Kubernetes identity which created the request. The supplied Kyverno
     /// reference policy overwrites this from authenticated admission `userInfo`.
     pub requested_by: DecisionActor,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(length(max = 64), regex(pattern = r"^([0-9]+[smh])+$"))]
+    /// Requested access duration; omission uses the access policy default.
     pub requested_duration: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(length(max = 2048))]
+    /// Reason for requesting access; required when the policy demands it.
     pub justification: Option<String>,
 }
 
 #[derive(KubeSchema, Debug, Clone, Serialize, Deserialize)]
 pub struct EphemeralAccessSubject {
     #[schemars(length(min = 1, max = 63))]
+    /// Existing PostgreSQL role receiving temporary access.
     pub role: String,
 }
 
@@ -1560,12 +1643,15 @@ pub struct EphemeralAccessSubject {
 #[serde(rename_all = "camelCase")]
 pub struct DecisionActor {
     #[schemars(length(min = 1, max = 512))]
+    /// Kubernetes username asserted for this actor; authenticated only when enforced by admission.
     pub username: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(length(max = 128))]
+    /// Optional Kubernetes user UID recorded by admission.
     pub uid: Option<String>,
     #[serde(default)]
     #[schemars(length(max = 64), inner(length(min = 1, max = 256)))]
+    /// Kubernetes groups recorded for this actor.
     pub groups: Vec<String>,
 }
 
@@ -1591,13 +1677,18 @@ pub struct DecisionActor {
     ).message("request conditions must use a declared lifecycle or decision type")
 )]
 #[serde(rename_all = "camelCase")]
+/// Controller lifecycle state and approval decisions for an access request.
 pub struct EphemeralAccessRequestStatus {
     #[serde(default)]
+    /// Current request lifecycle phase.
     pub phase: EphemeralAccessRequestPhase,
     #[serde(default)]
     #[schemars(length(max = 8))]
+    /// Lifecycle observations and terminal Approved or Denied decisions.
     pub conditions: Vec<EphemeralAccessCondition>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Write-once snapshot of the resolved target, duration, and exact memberships,
+    /// recorded before approval so the decision binds to this access bundle.
     pub resolved_access: Option<ResolvedEphemeralAccess>,
     /// Kubernetes identity which approved or denied the request. The supplied
     /// Kyverno reference policy overwrites this from authenticated admission
@@ -1606,21 +1697,27 @@ pub struct EphemeralAccessRequestStatus {
     pub decided_by: Option<DecisionActor>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(length(max = 64))]
+    /// Timestamp after which a pending approval is no longer actionable.
     pub approval_expires_at: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(length(max = 64))]
+    /// Timestamp at which the requested access became active.
     pub activated_at: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(length(max = 64))]
+    /// Timestamp at which active access must be revoked.
     pub expires_at: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(length(max = 64))]
+    /// Timestamp at which the request reached its terminal state.
     pub ended_at: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(length(max = 4096))]
+    /// Most recent controller error for this request.
     pub last_error: Option<String>,
     #[serde(default)]
     #[schemars(length(max = 32))]
+    /// Memberships retained because another active request or the base policy still requires them.
     pub retained_memberships: Vec<ResolvedEphemeralMembership>,
 }
 
@@ -1651,23 +1748,30 @@ impl std::fmt::Display for EphemeralAccessRequestPhase {
 pub struct EphemeralAccessCondition {
     #[serde(rename = "type")]
     #[schemars(length(min = 1, max = 32))]
+    /// Lifecycle or decision condition name.
     pub condition_type: String,
     #[schemars(length(min = 1, max = 16))]
+    /// Condition state, conventionally True, False, or Unknown.
     pub status: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(length(max = 128))]
+    /// Machine-readable reason for the condition.
     pub reason: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(length(max = 2048))]
+    /// Human-readable explanation of the condition.
     pub message: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(length(max = 64))]
+    /// Timestamp of the last condition-state transition.
     pub last_transition_time: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(length(max = 71))]
+    /// Digest of the membership bundle to which this decision applies.
     pub bundle_hash: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(length(max = 64))]
+    /// Access duration to which this decision applies.
     pub granted_duration: Option<String>,
 }
 
@@ -1675,22 +1779,30 @@ pub struct EphemeralAccessCondition {
 #[serde(rename_all = "camelCase")]
 pub struct ResolvedEphemeralAccess {
     #[schemars(length(max = 128))]
+    /// UID of the access policy resolved for this request.
     pub access_policy_uid: String,
+    /// Generation of the access policy resolved for this request.
     pub access_policy_generation: i64,
     #[schemars(length(max = 128))]
+    /// UID of the PostgresPolicy managing the resolved database.
     pub target_policy_uid: String,
+    /// Generation of the target PostgresPolicy at resolution.
     pub target_policy_generation: i64,
     /// SHA-256 fingerprint of resolved host, port, and database name. It binds
     /// activation and revocation to one database without persisting secrets.
     #[schemars(length(max = 71))]
     pub target_database_fingerprint: String,
     #[schemars(length(max = 64))]
+    /// Resolved duration for which access is granted.
     pub granted_duration: String,
     #[schemars(length(max = 128))]
+    /// Versioned encoding used to compute the canonical bundle digest.
     pub bundle_encoding: String,
     #[schemars(length(max = 71))]
+    /// SHA-256 digest of the canonical target and membership bundle.
     pub bundle_hash: String,
     #[schemars(length(max = 32))]
+    /// Exact membership edges frozen for activation and revocation.
     pub memberships: Vec<ResolvedEphemeralMembership>,
 }
 
@@ -1698,9 +1810,12 @@ pub struct ResolvedEphemeralAccess {
 #[serde(rename_all = "camelCase")]
 pub struct ResolvedEphemeralMembership {
     #[schemars(length(min = 1, max = 63))]
+    /// Granted PostgreSQL role.
     pub role: String,
     #[schemars(length(min = 1, max = 63))]
+    /// PostgreSQL role receiving the membership.
     pub member: String,
+    /// Whether privileges from role memberships are inherited automatically.
     pub inherit: bool,
 }
 
@@ -1767,7 +1882,9 @@ impl DatabaseIdentity {
 /// Conservative ownership claims for a policy.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct OwnershipClaims {
+    /// PostgreSQL roles claimed by this policy.
     pub roles: BTreeSet<String>,
+    /// PostgreSQL schemas claimed by this policy.
     pub schemas: BTreeSet<String>,
     /// Databases whose PUBLIC privileges this policy asserts.
     ///
@@ -2714,6 +2831,7 @@ pub struct PostgresPolicyCandidateSpec {
 #[derive(KubeSchema, Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CandidateTarget {
+    /// Connection information for the candidate evaluation target.
     pub connection_ref: CandidateConnectionRef,
 }
 
@@ -2740,6 +2858,7 @@ pub struct CandidateConnectionRef {
 #[serde(rename_all = "camelCase")]
 pub struct PostgresPolicyCandidateStatus {
     #[serde(default)]
+    /// Current candidate evaluation and promotion phase.
     pub phase: CandidatePhase,
 
     /// Canonical digest of `spec.content`, computed by
@@ -2755,6 +2874,7 @@ pub struct PostgresPolicyCandidateStatus {
 
     #[serde(default)]
     #[schemars(length(max = 16))]
+    /// Controller observations about candidate validity, planning, approval, and promotion.
     pub conditions: Vec<PolicyCondition>,
 
     /// The `.metadata.generation` that was last observed. A candidate spec is

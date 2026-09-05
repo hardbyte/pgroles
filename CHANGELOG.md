@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Documentation
+
+- Generate a complete field reference and downloadable served schema for all five CRDs; require source descriptions and detect reference drift in CI.
 ### Fixed
 
 - Retry plan-name collisions with computed or decided plans instead of treating a non-actionable plan as a successfully created replacement. (#185)

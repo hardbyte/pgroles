@@ -25,6 +25,7 @@ cargo test -p pgroles-core --lib diff::tests::diff_creates_new_roles -- --exact
 # CRD drift check (CI compares every committed CRD copy — chart and k8s/ —
 # against crdgen output)
 scripts/check-crd-drift.sh
+scripts/check-crd-docs.sh
 
 # Regenerate CRDs after modifying crd.rs. crdgen writes into the chart; the
 # k8s/ copies are duplicates that must be refreshed by hand, and

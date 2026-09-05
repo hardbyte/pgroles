@@ -109,6 +109,7 @@
                                 "type": "string"
                               },
                               "type": {
+                                "description": "Provider authentication mechanism.",
                                 "enum": [
                                   "gcp_workload_identity"
                                 ],
@@ -340,11 +341,12 @@
                       "description": "Default privilege configuration.\n\nThe scope rules are also expressed as CEL so the API server rejects a bad\nentry at apply time. `resolved_scope` enforces the same rules for the CLI,\nwhich has no admission step.",
                       "properties": {
                         "grant": {
+                          "description": "Grantee, privileges, and future object kind to reconcile.",
                           "items": {
                             "description": "A single default privilege grant entry.",
                             "properties": {
                               "ensure": {
-                                "description": "Whether the listed privileges must exist or must not exist.\n\n`absent` asserts one ACL edge only. It plans a REVOKE when the privilege is\nfound live, and it says nothing about access the grantee may still have\nthrough role membership or ownership.",
+                                "description": "Desired privilege state: present grants it; absent explicitly revokes it.",
                                 "enum": [
                                   "present",
                                   "absent"
@@ -352,7 +354,7 @@
                                 "type": "string"
                               },
                               "on_type": {
-                                "description": "PostgreSQL object types that can have privileges granted on them.",
+                                "description": "Kind of future object affected by the default privilege.",
                                 "enum": [
                                   "table",
                                   "view",
@@ -366,6 +368,7 @@
                                 "type": "string"
                               },
                               "privileges": {
+                                "description": "PostgreSQL privileges to reconcile on the selected objects.",
                                 "items": {
                                   "description": "PostgreSQL privilege types.",
                                   "enum": [
@@ -431,7 +434,7 @@
                               "type": "string"
                             },
                             "type": {
-                              "description": "The kind of default-privilege scope.",
+                              "description": "Global or per-schema scope of the default privilege.",
                               "enum": [
                                 "global",
                                 "schema"
@@ -472,7 +475,7 @@
                       "description": "A concrete grant on a specific object or wildcard.",
                       "properties": {
                         "ensure": {
-                          "description": "Whether the listed privileges must exist or must not exist.\n\n`absent` asserts one ACL edge only. It plans a REVOKE when the privilege is\nfound live, and it says nothing about access the grantee may still have\nthrough role membership or ownership.",
+                          "description": "Desired object privilege state: present grants it; absent explicitly revokes it.",
                           "enum": [
                             "present",
                             "absent"
@@ -480,7 +483,7 @@
                           "type": "string"
                         },
                         "object": {
-                          "description": "Target object for a grant.",
+                          "description": "Object kind and target to which the privileges apply.",
                           "properties": {
                             "name": {
                               "description": "Object name, or \"*\" for all objects. Omit for schema-level grants;\nrequired for database grants, where it names the connected database.",
@@ -497,7 +500,7 @@
                               "type": "string"
                             },
                             "type": {
-                              "description": "PostgreSQL object types that can have privileges granted on them.",
+                              "description": "PostgreSQL object kind.",
                               "enum": [
                                 "table",
                                 "view",
@@ -523,6 +526,7 @@
                           ]
                         },
                         "privileges": {
+                          "description": "PostgreSQL privileges to reconcile on the selected objects.",
                           "items": {
                             "description": "PostgreSQL privilege types.",
                             "enum": [
@@ -578,6 +582,7 @@
                           "type": "boolean"
                         },
                         "members": {
+                          "description": "Roles that should receive this membership.",
                           "items": {
                             "description": "A single member of a role.\n\nBoth `inherit` and `admin` are optional. When omitted, they default to\n`inherit: true` and `admin: false` at resolution time (in `RoleGraph`\nconstruction). Keeping them optional in the CRD avoids Kubernetes\ninjecting default values into the stored resource, which causes\nperpetual diffs in GitOps tools like ArgoCD.",
                             "properties": {
@@ -592,6 +597,7 @@
                                 "type": "boolean"
                               },
                               "name": {
+                                "description": "PostgreSQL role receiving the membership.",
                                 "maxLength": 63,
                                 "minLength": 1,
                                 "type": "string"
@@ -606,6 +612,7 @@
                           "type": "array"
                         },
                         "role": {
+                          "description": "PostgreSQL role granted to the listed members.",
                           "maxLength": 63,
                           "minLength": 1,
                           "type": "string"
@@ -646,6 +653,7 @@
                         },
                         "default_privileges": {
                           "default": [],
+                          "description": "Privileges to grant on future objects created by the configured owner.",
                           "items": {
                             "description": "Default privilege grant within a profile.",
                             "properties": {
@@ -658,7 +666,7 @@
                                 "type": "string"
                               },
                               "on_type": {
-                                "description": "PostgreSQL object types that can have privileges granted on them.",
+                                "description": "Kind of future object affected by the default privilege.",
                                 "enum": [
                                   "table",
                                   "view",
@@ -672,6 +680,7 @@
                                 "type": "string"
                               },
                               "privileges": {
+                                "description": "PostgreSQL privileges to reconcile on the selected objects.",
                                 "items": {
                                   "description": "PostgreSQL privilege types.",
                                   "enum": [
@@ -695,6 +704,7 @@
                                 "type": "array"
                               },
                               "role": {
+                                "description": "Grantee role; omitted values use the generated profile role.",
                                 "maxLength": 63,
                                 "minLength": 1,
                                 "nullable": true,
@@ -712,6 +722,7 @@
                         },
                         "grants": {
                           "default": [],
+                          "description": "Object privilege templates expanded for each bound schema.",
                           "items": {
                             "description": "Grant template within a profile.",
                             "properties": {
@@ -724,16 +735,17 @@
                                 "type": "string"
                               },
                               "object": {
-                                "description": "Object target within a profile.",
+                                "description": "Object kind and target to which the privileges apply.",
                                 "properties": {
                                   "name": {
+                                    "description": "Object name; omission selects the object-kind scope supported by the profile.",
                                     "maxLength": 256,
                                     "minLength": 1,
                                     "nullable": true,
                                     "type": "string"
                                   },
                                   "type": {
-                                    "description": "PostgreSQL object types that can have privileges granted on them.",
+                                    "description": "PostgreSQL object kind.",
                                     "enum": [
                                       "table",
                                       "view",
@@ -753,6 +765,7 @@
                                 "type": "object"
                               },
                               "privileges": {
+                                "description": "PostgreSQL privileges to reconcile on the selected objects.",
                                 "items": {
                                   "description": "PostgreSQL privilege types.",
                                   "enum": [
@@ -786,10 +799,12 @@
                           "type": "array"
                         },
                         "inherit": {
+                          "description": "Whether privileges from role memberships are inherited automatically.",
                           "nullable": true,
                           "type": "boolean"
                         },
                         "login": {
+                          "description": "Whether the role may initiate database sessions.",
                           "nullable": true,
                           "type": "boolean"
                         }
@@ -860,10 +875,12 @@
                       "description": "A concrete role definition (CRD-compatible version).",
                       "properties": {
                         "bypassrls": {
+                          "description": "Whether the role bypasses row-level security.",
                           "nullable": true,
                           "type": "boolean"
                         },
                         "comment": {
+                          "description": "Descriptive PostgreSQL role comment.",
                           "maxLength": 256,
                           "nullable": true,
                           "type": "string"
@@ -879,32 +896,38 @@
                           "type": "object"
                         },
                         "connection_limit": {
+                          "description": "Maximum concurrent connections for the role; -1 means unlimited.",
                           "format": "int32",
                           "nullable": true,
                           "type": "integer"
                         },
                         "createdb": {
+                          "description": "Whether the role may create databases.",
                           "nullable": true,
                           "type": "boolean"
                         },
                         "createrole": {
+                          "description": "Whether the role may create and administer roles, subject to server-version rules.",
                           "nullable": true,
                           "type": "boolean"
                         },
                         "external": {
                           "default": false,
-                          "description": "Treat this role as externally managed. The operator may reference it in\ngrants, ownership, and memberships, but will not create, alter, drop,\npassword-manage, or manage memberships granted from this role.",
+                          "description": "Treat this role as externally managed. The operator may reference it in\ngrants, ownership, and memberships, but will not create, alter, drop,\nor password-manage it. Declared membership edges remain managed.",
                           "type": "boolean"
                         },
                         "inherit": {
+                          "description": "Whether privileges from role memberships are inherited automatically.",
                           "nullable": true,
                           "type": "boolean"
                         },
                         "login": {
+                          "description": "Whether the role may initiate database sessions.",
                           "nullable": true,
                           "type": "boolean"
                         },
                         "name": {
+                          "description": "PostgreSQL role name.",
                           "maxLength": 63,
                           "minLength": 1,
                           "type": "string"
@@ -979,10 +1002,12 @@
                           "type": "boolean"
                         },
                         "replication": {
+                          "description": "Whether the role may initiate replication connections.",
                           "nullable": true,
                           "type": "boolean"
                         },
                         "superuser": {
+                          "description": "Whether the role bypasses PostgreSQL permission checks as a superuser.",
                           "nullable": true,
                           "type": "boolean"
                         }
@@ -1006,6 +1031,7 @@
                       "description": "A schema binding — associates a schema with one or more profiles.\n\nField bounds come from [`crate::bounds`]; see that module for why they\nexist and where else they are enforced.",
                       "properties": {
                         "name": {
+                          "description": "PostgreSQL schema name.",
                           "maxLength": 63,
                           "minLength": 1,
                           "type": "string"
@@ -1019,6 +1045,7 @@
                         },
                         "profiles": {
                           "default": [],
+                          "description": "Profile names to expand for this schema.",
                           "items": {
                             "maxLength": 63,
                             "minLength": 1,
@@ -1076,71 +1103,85 @@
                     "properties": {
                       "default_privileges_revoked": {
                         "default": 0,
+                        "description": "Number of default privilege revoke steps.",
                         "format": "int32",
                         "type": "integer"
                       },
                       "default_privileges_set": {
                         "default": 0,
+                        "description": "Number of default privilege grant steps.",
                         "format": "int32",
                         "type": "integer"
                       },
                       "grants_added": {
                         "default": 0,
+                        "description": "Number of object privilege grant steps.",
                         "format": "int32",
                         "type": "integer"
                       },
                       "grants_revoked": {
                         "default": 0,
+                        "description": "Number of object privilege revoke steps.",
                         "format": "int32",
                         "type": "integer"
                       },
                       "members_added": {
                         "default": 0,
+                        "description": "Number of membership additions.",
                         "format": "int32",
                         "type": "integer"
                       },
                       "members_removed": {
                         "default": 0,
+                        "description": "Number of membership removals.",
                         "format": "int32",
                         "type": "integer"
                       },
                       "passwords_set": {
                         "default": 0,
+                        "description": "Number of password updates.",
                         "format": "int32",
                         "type": "integer"
                       },
                       "roles_altered": {
                         "default": 0,
+                        "description": "Number of role attribute or configuration changes.",
                         "format": "int32",
                         "type": "integer"
                       },
                       "roles_created": {
                         "default": 0,
+                        "description": "Number of role creations.",
                         "format": "int32",
                         "type": "integer"
                       },
                       "roles_dropped": {
                         "default": 0,
+                        "description": "Number of role drops.",
                         "format": "int32",
                         "type": "integer"
                       },
                       "schema_owners_altered": {
                         "default": 0,
+                        "description": "Number of schema ownership changes.",
                         "format": "int32",
                         "type": "integer"
                       },
                       "schemas_created": {
                         "default": 0,
+                        "description": "Number of schema creations.",
                         "format": "int32",
                         "type": "integer"
                       },
                       "sessions_terminated": {
                         "default": 0,
+                        "description": "Number of session-termination steps.",
                         "format": "int32",
                         "type": "integer"
                       },
                       "total": {
                         "default": 0,
+                        "description": "Number of all planned change steps.",
                         "format": "int32",
                         "type": "integer"
                       }
@@ -1195,6 +1236,7 @@
                     "nullable": true,
                     "properties": {
                       "name": {
+                        "description": "Name of the PostgresPolicyPlan in the same namespace.",
                         "type": "string"
                       }
                     },

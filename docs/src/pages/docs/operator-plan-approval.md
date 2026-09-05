@@ -3,6 +3,8 @@ title: Plan and approval
 description: Preview changes with observe mode and gate execution behind a reviewed, approved plan.
 ---
 
+For field types, defaults, and admission constraints, see the [CRD API reference](/docs/operator-api-reference).
+
 Seeing what the operator would do before it does it. {% .lead %}
 
 ---
