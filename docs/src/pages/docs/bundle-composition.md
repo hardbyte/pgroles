@@ -35,6 +35,16 @@ This keeps three properties:
 2. **Conflicts are caught in CI.** `pgroles render-bundle --check pgroles.yaml` fails the build if the bundle composes to something different from the committed flat manifest, or if any fragment claims something outside its declared scope.
 3. **The operator stays simple.** Per-database serialization, advisory locking, and conflict detection between `PostgresPolicy` resources all keep working as documented in [the operator guide](/docs/operator).
 
+## Shared role naming
+
+Set `shared.role_pattern` in the bundle for a common naming convention. A
+fragment can set its own top-level `role_pattern`; an individual schema can
+set `role_pattern` to override both. Resolution is schema → fragment → bundle
+shared value → `"{schema}-{profile}"`. Every declared pattern must contain
+`{profile}`. Rendered manifests preserve the resolved fragment overrides, so
+rendering and reloading a bundle produces the same role names. An explicit
+`"{schema}-{profile}"` is preserved even when it overrides a custom shared pattern.
+
 ## A minimal end-to-end example
 
 ### 1. Author the bundle and fragments

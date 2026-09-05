@@ -266,6 +266,10 @@ impl Ensure {
 /// Top-level policy manifest — the YAML file that users write.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PolicyManifest {
+    /// Default role naming pattern for schema profile bindings.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role_pattern: Option<String>,
+
     /// Default owner for ALTER DEFAULT PRIVILEGES (e.g. "app_owner").
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default_owner: Option<String>,
@@ -433,10 +437,10 @@ pub struct SchemaBinding {
     pub profiles: Vec<String>,
 
     /// Role naming pattern. Supports `{schema}` and `{profile}` placeholders.
-    /// Defaults to `"{schema}-{profile}"`.
-    #[serde(default = "default_role_pattern")]
+    /// Overrides the policy pattern; otherwise inherits it, falling back to `"{schema}-{profile}"`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(length(min = 1, max = MAX_ROLE_PATTERN))]
-    pub role_pattern: String,
+    pub role_pattern: Option<String>,
 
     /// Override default_owner for this schema's default privileges.
     #[serde(default)]
@@ -462,9 +466,22 @@ impl std::fmt::Display for SchemaBindingFacet {
     }
 }
 
-pub(crate) fn default_role_pattern() -> String {
-    "{schema}-{profile}".to_string()
+fn validate_role_pattern(pattern: &str) -> Result<(), ManifestError> {
+    if pattern.chars().count() > MAX_ROLE_PATTERN as usize {
+        return Err(ManifestError::ValueTooLong {
+            context: "role_pattern".into(),
+            value: pattern.into(),
+            actual: pattern.chars().count(),
+            limit: MAX_ROLE_PATTERN,
+        });
+    }
+    if !pattern.contains("{profile}") {
+        return Err(ManifestError::InvalidRolePattern(pattern.into()));
+    }
+    Ok(())
 }
+
+pub const DEFAULT_ROLE_PATTERN: &str = "{schema}-{profile}";
 
 /// Substitute the `{schema}` and `{profile}` placeholders in a profile
 /// `config` value — the same two placeholders `role_pattern` supports.
@@ -1002,12 +1019,17 @@ pub fn validate_bounds(manifest: &PolicyManifest) -> Result<(), ManifestError> {
         for profile in &binding.profiles {
             text("profile reference", profile, MAX_IDENTIFIER)?;
         }
-        text("role_pattern", &binding.role_pattern, MAX_ROLE_PATTERN)?;
+        if let Some(pattern) = &binding.role_pattern {
+            validate_role_pattern(pattern)?;
+        }
         if let Some(owner) = &binding.owner {
             text("schema owner", owner, MAX_IDENTIFIER)?;
         }
     }
 
+    if let Some(pattern) = &manifest.role_pattern {
+        validate_role_pattern(pattern)?;
+    }
     if let Some(owner) = &manifest.default_owner {
         text("default_owner", owner, MAX_IDENTIFIER)?;
     }
@@ -1222,16 +1244,13 @@ pub fn expand_manifest(manifest: &PolicyManifest) -> Result<ExpandedManifest, Ma
                 ManifestError::UndefinedProfile(profile_name.clone(), schema_binding.name.clone())
             })?;
 
-            // Validate pattern contains {profile}
-            if !schema_binding.role_pattern.contains("{profile}") {
-                return Err(ManifestError::InvalidRolePattern(
-                    schema_binding.role_pattern.clone(),
-                ));
-            }
-
-            // Generate role name from pattern
-            let role_name = schema_binding
+            let pattern = schema_binding
                 .role_pattern
+                .as_deref()
+                .or(manifest.role_pattern.as_deref())
+                .unwrap_or(DEFAULT_ROLE_PATTERN);
+            // Generate role name from the resolved naming convention.
+            let role_name = pattern
                 .replace("{schema}", &schema_binding.name)
                 .replace("{profile}", profile_name);
 
@@ -1244,7 +1263,7 @@ pub fn expand_manifest(manifest: &PolicyManifest) -> Result<ExpandedManifest, Ma
                     context: format!(
                         "role name expanded from role_pattern \"{}\" for schema \"{}\" (bytes; \
                          PostgreSQL identifiers are limited to 63 bytes)",
-                        schema_binding.role_pattern, schema_binding.name
+                        pattern, schema_binding.name
                     ),
                     value: role_name.clone(),
                     actual: role_name.len(),
@@ -2261,6 +2280,69 @@ schemas:
         assert!(role_names.contains(&"beta-editor"));
         assert!(role_names.contains(&"beta-viewer"));
         assert!(role_names.contains(&"gamma-editor"));
+    }
+
+    #[test]
+    fn expand_inherited_role_pattern_and_explicit_default_override() {
+        let manifest = parse_manifest(
+            r#"
+role_pattern: "policy_{schema}_{profile}"
+profiles:
+  viewer: { grants: [] }
+schemas:
+  - name: inherited
+    profiles: [viewer]
+  - name: overridden
+    profiles: [viewer]
+    role_pattern: "{schema}-{profile}"
+"#,
+        )
+        .unwrap();
+        let expanded = expand_manifest(&manifest).unwrap();
+        let names: Vec<_> = expanded
+            .roles
+            .iter()
+            .map(|role| role.name.as_str())
+            .collect();
+        assert_eq!(names, ["policy_inherited_viewer", "overridden-viewer"]);
+        let yaml = serde_yaml::to_string(&manifest).unwrap();
+        let restored = expand_manifest(&parse_manifest(&yaml).unwrap()).unwrap();
+        assert_eq!(
+            names,
+            restored
+                .roles
+                .iter()
+                .map(|role| role.name.as_str())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_role_patterns_even_when_unused_or_overridden() {
+        for yaml in [
+            "role_pattern: invalid\n",
+            "role_pattern: invalid\nschemas:\n  - name: app\n    role_pattern: '{profile}'\n",
+            "role_pattern: '{profile}'\nschemas:\n  - name: app\n    role_pattern: invalid\n",
+        ] {
+            let result = parse_manifest(yaml).and_then(|manifest| expand_manifest(&manifest));
+            assert!(
+                matches!(result, Err(ManifestError::InvalidRolePattern(_))),
+                "{result:?}"
+            );
+        }
+        let oversized = format!("role_pattern: '{}{{profile}}'", "x".repeat(128));
+        assert!(matches!(
+            parse_manifest(&oversized).and_then(|manifest| expand_manifest(&manifest)),
+            Err(ManifestError::ValueTooLong { .. })
+        ));
+        let expanded_too_long = format!(
+            "role_pattern: '{}{{profile}}'\nprofiles:\n  viewer: {{grants: []}}\nschemas:\n  - name: app\n    profiles: [viewer]",
+            "x".repeat(63)
+        );
+        assert!(matches!(
+            parse_manifest(&expanded_too_long).and_then(|manifest| expand_manifest(&manifest)),
+            Err(ManifestError::ValueTooLong { .. })
+        ));
     }
 
     #[test]

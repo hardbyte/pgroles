@@ -256,7 +256,7 @@ pgroles render-bundle --bundle path/to/pgroles.bundle.yaml --check pgroles.yaml
 
 ### Output shape
 
-The rendered file is byte-deterministic across machines: the header records only the bundle file's basename (never an absolute or `pwd`-relative path), and the YAML body is post-processed to strip serde-emitted defaults (empty optional sequences, `null` scalars, and the default `role_pattern`) so the file does not churn under unrelated upgrades.
+The rendered file is byte-deterministic across machines: the header records only the bundle file's basename (never an absolute or `pwd`-relative path), and the YAML body is post-processed to strip serde-emitted defaults (empty optional sequences and `null` scalars) so the file does not churn under unrelated upgrades. Explicit `role_pattern` values are preserved because they can override inherited naming conventions.
 
 The header records the manifest schema version (`pgroles.manifest.v1` today). The schema identifier is bumped only on incompatible changes to the `PolicyManifest` serialization shape, so a `--check` failure after a pgroles upgrade can be diagnosed as "schema bumped — re-render required" rather than mystery drift.
 

@@ -120,6 +120,7 @@ For workflows, see [operator guidance](/docs/operator), [approval](/docs/operato
 | ` spec.retirements[].reassign_owned_to ` | **string; optional.** Optional successor role for &#96;REASSIGN OWNED BY ... TO ...&#96;. **Constraints:** ` {"maxLength":63,"minLength":1,"nullable":true} `. |
 | ` spec.retirements[].role ` | **string; required.** The role to retire and ultimately drop. **Constraints:** ` {"maxLength":63,"minLength":1} `. |
 | ` spec.retirements[].terminate_sessions ` | **boolean; optional.** Whether to terminate other active sessions for the role before drop. **Default:** ` false `. |
+| ` spec.role_pattern ` | **string; optional.** Default role naming pattern. Schema bindings can override it. Supports &#96;{schema}&#96; and requires &#96;{profile}&#96;; falls back to &#96;{schema}-{profile}&#96;. **Constraints:** ` {"maxLength":128,"minLength":1,"nullable":true} `. |
 | ` spec.roles ` | **array; optional.** One-off role definitions.  Keyed by &#96;name&#96;; see &#96;schemas&#96;. **Default:** ` [] `. **Constraints:** ` {"maxItems":1024,"x-kubernetes-list-map-keys":["name"],"x-kubernetes-list-type":"map"} `. |
 | ` spec.roles[] ` | **object; item or branch.** A concrete PostgreSQL role definition. **Constraints:** ` {"required":["name"]} `. |
 | ` spec.roles[].bypassrls ` | **boolean; optional.** Whether the role bypasses row-level security. **Constraints:** ` {"nullable":true} `. |
@@ -151,7 +152,7 @@ For workflows, see [operator guidance](/docs/operator), [approval](/docs/operato
 | ` spec.schemas[].owner ` | **string; optional.** Override default&#95;owner for this schema's default privileges. **Constraints:** ` {"maxLength":63,"minLength":1,"nullable":true} `. |
 | ` spec.schemas[].profiles ` | **array; optional.** Profile names to expand for this schema. **Default:** ` [] `. **Constraints:** ` {"maxItems":64} `. |
 | ` spec.schemas[].profiles[] ` | **string; item or branch.** Constraints on this array item, map value, or conditional schema. **Constraints:** ` {"maxLength":63,"minLength":1} `. |
-| ` spec.schemas[].role_pattern ` | **string; optional.** Role naming pattern. Supports &#96;{schema}&#96; and &#96;{profile}&#96; placeholders. Defaults to &#96;"{schema}-{profile}"&#96;. **Default:** ` "{schema}-{profile}" `. **Constraints:** ` {"maxLength":128,"minLength":1} `. |
+| ` spec.schemas[].role_pattern ` | **string; optional.** Role naming pattern. Supports &#96;{schema}&#96; and &#96;{profile}&#96; placeholders. Overrides the policy pattern; otherwise inherits it, falling back to &#96;"{schema}-{profile}"&#96;. **Constraints:** ` {"maxLength":128,"minLength":1,"nullable":true} `. |
 | ` spec.suspend ` | **boolean; optional.** Suspend reconciliation when true. Defaults to false. **Default:** ` false `. |
 
 ## Status (read-only except decisions)

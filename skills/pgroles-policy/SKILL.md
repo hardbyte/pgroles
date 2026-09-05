@@ -29,8 +29,10 @@ the migration window ends.
    start with `pgroles generate`; use `--suggest-profiles` only after reviewing
    that the refactoring preserves the exact expanded state.
 3. Define reusable profiles by access shape, then bind them to schemas. Profiles
-   create concrete roles using the schema's `role_pattern`, which defaults to
-   `{schema}-{profile}`.
+   create concrete roles using `role_pattern`: schema override, then policy
+   default, then `{schema}-{profile}`. Bundles resolve schema → fragment →
+   `shared.role_pattern` → built-in default. Every declared pattern requires
+   `{profile}`. Review naming changes as role changes, not cosmetic edits.
 4. Declare managed roles and memberships explicitly. Use `external: true` for a
    role whose lifecycle belongs to a provider or another system.
 5. Model current and future objects separately: ordinary grants cover existing

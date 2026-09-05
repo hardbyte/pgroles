@@ -2,6 +2,7 @@ import { isMap, isScalar, isSeq, parseDocument } from 'yaml'
 
 const topLevelFields = new Set([
   'default_owner',
+  'role_pattern',
   'auth_providers',
   'profiles',
   'schemas',
@@ -73,12 +74,14 @@ const authProviderFields = new Map([
 
 const roleReferenceFields = new Set([
   'default_owner',
+  'role_pattern',
   'owner',
   'role',
   'reassign_owned_to',
 ])
 
 const fieldHelp = {
+  role_pattern: 'Naming pattern inherited by schema profile bindings, unless overridden.',
   default_owner: 'Role used when a default privilege omits its owner.',
   roles: 'Roles whose lifecycle and supported attributes pgroles manages.',
   grants: 'Object privileges granted to a named role.',

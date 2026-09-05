@@ -64,6 +64,7 @@ fn policy_api(client: Client, namespace: &str) -> Api<DynamicObject> {
 /// API server, which would change the content digest without saying so.
 pub const CONTENT_KEYS: &[&str] = &[
     "default_owner",
+    "role_pattern",
     "default_privileges",
     "grants",
     "memberships",
@@ -927,6 +928,7 @@ mod tests {
         let content = extract_candidate_content(
             r#"
 default_owner: app_owner
+role_pattern: "{schema}_{profile}"
 roles:
   - name: reporting_reader
     login: true
@@ -935,6 +937,7 @@ roles:
         .expect("bare manifest should extract");
 
         assert_eq!(content["default_owner"], json!("app_owner"));
+        assert_eq!(content["role_pattern"], json!("{schema}_{profile}"));
         assert_eq!(content["roles"][0]["name"], json!("reporting_reader"));
     }
 

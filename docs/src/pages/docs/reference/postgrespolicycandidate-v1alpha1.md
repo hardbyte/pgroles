@@ -81,6 +81,7 @@ For workflows, see [operator guidance](/docs/operator), [approval](/docs/operato
 | ` spec.content.retirements[].reassign_owned_to ` | **string; optional.** Optional successor role for &#96;REASSIGN OWNED BY ... TO ...&#96;. **Constraints:** ` {"maxLength":63,"minLength":1,"nullable":true} `. |
 | ` spec.content.retirements[].role ` | **string; required.** The role to retire and ultimately drop. **Constraints:** ` {"maxLength":63,"minLength":1} `. |
 | ` spec.content.retirements[].terminate_sessions ` | **boolean; optional.** Whether to terminate other active sessions for the role before drop. |
+| ` spec.content.role_pattern ` | **string; optional.** Default role naming pattern. Schema bindings can override it. Supports &#96;{schema}&#96; and requires &#96;{profile}&#96;; falls back to &#96;{schema}-{profile}&#96;. **Constraints:** ` {"maxLength":128,"minLength":1,"nullable":true} `. |
 | ` spec.content.roles ` | **array; optional.** One-off role definitions. **Constraints:** ` {"maxItems":1024} `. |
 | ` spec.content.roles[] ` | **object; item or branch.** A concrete PostgreSQL role definition. **Constraints:** ` {"required":["name"]} `. |
 | ` spec.content.roles[].bypassrls ` | **boolean; optional.** Whether the role bypasses row-level security. **Constraints:** ` {"nullable":true} `. |
@@ -112,7 +113,7 @@ For workflows, see [operator guidance](/docs/operator), [approval](/docs/operato
 | ` spec.content.schemas[].owner ` | **string; optional.** Override default&#95;owner for this schema's default privileges. **Constraints:** ` {"maxLength":63,"minLength":1,"nullable":true} `. |
 | ` spec.content.schemas[].profiles ` | **array; optional.** Profile names to expand for this schema. **Constraints:** ` {"maxItems":64} `. |
 | ` spec.content.schemas[].profiles[] ` | **string; item or branch.** Constraints on this array item, map value, or conditional schema. **Constraints:** ` {"maxLength":63,"minLength":1} `. |
-| ` spec.content.schemas[].role_pattern ` | **string; optional.** Role naming pattern. Supports &#96;{schema}&#96; and &#96;{profile}&#96; placeholders. Defaults to &#96;"{schema}-{profile}"&#96;. **Constraints:** ` {"maxLength":128,"minLength":1} `. |
+| ` spec.content.schemas[].role_pattern ` | **string; optional.** Role naming pattern. Supports &#96;{schema}&#96; and &#96;{profile}&#96; placeholders. Overrides the policy pattern; otherwise inherits it, falling back to &#96;"{schema}-{profile}"&#96;. **Constraints:** ` {"maxLength":128,"minLength":1,"nullable":true} `. |
 | ` spec.policyRef ` | **object; required.** The &#96;PostgresPolicy&#96; this candidate proposes content for. Resolved in the candidate's own namespace: an owner reference cannot cross namespaces, so neither can this. **Constraints:** ` {"required":["name"]} `. |
 | ` spec.policyRef.name ` | **string; required.** Name of the referenced resource in the same namespace. **Constraints:** ` {"maxLength":253,"minLength":1} `. |
 | ` spec.replaces ` | **string; optional.** Name of an earlier candidate this one supersedes.  Supersession is always explicit. The operator never infers it from creator identity, because CI typically files every team's candidates under one service account. **Constraints:** ` {"maxLength":253,"minLength":1,"nullable":true} `. |

@@ -90,6 +90,11 @@ pub struct PostgresPolicySpec {
     #[schemars(length(min = 1, max = MAX_IDENTIFIER))]
     pub default_owner: Option<String>,
 
+    /// Default role naming pattern. Schema bindings can override it. Supports `{schema}` and requires `{profile}`; falls back to `{schema}-{profile}`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(length(min = 1, max = MAX_ROLE_PATTERN))]
+    pub role_pattern: Option<String>,
+
     /// Reusable privilege profiles.
     #[serde(default)]
     #[schemars(extend("maxProperties" = MAX_PROFILES))]
@@ -2211,6 +2216,7 @@ impl PostgresPolicySpec {
 #[allow(clippy::too_many_arguments)]
 fn build_policy_manifest<'a>(
     default_owner: Option<&str>,
+    role_pattern: Option<&str>,
     profiles: impl Iterator<Item = (&'a String, &'a ProfileSpec)>,
     schemas: &[SchemaBinding],
     roles: &[RoleSpec],
@@ -2297,6 +2303,7 @@ fn build_policy_manifest<'a>(
 
     PolicyManifest {
         default_owner: default_owner.map(str::to_string),
+        role_pattern: role_pattern.map(str::to_string),
         auth_providers: Vec::new(),
         profiles,
         schemas: schemas.to_vec(),
@@ -2316,6 +2323,7 @@ impl PolicyContent {
     pub fn to_policy_manifest(&self) -> pgroles_core::manifest::PolicyManifest {
         build_policy_manifest(
             self.default_owner.as_deref(),
+            self.role_pattern.as_deref(),
             self.profiles.iter(),
             &self.schemas,
             &self.roles,
@@ -2346,6 +2354,7 @@ impl PostgresPolicySpec {
     pub fn policy_content(&self) -> PolicyContent {
         PolicyContent {
             reconciliation_mode: self.reconciliation_mode,
+            role_pattern: self.role_pattern.clone(),
             default_owner: self.default_owner.clone(),
             profiles: self
                 .profiles
@@ -2374,6 +2383,7 @@ impl PostgresPolicySpec {
     pub fn to_policy_manifest(&self) -> pgroles_core::manifest::PolicyManifest {
         build_policy_manifest(
             self.default_owner.as_deref(),
+            self.role_pattern.as_deref(),
             self.profiles.iter(),
             &self.schemas,
             &self.roles,
@@ -2731,6 +2741,11 @@ pub struct PolicyContent {
     #[serde(default)]
     #[schemars(length(min = 1, max = MAX_IDENTIFIER))]
     pub default_owner: Option<String>,
+
+    /// Default role naming pattern. Schema bindings can override it. Supports `{schema}` and requires `{profile}`; falls back to `{schema}-{profile}`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(length(min = 1, max = MAX_ROLE_PATTERN))]
+    pub role_pattern: Option<String>,
 
     /// Reusable privilege profiles.
     ///
@@ -3217,6 +3232,7 @@ mod tests {
             mode: PolicyMode::Apply,
             reconciliation_mode: CrdReconciliationMode::default(),
             allow_schema_owner_transfers: false,
+            role_pattern: None,
             default_owner: Some("app_owner".to_string()),
             profiles: std::collections::HashMap::new(),
             schemas: vec![],
@@ -3282,6 +3298,7 @@ mod tests {
             mode: PolicyMode::Apply,
             reconciliation_mode: CrdReconciliationMode::default(),
             allow_schema_owner_transfers: false,
+            role_pattern: None,
             default_owner: None,
             profiles: std::collections::HashMap::from([(
                 "editor".to_string(),
@@ -3367,12 +3384,13 @@ mod tests {
             mode: PolicyMode::Apply,
             reconciliation_mode: CrdReconciliationMode::default(),
             allow_schema_owner_transfers: false,
+            role_pattern: None,
             default_owner: None,
             profiles,
             schemas: vec![SchemaBinding {
                 name: "inventory".to_string(),
                 profiles: vec!["editor".to_string()],
-                role_pattern: "{schema}-{profile}".to_string(),
+                role_pattern: Some("{schema}-{profile}".to_string()),
                 owner: None,
             }],
             roles: vec![RoleSpec {
@@ -3427,6 +3445,7 @@ mod tests {
             mode: PolicyMode::Apply,
             reconciliation_mode: CrdReconciliationMode::default(),
             allow_schema_owner_transfers: false,
+            role_pattern: None,
             default_owner: Some("app_owner".to_string()),
             profiles: std::collections::HashMap::new(),
             schemas: vec![],
@@ -3731,6 +3750,7 @@ mod tests {
             mode: PolicyMode::Apply,
             reconciliation_mode: CrdReconciliationMode::default(),
             allow_schema_owner_transfers: false,
+            role_pattern: None,
             default_owner: None,
             profiles: Default::default(),
             schemas: vec![],
@@ -4499,6 +4519,7 @@ params:
             mode: PolicyMode::Apply,
             reconciliation_mode: CrdReconciliationMode::default(),
             allow_schema_owner_transfers: false,
+            role_pattern: None,
             default_owner: None,
             profiles: std::collections::HashMap::new(),
             schemas: vec![],
@@ -4959,6 +4980,7 @@ retirements:
             mode: PolicyMode::Apply,
             reconciliation_mode: CrdReconciliationMode::default(),
             allow_schema_owner_transfers: false,
+            role_pattern: None,
             default_owner: None,
             profiles: std::collections::HashMap::new(),
             schemas: vec![],
@@ -4991,6 +5013,7 @@ retirements:
             mode: PolicyMode::Apply,
             reconciliation_mode: CrdReconciliationMode::default(),
             allow_schema_owner_transfers: false,
+            role_pattern: None,
             default_owner: None,
             profiles: std::collections::HashMap::new(),
             schemas: vec![],
@@ -5098,6 +5121,7 @@ retirements:
             mode: PolicyMode::Apply,
             reconciliation_mode: CrdReconciliationMode::default(),
             allow_schema_owner_transfers: false,
+            role_pattern: None,
             default_owner: None,
             profiles: std::collections::HashMap::new(),
             schemas: vec![],
@@ -5153,6 +5177,7 @@ retirements:
             mode: PolicyMode::Apply,
             reconciliation_mode: CrdReconciliationMode::default(),
             allow_schema_owner_transfers: false,
+            role_pattern: None,
             default_owner: None,
             profiles: std::collections::HashMap::new(),
             schemas: vec![],
@@ -5208,6 +5233,7 @@ retirements:
             mode: PolicyMode::Apply,
             reconciliation_mode: CrdReconciliationMode::default(),
             allow_schema_owner_transfers: false,
+            role_pattern: None,
             default_owner: None,
             profiles: std::collections::HashMap::new(),
             schemas: vec![],
@@ -5267,6 +5293,7 @@ retirements:
             mode: PolicyMode::Apply,
             reconciliation_mode: CrdReconciliationMode::default(),
             allow_schema_owner_transfers: false,
+            role_pattern: None,
             default_owner: None,
             profiles: std::collections::HashMap::new(),
             schemas: vec![],
@@ -5324,6 +5351,7 @@ retirements:
             mode: PolicyMode::Apply,
             reconciliation_mode: CrdReconciliationMode::default(),
             allow_schema_owner_transfers: false,
+            role_pattern: None,
             default_owner: None,
             profiles: std::collections::HashMap::new(),
             schemas: vec![],
@@ -5382,6 +5410,7 @@ retirements:
             mode: PolicyMode::Apply,
             reconciliation_mode: CrdReconciliationMode::default(),
             allow_schema_owner_transfers: false,
+            role_pattern: None,
             default_owner: None,
             profiles: std::collections::HashMap::new(),
             schemas: vec![],
@@ -5439,6 +5468,7 @@ retirements:
             mode: PolicyMode::Apply,
             reconciliation_mode: CrdReconciliationMode::default(),
             allow_schema_owner_transfers: false,
+            role_pattern: None,
             default_owner: None,
             profiles: std::collections::HashMap::new(),
             schemas: vec![],
@@ -5525,6 +5555,7 @@ retirements:
             mode: PolicyMode::Apply,
             reconciliation_mode: CrdReconciliationMode::Authoritative,
             allow_schema_owner_transfers: false,
+            role_pattern: None,
             default_owner: None,
             profiles: Default::default(),
             schemas: vec![],
@@ -5673,6 +5704,7 @@ retirements:
             mode: PolicyMode::Observe,
             reconciliation_mode: CrdReconciliationMode::Authoritative,
             allow_schema_owner_transfers: false,
+            role_pattern: None,
             default_owner: None,
             profiles: Default::default(),
             schemas: vec![],
@@ -6022,6 +6054,7 @@ retirements:
         let content: PolicyContent = serde_json::from_value(serde_json::json!({
             "reconciliation_mode": "additive",
             "default_owner": "app_owner",
+            "role_pattern": "{schema}_{profile}",
             "profiles": { "reader": { "grants": [] } },
             "schemas": [{ "name": "app", "profiles": ["reader"] }],
             "roles": [{ "name": "reporting-reader", "login": true }],
@@ -6050,6 +6083,19 @@ retirements:
             serde_json::from_value(spec_json).expect("promoted policy spec");
 
         assert_eq!(spec.content_digest(), content.content_digest());
+        for manifest in [spec.to_policy_manifest(), content.to_policy_manifest()] {
+            assert_eq!(
+                pgroles_core::manifest::expand_manifest(&manifest)
+                    .unwrap()
+                    .roles[0]
+                    .name,
+                "app_reader"
+            );
+        }
+        let mut renamed = spec.clone();
+        renamed.role_pattern = Some("{schema}-{profile}".into());
+        assert_ne!(renamed.content_digest(), spec.content_digest());
+
         assert_eq!(
             spec.content_digest(),
             pgroles_core::candidate::compute_content_digest(&content),
@@ -6081,6 +6127,17 @@ retirements:
             serde_json::to_value(postgres_policy_candidate_crd()).expect("CRD should serialize");
         let content = &candidate["spec"]["versions"][0]["schema"]["openAPIV3Schema"]["properties"]
             ["spec"]["properties"]["content"]["properties"];
+
+        for fields in [policy_spec, content] {
+            let schema_pattern = &fields["schemas"]["items"]["properties"]["role_pattern"];
+            assert_eq!(schema_pattern["type"], "string");
+            assert!(
+                schema_pattern.get("default").is_none(),
+                "schema default would prevent inheritance"
+            );
+            assert_eq!(fields["role_pattern"]["maxLength"], MAX_ROLE_PATTERN);
+            assert!(fields["role_pattern"].get("default").is_none());
+        }
 
         // Execution fields belong to the policy alone: a candidate carries no
         // connection (unless `spec.target` overrides it), interval, mode,

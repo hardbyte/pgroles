@@ -18,6 +18,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Policy-wide `role_pattern`, inherited by schema bindings with explicit per-schema overrides. CLI bundles also support `shared.role_pattern` and fragment overrides; candidates preserve the same naming content (#97).
+
 - `pgroles diff --format markdown` renders redacted review tables with source attribution, conservative priorities, and a versioned report fingerprint. Existing JSON formats and drift exit codes are unchanged.
 
 ### Documentation
