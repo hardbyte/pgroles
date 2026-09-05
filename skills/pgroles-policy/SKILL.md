@@ -46,7 +46,7 @@ pgroles graph desired -f pgroles.yaml
 pgroles diff -f pgroles.yaml --database-url "$DATABASE_URL"
 ```
 
-On an unreleased build from `main` (not v0.10.1), use
+With v0.11.0 or later, use
 `pgroles diff --format markdown` for a review artifact and retain stderr
 warnings. Bundle changes are attributed to their owning source document. The
 redacted report fingerprint identifies that report, not database state or an
@@ -182,7 +182,7 @@ Review effective and transitive privileges, not role names alone.
   no rule mentions is left alone in every mode, so deleting a `present` PUBLIC
   rule does not revoke anything — switch it to `ensure: absent` instead.
 
-Wildcard revocations preserve concrete grantor attribution. Review per-object
+Since v0.11.0, wildcard revocations preserve concrete grantor attribution. Review per-object
 changes and ensure the executor can act as every recorded grantor. Do not
 replace those statements with a broad plain REVOKE. Versions through 0.10.1
 have a known wildcard grantor gap; use the matching release limitations.

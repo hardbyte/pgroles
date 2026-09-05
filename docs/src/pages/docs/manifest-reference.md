@@ -179,7 +179,7 @@ roles:
 
 With `preserve_undeclared_grants: true`, convergence adds missing declared object privileges and preserves undeclared object grants, including excess privileges on targets the manifest does declare. Explicit `ensure: absent` assertions still revoke object privileges, and owner-inherent privileges are unaffected either way. Once the full object-grant surface is declared, remove the flag to restore trimming.
 
-This flag applies only to object grants. It does not preserve default privileges for future objects or change membership reconciliation, role attributes, or other convergence behavior. Review default-privilege revocations and membership changes separately before applying an adoption plan; use [additive reconciliation](/docs/adoption) while existing access must remain untouched.
+This flag applies only to object grants. It does not preserve default privileges for future objects or change membership reconciliation, role attributes, or other convergence behavior. Review default-privilege revocations and membership changes separately before applying an adoption plan; use [additive reconciliation](/docs/adoption) to filter revocations and membership removals during rollout. Review the complete plan before applying.
 
 {% callout type="note" title="Passwords and drift detection" %}
 Because PostgreSQL does not expose password hashes for comparison, password changes always appear in the plan. The `diff --exit-code` flag treats password-only changes as non-structural; they do not trigger exit code 2.

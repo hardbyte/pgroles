@@ -40,8 +40,8 @@ so removing a membership cannot silently invalidate a later statement's authorit
 Wildcard revocations expand to concrete changes because different objects may
 have different owners and grantors. Owner-inherent privileges are preserved.
 The plan can therefore contain more entries than the wildcard rules in the
-manifest; review its complete SQL. This behavior ships in the next release after
-0.10.1. In 0.10.0–0.10.1, wildcard-collapsed revokes can fall back to a plain revoke
+manifest; review its complete SQL. This behavior is available since
+v0.11.0. In 0.10.0–0.10.1, wildcard-collapsed revokes can fall back to a plain revoke
 and leave delegated entries behind; see [#215](https://github.com/thepartly/pgroles/issues/215).
 
 If identical effects remain after apply, the operator reports `NonConvergentPlan`
