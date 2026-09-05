@@ -914,6 +914,7 @@ jobs:
       - uses: ./.github/actions/setup-e2e
         with:
           cluster-name: pgroles-e2e-plans
+          operator-features: e2e-fault-injection
 
       # The candidate scenarios below drive the `pgroles` CLI against this live
       # cluster, so the binary has to exist on the runner. Built from the
@@ -928,6 +929,12 @@ jobs:
           trap 'docker rm -f "$container" >/dev/null 2>&1 || true' EXIT
           docker cp "$container:/usr/local/bin/pgroles" /usr/local/bin/pgroles
           pgroles --version
+
+      - name: Recover from a Secret-first process crash
+        run: scripts/e2e-secret-first-crash.sh
+
+      - name: Recover from a computed plan name collision
+        run: scripts/e2e-plan-name-collision.sh
 
       - name: Run plan lifecycle scenarios
         run: |

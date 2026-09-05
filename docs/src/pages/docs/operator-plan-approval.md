@@ -459,3 +459,19 @@ inference is deprecated: a policy relying on it reports an `ApprovalUnset`
 condition, emits a warning Event, and counts toward
 `pgroles.deprecated.approval_unset`. Write the value down explicitly.
 {% /callout %}
+
+## Generated-password crash recovery
+
+A generated password Secret is written after approval and before SQL execution. If the operator crashes between those steps, it keeps the Secret and supersedes the old approval because the password source version changed. Review and approve the replacement plan; it reuses that credential. New plans record a diagnostic `passwordSourceDigest`, and superseded plans report `PasswordSourceChanged` when that fingerprint differs. Older plans without the fingerprint still fail closed through the approval digest, with a generic replacement reason.
+
+The plan lifecycle CI suite tests this exact process-crash boundary with an `e2e-fault-injection` build. Ordinary and released images do not compile the crash hook.
+
+## Replacement-plan name collisions
+
+If creating a replacement reports `PlanNameCollision`, the operator retries
+without overwriting the existing plan or its decision. Plan names include a
+second-resolution timestamp and SQL hash, so different approval contexts can
+occasionally produce the same name. An interrupted creation is resumed only
+when its persisted spec matches and it has neither computed status nor a
+reviewer decision. Normal retries move beyond the naming window; do not delete
+an approved or rejected plan to make room for a replacement.

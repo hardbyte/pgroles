@@ -6,6 +6,9 @@ inputs:
   cluster-name:
     description: Name for the kind cluster
     required: true
+  operator-features:
+    description: Optional operator Cargo features for this test image
+    default: ""
 runs:
   using: composite
   steps:
@@ -112,7 +115,9 @@ runs:
 
     - name: Build operator image
       shell: bash
-      run: docker build -f docker/Dockerfile --target operator -t pgroles-operator:e2e .
+      env:
+        OPERATOR_FEATURES: ${{ inputs.operator-features }}
+      run: docker build -f docker/Dockerfile --target operator --build-arg "OPERATOR_FEATURES=$OPERATOR_FEATURES" -t pgroles-operator:e2e .
 
     - name: Load image into kind
       shell: bash

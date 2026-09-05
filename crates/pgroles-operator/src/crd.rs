@@ -1128,7 +1128,7 @@ pub struct ChangeSummary {
 ///
 /// Represents a computed reconciliation plan for a `PostgresPolicy`. Plans are
 /// created by the operator and may require explicit approval before execution.
-#[derive(CustomResource, KubeSchema, Debug, Clone, Serialize, Deserialize)]
+#[derive(CustomResource, KubeSchema, Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[kube(
     group = "pgroles.io",
     version = "v1alpha1",
@@ -1250,7 +1250,7 @@ pub enum ScopedPlanOperation {
 }
 
 /// Reference to the parent `PostgresPolicy` that generated a plan.
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 pub struct PolicyPlanRef {
     /// Name of the originating PostgresPolicy in the same namespace.
     pub name: String,
@@ -1361,6 +1361,11 @@ pub struct PostgresPolicyPlanStatus {
     /// verifier. See `pgroles_core::approval`.
     #[serde(default)]
     pub change_digest: Option<String>,
+    /// Diagnostic SHA-256 digest of the password source-version map. Contains
+    /// no password material. A mismatch identifies credential-source changes;
+    /// approval remains bound by changeDigest. Absent on older plans.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub password_source_digest: Option<String>,
     /// Version tag of the encoding `change_digest` was computed under. Digests
     /// from different encodings are never comparable.
     #[serde(default)]
