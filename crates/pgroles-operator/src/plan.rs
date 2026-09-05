@@ -937,9 +937,9 @@ pub async fn create_or_update_plan(
                     "plan {plan_name} already exists and is owned by another object"
                 )));
             }
-            if !should_patch_existing_plan_status(&existing) {
-                // A terminal or already-computed plan with the same
-                // second/SQL name is not a newly actionable replacement.
+            if !can_resume_plan_creation(&existing, &plan.spec) {
+                // A completed or differently scoped plan with the same
+                // second/SQL name is not this interrupted creation.
                 // Retry after the naming window moves; never repoint the
                 // policy to it or overwrite an existing decision.
                 rollback_plan_sql_configmap(client, &namespace, sql_configmap_name.as_ref()).await;
@@ -1780,6 +1780,16 @@ fn is_orphan_sql_configmap(
         .get(LABEL_PLAN)
         .map(|plan_label| !known_plan_labels.contains(plan_label))
         .unwrap_or(true)
+}
+
+// SQL-equivalent changes can still have different scope, policy generations,
+// or candidate base pins. Recover only the exact interrupted create: status
+// for a new computation must never be attached to another persisted spec.
+fn can_resume_plan_creation(
+    existing: &PostgresPolicyPlan,
+    intended_spec: &PostgresPolicyPlanSpec,
+) -> bool {
+    existing.spec == *intended_spec && should_patch_existing_plan_status(existing)
 }
 
 fn should_patch_existing_plan_status(plan: &PostgresPolicyPlan) -> bool {
@@ -3820,10 +3830,6 @@ mod tests {
         assert_eq!(check_plan_approval(&plan), PlanApprovalState::Pending);
     }
 
-    /// The supersede condition is often the only trace a reviewer sees of why
-    /// the plan they were looking at vanished. Every cause must describe
-    /// itself; the previous single message claimed the database had changed
-    /// even when it was an effect-neutral policy edit that retired the plan.
     #[test]
     fn diagnostic_source_digest_detects_secret_materialization_without_passwords() {
         let missing = BTreeMap::from([("app".into(), "credential:password:missing".into())]);
@@ -3845,6 +3851,10 @@ mod tests {
         assert!(!password_source_changed(&status, &real));
     }
 
+    /// The supersede condition is often the only trace a reviewer sees of why
+    /// the plan they were looking at vanished. Every cause must describe
+    /// itself; the previous single message claimed the database had changed
+    /// even when it was an effect-neutral policy edit that retired the plan.
     #[test]
     fn every_supersede_cause_names_its_own_reason() {
         use pgroles_core::approval::TargetIdentityReason;
@@ -4226,6 +4236,9 @@ mod tests {
         computed.status.as_mut().unwrap().change_digest = None;
         computed.status.as_mut().unwrap().sql_hash = Some("legacy-sql".into());
         assert!(!should_patch_existing_plan_status(&computed));
+        computed.status.as_mut().unwrap().sql_hash = None;
+        computed.status.as_mut().unwrap().computed_at = Some("2026-09-05T00:00:00Z".into());
+        assert!(!should_patch_existing_plan_status(&computed));
         for decision in ["Approved", "Denied"] {
             let decided =
                 test_plan_with_decisions("same-second", PlanPhase::Pending, &[(decision, "True")]);
@@ -4253,6 +4266,42 @@ mod tests {
 
         assert!(should_patch_existing_plan_status(&pending));
         assert!(should_patch_existing_plan_status(&statusless));
+    }
+
+    #[test]
+    fn interrupted_create_resumes_only_with_the_same_persisted_spec() {
+        let mut interrupted = test_plan("same-second", PlanPhase::Pending, None);
+        for statusless in [false, true] {
+            if statusless {
+                interrupted.status = None;
+            }
+            let intended = interrupted.spec.clone();
+            assert!(can_resume_plan_creation(&interrupted, &intended));
+
+            let mut next_generation = intended.clone();
+            next_generation.policy_generation += 1;
+            assert!(!can_resume_plan_creation(&interrupted, &next_generation));
+
+            let mut next_scope = intended.clone();
+            next_scope.owned_roles.push("newly-managed".into());
+            assert!(!can_resume_plan_creation(&interrupted, &next_scope));
+
+            let mut next_target = intended.clone();
+            next_target.managed_database_identity = "other-db".into();
+            assert!(!can_resume_plan_creation(&interrupted, &next_target));
+
+            let mut candidate = intended.clone();
+            candidate.origin = Some(crate::crd::PlanOrigin {
+                kind: "PostgresPolicyCandidate".into(),
+                name: "proposal".into(),
+                uid: "proposal-uid".into(),
+                content_digest: Some("content".into()),
+                content_digest_encoding: Some("v1".into()),
+                policy_uid: Some("policy-uid".into()),
+                base_content_digest: Some("new-base".into()),
+            });
+            assert!(!can_resume_plan_creation(&interrupted, &candidate));
+        }
     }
 
     #[test]

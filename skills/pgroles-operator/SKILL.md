@@ -303,6 +303,10 @@ New plans record a diagnostic `passwordSourceDigest`; older plans without it
 still fail closed through the approval digest and may show a generic replacement
 reason.
 
+For `PlanNameCollision`, allow the operator to retry with a fresh name. It
+preserves the existing plan and decision; do not delete a decided plan to
+unblock replacement creation.
+
 ## Troubleshooting Order
 
 1. Confirm Kubernetes context, namespace, chart version, CRD, and policy

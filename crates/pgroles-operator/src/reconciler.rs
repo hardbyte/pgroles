@@ -198,7 +198,9 @@ pub enum ReconcileError {
 
     #[error("plan SQL storage error: {0}")]
     PlanSqlStorage(String),
-    #[error("plan name {0} collided with an existing computed plan; retrying with a fresh name")]
+    #[error(
+        "plan name {0} collided with an incompatible existing plan; retrying with a fresh name"
+    )]
     PlanNameCollision(String),
 
     #[error("Kubernetes API call \"{0}\" did not complete within {1:?}")]

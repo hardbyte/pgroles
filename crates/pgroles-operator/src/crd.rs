@@ -1076,7 +1076,7 @@ pub struct ChangeSummary {
 ///
 /// Represents a computed reconciliation plan for a `PostgresPolicy`. Plans are
 /// created by the operator and may require explicit approval before execution.
-#[derive(CustomResource, KubeSchema, Debug, Clone, Serialize, Deserialize)]
+#[derive(CustomResource, KubeSchema, Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[kube(
     group = "pgroles.io",
     version = "v1alpha1",
@@ -1192,7 +1192,7 @@ pub enum ScopedPlanOperation {
 }
 
 /// Reference to the parent `PostgresPolicy` that generated a plan.
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 pub struct PolicyPlanRef {
     pub name: String,
 }
