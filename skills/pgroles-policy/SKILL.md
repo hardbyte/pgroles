@@ -46,6 +46,15 @@ pgroles graph desired -f pgroles.yaml
 pgroles diff -f pgroles.yaml --database-url "$DATABASE_URL"
 ```
 
+On an unreleased build from `main` (not v0.10.1), use
+`pgroles diff --format markdown` for a review artifact and retain stderr
+warnings. Bundle changes are attributed to their owning source document. The
+redacted report fingerprint identifies that report, not database state or an
+execution approval; it excludes password values and database identity. Record
+the target environment alongside it. Markdown records declared
+password changes without reading their environment variables. Review the SQL and effective
+privileges as well as the conservative change priorities.
+
 Never print database URLs, passwords, or rendered Secrets in logs.
 
 ## Reconciliation Modes

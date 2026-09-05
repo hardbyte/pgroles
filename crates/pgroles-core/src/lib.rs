@@ -10,6 +10,7 @@ pub mod model;
 pub mod overlap;
 pub mod ownership;
 pub mod report;
+pub mod review;
 pub mod scram;
 pub mod sql;
 pub mod suggest;
