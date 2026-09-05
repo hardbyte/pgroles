@@ -56,18 +56,34 @@ struct Row {
 }
 
 fn escape(value: &str) -> String {
-    value
-        .replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-        .replace('\\', "&#92;")
-        .replace('|', "&#124;")
-        .replace('`', "&#96;")
-        .replace('[', "&#91;")
-        .replace(']', "&#93;")
-        .replace('*', "&#42;")
-        .replace('_', "&#95;")
-        .replace(['\r', '\n'], " ")
+    let mut escaped = String::with_capacity(value.len());
+    for character in value.chars() {
+        let entity = match character {
+            '&' => "&amp;",
+            '<' => "&lt;",
+            '>' => "&gt;",
+            '\\' => "&#92;",
+            '|' => "&#124;",
+            '`' => "&#96;",
+            '[' => "&#91;",
+            ']' => "&#93;",
+            '*' => "&#42;",
+            '_' => "&#95;",
+            '~' => "&#126;",
+            // Neutralize GFM bare URLs, mentions, and issue references as well.
+            '@' => "&#64;",
+            '#' => "&#35;",
+            ':' => "&#58;",
+            '.' => "&#46;",
+            '\r' | '\n' => " ",
+            _ => {
+                escaped.push(character);
+                continue;
+            }
+        };
+        escaped.push_str(entity);
+    }
+    escaped
 }
 
 /// Render the final filtered plan. Bundle attribution is by owning document;
@@ -110,7 +126,7 @@ pub fn render_markdown(
         .count();
     let info = rows.len() - high - review;
     let mut output = format!(
-        "## pgroles review\n\nSource: {}. Mode: {mode:?}.\n\n{} change(s): **{high} high priority**, {review} review, {info} informational.\n\nRedacted report fingerprint (pgroles.review.v1): `{fingerprint}`\n\nThis identifies the displayed changes, source attribution, and mode. It excludes password values and is not an approval token or a database-state fingerprint. Priorities are conservative change-kind hints; inspect the details and database impact before applying.\n",
+        "## pgroles review\n\nSource: {}. Mode: {mode:?}.\n\n{} change(s): **{high} high priority**, {review} review, {info} informational.\n\nRedacted report fingerprint (pgroles.review.v1): `{fingerprint}`\n\nThis identifies the displayed changes, source attribution, and mode. It excludes password values and database identity and is not an approval token or a database-state fingerprint. Record the target environment alongside this report. Declared passwords appear even when no structural drift exists. Priorities are conservative change-kind hints; inspect the details and database impact before applying.\n",
         escape(source),
         rows.len()
     );
@@ -200,7 +216,7 @@ mod tests {
     #[test]
     fn redacts_credentials_and_escapes_untrusted_markdown() {
         let changes = vec![Change::SetPassword {
-            name: "x|[link](javascript:bad)<b>\nnext".into(),
+            name: "x|[link](javascript:bad)<b>\nnext ~~hidden~~ @team #123 https://example.com www.example.com".into(),
             password: "SCRAM-secret".into(),
         }];
         let report =
@@ -209,6 +225,11 @@ mod tests {
         assert!(!report.contains("<b>"));
         assert!(!report.contains("[link]"));
         assert!(report.contains("&#124;"));
+        assert!(!report.contains("~~hidden~~"));
+        assert!(!report.contains("@team"));
+        assert!(!report.contains("#123"));
+        assert!(!report.contains("https://"));
+        assert!(!report.contains("www.example.com"));
         assert!(report.contains("REDACTED"));
         assert!(report.contains("1 high priority"));
     }

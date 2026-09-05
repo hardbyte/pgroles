@@ -181,7 +181,7 @@ pgroles apply -f pgroles.yaml --database-url "$PROD_DATABASE_URL"
 
 ## Review summaries
 
-Use `pgroles diff --format markdown` to produce a redacted table for a review artifact:
+`--format markdown` is unreleased and requires a build from `main`; it is not available in v0.10.1. Use it to produce a redacted table for a review artifact:
 
 ```bash
 pgroles diff -f pgroles.yaml --mode adopt --format markdown > pgroles-review.md
@@ -191,6 +191,6 @@ pgroles diff --bundle bundle.yaml --mode adopt --format markdown > bundle-review
 
 Markdown records declared password changes without resolving application-password environment variables; database connection credentials are still required. The report includes complete redacted change details, source attribution, and conservative priorities. Revocations, retirement, ownership transfers, password changes, role alterations, PUBLIC grants, elevated new roles, and membership administration are high priority. Other access changes still require review; these labels do not evaluate your application's transitive privileges or availability requirements.
 
-The `pgroles.review.v1` fingerprint identifies the displayed changes, source attribution, and reconciliation mode. Password values are excluded, so password-only value changes do not change this fingerprint. It is not a database-state fingerprint or an operator approval token. Existing `--format json` output remains available for structured integrations, including bundle ownership annotations.
+The `pgroles.review.v1` fingerprint identifies the displayed changes, source attribution, and reconciliation mode. Password values and database identity are excluded, so password-only value changes do not change this fingerprint, and identical reports from different databases share a fingerprint. Record the target environment alongside the artifact. It is not a database-state fingerprint or an operator approval token. Existing `--format json` output remains available for structured integrations, including bundle ownership annotations.
 
-Keep stderr with the report: executor-authority warnings and role-drop preflight findings are emitted there. `--exit-code` retains its existing drift semantics with this format. Posting a report is a separate pipeline action; generating one does not publish it.
+Keep stderr with the report: executor-authority warnings and role-drop preflight findings are emitted there. `--exit-code` returns 2 for structural drift; declared password operations alone return 0 because PostgreSQL passwords cannot be read back for comparison. Posting a report is a separate pipeline action; generating one does not publish it.
