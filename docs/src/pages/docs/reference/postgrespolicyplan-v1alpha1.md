@@ -77,7 +77,7 @@ For workflows, see [operator guidance](/docs/operator), [approval](/docs/operato
 | ` status.conditions[].message ` | **string; optional.** Human-readable message. **Constraints:** ` {"nullable":true} `. |
 | ` status.conditions[].reason ` | **string; optional.** Human-readable reason for the condition. **Constraints:** ` {"nullable":true} `. |
 | ` status.conditions[].status ` | **string; required.** Status: "True", "False", or "Unknown". |
-| ` status.conditions[].type ` | **string; required.** Type of condition: "Ready", "Reconciling", "Degraded". |
+| ` status.conditions[].type ` | **string; required.** Controller-defined condition type, such as Ready, Reconciling, or Degraded. This is an open vocabulary; consult status guidance for operational meanings. |
 | ` status.decidedBy ` | **object; optional.** Kubernetes identity which approved or denied this plan.  Written in the same status update as the terminal decision, and write-once thereafter. The supplied Kyverno reference policy overwrites it from authenticated admission &#96;userInfo&#96;; without that admission layer it is an assertion by whoever wrote the status, not a verified identity. **Constraints:** ` {"nullable":true,"required":["username"]} `. |
 | ` status.decidedBy.groups ` | **array; optional.** Kubernetes groups recorded for this actor. **Default:** ` [] `. **Constraints:** ` {"maxItems":64} `. |
 | ` status.decidedBy.groups[] ` | **string; item or branch.** Constraints on this array item, map value, or conditional schema. **Constraints:** ` {"maxLength":256,"minLength":1} `. |

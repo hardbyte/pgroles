@@ -68,8 +68,9 @@ pub struct PostgresPolicySpec {
 
     /// Convergence strategy: how aggressively to converge the database.
     ///
-    /// - `authoritative` (default): full convergence — anything not in the
-    ///   manifest is revoked/dropped.
+    /// - `authoritative` (default): revoke undeclared managed privileges and
+    ///   drop undeclared roles within the configured inspection scope. External
+    ///   roles are not altered or dropped; PUBLIC targets require explicit rules.
     /// - `additive`: only grant, never revoke — safe for incremental adoption;
     ///   `ensure: absent` assertions are ignored with a warning condition.
     /// - `adopt`: manage declared roles fully, but never drop undeclared roles.
@@ -152,20 +153,20 @@ fn default_interval() -> String {
     "5m".to_string()
 }
 
-/// Policy reconcile mode.
-///
-/// Deliberately not `PartialEq`: `plan` is a deprecated spelling of `observe`
-/// that must behave identically everywhere, and an `==` comparison is exactly
-/// the kind of site that forgets one of the two. Compare through
-/// [`PolicyMode::never_executes`] and [`PolicyMode::is_deprecated_spelling`],
-/// or match exhaustively.
+/// Controls whether the operator executes changes or only computes plans.
+//
+// Deliberately not `PartialEq`: `plan` is a deprecated spelling of `observe`
+// that must behave identically everywhere, and an `==` comparison is exactly
+// the kind of site that forgets one of the two. Compare through
+// PolicyMode::never_executes and PolicyMode::is_deprecated_spelling,
+// or match exhaustively.
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum PolicyMode {
     #[default]
     Apply,
-    /// Compute and publish plans, never execute. The current name: "plan"
-    /// should name exactly one artifact, the `PostgresPolicyPlan` (ADR-001).
+    /// Compute and publish plans without executing SQL.
+    // The name "plan" refers to the PostgresPolicyPlan artifact (ADR-001).
     Observe,
     /// Deprecated spelling of `observe`, kept as an accepted schema value so
     /// existing manifests — including ones a GitOps controller re-applies on
@@ -640,9 +641,8 @@ pub struct SecretReference {
     pub name: String,
 }
 
-/// A reusable privilege profile (CRD-compatible version).
-///
-/// This mirrors `pgroles_core::manifest::Profile` but derives `JsonSchema`.
+/// A reusable privilege profile.
+// CRD-compatible mirror of pgroles_core::manifest::Profile.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct ProfileSpec {
     #[serde(default)]
@@ -719,7 +719,8 @@ pub struct DefaultPrivilegeGrantSpec {
     pub ensure: Ensure,
 }
 
-/// A concrete role definition (CRD-compatible version).
+/// A concrete PostgreSQL role definition.
+// CRD-compatible role representation.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct RoleSpec {
     #[schemars(length(min = 1, max = MAX_IDENTIFIER))]
@@ -1043,7 +1044,8 @@ pub struct PostgresPolicyStatus {
 /// A condition on the `PostgresPolicy` resource.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct PolicyCondition {
-    /// Type of condition: "Ready", "Reconciling", "Degraded".
+    /// Controller-defined condition type, such as Ready, Reconciling, or Degraded.
+    /// This is an open vocabulary; consult status guidance for operational meanings.
     #[serde(rename = "type")]
     pub condition_type: String,
 
