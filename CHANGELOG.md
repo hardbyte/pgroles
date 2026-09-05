@@ -13,6 +13,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Documentation
 
+- Clarify that `preserve_undeclared_grants` preserves object grants only; default-privilege revocations and membership reconciliation remain unchanged.
 - Generate a complete field reference and downloadable served schema for all five CRDs; require source descriptions and detect reference drift in CI.
 
 ### Fixed

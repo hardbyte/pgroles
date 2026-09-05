@@ -122,9 +122,12 @@ predefined role the server does not have, with the version that introduced it.
 generate` exports them.
 
 For brownfield roles whose full grant surface is not yet declared,
-`preserve_undeclared_grants: true` keeps out-of-band access through
-convergence; explicit `ensure: absent` assertions still revoke. Remove the
-flag once the manifest declares the role's real grants. Adopt mode refuses to
+`preserve_undeclared_grants: true` preserves undeclared object grants through
+convergence; explicit `ensure: absent` assertions still revoke. The flag does
+not preserve default privileges for future objects or change membership
+reconciliation, role attributes, or other convergence behavior. Review those
+changes separately before applying an adoption plan. Remove the flag once the
+manifest declares the role's full object-grant surface. Adopt mode refuses to
 transfer schema ownership away from the live owner unless apply passes
 `--allow-schema-owner-transfers`.
 

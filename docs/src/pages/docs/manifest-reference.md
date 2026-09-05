@@ -144,7 +144,7 @@ roles:
 |---|---|---|---|
 | `name` | string | *required* | Role name |
 | `external` | bool | `false` | Role lifecycle is managed outside pgroles |
-| `preserve_undeclared_grants` | bool | `false` | Keep the role's undeclared in-scope grants during convergence |
+| `preserve_undeclared_grants` | bool | `false` | Keep the role's undeclared in-scope object grants during convergence |
 | `login` | bool | `false` | Can the role log in? |
 | `superuser` | bool | `false` | Superuser privileges |
 | `createdb` | bool | `false` | Can create databases |
@@ -168,7 +168,7 @@ Memberships granted **from** an external role follow declared intent: members li
 
 ### Preserving undeclared grants
 
-By default, adopt and authoritative modes revoke every privilege a declared role holds that the manifest does not declare. During brownfield adoption that is often premature: the role may hold out-of-band access (granted by migrations or manual SQL) that production still relies on.
+By default, adopt and authoritative modes revoke undeclared object privileges held by declared roles within the inspection scope, except owner-inherent privileges. During brownfield adoption that is often premature: the role may hold out-of-band access (granted by migrations or manual SQL) that production still relies on.
 
 ```yaml
 roles:
@@ -177,7 +177,9 @@ roles:
     preserve_undeclared_grants: true
 ```
 
-With `preserve_undeclared_grants: true`, convergence grants any declared privileges the role lacks but never revokes anything else it holds in scope — including excess privileges on grant targets the manifest does declare. Once the full surface is declared, remove the flag to restore trimming. Explicit `ensure: absent` assertions still revoke — an asserted absence is a declaration, not drift discovery — and owner-inherent privileges are unaffected either way.
+With `preserve_undeclared_grants: true`, convergence adds missing declared object privileges and preserves undeclared object grants, including excess privileges on targets the manifest does declare. Explicit `ensure: absent` assertions still revoke object privileges, and owner-inherent privileges are unaffected either way. Once the full object-grant surface is declared, remove the flag to restore trimming.
+
+This flag applies only to object grants. It does not preserve default privileges for future objects or change membership reconciliation, role attributes, or other convergence behavior. Review default-privilege revocations and membership changes separately before applying an adoption plan; use [additive reconciliation](/docs/adoption) while existing access must remain untouched.
 
 {% callout type="note" title="Passwords and drift detection" %}
 Because PostgreSQL does not expose password hashes for comparison, password changes always appear in the plan. The `diff --exit-code` flag treats password-only changes as non-structural; they do not trigger exit code 2.
