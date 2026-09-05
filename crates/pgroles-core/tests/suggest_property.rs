@@ -244,12 +244,13 @@ fn random_manifest(rng: &mut Rng) -> PolicyManifest {
         .map(|s| SchemaBinding {
             name: s.clone(),
             profiles: vec![],
-            role_pattern: "{schema}-{profile}".to_string(),
+            role_pattern: Some("{schema}-{profile}".to_string()),
             owner: Some(owner.clone()),
         })
         .collect();
 
     PolicyManifest {
+        role_pattern: None,
         default_owner: Some(owner),
         auth_providers: vec![],
         profiles: Default::default(),

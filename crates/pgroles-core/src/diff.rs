@@ -325,12 +325,13 @@ pub fn filter_external_role_changes(
         .collect()
 }
 
-/// Drop revokes against roles that declare `preserve_undeclared_grants`.
+/// Drop object-grant revokes against roles that declare `preserve_undeclared_grants`.
 ///
 /// The flag marks a brownfield role whose grant surface pgroles should adopt
 /// before it is fully declared: missing declared privileges are granted, and
-/// nothing else the role holds in scope is revoked — including excess
-/// privileges on grant targets the manifest does declare. Explicit
+/// undeclared object grants in scope are preserved — including excess
+/// privileges on grant targets the manifest does declare. Default-privilege
+/// revocations, memberships, and other changes are unaffected. Explicit
 /// `ensure: absent` assertions still apply — an asserted absence is a
 /// declaration, not drift discovery.
 pub fn filter_preserved_grant_revokes(
@@ -2197,6 +2198,66 @@ memberships:
             Change::Revoke { role, .. } => assert_eq!(role.as_str(), "managed"),
             other => panic!("expected Revoke, got: {other:?}"),
         }
+    }
+
+    #[test]
+    fn preserve_flag_keeps_object_grants_but_revokes_defaults_and_memberships() {
+        let mut preserved_role = role_definition("brownfield", false);
+        preserved_role.preserve_undeclared_grants = true;
+
+        let mut current = empty_graph();
+        current.grants.insert(
+            GrantKey {
+                role: "brownfield".into(),
+                object_type: ObjectType::Table,
+                schema: Some("app".into()),
+                name: Some("widgets".into()),
+            },
+            GrantState {
+                privileges: BTreeSet::from([Privilege::Select]),
+            },
+        );
+        current.default_privileges.insert(
+            DefaultPrivKey {
+                owner: "app_owner".into(),
+                scope: DefaultPrivilegeScope::Schema {
+                    schema: "app".into(),
+                },
+                on_type: ObjectType::Table,
+                grantee: "brownfield".into(),
+            },
+            DefaultPrivState {
+                privileges: BTreeSet::from([Privilege::Select]),
+            },
+        );
+        current.memberships.insert(MembershipEdge {
+            role: "readers".into(),
+            member: "brownfield".into(),
+            inherit: true,
+            admin: false,
+        });
+        let desired = empty_graph();
+        let changes = diff(&current, &desired);
+        assert_eq!(changes.len(), 3);
+        assert!(
+            changes
+                .iter()
+                .any(|change| matches!(change, Change::Revoke { .. }))
+        );
+
+        let changes = filter_preserved_grant_revokes(changes, &[preserved_role], &desired);
+        assert_eq!(changes.len(), 2);
+        assert!(changes.iter().any(|change| matches!(
+            change,
+            Change::RevokeDefaultPrivilege { grantee, privileges, .. }
+                if grantee.to_string() == "brownfield"
+                    && privileges == &BTreeSet::from([Privilege::Select])
+        )));
+        assert!(changes.iter().any(|change| matches!(
+            change,
+            Change::RemoveMember { role, member, .. }
+                if role == "readers" && member == "brownfield"
+        )));
     }
 
     #[test]

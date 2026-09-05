@@ -125,7 +125,7 @@ pub fn role_graph_to_manifest(graph: &RoleGraph) -> PolicyManifest {
         .map(|(name, state)| SchemaBinding {
             name: name.clone(),
             profiles: Vec::new(),
-            role_pattern: "{schema}-{profile}".to_string(),
+            role_pattern: None,
             owner: state.owner.clone(),
         })
         .collect();
@@ -193,6 +193,7 @@ pub fn role_graph_to_manifest(graph: &RoleGraph) -> PolicyManifest {
         .collect();
 
     PolicyManifest {
+        role_pattern: None,
         default_owner: None,
         auth_providers: Vec::new(),
         profiles: BTreeMap::new(),

@@ -589,7 +589,7 @@ pub fn suggest_profiles(input: &PolicyManifest, opts: &SuggestOptions) -> Sugges
             let pattern = schema_pattern
                 .get(&s.name)
                 .cloned()
-                .unwrap_or_else(|| s.role_pattern.clone());
+                .or_else(|| s.role_pattern.clone());
             SchemaBinding {
                 name: s.name.clone(),
                 profiles: bound_profiles,
@@ -641,6 +641,7 @@ pub fn suggest_profiles(input: &PolicyManifest, opts: &SuggestOptions) -> Sugges
         .collect();
 
     let candidate = PolicyManifest {
+        role_pattern: input.role_pattern.clone(),
         default_owner: input.default_owner.clone(),
         auth_providers: input.auth_providers.clone(),
         profiles: profiles_out,
@@ -1296,7 +1297,7 @@ grants:
         // Schema bindings should reference the new profile.
         for s in &report.manifest.schemas {
             assert_eq!(s.profiles, vec!["reader"]);
-            assert_eq!(s.role_pattern, "{schema}-{profile}");
+            assert_eq!(s.role_pattern.as_deref(), Some("{schema}-{profile}"));
         }
     }
 

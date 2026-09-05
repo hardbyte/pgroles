@@ -81,6 +81,7 @@ The login roles (`app_runtime`, `analyst`) get access through memberships rather
 
 | Section | Defines | Referenced by |
 |---|---|---|
+| [`role_pattern`](/docs/manifest-reference#role-pattern) | Naming convention for generated roles, with per-schema overrides | `profiles`, `schemas` |
 | [`default_owner`](/docs/manifest-reference#default-owner) | Default object-creator role for future grants | `default_privileges`, `profiles`, `schemas` |
 | [`profiles`](/docs/manifest-reference#profiles) | Reusable schema-relative grant templates | `schemas[].profiles` |
 | [`schemas`](/docs/manifest-reference#schemas) | Managed schemas and profile bindings | `profiles`, generated roles, generated grants |

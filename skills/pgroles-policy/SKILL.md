@@ -29,8 +29,10 @@ the migration window ends.
    start with `pgroles generate`; use `--suggest-profiles` only after reviewing
    that the refactoring preserves the exact expanded state.
 3. Define reusable profiles by access shape, then bind them to schemas. Profiles
-   create concrete roles using the schema's `role_pattern`, which defaults to
-   `{schema}-{profile}`.
+   create concrete roles using `role_pattern`: schema override, then policy
+   default, then `{schema}-{profile}`. Bundles resolve schema → fragment →
+   `shared.role_pattern` → built-in default. Every declared pattern requires
+   `{profile}`. Review naming changes as role changes, not cosmetic edits.
 4. Declare managed roles and memberships explicitly. Use `external: true` for a
    role whose lifecycle belongs to a provider or another system.
 5. Model current and future objects separately: ordinary grants cover existing
@@ -46,7 +48,7 @@ pgroles graph desired -f pgroles.yaml
 pgroles diff -f pgroles.yaml --database-url "$DATABASE_URL"
 ```
 
-On an unreleased build from `main` (not v0.10.1), use
+With v0.11.0 or later, use
 `pgroles diff --format markdown` for a review artifact and retain stderr
 warnings. Bundle changes are attributed to their owning source document. The
 redacted report fingerprint identifies that report, not database state or an
@@ -122,9 +124,12 @@ predefined role the server does not have, with the version that introduced it.
 generate` exports them.
 
 For brownfield roles whose full grant surface is not yet declared,
-`preserve_undeclared_grants: true` keeps out-of-band access through
-convergence; explicit `ensure: absent` assertions still revoke. Remove the
-flag once the manifest declares the role's real grants. Adopt mode refuses to
+`preserve_undeclared_grants: true` preserves undeclared object grants through
+convergence; explicit `ensure: absent` assertions still revoke. The flag does
+not preserve default privileges for future objects or change membership
+reconciliation, role attributes, or other convergence behavior. Review those
+changes separately before applying an adoption plan. Remove the flag once the
+manifest declares the role's full object-grant surface. Adopt mode refuses to
 transfer schema ownership away from the live owner unless apply passes
 `--allow-schema-owner-transfers`.
 
@@ -179,7 +184,7 @@ Review effective and transitive privileges, not role names alone.
   no rule mentions is left alone in every mode, so deleting a `present` PUBLIC
   rule does not revoke anything — switch it to `ensure: absent` instead.
 
-Wildcard revocations preserve concrete grantor attribution. Review per-object
+Since v0.11.0, wildcard revocations preserve concrete grantor attribution. Review per-object
 changes and ensure the executor can act as every recorded grantor. Do not
 replace those statements with a broad plain REVOKE. Versions through 0.10.1
 have a known wildcard grantor gap; use the matching release limitations.

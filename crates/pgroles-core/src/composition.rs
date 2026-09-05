@@ -6,7 +6,7 @@ use thiserror::Error;
 use crate::manifest::{
     AuthProvider, DefaultPrivilege, ExpandedManifest, Grant, ManifestError, Membership,
     PolicyManifest, Profile, RoleDefinition, RoleRetirement, SchemaBinding, SchemaBindingFacet,
-    default_role_pattern, expand_manifest,
+    expand_manifest,
 };
 use crate::model::{DefaultPrivKey, GrantKey, RoleGraph};
 use crate::ownership::{
@@ -111,6 +111,10 @@ pub struct PolicyBundle {
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct SharedPolicy {
+    /// Naming convention inherited by schema bindings without an override.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role_pattern: Option<String>,
+
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default_owner: Option<String>,
 
@@ -144,6 +148,10 @@ impl PolicyDocument {
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct PolicyFragment {
+    /// Naming convention inherited by schema bindings without an override.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role_pattern: Option<String>,
+
     #[serde(default)]
     pub policy: FragmentMetadata,
 
@@ -230,6 +238,7 @@ pub fn compose_bundle(
     let mut ownership = OwnershipIndex::default();
     let mut merged_schemas: BTreeMap<String, SchemaBinding> = BTreeMap::new();
     let mut manifest = PolicyManifest {
+        role_pattern: bundle.shared.role_pattern.clone(),
         default_owner: bundle.shared.default_owner.clone(),
         auth_providers: bundle.shared.auth_providers.clone(),
         profiles: bundle.shared.profiles.clone(),
@@ -282,6 +291,10 @@ pub fn compose_bundle(
 
 fn document_manifest(bundle: &PolicyBundle, fragment: &PolicyFragment) -> PolicyManifest {
     PolicyManifest {
+        role_pattern: fragment
+            .role_pattern
+            .clone()
+            .or_else(|| bundle.shared.role_pattern.clone()),
         default_owner: bundle.shared.default_owner.clone(),
         auth_providers: bundle.shared.auth_providers.clone(),
         profiles: bundle.shared.profiles.clone(),
@@ -327,8 +340,7 @@ fn validate_document_scope(
     }
 
     for schema in &document.fragment.schemas {
-        let manages_bindings =
-            !schema.profiles.is_empty() || schema.role_pattern != default_role_pattern();
+        let manages_bindings = !schema.profiles.is_empty() || schema.role_pattern.is_some();
         if manages_bindings
             && !has_schema_facet(&schema_scope, &schema.name, SchemaBindingFacet::Bindings)
         {
@@ -646,7 +658,7 @@ fn merge_document_manifest(
             .or_insert_with(|| SchemaBinding {
                 name: schema.name.clone(),
                 profiles: Vec::new(),
-                role_pattern: default_role_pattern(),
+                role_pattern: None,
                 owner: None,
             });
 
@@ -658,8 +670,11 @@ fn merge_document_manifest(
             entry.profiles = schema.profiles.clone();
         }
 
-        if schema.role_pattern != default_role_pattern() {
-            entry.role_pattern = schema.role_pattern.clone();
+        if !schema.profiles.is_empty() || schema.role_pattern.is_some() {
+            entry.role_pattern = schema
+                .role_pattern
+                .clone()
+                .or_else(|| fragment.role_pattern.clone());
         }
     }
 }
@@ -687,6 +702,38 @@ sources:
   - file: app.yaml
 "#;
         parse_policy_bundle(bundle).expect("bundle should parse")
+    }
+
+    #[test]
+    fn bundle_fragment_and_schema_patterns_preserve_precedence_when_merged() {
+        let mut bundle = bundle_with_editor_profile();
+        bundle.shared.role_pattern = Some("bundle_{schema}_{profile}".into());
+        let documents: Vec<_> = [
+            ("a", "", ""),
+            ("b", "role_pattern: 'fragment_{schema}_{profile}'", ""),
+            ("c", "role_pattern: 'fragment_{schema}_{profile}'", "    role_pattern: '{schema}-{profile}'"),
+        ].into_iter().map(|(name, fragment_pattern, schema_pattern)| PolicyDocument {
+            source: format!("{name}.yaml"),
+            fragment: parse_policy_fragment(&format!("{fragment_pattern}\nscope:\n  schemas:\n    - name: {name}\n      facets: [bindings]\nschemas:\n  - name: {name}\n    profiles: [editor]\n{schema_pattern}\n")).unwrap(),
+        }).collect();
+        let composed = compose_bundle(&bundle, &documents).unwrap();
+        let names: Vec<_> = composed
+            .expanded
+            .roles
+            .iter()
+            .map(|role| role.name.as_str())
+            .collect();
+        assert_eq!(names, ["bundle_a_editor", "fragment_b_editor", "c-editor"]);
+        let yaml = serde_yaml::to_string(&composed.manifest).unwrap();
+        let restored = expand_manifest(&crate::manifest::parse_manifest(&yaml).unwrap()).unwrap();
+        assert_eq!(
+            names,
+            restored
+                .roles
+                .iter()
+                .map(|role| role.name.as_str())
+                .collect::<Vec<_>>()
+        );
     }
 
     #[test]

@@ -868,6 +868,13 @@
                     ],
                     "x-kubernetes-list-type": "map"
                   },
+                  "role_pattern": {
+                    "description": "Default role naming pattern. Schema bindings can override it. Supports `{schema}` and requires `{profile}`; falls back to `{schema}-{profile}`.",
+                    "maxLength": 128,
+                    "minLength": 1,
+                    "nullable": true,
+                    "type": "string"
+                  },
                   "roles": {
                     "default": [],
                     "description": "One-off role definitions.\n\nKeyed by `name`; see `schemas`.",
@@ -1055,10 +1062,10 @@
                           "type": "array"
                         },
                         "role_pattern": {
-                          "default": "{schema}-{profile}",
-                          "description": "Role naming pattern. Supports `{schema}` and `{profile}` placeholders.\nDefaults to `\"{schema}-{profile}\"`.",
+                          "description": "Role naming pattern. Supports `{schema}` and `{profile}` placeholders.\nOverrides the policy pattern; otherwise inherits it, falling back to `\"{schema}-{profile}\"`.",
                           "maxLength": 128,
                           "minLength": 1,
+                          "nullable": true,
                           "type": "string"
                         }
                       },

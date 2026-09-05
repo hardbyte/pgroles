@@ -71,7 +71,7 @@ spec:
 
 Preview with `pgroles diff --mode adopt -f pgroles.yaml`. Adopt retains revocations and membership removals, but filters role drops and retirement steps. Review every removal and verify application access before setting `reconciliation_mode: adopt`. You can stay in adopt mode permanently.
 
-Roles whose grant surface is known but not yet fully declared can be onboarded safely with `preserve_undeclared_grants: true` — see [preserving undeclared grants](/docs/manifest-reference#preserving-undeclared-grants). Adopt mode additionally refuses to transfer schema ownership unless `--allow-schema-owner-transfers` is passed (CLI) or `spec.allow_schema_owner_transfers: true` is set (operator) — reviewing or approving a plan does not bypass the guard.
+For roles whose object grants are not yet fully declared, `preserve_undeclared_grants: true` preserves undeclared object grants while still enforcing explicit `ensure: absent` assertions. It does not protect default privileges for future objects or change membership reconciliation. Review those parts of the plan separately before leaving additive mode — see [preserving undeclared grants](/docs/manifest-reference#preserving-undeclared-grants). Adopt mode additionally refuses to transfer schema ownership unless `--allow-schema-owner-transfers` is passed (CLI) or `spec.allow_schema_owner_transfers: true` is set (operator) — reviewing or approving a plan does not bypass the guard.
 
 ### 6. Authoritative control (optional)
 

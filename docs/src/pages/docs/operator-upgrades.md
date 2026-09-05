@@ -11,11 +11,11 @@ Read the target release's upgrade notes. Save your current chart version, values
 and policy manifests in your deployment repository. Keep database recovery
 procedures separate: rolling back a controller does not reverse committed SQL.
 
-Set the exact release you reviewed, for example `VERSION=0.10.1`. Render and
+Set the exact release you reviewed, for example `VERSION=0.11.0`. Render and
 review its resources using your existing values:
 
 ```bash
-VERSION=0.10.1
+VERSION=0.11.0
 helm template pgroles-operator oci://ghcr.io/thepartly/charts/pgroles-operator \
   --version "$VERSION" --namespace pgroles-system --include-crds \
   --values values.yaml > operator-rendered.yaml
@@ -45,6 +45,35 @@ kubectl apply --server-side -f operator-crds.yaml
 helm upgrade pgroles-operator oci://ghcr.io/thepartly/charts/pgroles-operator \
   --version "$VERSION" --namespace pgroles-system --values values.yaml --wait
 ```
+
+## Moving from 0.10 to 0.11
+
+- Apply all five version-matched CRDs before starting the new controller. The
+  plan schema adds the optional diagnostic `passwordSourceDigest` field; it
+  does not replace the approval digest or authorize execution.
+- Wildcard revocations now retain each concrete object's grantor. Plans can
+  contain more revoke statements, and changed effects require fresh approval.
+  Review replacement plans and the executor's authority to act as each grantor.
+- Plan creation now distinguishes interrupted creates from collisions with
+  existing plans. Changes to password source versions also replace stale plans; review
+  and approve the replacement when manual approval is required.
+- A policy-level `role_pattern` now supplies the naming convention for schemas
+  that omit their own pattern. Previously ignored top-level patterns in CLI
+  manifests now take effect. Review generated role names and the resulting plan
+  before applying; keep explicit schema patterns where names must stay unchanged.
+  The old Kubernetes API pruned the unsupported policy-level field, so reapply
+  it after upgrading the CRDs. Existing resources may also contain schema-level
+  patterns inserted by the previous CRD's defaulting. Inspect the live resource:
+  those values still override the policy pattern. Remove an override only when
+  you intend that schema to inherit the new convention. Inspect outstanding
+  candidates and plans after the upgrade; review any replacement plans before
+  approving them.
+- Reconciliation concurrency still defaults to one. Retain that setting unless
+  measurements justify increasing it.
+
+The CLI's new Markdown report fingerprint identifies report content. It is not
+an approval digest or a database identity check; approve operator plans through
+the existing plan workflow.
 
 ## Moving from 0.9 to 0.10
 

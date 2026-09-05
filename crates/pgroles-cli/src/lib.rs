@@ -407,8 +407,8 @@ pub fn format_validation_result(validated: &ValidatedManifest) -> String {
 /// then post-processed to drop noise that would otherwise churn under
 /// upgrades or render in irrelevant places: `null` scalars, empty sequences
 /// (except for required-field keys like `members`/`privileges`/`grant`),
-/// known empty top-level maps, and known-default scalar values (e.g. the
-/// default `role_pattern`). The cleaned output still round-trips through
+/// and known empty top-level maps. Explicit naming patterns remain intact.
+/// The cleaned output still round-trips through
 /// `pgroles validate -f` / `diff -f` / `apply -f` because the parser fills
 /// the same defaults back in on read.
 pub fn format_rendered_bundle(
@@ -449,11 +449,6 @@ pub fn format_rendered_bundle(
 /// drift, and so consumers parsing the rendered file can detect mismatches.
 pub const RENDERED_MANIFEST_SCHEMA: &str = "pgroles.manifest.v1";
 
-/// The default value of `SchemaBinding::role_pattern`. Kept in sync with
-/// `pgroles_core::manifest::default_role_pattern()`; if that default ever
-/// changes, this needs to follow so the renderer keeps stripping it.
-const DEFAULT_ROLE_PATTERN: &str = "{schema}-{profile}";
-
 /// Recursively strip serde-emitted defaults from a serialized manifest so
 /// the rendered YAML stays focused on author-meaningful content.
 ///
@@ -461,7 +456,8 @@ const DEFAULT_ROLE_PATTERN: &str = "{schema}-{profile}";
 /// - `null` scalars (e.g. `login: null` on profiles, `name: null` on grants),
 /// - empty sequences (`memberships: []`, `retirements: []`, …),
 /// - empty top-level maps (`profiles: {}` when no profiles are declared),
-/// - known scalar defaults (currently `role_pattern: "{schema}-{profile}"`).
+///
+/// Explicit naming patterns are preserved because they can override inherited patterns.
 ///
 /// All stripped fields round-trip on parse because each has a `#[serde(default)]`
 /// on its struct definition, so a re-read produces an equivalent `PolicyManifest`.
@@ -519,16 +515,6 @@ fn is_strippable(path: &[String], value: &serde_yaml::Value) -> bool {
             // semantically meaningful even though its serialized profile body
             // is empty after defaults are removed.
             matches!(path, [field] if field == "profiles")
-        }
-        Value::String(s) => {
-            // Only strip `role_pattern` at its actual manifest position
-            // (`schemas[i].role_pattern`). Matching on the leaf key alone
-            // would also strip a role/profile *config parameter* that happens
-            // to be named `role_pattern` with a value equal to the default
-            // pattern string — config maps carry arbitrary user-chosen
-            // PostgreSQL parameter names and must round-trip verbatim.
-            matches!(path, [first, last] if first == "schemas" && last == "role_pattern")
-                && s == DEFAULT_ROLE_PATTERN
         }
         _ => false,
     }
@@ -1298,6 +1284,52 @@ roles:
     }
 
     #[test]
+    fn rendered_bundle_preserves_explicit_default_over_custom_shared_pattern() {
+        let mut validated = validated_bundle_for_render();
+        validated.bundle.shared.role_pattern = Some("shared_{schema}_{profile}".into());
+        validated
+            .bundle
+            .shared
+            .profiles
+            .insert("reader".into(), serde_yaml::from_str("grants: []").unwrap());
+        let bindings = composition::PolicyDocument {
+            source: "bindings.yaml".into(),
+            fragment: composition::parse_policy_fragment(
+                r#"
+scope:
+  schemas:
+    - name: app
+      facets: [bindings]
+schemas:
+  - name: app
+    profiles: [reader]
+    role_pattern: "{schema}-{profile}"
+"#,
+            )
+            .unwrap(),
+        };
+        validated.documents.push(bindings);
+        validated.composed =
+            composition::compose_bundle(&validated.bundle, &validated.documents).unwrap();
+        let rendered = format_rendered_bundle(&validated, "bundle.yaml", false).unwrap();
+        let reparsed = validate_manifest(&rendered).unwrap();
+        assert!(
+            reparsed
+                .expanded
+                .roles
+                .iter()
+                .any(|role| role.name == "app-reader")
+        );
+        assert!(
+            !reparsed
+                .expanded
+                .roles
+                .iter()
+                .any(|role| role.name == "shared_app_reader")
+        );
+    }
+
+    #[test]
     fn rendered_bundle_round_trips_to_equivalent_expansion() {
         let validated = validated_bundle_for_render();
         let rendered = format_rendered_bundle(&validated, "bundle.yaml", true).unwrap();
@@ -1372,8 +1404,7 @@ roles:
         // A config parameter is an arbitrary user-chosen PostgreSQL setting
         // name. One literally named `role_pattern` whose value equals the
         // default role pattern string must NOT be stripped by the renderer's
-        // default-removal pass — only `schemas[i].role_pattern` is a
-        // strippable manifest default.
+        // default-removal pass. Explicit schema overrides must also survive.
         let yaml = r#"
 schemas:
   - name: inventory
@@ -1389,13 +1420,13 @@ roles:
         let stripped = strip_manifest_defaults(value);
         let out = serde_yaml::to_string(&stripped).unwrap();
 
-        // The schema-binding default is stripped...
+        // Both the explicit schema override and arbitrary config entry survive.
         assert_eq!(
             out.matches("role_pattern").count(),
-            1,
-            "expected exactly the config entry to survive, got:\n{out}"
+            2,
+            "expected both explicit patterns to survive, got:\n{out}"
         );
-        // ...while the config entry survives with its value intact.
+        // The config value is preserved verbatim.
         let reparsed: serde_yaml::Value = serde_yaml::from_str(&out).unwrap();
         let config_value = reparsed["roles"][0]["config"]["role_pattern"]
             .as_str()
@@ -1468,11 +1499,10 @@ roles:
             !rendered.contains("inherit: null"),
             "rendered output must not include null inherit, got: {rendered}"
         );
-        // The default role_pattern must be elided so it doesn't churn under
-        // future default changes.
+        // An omitted pattern stays omitted.
         assert!(
             !rendered.contains("role_pattern:"),
-            "rendered output must elide default role_pattern, got: {rendered}"
+            "rendered output must omit absent role_pattern, got: {rendered}"
         );
     }
 

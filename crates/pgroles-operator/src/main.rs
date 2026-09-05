@@ -536,6 +536,7 @@ mod tests {
             mode: PolicyMode::Apply,
             reconciliation_mode: CrdReconciliationMode::default(),
             allow_schema_owner_transfers: false,
+            role_pattern: None,
             default_owner: None,
             profiles: Default::default(),
             schemas: Vec::new(),
