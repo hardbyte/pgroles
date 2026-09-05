@@ -418,10 +418,9 @@ pub struct ProfileObjectTarget {
     pub name: Option<String>,
 }
 
-/// A schema binding — associates a schema with one or more profiles.
-///
-/// Field bounds come from [`crate::bounds`]; see that module for why they
-/// exist and where else they are enforced.
+/// Associates a PostgreSQL schema with one or more reusable privilege profiles.
+// Field bounds come from crate::bounds; see that module for why they
+// exist and where else they are enforced.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct SchemaBinding {
     #[schemars(length(min = 1, max = MAX_IDENTIFIER))]
