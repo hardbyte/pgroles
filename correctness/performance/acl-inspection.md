@@ -74,3 +74,9 @@ maximum resident set size (`/usr/bin/time -l`) was 103,792,640 bytes inline and
 103,235,584 bytes bounded. This is process RSS, not an allocation/heap profile;
 it supports no extra full snapshot copy, not a general memory reduction claim.
 Timing varies with host load. Use the low-CPU cluster gate for deployment claims.
+
+## Cluster validation
+
+Run [33926081262](https://github.com/thepartly/pgroles/actions/runs/33926081262) tested the chart's 200m CPU setting with one and two Tokio workers, ten policies, and 40,000 ACL rows per policy. Serial reconciliation converged with zero restarts and peak working sets of 76,382,208 and 76,492,800 bytes respectively. The test used a 512 MiB memory limit. Unbounded reconciliation failed to complete, so these runs do not provide a bounded/unbounded ratio or a 128 MiB production guarantee.
+
+The burst gate additionally samples real `/livez` and `/readyz` requests to the new pod through the Kubernetes API proxy. It reports p95 and maximum latency, includes proxy overhead, requires at least three samples per endpoint, and rejects failures or requests at or above the shipped two-second timeout after each endpoint first responds. Startup before the endpoint listens is excluded; pod restart checks remain independent. Tokio scheduling lag is a separate metric and is not presented as HTTP latency.
