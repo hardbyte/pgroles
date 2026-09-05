@@ -3,6 +3,8 @@ title: Ephemeral access
 description: Request, approve, and revoke bounded PostgreSQL role memberships.
 ---
 
+For field types, defaults, and admission constraints, see the [CRD API reference](/docs/operator-api-reference).
+
 Ephemeral access grants an existing PostgreSQL identity one predefined bundle of
 role memberships for a bounded duration, then takes it back.
 

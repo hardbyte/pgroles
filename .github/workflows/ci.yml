@@ -120,6 +120,9 @@ jobs:
       - name: CRD drift check
         run: scripts/check-crd-drift.sh
 
+      - name: CRD reference drift and description coverage
+        run: scripts/check-crd-docs.sh
+
       - name: Chart README drift check
         run: scripts/check-helm-docs.sh
 

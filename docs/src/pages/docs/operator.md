@@ -3,15 +3,19 @@ title: Kubernetes operator
 description: Run pgroles as a Kubernetes operator that continuously reconciles PostgreSQL roles against a custom resource.
 ---
 
+For field types, defaults, and admission constraints, see the [CRD API reference](/docs/operator-api-reference).
+
 Declare your PostgreSQL roles, memberships, and privileges as a Kubernetes resource, and let the operator keep the database matching it. {% .lead %}
 
 ---
 
 {% callout type="warning" title="Know what it will do before you apply it" %}
 By default a `PostgresPolicy` runs in `mode: apply` with
-`reconciliation_mode: authoritative`, which means anything in the database but
-not in the policy is revoked or dropped. On an existing database that can be
-thousands of grants. Start with `mode: observe`, which executes no mutating SQL, and
+`reconciliation_mode: authoritative`, which can revoke undeclared managed
+privileges and drop undeclared roles within its configured inspection scope.
+External roles are protected from alteration and dropping; `PUBLIC` targets need
+explicit rules. On an existing database, the managed scope can contain thousands
+of grants. Start with `mode: observe`, which executes no mutating SQL, and
 read [staged adoption](/docs/adoption) before pointing pgroles at something you
 care about.
 {% /callout %}

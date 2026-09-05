@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Documentation
+
+- Generate a complete field reference and downloadable served schema for all five CRDs; require source descriptions and detect reference drift in CI.
 ### Fixed
 
 - Wildcard revocations retain concrete object/grantor attribution, including PUBLIC and mixed-owner scopes. Normalization preserves named-object exceptions; owner privileges remain protected. Revocations may produce more concrete plan entries and require fresh approval when effects differ. (#215)

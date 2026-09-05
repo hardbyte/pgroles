@@ -105,3 +105,10 @@
   --input: var(--color-stone-700);
   --ring: var(--color-amber-400);
 }
+
+/* API paths and CEL expressions must wrap inside the article, including on
+   narrow screens; they must never extend under the page navigation. */
+.crd-reference table { table-layout: fixed; width: 100%; }
+.crd-reference th:first-child { width: 34%; }
+.crd-reference td { overflow-wrap: anywhere; }
+.crd-reference td code { white-space: normal; overflow-wrap: anywhere; }

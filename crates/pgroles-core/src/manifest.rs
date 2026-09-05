@@ -361,15 +361,19 @@ pub enum AuthProvider {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Profile {
     #[serde(default)]
+    /// Whether the role may initiate database sessions.
     pub login: Option<bool>,
 
     #[serde(default)]
+    /// Whether privileges from role memberships are inherited automatically.
     pub inherit: Option<bool>,
 
     #[serde(default)]
+    /// Object privilege templates expanded for each bound schema.
     pub grants: Vec<ProfileGrant>,
 
     #[serde(default)]
+    /// Privileges to grant on future objects created by the configured owner.
     pub default_privileges: Vec<DefaultPrivilegeGrant>,
 
     /// Role-level configuration parameter defaults for generated roles,
@@ -389,8 +393,10 @@ pub struct Profile {
 /// A grant template within a profile (schema is filled in during expansion).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProfileGrant {
+    /// PostgreSQL privileges to reconcile on the selected objects.
     pub privileges: Vec<Privilege>,
     #[serde(alias = "on")]
+    /// Object kind and target to which the privileges apply.
     pub object: ProfileObjectTarget,
     /// Whether the privilege must be present or absent. Expansion rejects
     /// `absent`, because a profile is an additive template. The field exists
@@ -405,23 +411,25 @@ pub struct ProfileGrant {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProfileObjectTarget {
     #[serde(rename = "type")]
+    /// PostgreSQL object kind.
     pub object_type: ObjectType,
     /// Object name, or "*" for all objects of this type. Omit for schema-level grants.
     #[serde(default)]
     pub name: Option<String>,
 }
 
-/// A schema binding — associates a schema with one or more profiles.
-///
-/// Field bounds come from [`crate::bounds`]; see that module for why they
-/// exist and where else they are enforced.
+/// Associates a PostgreSQL schema with one or more reusable privilege profiles.
+// Field bounds come from crate::bounds; see that module for why they
+// exist and where else they are enforced.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct SchemaBinding {
     #[schemars(length(min = 1, max = MAX_IDENTIFIER))]
+    /// PostgreSQL schema name.
     pub name: String,
 
     #[serde(default)]
     #[schemars(length(max = MAX_SCHEMA_PROFILES), inner(length(min = 1, max = MAX_IDENTIFIER)))]
+    /// Profile names to expand for this schema.
     pub profiles: Vec<String>,
 
     /// Role naming pattern. Supports `{schema}` and `{profile}` placeholders.
@@ -474,6 +482,7 @@ fn is_false(value: &bool) -> bool {
 /// A concrete role definition.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RoleDefinition {
+    /// PostgreSQL role name.
     pub name: String,
 
     /// Treat this role as managed by another system. pgroles may reference it
@@ -492,30 +501,39 @@ pub struct RoleDefinition {
     pub preserve_undeclared_grants: bool,
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Whether the role may initiate database sessions.
     pub login: Option<bool>,
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Whether the role bypasses PostgreSQL permission checks as a superuser.
     pub superuser: Option<bool>,
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Whether the role may create databases.
     pub createdb: Option<bool>,
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Whether the role may create and administer roles, subject to server-version rules.
     pub createrole: Option<bool>,
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Whether privileges from role memberships are inherited automatically.
     pub inherit: Option<bool>,
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Whether the role may initiate replication connections.
     pub replication: Option<bool>,
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Whether the role bypasses row-level security.
     pub bypassrls: Option<bool>,
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Maximum concurrent connections for the role; -1 means unlimited.
     pub connection_limit: Option<i32>,
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Descriptive PostgreSQL role comment.
     pub comment: Option<String>,
 
     /// Password source for this role. Passwords are never stored in the manifest
@@ -630,10 +648,13 @@ pub struct Grant {
     #[schemars(length(min = 1, max = MAX_IDENTIFIER))]
     pub role: String,
     #[schemars(length(min = 1, max = MAX_PRIVILEGES))]
+    /// PostgreSQL privileges to reconcile on the selected objects.
     pub privileges: Vec<Privilege>,
     #[serde(alias = "on")]
+    /// Object kind and target to which the privileges apply.
     pub object: ObjectTarget,
     #[serde(default, skip_serializing_if = "Ensure::is_present")]
+    /// Desired object privilege state: present grants it; absent explicitly revokes it.
     pub ensure: Ensure,
 }
 
@@ -645,6 +666,7 @@ pub struct Grant {
 })]))]
 pub struct ObjectTarget {
     #[serde(rename = "type")]
+    /// PostgreSQL object kind.
     pub object_type: ObjectType,
 
     /// Schema name. Required for most object types except database.
@@ -687,6 +709,7 @@ pub struct DefaultPrivilege {
     pub scope: Option<DefaultPrivilegeScopeSpec>,
 
     #[schemars(length(max = MAX_DEFAULT_PRIVILEGE_GRANTS))]
+    /// Grantee, privileges, and future object kind to reconcile.
     pub grant: Vec<DefaultPrivilegeGrant>,
 }
 
@@ -698,6 +721,7 @@ pub struct DefaultPrivilege {
 })]))]
 pub struct DefaultPrivilegeScopeSpec {
     #[serde(rename = "type")]
+    /// Global or per-schema scope of the default privilege.
     pub scope_type: DefaultPrivilegeScopeType,
 
     /// Schema name. Required for `type: schema`, forbidden for `type: global`.
@@ -766,10 +790,13 @@ pub struct DefaultPrivilegeGrant {
     pub role: Option<String>,
 
     #[schemars(length(min = 1, max = MAX_PRIVILEGES))]
+    /// PostgreSQL privileges to reconcile on the selected objects.
     pub privileges: Vec<Privilege>,
+    /// Kind of future object affected by the default privilege.
     pub on_type: ObjectType,
 
     #[serde(default, skip_serializing_if = "Ensure::is_present")]
+    /// Desired privilege state: present grants it; absent explicitly revokes it.
     pub ensure: Ensure,
 }
 
@@ -777,8 +804,10 @@ pub struct DefaultPrivilegeGrant {
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct Membership {
     #[schemars(length(min = 1, max = MAX_IDENTIFIER))]
+    /// PostgreSQL role granted to the listed members.
     pub role: String,
     #[schemars(length(max = MAX_MEMBERS))]
+    /// Roles that should receive this membership.
     pub members: Vec<MemberSpec>,
 
     /// Assert that `members` is the complete membership of `role`: plan a
@@ -803,6 +832,7 @@ pub struct Membership {
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct MemberSpec {
     #[schemars(length(min = 1, max = MAX_IDENTIFIER))]
+    /// PostgreSQL role receiving the membership.
     pub name: String,
 
     /// Whether the member inherits the role's privileges. Defaults to `true`.
@@ -1088,7 +1118,9 @@ pub fn validate_bounds(manifest: &PolicyManifest) -> Result<(), ManifestError> {
 pub struct ExpandedManifest {
     pub schemas: Vec<ExpandedSchema>,
     pub roles: Vec<RoleDefinition>,
+    /// Object privilege templates expanded for each bound schema.
     pub grants: Vec<Grant>,
+    /// Privileges to grant on future objects created by the configured owner.
     pub default_privileges: Vec<DefaultPrivilege>,
     pub memberships: Vec<Membership>,
 }
