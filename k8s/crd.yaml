@@ -639,7 +639,7 @@
                   },
                   "profiles": {
                     "additionalProperties": {
-                      "description": "A reusable privilege profile (CRD-compatible version).\n\nThis mirrors `pgroles_core::manifest::Profile` but derives `JsonSchema`.",
+                      "description": "A reusable privilege profile.",
                       "properties": {
                         "config": {
                           "additionalProperties": {
@@ -818,7 +818,7 @@
                   },
                   "reconciliation_mode": {
                     "default": "authoritative",
-                    "description": "Convergence strategy: how aggressively to converge the database.\n\n- `authoritative` (default): full convergence — anything not in the\n  manifest is revoked/dropped.\n- `additive`: only grant, never revoke — safe for incremental adoption;\n  `ensure: absent` assertions are ignored with a warning condition.\n- `adopt`: manage declared roles fully, but never drop undeclared roles.",
+                    "description": "Convergence strategy: how aggressively to converge the database.\n\n- `authoritative` (default): revoke undeclared managed privileges and\n  drop undeclared roles within the configured inspection scope. External\n  roles are not altered or dropped; PUBLIC targets require explicit rules.\n- `additive`: only grant, never revoke — safe for incremental adoption;\n  `ensure: absent` assertions are ignored with a warning condition.\n- `adopt`: manage declared roles fully, but never drop undeclared roles.",
                     "enum": [
                       "authoritative",
                       "additive",
@@ -872,7 +872,7 @@
                     "default": [],
                     "description": "One-off role definitions.\n\nKeyed by `name`; see `schemas`.",
                     "items": {
-                      "description": "A concrete role definition (CRD-compatible version).",
+                      "description": "A concrete PostgreSQL role definition.",
                       "properties": {
                         "bypassrls": {
                           "description": "Whether the role bypasses row-level security.",
@@ -1028,7 +1028,7 @@
                     "default": [],
                     "description": "Schema bindings that expand profiles into concrete roles/grants.\n\nKeyed by `name` so server-side apply merges entries per schema instead\nof replacing the whole list. The API server also rejects duplicate keys.",
                     "items": {
-                      "description": "A schema binding — associates a schema with one or more profiles.\n\nField bounds come from [`crate::bounds`]; see that module for why they\nexist and where else they are enforced.",
+                      "description": "Associates a PostgreSQL schema with one or more reusable privilege profiles.",
                       "properties": {
                         "name": {
                           "description": "PostgreSQL schema name.",
@@ -1214,7 +1214,7 @@
                           "type": "string"
                         },
                         "type": {
-                          "description": "Type of condition: \"Ready\", \"Reconciling\", \"Degraded\".",
+                          "description": "Controller-defined condition type, such as Ready, Reconciling, or Degraded.\nThis is an open vocabulary; consult status guidance for operational meanings.",
                           "type": "string"
                         }
                       },
@@ -1262,7 +1262,7 @@
                     "type": "string"
                   },
                   "last_reconcile_mode": {
-                    "description": "Policy reconcile mode.\n\nDeliberately not `PartialEq`: `plan` is a deprecated spelling of `observe`\nthat must behave identically everywhere, and an `==` comparison is exactly\nthe kind of site that forgets one of the two. Compare through\n[`PolicyMode::never_executes`] and [`PolicyMode::is_deprecated_spelling`],\nor match exhaustively.",
+                    "description": "Controls whether the operator executes changes or only computes plans.",
                     "enum": [
                       "apply",
                       "observe",

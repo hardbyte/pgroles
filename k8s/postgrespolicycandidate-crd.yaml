@@ -353,7 +353,7 @@
                       },
                       "profiles": {
                         "additionalProperties": {
-                          "description": "A reusable privilege profile (CRD-compatible version).\n\nThis mirrors `pgroles_core::manifest::Profile` but derives `JsonSchema`.",
+                          "description": "A reusable privilege profile.",
                           "properties": {
                             "config": {
                               "additionalProperties": {
@@ -574,7 +574,7 @@
                       "roles": {
                         "description": "One-off role definitions.",
                         "items": {
-                          "description": "A concrete role definition (CRD-compatible version).",
+                          "description": "A concrete PostgreSQL role definition.",
                           "properties": {
                             "bypassrls": {
                               "description": "Whether the role bypasses row-level security.",
@@ -723,7 +723,7 @@
                       "schemas": {
                         "description": "Schema bindings that expand profiles into concrete roles/grants.",
                         "items": {
-                          "description": "A schema binding — associates a schema with one or more profiles.\n\nField bounds come from [`crate::bounds`]; see that module for why they\nexist and where else they are enforced.",
+                          "description": "Associates a PostgreSQL schema with one or more reusable privilege profiles.",
                           "properties": {
                             "name": {
                               "description": "PostgreSQL schema name.",
@@ -863,7 +863,7 @@
                           "type": "string"
                         },
                         "type": {
-                          "description": "Type of condition: \"Ready\", \"Reconciling\", \"Degraded\".",
+                          "description": "Controller-defined condition type, such as Ready, Reconciling, or Degraded.\nThis is an open vocabulary; consult status guidance for operational meanings.",
                           "type": "string"
                         }
                       },

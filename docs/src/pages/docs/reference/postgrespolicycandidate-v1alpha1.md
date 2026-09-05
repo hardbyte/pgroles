@@ -54,7 +54,7 @@ For workflows, see [operator guidance](/docs/operator), [approval](/docs/operato
 | ` spec.content.memberships[].members[].name ` | **string; required.** PostgreSQL role receiving the membership. **Constraints:** ` {"maxLength":63,"minLength":1} `. |
 | ` spec.content.memberships[].role ` | **string; required.** PostgreSQL role granted to the listed members. **Constraints:** ` {"maxLength":63,"minLength":1} `. |
 | ` spec.content.profiles ` | **object; optional.** Reusable privilege profiles.  A &#96;BTreeMap&#96; rather than the policy's &#96;HashMap&#96;: the content digest is computed over a canonical serialization, and deterministic iteration order is one less thing that has to be normalised later. **Constraints:** ` {"maxProperties":128} `. |
-| ` spec.content.profiles.<name> ` | **object; item or branch.** A reusable privilege profile (CRD-compatible version).  This mirrors &#96;pgroles&#95;core::manifest::Profile&#96; but derives &#96;JsonSchema&#96;. |
+| ` spec.content.profiles.<name> ` | **object; item or branch.** A reusable privilege profile. |
 | ` spec.content.profiles.<name>.config ` | **object; optional.** Role-level configuration parameter defaults for generated roles, applied via &#96;ALTER ROLE ... SET parameter = value&#96;. Values support the &#96;{schema}&#96; and &#96;{profile}&#96; placeholders, substituted per &#96;schema x profile&#96; expansion (e.g. &#96;search&#95;path: "{schema}"&#96;). **Constraints:** ` {"maxProperties":32} `. |
 | ` spec.content.profiles.<name>.config.<name> ` | **string; item or branch.** A role configuration parameter value.  Values are always strings — quote numbers and booleans (e.g. &#96;statement&#95;timeout: "30000"&#96;, &#96;jit: "off"&#96;). The Kubernetes CRD schema types config values as strings, and the CLI enforces the same rule so a manifest means the same thing whether it is applied with &#96;pgroles&#96; or &#96;kubectl&#96;. PostgreSQL coerces the string to the parameter's type. **Constraints:** ` {"maxLength":256} `. |
 | ` spec.content.profiles.<name>.default_privileges ` | **array; optional.** Privileges to grant on future objects created by the configured owner. **Constraints:** ` {"maxItems":32} `. |
@@ -82,7 +82,7 @@ For workflows, see [operator guidance](/docs/operator), [approval](/docs/operato
 | ` spec.content.retirements[].role ` | **string; required.** The role to retire and ultimately drop. **Constraints:** ` {"maxLength":63,"minLength":1} `. |
 | ` spec.content.retirements[].terminate_sessions ` | **boolean; optional.** Whether to terminate other active sessions for the role before drop. |
 | ` spec.content.roles ` | **array; optional.** One-off role definitions. **Constraints:** ` {"maxItems":1024} `. |
-| ` spec.content.roles[] ` | **object; item or branch.** A concrete role definition (CRD-compatible version). **Constraints:** ` {"required":["name"]} `. |
+| ` spec.content.roles[] ` | **object; item or branch.** A concrete PostgreSQL role definition. **Constraints:** ` {"required":["name"]} `. |
 | ` spec.content.roles[].bypassrls ` | **boolean; optional.** Whether the role bypasses row-level security. **Constraints:** ` {"nullable":true} `. |
 | ` spec.content.roles[].comment ` | **string; optional.** Descriptive PostgreSQL role comment. **Constraints:** ` {"maxLength":256,"nullable":true} `. |
 | ` spec.content.roles[].config ` | **object; optional.** Role-level configuration parameter defaults, applied via &#96;ALTER ROLE ... SET parameter = value&#96; (e.g. &#96;role: combined&#96;, &#96;search&#95;path: app&#96;). Settings present on the role in the database but absent here are RESET in authoritative mode. **Constraints:** ` {"maxProperties":32} `. |
@@ -107,7 +107,7 @@ For workflows, see [operator guidance](/docs/operator), [approval](/docs/operato
 | ` spec.content.roles[].replication ` | **boolean; optional.** Whether the role may initiate replication connections. **Constraints:** ` {"nullable":true} `. |
 | ` spec.content.roles[].superuser ` | **boolean; optional.** Whether the role bypasses PostgreSQL permission checks as a superuser. **Constraints:** ` {"nullable":true} `. |
 | ` spec.content.schemas ` | **array; optional.** Schema bindings that expand profiles into concrete roles/grants. **Constraints:** ` {"maxItems":1024} `. |
-| ` spec.content.schemas[] ` | **object; item or branch.** A schema binding — associates a schema with one or more profiles.  Field bounds come from &#91;&#96;crate::bounds&#96;&#93;; see that module for why they exist and where else they are enforced. **Constraints:** ` {"required":["name"]} `. |
+| ` spec.content.schemas[] ` | **object; item or branch.** Associates a PostgreSQL schema with one or more reusable privilege profiles. **Constraints:** ` {"required":["name"]} `. |
 | ` spec.content.schemas[].name ` | **string; required.** PostgreSQL schema name. **Constraints:** ` {"maxLength":63,"minLength":1} `. |
 | ` spec.content.schemas[].owner ` | **string; optional.** Override default&#95;owner for this schema's default privileges. **Constraints:** ` {"maxLength":63,"minLength":1,"nullable":true} `. |
 | ` spec.content.schemas[].profiles ` | **array; optional.** Profile names to expand for this schema. **Constraints:** ` {"maxItems":64} `. |
@@ -132,7 +132,7 @@ For workflows, see [operator guidance](/docs/operator), [approval](/docs/operato
 | ` status.conditions[].message ` | **string; optional.** Human-readable message. **Constraints:** ` {"nullable":true} `. |
 | ` status.conditions[].reason ` | **string; optional.** Human-readable reason for the condition. **Constraints:** ` {"nullable":true} `. |
 | ` status.conditions[].status ` | **string; required.** Status: "True", "False", or "Unknown". |
-| ` status.conditions[].type ` | **string; required.** Type of condition: "Ready", "Reconciling", "Degraded". |
+| ` status.conditions[].type ` | **string; required.** Controller-defined condition type, such as Ready, Reconciling, or Degraded. This is an open vocabulary; consult status guidance for operational meanings. |
 | ` status.contentDigest ` | **string; optional.** Canonical digest of &#96;spec.content&#96;, computed by &#96;pgroles&#95;core::candidate::compute&#95;content&#95;digest&#96;. This is what promotion is verified against. **Constraints:** ` {"maxLength":128,"nullable":true} `. |
 | ` status.observedGeneration ` | **integer; optional.** The &#96;.metadata.generation&#96; that was last observed. A candidate spec is immutable, so this advances at most once. **Constraints:** ` {"format":"int64","nullable":true} `. |
 | ` status.phase ` | **string; optional.** Current candidate evaluation and promotion phase. **Default:** ` "Pending" `. **Constraints:** ` {"enum":["Pending","Planned","Promoted","Superseded","Stale"]} `. |
