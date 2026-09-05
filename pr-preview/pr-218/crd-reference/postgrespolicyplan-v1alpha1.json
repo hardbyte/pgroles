@@ -291,7 +291,7 @@
                 "type": "string"
               },
               "type": {
-                "description": "Type of condition: \"Ready\", \"Reconciling\", \"Degraded\".",
+                "description": "Controller-defined condition type, such as Ready, Reconciling, or Degraded.\nThis is an open vocabulary; consult status guidance for operational meanings.",
                 "type": "string"
               }
             },
