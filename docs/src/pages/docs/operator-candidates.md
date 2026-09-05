@@ -3,6 +3,8 @@ title: Candidates and promotion
 description: Propose policy changes, review their exact PostgreSQL effects, and promote them — while the active policy keeps enforcing during review.
 ---
 
+For field types, defaults, and admission constraints, see the [CRD API reference](/docs/operator-api-reference).
+
 Review what a change would do to production before it becomes the desired state. {% .lead %}
 
 ---

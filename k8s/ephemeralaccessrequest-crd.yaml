@@ -287,7 +287,7 @@
                     "type": "string"
                   },
                   "resolvedAccess": {
-                    "description": "Write-once snapshot of the approved target, duration, and exact memberships.",
+                    "description": "Write-once snapshot of the resolved target, duration, and exact memberships,\nrecorded before approval so the decision binds to this access bundle.",
                     "nullable": true,
                     "properties": {
                       "accessPolicyGeneration": {

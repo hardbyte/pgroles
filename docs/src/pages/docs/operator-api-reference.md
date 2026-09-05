@@ -3,7 +3,7 @@ title: CRD API reference
 description: Generated field descriptions, defaults, and validation for all five pgroles custom resources.
 ---
 
-Use the [operator quick start](/docs/operator-quick-start) for a working deployment. These references describe the exact served schemas, including nested fields, defaults, requiredness, and CEL admission rules.
+Use the [operator quick start](/docs/operator-quick-start) for a working deployment. These references describe the served schemas generated from the source revision used to build this documentation, including nested fields, defaults, requiredness, and CEL admission rules. The site can lead the latest release; compare against the CRDs installed in your cluster or the tagged source for your operator version.
 
 | Resource | Purpose |
 | --- | --- |

@@ -7,6 +7,7 @@
     "build": "next build --webpack",
     "start": "next start",
     "lint": "eslint src markdoc tests --ext .js,.jsx,.mjs",
+    "test:reference": "node --test tests/crd-reference.test.mjs",
     "test:labs": "node tests/labs.test.mjs"
   },
   "browserslist": "defaults, not ie <= 11",

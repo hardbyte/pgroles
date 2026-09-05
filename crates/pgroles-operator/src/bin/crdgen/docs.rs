@@ -8,8 +8,20 @@ fn text(value: &str) -> String {
         .replace('>', "&gt;")
         .replace('|', "&#124;")
         .replace('`', "&#96;")
+        .replace('*', "&#42;")
+        .replace('_', "&#95;")
+        .replace('[', "&#91;")
+        .replace(']', "&#93;")
         .replace("{%", "&#123;%")
         .replace('\n', " ")
+}
+
+// Code spans must retain literal angle brackets and ampersands: Markdown does
+// not decode HTML entities inside code. Escape table separators before parsing.
+fn code(value: &str) -> String {
+    let delimiter = "`".repeat(value.split(|c| c != '`').map(str::len).max().unwrap_or(0) + 1);
+    let value = value.replace('|', "\\|").replace('\n', " ");
+    format!("{delimiter} {value} {delimiter}")
 }
 
 // allOf adds requirements; alternatives guarantee only their intersection.
@@ -66,6 +78,7 @@ fn walk(
             })
             .unwrap_or_else(|| "union".into());
         let constraints: serde_json::Map<String, Value> = [
+            "required",
             "format",
             "nullable",
             "enum",
@@ -99,19 +112,19 @@ fn walk(
         };
         let default = schema
             .get("default")
-            .map(|v| format!(" **Default:** {}.", text(&v.to_string())))
+            .map(|v| format!(" **Default:** {}.", code(&v.to_string())))
             .unwrap_or_default();
         let limits = if constraints.is_empty() {
             String::new()
         } else {
             format!(
                 " **Constraints:** {}.",
-                text(&Value::Object(constraints).to_string())
+                code(&Value::Object(constraints).to_string())
             )
         };
         output.push_str(&format!(
-            "| `{}` | **{}; {}.** {}{}{} |\n",
-            text(path),
+            "| {} | **{}; {}.** {}{}{} |\n",
+            code(path),
             text(&kind),
             presence,
             text(description),
@@ -125,9 +138,9 @@ fn walk(
     {
         for rule in rules {
             output.push_str(&format!(
-                "| `{}` | **CEL:** {}. {} |\n",
-                text(path),
-                text(&rule.to_string()),
+                "| {} | **CEL:** {}. {} |\n",
+                code(path),
+                code(&rule.to_string()),
                 "Evaluated with self at this path; oldSelf refers to the previous value on update."
             ));
         }
@@ -159,7 +172,12 @@ fn walk(
             for (index, branch) in branches.iter().enumerate() {
                 // Branch fields retain the real field path; the branch label
                 // states their conditional requiredness without inventing an API path.
-                output.push_str(&format!("| `{}` | **{} branch {} (conditional).** Fields below apply within this branch. |\n", text(path), keyword, index + 1));
+                let scope = if keyword == "allOf" {
+                    "all branches apply"
+                } else {
+                    "conditional"
+                };
+                output.push_str(&format!("| {} | **{} branch {} ({scope}).** Constraints and fields below apply within this branch. |\n", code(path), keyword, index + 1));
                 walk(branch, path, false, false, output)?;
             }
         }
@@ -265,9 +283,9 @@ mod tests {
         let pages = render(&crd(schema)).unwrap();
         let body = &pages[0].1;
         for expected in [
-            "`spec.roles` | **array; required",
+            "` spec.roles ` | **array; required",
             "spec.roles[].name",
-            "spec.profiles.&lt;name&gt;.enabled",
+            "spec.profiles.<name>.enabled",
             "maxItems",
             "self == oldSelf",
             "A &#124; B &lt;name&gt;",
@@ -285,7 +303,7 @@ mod tests {
         ],"x-kubernetes-validations":[{"rule":"self == oldSelf","optionalOldSelf":true}]});
         let body = &render(&crd(schema.clone())).unwrap()[0].1;
         assert!(body.contains("oneOf branch 1"));
-        assert!(body.contains("`spec.kind` | **string; required"));
+        assert!(body.contains("` spec.kind ` | **string; required"));
         assert!(body.contains("optionalOldSelf"));
         let assets = schemas(&crd(schema.clone())).unwrap();
         let parsed: Value = serde_json::from_str(&assets[0].1).unwrap();
@@ -299,13 +317,28 @@ mod tests {
             "b":{"type":"string","description":"B"}},
             "oneOf":[{"required":["type","a"]},{"required":["type","b"]}]});
         let body = &render(&crd(schema)).unwrap()[0].1;
-        assert!(body.contains("`spec.type` | **string; required"));
-        assert!(body.contains("`spec.a` | **string; optional"));
+        assert!(body.contains("` spec.type ` | **string; required"));
+        assert!(body.contains("` spec.a ` | **string; optional"));
+        assert!(body.contains(r#""required":["type","a"]"#));
+        assert!(body.contains(r#""required":["type","b"]"#));
         assert_eq!(
             required_fields(&json!({"allOf":[{"required":["a"]},{"anyOf":[{"required":["b"]}]}]})),
             ["a".to_string(), "b".to_string()].into()
         );
     }
+    #[test]
+    fn literal_code_keeps_paths_patterns_and_composition_constraints() {
+        assert_eq!(code("spec.profiles.<name>"), "` spec.profiles.<name> `");
+        assert_eq!(code("a`b|c"), "`` a`b\\|c ``");
+        let body = &render(&crd(
+            json!({"description":"Spec", "allOf":[{"required":["a"]}]}),
+        ))
+        .unwrap()[0]
+            .1;
+        assert!(body.contains("allOf branch 1 (all branches apply)"));
+        assert!(body.contains(r#""required":["a"]"#));
+    }
+
     #[test]
     fn all_product_schemas_have_descriptions() {
         for crd in crate::generate() {

@@ -1682,7 +1682,8 @@ pub struct EphemeralAccessRequestStatus {
     /// Lifecycle observations and terminal Approved or Denied decisions.
     pub conditions: Vec<EphemeralAccessCondition>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    /// Write-once snapshot of the approved target, duration, and exact memberships.
+    /// Write-once snapshot of the resolved target, duration, and exact memberships,
+    /// recorded before approval so the decision binds to this access bundle.
     pub resolved_access: Option<ResolvedEphemeralAccess>,
     /// Kubernetes identity which approved or denied the request. The supplied
     /// Kyverno reference policy overwrites this from authenticated admission
