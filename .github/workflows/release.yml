@@ -92,21 +92,19 @@ jobs:
             exit 1
           fi
 
-          # Lead the body with this version's changelog entry, the way releases
-          # read before the process moved into this workflow. GitHub appends its
-          # generated "What's Changed" list after it.
+          # Use only this version's curated changelog entry. Do not add
+          # --generate-notes: GitHub would append a duplicate change list.
           awk -v section="## [${tag#v}]" '
             index($0, section) == 1 { inside = 1; next }
             inside && /^## \[/ { exit }
             inside { print }
           ' CHANGELOG.md > release-notes.md
 
-          release_args=(--verify-tag --title "$tag" --generate-notes --draft)
-          if [ -s release-notes.md ]; then
-            release_args+=(--notes-file release-notes.md)
-          else
-            echo "::warning::No CHANGELOG.md section found for ${tag}; using generated notes only."
+          if ! grep -q '[^[:space:]]' release-notes.md; then
+            echo "::error::Missing or empty CHANGELOG.md section for ${tag}; refusing to create a release without curated notes."
+            exit 1
           fi
+          release_args=(--verify-tag --title "$tag" --notes-file release-notes.md --draft)
           if [[ "$tag" == *-* ]]; then
             release_args+=(--prerelease)
           fi
