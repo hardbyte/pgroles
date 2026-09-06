@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Release notes use only the matching changelog entry, without GitHub's duplicated change list. Missing or empty release notes stop draft creation.
+
 ## [0.11.0] - 2026-09-06
 
 ### Upgrade notes

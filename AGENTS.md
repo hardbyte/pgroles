@@ -139,9 +139,10 @@ The tag push then drives everything, in this order:
    runs before anything else, so tagging a commit CI has not passed costs
    nothing.
 2. **`prepare-github-release`** creates a *draft* release, with the body taken
-   from that version's `CHANGELOG.md` section and GitHub's generated "What's
-   Changed" appended. Every publishing job waits on it, so a release that was
-   published by hand fails here — while nothing has reached crates.io or GHCR.
+   only from that version's `CHANGELOG.md` section. Never pass `--generate-notes`:
+   it appends a duplicate GitHub change list. A missing or empty changelog entry
+   stops the release. Every publishing job waits on this gate, so a release that
+   was published by hand fails here — while nothing has reached crates.io or GHCR.
 3. **`build-binaries`** cross-compiles the CLI for four targets.
 4. **`docker-operator`** and **`docker-cli`** push, sign, and attest the images.
 5. **`publish-crates`** publishes the four crates, after the images rather than
